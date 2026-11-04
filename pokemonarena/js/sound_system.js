@@ -395,8 +395,8 @@ export function createSoundSystem(opts = {}) {
     return true;
   }
   /**
-   * Called every frame by the battle page: the music follows the scene's mode, and the pause menu ducks it. hasPreview = the battle opens on a team preview (3v3): its
-   * intro text then waits for the preview song; a battle without one (6v6) starts its battle song with the intro text.
+   * Called every frame by the battle page: the music follows the scene's mode, and the pause menu ducks it. hasPreview = the battle opens on a preview (the 3v3 team preview, or the 6v6 lead preview when the player has a lead to
+   * choose; matchctl.js opensOnPreview): its intro text then waits for the preview song; a battle without one (a 6v6 team of one) starts its battle song with the intro text.
    */
   function battleFrame(scene, cpu, hasPreview) {
     try { battleFrameInner(scene, cpu, hasPreview); } catch (e) { S.frameError = String(e && e.message ? e.message : e); }

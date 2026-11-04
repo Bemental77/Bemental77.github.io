@@ -13,7 +13,9 @@
 // choice into several seconds. This module is message driven, so a hidden tab costs nothing. What IS reused from lib/netplay.js is everything about
 // getting two people connected: the room code, the host's approval of the joiner, ICE / relay fallback, link health (js/online.js).
 //
-// THE PROTOCOL (every message is { t:'lsarena', v:1, k:<kind>, mn:<match number>, ... }; mn counts rematches):
+// THE PROTOCOL (every message is { t:'lsarena', v:2, k:<kind>, mn:<match number>, ... }; mn counts rematches). Version 2 is the build in which a 6v6 battle opens with a LEAD
+// preview (each player chooses which Pokemon is sent out first): a round like the 3v3 team preview, committed and revealed together, so the version moved on and a page on the
+// older build is refused by name (checkMessage 'version'), where it would otherwise have waited for a choice the other build never asks for.
 //   hello   both    { rom, fp, rs, name, team, fmt? }  who I am, my team code, the host's format. Refused by NAME on a different ROM, a different
 //                    engine (fp = a fingerprint of a fixed battle), different rules, a team that is not legal, or a team too small for the format.
 //   seedc   host    { c }   commitment to the host's half of the battle seed:  sha256(ctx|seed|a|nonce)
@@ -37,7 +39,7 @@
 import { sha256Hex } from './rom.js';
 import { decodeChoice, encodeChoice } from './engine.js';
 
-export const PROTO = 1;
+export const PROTO = 2;          // 1 = the build without the 6v6 lead preview; the stored reload record carries the same number (a record of another version is not resumed)
 export const MSG = 'lsarena';
 export const NAME_MAX = 10;
 export const LIMITS = Object.freeze({ team: 1100, name: 40, str: 64, early: 64, rounds: 5000 });
@@ -542,6 +544,7 @@ export function createNetMatch(opts) {
   nm.receive = function receive(msg) {
     if (dead() || nm.phase === 'idle' && !msg) return;
     const bad = checkMessage(msg);
+    if (bad === 'version') { if (nm.phase !== 'idle') fail('version', 'The other player is on a different version of the Arena. Reload the page on both sides and try again.'); return; }
     if (bad) { if (nm.phase !== 'idle') fail('protocol', 'The other player sent something this game does not understand (' + bad + '). One of you may be running an older cached copy of the page: reload it and try again.'); return; }
     q.push(msg);
     drain();
@@ -596,7 +599,7 @@ export function createNetMatch(opts) {
   nm.snapshot = function snapshot() {
     if (nm.phase !== 'playing' || !nm.ctl || !round) return null;
     return {
-      v: 1, room: opts.room, role, mn: nm.mn, seed: nm.seed, fmt: nm.fmt, names: nm.names.slice(), r: round.r, rh: round.hash, hash: nm.ctl.battle.hash(),
+      v: PROTO, room: opts.room, role, mn: nm.mn, seed: nm.seed, fmt: nm.fmt, names: nm.names.slice(), r: round.r, rh: round.hash, hash: nm.ctl.battle.hash(),
       log: nm.ctl.battle.choiceLog.map((e) => ({ s: e.s, c: JSON.parse(JSON.stringify(e.c)) })),
       outLog: outLog.slice(-600), secret: round.mine && round.mine.nonce ? { r: round.r, w: round.mine.w, nonce: round.mine.nonce } : null,
     };
@@ -610,7 +613,7 @@ export function createNetMatch(opts) {
   nm.resume = function resume(rec) {
     if (nm.phase !== 'idle') return false;
     const bad = (why) => { fail('resume', 'The battle could not be picked up again (' + why + ').', { tell: false }); return false; };
-    if (!rec || rec.v !== 1 || rec.role !== role || rec.room !== opts.room || !isInt(rec.mn, 1, 1000) || !isU32(rec.seed) || !Array.isArray(rec.names) || rec.names.length !== 2
+    if (!rec || rec.v !== PROTO || rec.role !== role || rec.room !== opts.room || !isInt(rec.mn, 1, 1000) || !isU32(rec.seed) || !Array.isArray(rec.names) || rec.names.length !== 2
       || !isInt(rec.r, 1, LIMITS.rounds) || typeof rec.hash !== 'string' || !Array.isArray(rec.log) || rec.log.length > 4000 || !Array.isArray(rec.outLog) || !(rec.fmt === '6v6' || rec.fmt === '3v3')) return bad('the record is not one this page wrote');
     nm.mn = rec.mn; nm.fmt = rec.fmt; nm.names = rec.names.map((x) => cleanName(x)); nm.oppName = nm.names[oppSide]; nm.myName = nm.names[mySide];
     nm.seed = rec.seed >>> 0; nm.seedMn = nm.mn; ctx = opts.room + '#' + nm.mn;
@@ -656,7 +659,7 @@ export function createNetMatch(opts) {
     const open = round && !round.applied;
     const got = (s) => (s === mySide ? round.mine : round.theirs && (round.theirs.c || round.theirs.w !== undefined));
     return {
-      phase: nm.phase, role, mySide, mn: nm.mn, link: nm.link, round: round ? round.r : 0, turn: nm.ctl ? nm.ctl.turn : 0,
+      phase: nm.phase, role, mySide, mn: nm.mn, link: nm.link, round: round ? round.r : 0, kind: round ? round.kind : '', turn: nm.ctl ? nm.ctl.turn : 0,
       waitingOn: open ? [0, 1].filter((s) => round.need[s] && !got(s)) : [],
       opponent: nm.oppName, error: nm.error, result: nm.result, oppReady: !!(round && round.rdyTheirs), myClockMs: nm.myClock(),
       rematch: { mine: rematchMine, theirs: rematchTheirs }, oppGone: !!nm.oppGone,

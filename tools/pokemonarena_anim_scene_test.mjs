@@ -185,7 +185,7 @@ function makeBattle(M, o) {
   const pack = packOf(M), ui = uiOf(M), text = M.BT.loadBattleText(rom, manifest);
   const seed = o.seed || 1;
   const A = M.MC.randomTeam(pack, seed * 1000 + 1, 6), B = M.MC.randomTeam(pack, seed * 1000 + 2, 6);
-  const ctl = M.MC.createMatchController({ pack, teams: [A.recs, B.recs], seed: seed * 77, pick: 3, names: ['You', 'CPU'], sides: [{ kind: 'human' }, { kind: 'cpu', level: 'normal', seed: seed + 5 }] });
+  const ctl = M.MC.createMatchController({ pack, teams: [A.recs, B.recs], seed: seed * 77, pick: 3, ...(o.freeSwitch ? { freeSwitch: true } : {}), names: ['You', 'CPU'], sides: [{ kind: 'human' }, { kind: 'cpu', level: 'normal', seed: seed + 5 }] });
   const hooks = Object.assign({ sounds: [], cries: [] }, o.hooks || {});
   if (!hooks.onSound) hooks.onSound = (index, pan) => hooks.sounds.push([index, pan]);
   if (!hooks.onCry) hooks.onCry = (species, pan) => hooks.cries.push([species, pan]);
@@ -605,6 +605,49 @@ async function core(M, opts = {}) {
       t('system/stale: ' + swRuns + ' send-out / recall runs (ids 2, 3, 8, 9) in the same battles each begin with the Pokemon the effect draws (the OTHER side\'s for a send-out, both for a recall: species, level, HP bar) as the scene shows them at that moment' + (bad.some((b) => b.id === 2 || b.id === 3 || b.id === 8 || b.id === 9) ? ' -- ' + JSON.stringify(bad.find((b) => b.id === 2 || b.id === 3 || b.id === 8 || b.id === 9)).slice(0, 260) : ''), swRuns >= 20 && !bad.some((b) => b.id === 2 || b.id === 3 || b.id === 8 || b.id === 9), swRuns + ' runs, ' + bad.filter((b) => b.id === 2 || b.id === 3 || b.id === 8 || b.id === 9).length + ' wrong');
       t('system/stale: ...and the picture was right the first time: no prepared hit / faint / send-out / recall had to be prepared again (' + restale + ' re-prepared)', restale === 0, String(restale));
       t('system/stale: the diagnostics carry the count (animInfo().restale)', seen.every((i) => typeof i.restale === 'number'), '');
+    }
+    // THE FREE SWITCH ("Will you switch your Pokemon?", ANIM.md Round 9). The question itself is a request, not an event, so nothing is prepared for it; what an answer brings is an ordinary recall + send-out of the
+    // player's Pokemon and then the foe's send-out. Every run of those (and of every hit / faint around them) is checked, as in the group above, against the Pokemon the screen shows when the run BEGINS, in battles
+    // where the player answers at every offer: 'auto' = the automatic player (YES, NO, YES ...), 'ui' = the real question (typed, YES / NO, the party screen; offers go YES with a detour through B from the party
+    // screen, YES straight, NO), 'set' = BATTLE STYLE: SET (the scene answers NO itself: no question may ever open).
+    {
+      const bad = [], logs = [];
+      let restale = 0, runs = 0, yes = 0, no = 0, uiAnswers = 0, backs = 0, prompts = 0, setStays = 0, battles = 0;
+      for (const sd of (quick ? SEL.sys.slice(0, 2) : SEL.sys.concat([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15]))) for (const how of ['auto', 'ui', 'set']) {
+        const st = await makeAnimator({ system: true });
+        let sceneRef = null, offers = 0, detour = false, back = false;
+        const snap = (id, ctx) => {
+          const d = sceneRef.S.disp, mon = (m) => (m ? { species: m.species, level: m.level, hp: m.hp, maxHp: m.maxHp } : null);
+          const want = { player: mon(d[0]), foe: mon(d[1]) }, got = { player: ctx.player && { species: ctx.player.species, level: ctx.player.level, hp: ctx.player.hp, maxHp: ctx.player.maxHp }, foe: ctx.foe && { species: ctx.foe.species, level: ctx.foe.level, hp: ctx.foe.hp, maxHp: ctx.foe.maxHp } };
+          const faintSide = id === 4 ? 'player' : id === 5 ? 'foe' : null, swSide = id === 2 ? 'player' : id === 8 ? 'foe' : null;
+          const sideOk = (k) => k === swSide || !want[k] || !got[k] || (got[k].species === want[k].species && got[k].level === want[k].level && (k === faintSide || (got[k].hp === want[k].hp && got[k].maxHp === want[k].maxHp)));
+          runs++; if (!sideOk('player') || !sideOk('foe')) bad.push({ seed: sd, how, id, want, got });
+        };
+        const wrap = (h, id, ctx) => { if (id >= 2 && id <= 9 && h && typeof h.begin === 'function') { const b = h.begin; h.begin = function () { snap(id, ctx); return b.apply(this, arguments); }; } return h; };
+        const prep = st.prepare && st.prepare.bind(st), start = st.start.bind(st);
+        if (prep) st.prepare = (kind, id, ctx) => (kind === 'system' ? wrap(prep(kind, id, ctx), id, ctx) : prep(kind, id, ctx));
+        st.start = (kind, id, ctx) => { const r = start(kind, id, ctx); if (kind === 'system' && id >= 2 && id <= 9) snap(id, ctx); return r; };
+        const r = playBattle(M, { seed: sd, cfg: mkCfg(onSys), animator: st, freeSwitch: true, maxFrames: quick ? 30000 : undefined, sceneOpts: how === 'set' ? { style: { get: () => ({ style: 'set' }), set() {} } } : {},
+          onTick: (scene) => {
+            sceneRef = scene;
+            const S = scene.S;
+            if (scene.mode === 'confirm' && S.confirm && S.confirm.kind === 'free') {
+              if (how === 'set') { prompts++; return; }
+              if (how !== 'ui') return;
+              if (back) { back = false; scene.press('a'); return; }                                   // back at the question after B: YES again
+              offers++; uiAnswers++;
+              if ((offers + sd) % 3 === 1) { scene.press('a'); yes++; detour = true; }                // YES, then B from the party screen, then YES again
+              else if ((offers + sd) % 3 === 2) { scene.press('a'); yes++; }                                 // YES straight
+              else { scene.press('down'); scene.press('a'); no++; }                                   // NO
+            } else if (how === 'ui' && scene.mode === 'party' && S.party && S.party.free) { if (detour) { detour = false; back = true; backs++; scene.press('b'); } else scene.press('a'); }
+          },
+          decide: (req, def) => { if (req.phase === 'switch' && req.reason === 'free') { if (how !== 'auto') return null; offers++; if ((offers + sd) % 2 === 1) { yes++; return { kind: 'switch', slot: req.switches[0].slot }; } no++; return { kind: 'stay' }; } return def; } });
+        battles++; logs.push(...r.scene.animInfo().log); restale += r.scene.animInfo().restale | 0;
+        if (how === 'set') setStays += r.ctl.battle.choiceLog.filter((e) => e.c.kind === 'stay').length;
+      }
+      t('system/free-switch: ' + runs + ' system runs (send-outs, recalls, hits, faints) in ' + battles + ' battles with free switches (' + yes + ' YES, ' + no + ' NO, ' + uiAnswers + ' answered through the real question, ' + backs + ' with a detour through B from the party screen) each begin with the Pokemon the scene shows at that moment' + (bad.length ? ' -- ' + JSON.stringify(bad[0]).slice(0, 260) : ''), bad.length === 0 && (quick ? yes >= 1 && no >= 1 && uiAnswers >= 1 && runs >= 10 : yes >= 9 && no >= 6 && uiAnswers >= 9 && backs >= 3 && runs >= 90), runs + ' runs, yes ' + yes + ', no ' + no + ', ui ' + uiAnswers + ', backs ' + backs + ', ' + bad.length + ' wrong');
+      t('system/free-switch: BATTLE STYLE: SET with the animator: no question ever opened (' + prompts + ' prompts), the scene answered NO itself (' + setStays + ' stays in the logs), and its runs begin right too', prompts === 0 && setStays >= (quick ? 1 : 6), prompts + ' prompts, ' + setStays + ' stays');
+      t('system/free-switch: ...none had to be prepared again (' + restale + ' re-prepared) and the animation layer logged no problem (' + logs.length + ')', restale === 0 && logs.length === 0, restale + ' / ' + JSON.stringify(logs.slice(0, 2)));
     }
     // ... and a change NOBODY foresaw between preparing a hit and playing it is still caught when it starts: the picture is made again for what is on screen (a brief hold of the previous picture, never a wrong one)
     {
@@ -1161,6 +1204,7 @@ if (process.env.ARENA_SKIP_MUTANTS !== '1') {
     ['scene.js', 'SYSTEM/stale: a send-out is not given the projection of the OTHER side (a drain on it, a replacement queued first: the dead Pokemon / the old bar are drawn)', (s) => s.replace('const pm = proj && (side !== st.side || drawsLead(kind)) ? proj[side] : undefined;', 'const pm = proj && drawsLead(kind) ? proj[side] : undefined;')],
     ['scene.js', 'SYSTEM/stale: a recall is not given the projection of the Pokemon it recalls (its own bar drains first: Eject Button, Emergency Exit)', (s) => s.replace("const drawsLead = (kind) => kind !== 'sendout';", "const drawsLead = (kind) => kind === 'hit' || kind === 'faint';")],
     ['scene.js', 'SYSTEM/stale: a replacement queued before the effect is not projected (the Pokemon it replaces is drawn)', (s) => s.replace("if (t === 'slidein' || k === 'sendout') proj[step.side] = step.mon;", 'if (false) proj[step.side] = step.mon;')],
+    ['scene.js', 'SYSTEM/free-switch: the question is never asked (every offer is answered NO at once, nothing reaches the UI)', (s) => s.replace("    if (autoStay()) return;\n    S.free = { box: null };", "    submit({ kind: 'stay' }); return;\n    S.free = { box: null };")],
     ['scene.js', 'SYSTEM/stale: a send-out is not re-checked against the screen when it starts', (s) => s.replace('(st.side === viewSide ? [ctx.foe, null] : [null, ctx.player])', '[]')],
     ['scene.js', 'SYSTEM/stale: a recall is not re-checked against the screen when it starts', (s) => s.replace('if (P && P.sig !== undefined) {', "if (P && P.sig !== undefined && kind !== 'recall') {")],
     ['scene.js', 'SYSTEM/stale: the Pokemon a send-out replaces is compared too (a hold for a picture nobody sees)', (s) => s.replace("const drawsLead = (kind) => kind !== 'sendout';", 'const drawsLead = () => true;')],

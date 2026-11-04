@@ -464,8 +464,8 @@ function step(state, action, ctx) {
     return commit(state, type, { ...P, teams: P.teams.map((t) => (t === team ? { ...t, monIds: ids } : t)) });
   }
   if (type === 'teamSort') {
-    // Put a team's Pokemon in Pokedex, name or type order. This is the team's SLOT order: in a 6v6 battle slot 1 leads, but in 3v3 the lead is chosen at team preview
-    // (engine.js: a `pick` battle starts in the 'preview' phase), so nothing here promises a lead. One undo step; equal Pokemon keep the order they had.
+    // Put a team's Pokemon in Pokedex, name or type order. This is the team's SLOT order: in a 6v6 battle the lead is chosen at the lead preview (engine.js: a `lead` battle starts in the
+    // 'preview' phase) and the rest follow in this order, in 3v3 the lead is the first of the three picks at team preview (a `pick` battle), so nothing here promises a lead. One undo step; equal Pokemon keep the order they had.
     // Both outcomes carry a notice, because the screen says nothing else: 'team.sorted' (what the new order is) and 'team.in-order' (nothing moved, and why).
     const team = findTeam(P, action.teamId);
     if (!team) return reject(state, type, 'team.missing', 'no such team');

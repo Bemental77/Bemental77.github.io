@@ -26,7 +26,7 @@
 import { openStore } from './store.js';
 import { readHubData, teamCodeFor } from './hub_data.js';
 import { judgeTeamCode, randomTeamCode, buildNetController, engineFingerprint } from './online_match.js';
-import { createNetMatch, cleanName, NAME_MAX } from './netmatch.js';
+import { createNetMatch, cleanName, NAME_MAX, PROTO } from './netmatch.js';
 import { PINNED } from './rom.js';
 import { isId } from './profile.js';
 import { navigationType } from './battle_resume.js';
@@ -161,7 +161,7 @@ export function createOnline(cfg) {
     if (!ss || !query.room || !query.role) return null;
     let rec = null;
     try { rec = JSON.parse(ss.getItem(resumeKey(query.room, query.role)) || 'null'); } catch (_e) { return null; }
-    const ok = rec && typeof rec === 'object' && rec.v === 1 && rec.room === query.room && rec.role === query.role && typeof rec.myTeam === 'string' && typeof rec.oppTeam === 'string'
+    const ok = rec && typeof rec === 'object' && rec.v === PROTO && rec.room === query.room && rec.role === query.role && typeof rec.myTeam === 'string' && typeof rec.oppTeam === 'string'
       && rec.myTeam.length <= 1100 && rec.oppTeam.length <= 1100 && typeof rec.myName === 'string' && Number.isFinite(rec.at) && Date.now() - rec.at <= RESUME_MAX_AGE_MS && rec.at <= Date.now() + 60000;
     return ok ? rec : null;
   }
@@ -204,7 +204,7 @@ export function createOnline(cfg) {
     ui.name = el(doc, 'input', { id: 'olName', type: 'text', maxlength: String(NAME_MAX), autocomplete: 'nickname', spellcheck: 'false', oninput: () => { nameTouched = true; } });
     ui.nameField.append(ui.name);
     ui.fmtField = el(doc, 'label', { class: 'field' }, el(doc, 'span', { text: 'Format' }));
-    ui.fmt = el(doc, 'select', { id: 'olFmt' }, el(doc, 'option', { value: '3v3', text: '3 v 3 (pick 3 at the team preview)' }), el(doc, 'option', { value: '6v6', text: '6 v 6 (the whole team)' }));
+    ui.fmt = el(doc, 'select', { id: 'olFmt' }, el(doc, 'option', { value: '3v3', text: '3 v 3 (pick 3 at the team preview)' }), el(doc, 'option', { value: '6v6', text: '6 v 6 (the whole team; you choose who leads)' }));
     ui.fmtField.append(ui.fmt);
     ui.pub = el(doc, 'button', { type: 'button', class: 'textbtn', id: 'olPublic', 'aria-pressed': 'false', text: 'Open to anyone: off', onclick: () => setOpenWanted(!state.openWanted) });
     ui.pubNote = el(doc, 'p', { class: 'dim small', id: 'olPublicNote' });
@@ -907,8 +907,8 @@ export function createOnline(cfg) {
       msg = st.oppGone ? base + ' ' + (st.opponent || 'Your friend') + ' has left.' : st.rematch.mine ? base + ' Rematch requested - waiting for ' + st.opponent + '.' : st.rematch.theirs ? base + ' ' + st.opponent + ' wants a rematch.' : base;
     } else if (st.phase !== 'playing') msg = st.phase === 'judging' ? 'Checking the teams...' : 'Connecting to the other player...';
     else if (st.link === 'down') msg = 'Connection lost - waiting for ' + (st.opponent || 'the other player') + ' to come back...', kind = 'warn';
-    else if (st.waitingOn.includes(st.mySide)) msg = 'Your move.';
-    else if (st.waitingOn.includes(st.mySide ^ 1)) msg = st.oppReady ? 'Waiting for ' + st.opponent + ' to choose...' : st.opponent + ' is still watching the last turn...';
+    else if (st.waitingOn.includes(st.mySide)) msg = st.kind === 'preview' ? 'Choose your Pokemon.' : 'Your move.';          // the team preview and the 6v6 lead round are not a move
+    else if (st.waitingOn.includes(st.mySide ^ 1)) msg = st.oppReady || st.kind === 'preview' ? 'Waiting for ' + st.opponent + ' to choose...' : st.opponent + ' is still watching the last turn...';
     const clock = st.myClockMs !== null ? fmtClock(st.myClockMs) : '';
     if (warned.r !== st.round) { warned.r = st.round; warned.w30 = warned.w10 = false; }
     if (st.myClockMs !== null) {

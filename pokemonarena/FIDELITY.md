@@ -78,7 +78,7 @@ pokemonarena tests find it (`ARENA_ROM` or `gba/gbaWasm/roms/Pokemon SoulGold (v
 
 ## Elements with no ROM equivalent ("arena-only")
 
-Team preview, the result screen, the pause menu, the forfeit / leave confirmations, the hub, the start-menu rows, the weather / Trick Room tag plates, the "Choose n (a/b)" counter and the
+Team preview, the result screen, the pause menu, the forfeit / leave confirmations, the hub, the start-menu rows, the weather / Trick Room tag plates, the "Choose n (a/b)" counter, the 6v6 lead preview's question "Send out this one first?" (its title is the ROM's own party-menu line "Choose a Pokemon."; the ROM holds no battle or party-menu line that asks which Pokemon should go first, only overworld NPC dialogue that does) and the
 text of lines the ROM has no string for (listed by `scene.fallbacks()`; `scene.js` header) are built by this site from ROM windows, tiles and fonts; none is claimed to match the game.
 Since FA1 they use the real game's window frame (blue-white ring) instead of the old black one, because they share the ring art.
 

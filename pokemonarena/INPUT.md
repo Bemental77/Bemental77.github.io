@@ -156,6 +156,10 @@ function frame() { input.poll(); requestAnimationFrame(frame); }              //
 requestAnimationFrame(frame);
 ```
 
+**The 6v6 lead preview uses the existing preview input and nothing new:** the same rows (`'preview'` hits, one per Pokemon), A / a click / a tap on a row picks it and opens the YES / NO (`'overlay'` hits), B / Backspace / a right click / the on-screen B / a tap beside the box answers NO, and the pause menu, FORFEIT and the Controls panel behave as at the 3v3 preview. `tools/pokemonarena_lead_page_test.mjs` drives it by tap, on-screen pad, controller, keys and mouse, each on its own, and `tools/pokemonarena_devices_test.mjs` journey A chooses the lead with each of the four device families.
+
+**The free switch ("Will you switch your Pokemon?") uses the existing battle inputs and nothing new:** its YES / NO is the `'overlay'` hits (YES row, NO row) with the cursor on YES, A / a click / a tap on a row answers it, B / Backspace / a right click / the on-screen B / a tap beside the box is NO; YES opens the party screen with its `'party'` rows and the `'cancel'` button, and B, a right click or a tap on CANCEL comes back to the question. `tools/pokemonarena_switch_page_test.mjs` drives it by tap, on-screen pad, controller, keys and mouse, each on its own, and `tools/pokemonarena_devices_test.mjs` answers it with each of the four device families (`toAction`: YES and the first healthy Pokemon the first time, NO after). The pause menu's BATTLE STYLE row is an ordinary menu row (A flips it).
+
 **Hit-test contract for `battle_ui.js`** (to be added by the battle-scene stage): `hitTest(view, x, y) -> null | { kind, index }` in
 logical 240x160 pixels, where `kind` is one of `'action'` (the four-way action menu), `'move'` (the move menu), `'party'`,
 `'preview'` or `'result'`, plus (W1) `'overlay'` (a row of an open pause menu / YES-NO box), `'text'` (a message: a tap is A), `'back'` (a tap beside an open

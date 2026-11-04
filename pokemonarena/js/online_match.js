@@ -9,7 +9,7 @@
 // test judges is what the page judges.
 
 import { decodeTeamCode, encodeTeamCode, validateDecodedTeam } from './teamcode.js';
-import { createMatchController, randomTeam, teamFromMons, FORMATS } from './matchctl.js';
+import { createMatchController, randomTeam, teamFromMons, FORMATS, formatOpts } from './matchctl.js';
 import { PINNED } from './rom.js';
 import { DEFAULT_RULESET_ID } from './rules.js';
 import { ENGINE_VERSION } from './engine.js';
@@ -57,11 +57,11 @@ export function buildNetController({ pack, mySide, seed, fmt, names, mine, their
   const human = { kind: 'human', concede: true }, remote = { kind: 'remote' };
   const teams = mySide === 0 ? [mine.recs, theirs.recs] : [theirs.recs, mine.recs];
   const ctl = createMatchController({
-    pack, ruleset: mine.rs, teams, seed: seed >>> 0, pick: FORMATS[fmt].pick, names: [String(names[0]), String(names[1])],
+    pack, ruleset: mine.rs, teams, seed: seed >>> 0, ...formatOpts(fmt), names: [String(names[0]), String(names[1])],       // 3v3: pick 3; 6v6: a lead preview (both players choose their lead, committed and revealed together like every other round)
     sides: mySide === 0 ? [human, remote] : [remote, human],
   });
   ctl.start();
-  ctl.netMeta = { meta: mySide === 0 ? [mine.meta, theirs.meta] : [theirs.meta, mine.meta], ruleset: mine.rs, pick: FORMATS[fmt].pick, fmt };
+  ctl.netMeta = { meta: mySide === 0 ? [mine.meta, theirs.meta] : [theirs.meta, mine.meta], ruleset: mine.rs, pick: FORMATS[fmt].pick, lead: !!FORMATS[fmt].lead, fmt };
   return ctl;
 }
 

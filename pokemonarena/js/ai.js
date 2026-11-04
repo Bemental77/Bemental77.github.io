@@ -397,6 +397,7 @@ export function createAi({ pack, level = 'normal', seed = 1 }) {
       if (!request) return null;
       if (request.phase === 'preview') return choosePreview(pack, request, view, rng, level, extra.previewInfo);
       if (request.phase !== 'move' && request.phase !== 'switch') return null;
+      if (request.phase === 'switch' && request.reason === 'free') return { kind: 'stay' };          // the free-switch offer ("Will you switch your Pokemon?"): a CPU standing in for a person (autoplay) says NO, it draws nothing from its rng
       if (request.phase === 'switch' && (!request.switches || !request.switches.length)) return null;
       if (level === 'easy') return chooseEasy(request, rng);
       return level === 'hard' ? chooseHard(pack, request, view, rng) : chooseNormal(pack, request, view, rng);

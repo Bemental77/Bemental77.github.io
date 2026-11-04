@@ -494,6 +494,8 @@ The battle page needs a *tower mode*: build the match from `battleSetup(pack, ru
 
 ## 13. How the Tower reaches the engine
 
+**Integrator's note (preview and question).** `battleSetup` returns `pick` only, with no `lead`: the page that builds the match must spread `formatOpts(<the run's format>)` from `matchctl.js` into `createMatchController` (a 6v6 floor then opens on the LEAD preview, a 3v3 floor on the team preview) and, for the question "Will you switch your Pokemon?" that a Pokemon trainer battle asks, pass `freeSwitch: true` and give the scene the page's BATTLE STYLE setting (`createScene({ style })`, `style_settings.js`), exactly as `battle_boot.js` does; a Tower floor is a human seat against a CPU, so the question applies. Both are answered through `ctl.submit` and are ordinary recorded choices (they do not change what a floor's turn count means: a free switch is not a turn). (When `tower.js` is next touched, `battleSetup` can return `lead: !!FORMATS[run.format].lead` and `freeSwitch: true` itself; F8 pins today's `pick`.)
+
 `battleSetup` returns `{ player: { recs, meta }, foe: { recs, meta }, ruleset, pick, validate: false, seed, names, cpu, trainer, effects }`. For a 3v3 run `pick` is 3, for 6v6 0. `player.recs` is `applyTeam(pack, run.team.recs, run.held)` - a **new** array (the saved team is never touched: `C1`, `H7` run it on a deep-frozen team through every family) - and `foe.recs` is the floor's trainer after the opponent-side ops. `effects` carries what the buffs do to the run itself (offer size, Fortune, lives, Scouting).
 
 ## 14. Engine hooks needed (not built)

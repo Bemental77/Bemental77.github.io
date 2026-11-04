@@ -684,7 +684,7 @@ export function teamView(app, teamId) {
       // thrown to the top of the page, and could never reach the reason. Pressed again it does nothing but say "already sorted" in the live region (the reducer's notice).
       // data-fk lets rebuild() hand focus to the new button when the view is redrawn (the sort itself, then the team code arriving).
       kids.push(h('div', { class: 'row' }, h('button', { type: 'button', class: 'btn', 'aria-disabled': inOrder ? 'true' : null, dataset: { act: 'sort-team-type', fk: 'sort-team-type' },
-        title: inOrder ? 'Already in type order' : 'Put the team in type order: Normal, Fighting, Flying ... as the game lists the types. This is the order of the slots: in a 6v6 battle the first Pokemon leads, in 3v3 you choose the lead at team preview. You can undo it.',
+        title: inOrder ? 'Already in type order' : 'Put the team in type order: Normal, Fighting, Flying ... as the game lists the types. This is the order of the slots: in a 6v6 battle you choose which Pokemon leads at team preview and the rest follow in this order, in 3v3 you choose the lead among your three picks. You can undo it.',
         onClick: () => app.dispatch({ type: 'teamSort', teamId, by: 'type' }) }, 'Sort team by type')));
     }
 

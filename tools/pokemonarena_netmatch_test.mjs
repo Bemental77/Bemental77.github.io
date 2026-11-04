@@ -59,7 +59,7 @@ async function suiteMain(S, label, { only } = {}) {
       const bySide = (P, side) => JSON.stringify(P.ctl.battle.choiceLog.filter((e) => e.s === side));
       ok(bySide(h, 0) === bySide(g, 0) && bySide(h, 1) === bySide(g, 1), tag(`A${i} each side made the same choices on both machines (only the order within a round differs: own choice first)`));
       // the network added nothing: replaying the log on ONE machine gives the same battle
-      const rp = S.engine.replay({ pack: S.pack, ruleset: 'arena-gen3-standard', teams: [h.judged.recs, g.judged.recs], seed: h.mc.seed, pick: fmt === '3v3' ? 3 : 0, names: h.mc.names, choiceLog: h.ctl.battle.choiceLog });
+      const rp = S.engine.replay({ pack: S.pack, ruleset: 'arena-gen3-standard', teams: [h.judged.recs, g.judged.recs], seed: h.mc.seed, ...S.matchctl.formatOpts(fmt), names: h.mc.names, choiceLog: h.ctl.battle.choiceLog });
       ok(rp.hash === h.nm.result.hash, tag(`A${i} a single-machine replay of the choices gives the same state`), rp.hash + ' vs ' + h.nm.result.hash);
       ok(h.mc.seed === g.mc.seed && h.mc.names.join('|') === g.mc.names.join('|'), tag(`A${i} same seed and names`));
       seen.add(h.mc.seed);
@@ -575,7 +575,7 @@ async function suiteMain(S, label, { only } = {}) {
     const bads = [
       mutate(valid[6], 'r', 0), mutate(valid[6], 'r', 1.5), mutate(valid[6], 'r', 'x'), mutate(valid[6], 'c', 'z'.repeat(64)), mutate(valid[6], 'c', 'D'.repeat(64)),
       mutate(valid[7], 'w', 65536), mutate(valid[7], 'w', -1), mutate(valid[7], 'n', 'e'.repeat(31)), mutate(valid[3], 'a', 2 ** 32), mutate(valid[2], 'b', -1),
-      mutate(valid[0], 'team', 't'.repeat(1101)), mutate(valid[0], 'name', ''), mutate(valid[0], 'fmt', '9v9'), mutate(valid[11], 'win', 2), mutate(valid[0], 'v', 2),
+      mutate(valid[0], 'team', 't'.repeat(1101)), mutate(valid[0], 'name', ''), mutate(valid[0], 'fmt', '9v9'), mutate(valid[11], 'win', 2), mutate(valid[0], 'v', NM.PROTO + 1), mutate(valid[0], 'v', NM.PROTO - 1),       // (the build before the lead preview spoke v1, and is refused)
       mutate(valid[0], 'mn', 0), mutate(valid[0], 't', 'nope'), { ...valid[0], k: 'unknown' }, null, undefined, 5, 'x', [], [valid[0]], mutate(valid[13], 'ph', 'p'.repeat(13)),
     ];
     ok(bads.every((m) => NM.checkMessage(m) !== null), tag('M malformed messages are all refused'), bads.map((m, i) => (NM.checkMessage(m) === null ? i : '')).filter((x) => x !== '').join(','));
@@ -606,6 +606,124 @@ async function suiteMain(S, label, { only } = {}) {
     const pc = await makeRig(S, { seedBase: 27, mutate: (P, wire) => { wire.rewrite = (from, m) => (from === 'guest' && m.k === 'commit' && m.r === 1 ? { t: m.t, v: m.v, k: 'choice', mn: m.mn, r: 1, w: 1, ph: m.ph } : m); } });
     await pc.run();
     ok(pc.host.nm.phase === 'failed' && pc.host.nm.error.code === 'protocol' && /plain choice/.test(pc.host.nm.error.message), tag('N a plain choice where both sides must commit is refused, for that reason'), JSON.stringify(pc.host.nm.error));
+  }
+
+  // ---- S. the 6v6 LEAD preview ----------------------------------------------------------------------------------------------------------------------------
+  // A 6v6 match now opens with a round in which each player chooses which Pokemon is sent out first (engine `lead`; a one-slot preview choice, one 16-bit word). It is a round like the 3v3 team
+  // preview: committed and revealed together, so neither player sees the other's lead first. A team of one has nothing to choose and is not asked. The protocol moved from version 1 to 2 so that a
+  // page on the older build is refused by name; a stored reload record carries the same number.
+  if (run('S')) {
+    const NM = S.netmatch, E = S.engine, rs = 'arena-gen3-standard';
+    const codeOf = (seed, n) => S.om.randomTeamCode(S.pack, seed, n, rs);
+    const orig = (P, side) => P.ctl.battle.s.sides[side].team.map((m) => m.orig);
+    const restOf = (n, lead) => [lead].concat(Array.from({ length: n }, (_, i) => i).filter((i) => i !== lead));
+    const round1 = (rig) => rig.wire.log.filter((e) => e.msg.r === 1 && ['commit', 'reveal', 'choice'].includes(e.msg.k));
+    const dec = (m) => E.decodeChoice(m.w);
+    const shapes = [[6, 6], [4, 6], [6, 2], [1, 6], [6, 1], [1, 1], [3, 5]];
+    for (const [i, [na, nb]] of shapes.entries()) {
+      const rig = await makeRig(S, { seedBase: 90 + i, fmt: '6v6', teamA: await codeOf(500 + i, na), teamB: await codeOf(600 + i, nb), aiLevelA: i % 2 ? 'hard' : 'normal' });
+      const done = await rig.run();
+      const [h, g] = both(rig);
+      const tg = `S${na}v${nb} `;
+      ok(done && finished(rig) && !h.nm.error && !g.nm.error, tag(tg + 'a 6v6 match with a lead preview runs to its end on both machines'), phasesOf(rig).join(',') + JSON.stringify(errCodes(rig)));
+      if (!(done && finished(rig))) continue;
+      const r1 = round1(rig), kinds = r1.map((e) => e.msg.k + ':' + e.from);
+      if (na > 1 && nb > 1) {
+        const rev = r1.filter((e) => e.msg.k === 'reveal'), com = r1.filter((e) => e.msg.k === 'commit');
+        ok(com.length === 2 && rev.length === 2 && rev.every((e) => { const c = dec(e.msg); return c && c.kind === 'preview' && c.order.length === 1; }), tag(tg + 'round 1 is a lead round: both commit, both reveal a one-slot preview'), kinds.join(' '));
+        ok(Math.min(...rev.map((e) => r1.indexOf(e))) > Math.max(...com.map((e) => r1.indexOf(e))), tag(tg + '... and no lead is revealed until both are committed'), kinds.join(' '));
+      } else if (na === 1 && nb === 1) {
+        const rev = r1.filter((e) => e.msg.k === 'reveal');
+        ok(rev.length === 2 && rev.every((e) => { const c = dec(e.msg); return c && c.kind === 'move'; }), tag(tg + 'two teams of one have no lead round: round 1 is the first turn (both commit a move)'), kinds.join(' '));
+      } else {
+        const only = r1.filter((e) => e.msg.k === 'choice'), none = r1.filter((e) => e.msg.k === 'commit' || e.msg.k === 'reveal');
+        const asked = na === 1 ? 'guest' : 'host';
+        ok(only.length === 1 && only[0].from === asked && none.length === 0 && (() => { const c = dec(only[0].msg); return c && c.kind === 'preview' && c.order.length === 1; })(), tag(tg + 'a team of one is not asked: round 1 is one plain lead choice from the other player only'), kinds.join(' '));
+      }
+      const leads = [0, 1].map((s2) => { const e = h.ctl.battle.choiceLog.find((x) => x.s === s2 && x.c.kind === 'preview'); return e ? e.c.order[0] : 0; });
+      ok(JSON.stringify(orig(h, 0)) === JSON.stringify(restOf(na, leads[0])) && JSON.stringify(orig(h, 1)) === JSON.stringify(restOf(nb, leads[1])), tag(tg + 'each side\'s team order is its chosen lead then the rest in team order'), JSON.stringify([orig(h, 0), orig(h, 1), leads]));
+      ok(JSON.stringify(orig(h, 0)) === JSON.stringify(orig(g, 0)) && JSON.stringify(orig(h, 1)) === JSON.stringify(orig(g, 1)) && h.nm.result.hash === g.nm.result.hash, tag(tg + 'both machines hold the same order and finish in the same position'), '');
+      const rp = E.replay({ pack: S.pack, ruleset: rs, teams: [h.judged.recs, g.judged.recs], seed: h.mc.seed, ...S.matchctl.formatOpts('6v6'), names: h.mc.names, choiceLog: h.ctl.battle.choiceLog });
+      ok(rp.hash === h.nm.result.hash, tag(tg + 'a single-machine replay of the choices (lead true) gives the same final position'), rp.hash + ' vs ' + h.nm.result.hash);
+    }
+
+    // the lead is blind: the player who chooses first sends a commitment and nothing else, and cannot change the choice
+    {
+      const st = await makeRig(S, { seedBase: 97, fmt: '6v6' });
+      await st.start(); await st.until(() => st.host.nm.phase === 'playing' && st.guest.nm.phase === 'playing');
+      st.guest.hold = true;
+      for (let i = 0; i < 12; i++) await st.step();
+      const kinds = (from) => st.wire.log.filter((e) => e.from === from && e.msg.r === 1).map((e) => e.msg.k).filter((k) => k !== 'rdy');
+      ok(kinds('host').join() === 'commit' && kinds('guest').length === 0, tag('S the player who chose a lead first sends a commitment and nothing more while the other has not chosen'), kinds('host').join() + ' / ' + kinds('guest').join());
+      ok(st.host.nm.ctl.battle.s.phase === 'preview' && st.host.nm.ctl.pending(0) === null && st.host.ctl.submit(0, { kind: 'preview', order: [3] }).code === 'already-chosen', tag('S ... the battle waits in the preview and the lead cannot be changed'), st.host.nm.ctl.battle.s.phase);
+      const committed = st.wire.log.find((e) => e.from === 'host' && e.msg.k === 'commit').msg;
+      ok(!JSON.stringify(committed).includes('"w"') && /^[0-9a-f]{64}$/.test(committed.c), tag('S ... and the commitment carries no lead, only a digest'), JSON.stringify(committed).slice(0, 120));
+      st.guest.hold = false;
+      await st.until(() => st.wire.log.some((e) => e.from === 'host' && e.msg.k === 'reveal'));
+      const iG = st.wire.log.findIndex((e) => e.from === 'guest' && e.msg.k === 'commit' && e.msg.r === 1), iR = st.wire.log.findIndex((e) => e.from === 'host' && e.msg.k === 'reveal' && e.msg.r === 1);
+      ok(iG >= 0 && iR > iG, tag('S ... the first lead is revealed only after the other commitment arrived'), iG + ' < ' + iR);
+    }
+
+    // a lead that is not the committed one, and a lead that is not legal
+    {
+      const lie = await makeRig(S, { seedBase: 96, fmt: '6v6', mutate: (P, wire) => { wire.rewrite = (from, m) => (from === 'guest' && m.k === 'reveal' && m.r === 1 ? { ...m, w: (m.w ^ 0x10) & 0xffff } : m); } });
+      await lie.run();
+      ok(lie.host.nm.phase === 'failed' && lie.host.nm.error.code === 'cheat', tag('S a lead revealed that is not the one committed stops the match (cheat)'), JSON.stringify(lie.host.nm.error));
+      const forge = (w) => (wire) => {
+        const nonce = 'cd'.repeat(16);
+        wire.rewrite = (from, m) => {
+          if (from !== 'guest' || m.r !== 1) return m;
+          if (m.k === 'commit') return { ...m, c: S.rom.sha256Hex(new TextEncoder().encode(['arena1', 'ROOM95#1', 1, 1, w, nonce].join('|'))) };
+          if (m.k === 'reveal') return { ...m, w, n: nonce };
+          return m;
+        };
+      };
+      for (const [what, w] of [['a lead beyond the guest\'s team of four (slot 5)', E.encodeChoice({ kind: 'preview', order: [5] })], ['a lead that names two Pokemon', E.encodeChoice({ kind: 'preview', order: [0, 1] })], ['a move where a lead is owed', E.encodeChoice({ kind: 'move', slot: 0 })]]) {
+        const ill = await makeRig(S, { seedBase: 95, fmt: '6v6', teamB: await codeOf(700, 4), mutate: (P, wire) => forge(w)(wire) });
+        await ill.run();
+        ok(ill.host.nm.phase === 'failed' && ill.host.nm.error.code === 'illegal', tag('S ' + what + ', honestly committed, stops the match (illegal)'), JSON.stringify(ill.host.nm.error));
+      }
+    }
+
+    // the version: two builds refuse each other by name, and nothing starts
+    {
+      const hello = { t: NM.MSG, mn: 1, k: 'hello', rom: S.rom.PINNED.sha256, fp: 'x', rs, name: 'Old', team: 'ARENA1.x.0000' };
+      ok(NM.PROTO === 2 && NM.checkMessage({ ...hello, v: 1 }) === 'version' && NM.checkMessage({ ...hello, v: 3 }) === 'version' && NM.checkMessage({ ...hello, v: 2 }) === null, tag('S the protocol is version 2: the build before the lead preview (1) and a later one (3) are refused as "version"'), NM.checkMessage({ ...hello, v: 1 }) + ' ' + NM.checkMessage({ ...hello, v: 2 }));
+      const rig = await makeRig(S, { seedBase: 94, fmt: '6v6', mutate: (P, wire) => { wire.rewrite = (from, m) => (from === 'host' ? { ...m, v: 1 } : m); } });
+      await rig.run();
+      ok(rig.guest.nm.phase === 'failed' && rig.guest.nm.error.code === 'version' && /different version of the Arena/.test(rig.guest.nm.error.message) && !rig.guest.nm.ctl, tag('S a host on the older build (version 1) is refused by name by the new guest, and no battle was built'), JSON.stringify(rig.guest.nm.error));
+      ok(rig.host.nm.phase === 'failed' && !rig.host.nm.ctl && rig.wire.log.some((e) => e.from === 'guest' && e.msg.k === 'bye' && e.msg.why === 'version' && e.msg.v === NM.PROTO), tag('S ... the new guest tells it why (bye: version) and the older host stops too'), JSON.stringify([rig.host.nm.phase, rig.host.nm.error]));
+      const rig2 = await makeRig(S, { seedBase: 94, fmt: '3v3', mutate: (P, wire) => { wire.rewrite = (from, m) => (from === 'guest' ? { ...m, v: 1 } : m); } });
+      await rig2.run();
+      ok(rig2.host.nm.phase === 'failed' && rig2.host.nm.error.code === 'version' && !rig2.host.nm.ctl, tag('S the same in 3v3 and from the other side: the version, not the format, is what is refused'), JSON.stringify(rig2.host.nm.error));
+    }
+
+    // a reload around the lead preview: every step, both players, with and without the messages in flight; and the stored record's version
+    {
+      const playing = (rig) => rig.host.nm.phase === 'playing' && rig.guest.nm.phase === 'playing';
+      const tA = await codeOf(800, 6), tB = await codeOf(801, 4);
+      const ref = await makeRig(S, { seedBase: 93, fmt: '6v6', teamA: tA, teamB: tB }); await ref.run();
+      let cases = 0, good = 0;
+      for (const role of ['host', 'guest']) for (const mode of ['clean', 'lose', 'act-lose']) for (let k = 1; k <= 12; k++) {
+        const rig = await makeRig(S, { seedBase: 93, fmt: '6v6', teamA: tA, teamB: tB });
+        await rig.start(); await rig.until(() => playing(rig));
+        for (let i = 0; i < k && playing(rig); i++) await rig.step();
+        if (!playing(rig)) continue;
+        if (mode === 'act-lose') { rig.actNoPump(role); await settle(); }
+        const c = await rig.crash(role, { loseOutgoing: mode !== 'clean' });
+        if (c.skipped) continue;
+        cases++;
+        for (let i = 0; i < 4000 && !finished(rig) && !both(rig).some((P) => P.nm.phase === 'failed'); i++) { if (!(await rig.step())) { await settle(); if (!(await rig.step())) break; } }
+        if (c.ok && finished(rig) && rig.host.nm.result.hash === ref.host.nm.result.hash && rig.guest.nm.result.hash === ref.host.nm.result.hash && !rig.host.nm.error && !rig.guest.nm.error) good++;
+        else ok(false, tag(`S ${role} reloaded at step ${k} (${mode}) in a 6v6 lead match ends in the same battle`), `resume=${c.ok} phases=${phasesOf(rig)} err=${JSON.stringify(errCodes(rig))}`);
+      }
+      ok(cases >= 60 && good === cases, tag('S a reload at each of the first twelve steps of a 6v6 match (the lead round included), host and guest, ends in the uninterrupted position'), good + '/' + cases);
+      const rec = await makeRig(S, { seedBase: 93, fmt: '6v6', teamA: tA, teamB: tB }); await rec.start(); await rec.until(() => playing(rec)); for (let i = 0; i < 2; i++) await rec.step();
+      const snap = rec.host.nm.snapshot();
+      ok(!!snap && snap.v === NM.PROTO && snap.fmt === '6v6', tag('S the reload record carries the protocol version'), JSON.stringify(snap && { v: snap.v, fmt: snap.fmt }));
+      const old = await rec.crash('host', { tamper: (r) => { r.v = 1; return r; } });
+      ok(old.ok === false && rec.host.nm.phase === 'failed' && rec.host.nm.error && rec.host.nm.error.code === 'resume', tag('S a record saved by the older build (version 1) is refused by name, not replayed'), JSON.stringify([old.ok, rec.host.nm.phase, rec.host.nm.error]));
+    }
   }
 }
 
@@ -645,6 +763,13 @@ const MUTANTS = [
   { id: 'id-ignores-the-seed', why: 'every match of a room shares a record id', file: 'career_stats.js', from: /return String\(seed >>> 0\) \+ '_'/, to: "return '0_'", cases: ['O'] },
   { id: 'no-equivocation', why: 'a second, different commitment for a round is not noticed', file: 'netmatch.js', from: /if \(round\.theirs && round\.theirs\.c\) \{ if \(round\.theirs\.c !== m\.c\) fail\('equivocation'[^\n]*\n/, to: 'if (round.theirs && round.theirs.c) return;\n', cases: ['J'] },
   { id: 'names-not-cleaned', why: 'a hostile name goes into the battle as it was sent', file: 'netmatch.js', from: /t = t\.replace\(\/\[\^A-Za-z0-9 \.'_!\?-\]\/g, ''\)/, to: 't = t', cases: ['G', 'M'] },
+  // the 6v6 lead preview (case S)
+  { id: 'protocol-stays-1', why: 'the protocol version was not moved, so a build without the lead preview is not refused', file: 'netmatch.js', from: /export const PROTO = 2;/, to: 'export const PROTO = 1;', cases: ['S'] },
+  { id: 'version-is-a-protocol-error', why: 'a message of another version is reported as garbage ("protocol") instead of a different version', file: 'netmatch.js', from: /if \(bad === 'version'\) \{ if \(nm\.phase !== 'idle'\) fail\('version'/, to: "if (bad === 'version') { if (nm.phase !== 'idle') fail('protocol'", cases: ['S'] },
+  { id: 'record-version-not-checked', why: 'a reload record of another protocol version is replayed', file: 'netmatch.js', from: /if \(!rec \|\| rec\.v !== PROTO \|\| rec\.role !== role/, to: 'if (!rec || rec.role !== role', cases: ['S'] },
+  { id: 'net-controller-without-lead', why: 'the networked controller is built without the lead preview, so the two builds play different battles from the same page', file: 'online_match.js', from: /seed: seed >>> 0, \.\.\.formatOpts\(fmt\), names:/, to: 'seed: seed >>> 0, pick: FORMATS[fmt].pick, names:', cases: ['S'] },
+  { id: 'lead-sent-plain', why: 'a lead round is sent as a plain choice, so the first player to choose shows the other their lead', file: 'netmatch.js', from: /if \(round\.need\[0\] && round\.need\[1\]\) \{\n      const nonce = hex\(rbytes\(16\)\);/, to: "if (round.need[0] && round.need[1] && round.kind !== 'preview') {\n      const nonce = hex(rbytes(16));", cases: ['S'] },
+  { id: 'one-pokemon-still-asked-round', why: 'the engine asks a team of one for a lead, so the protocol runs a round for a choice that is not there', file: 'engine.js', from: /const one = S\.sides\[side\]\.team\.length < 2;/, to: 'const one = false;', cases: ['S'] },
 ];
 
 async function runMutants() {

@@ -149,7 +149,7 @@ export function validateSnapshot(snap, ctx) {
 
   // ---- top level state
   const S = obj(snap.s, 'snapshot.s');
-  only(S, ['v', 'ruleset', 'seed', 'rng', 'turn', 'phase', 'reason', 'need', 'pause', 'mb', 'pick', 'wx', 'tr', 'sides', 'q', 'winner', 'tn', 'gv', 'pw', 'ms', 'ws', 'wr', 'mr', 'fl', 'ion', 'lm', 'bp', 'fu', 'pk'], 's');
+  only(S, ['v', 'ruleset', 'seed', 'rng', 'turn', 'phase', 'reason', 'need', 'pause', 'mb', 'pick', 'wx', 'tr', 'sides', 'q', 'winner', 'tn', 'gv', 'pw', 'ms', 'ws', 'wr', 'mr', 'fl', 'ion', 'lm', 'bp', 'fu', 'pk', 'lead', 'fs', 'fo'], 's');
   if (S.v !== ENGINE_VERSION) fail('s.v', 'engine version differs');
   str(S.ruleset, 64, 's.ruleset');
   if (snap.ruleset !== undefined && snap.ruleset !== S.ruleset) fail('ruleset', 'differs from s.ruleset');
@@ -162,6 +162,13 @@ export function validateSnapshot(snap, ctx) {
   int(S.pause, -1, 1, 's.pause');
   if (typeof S.mb !== 'boolean') fail('s.mb', 'expected a boolean');
   int(S.pick, 0, E.pickMax, 's.pick');
+  if (S.lead !== undefined && (S.lead !== 1 || S.pick !== 1)) fail('s.lead', 'a lead battle is lead 1 with pick 1 (the lead is the one member that is picked)');
+  if (S.fs !== undefined) { arr(S.fs, 2, 2, 's.fs').forEach((x, i) => int(x, 0, 1, `s.fs[${i}]`)); if (!S.fs[0] && !S.fs[1]) fail('s.fs', 'present only when some side is offered the free switch'); }
+  if (S.fo !== undefined) {
+    int(S.fo, 0, 1, 's.fo');
+    if (!S.fs || S.fs[S.fo] !== 1) fail('s.fo', 'a free-switch offer to a side that is not offered it');
+    if (S.phase !== 'switch' || S.reason !== 'faint' || S.need[S.fo] !== true || S.need[S.fo ^ 1] !== true) fail('s.fo', 'an open free-switch offer needs the faint-replacement phase with both sides asked (the offered side and the foe that is replacing)');
+  }
   arr(S.wx, 2, 2, 's.wx'); int(S.wx[0], 0, 5, 's.wx[0]'); int(S.wx[1], 0, 16, 's.wx[1]');
   int(S.tr, 0, 16, 's.tr');
   if (S.tn !== undefined) { arr(S.tn, 2, 2, 's.tn'); int(S.tn[0], 1, 5, 's.tn[0]'); int(S.tn[1], 1, 8, 's.tn[1]'); }
@@ -201,7 +208,7 @@ export function validateSnapshot(snap, ctx) {
     }
     if (sd.ch !== null) {
       const c = obj(sd.ch, `${sp}.ch`);
-      if (c.kind === 'auto' || c.kind === 'forfeit') only(c, ['kind'], `${sp}.ch`);
+      if (c.kind === 'auto' || c.kind === 'forfeit' || c.kind === 'stay') only(c, ['kind'], `${sp}.ch`);
       else if (c.kind === 'move') { only(c, ['kind', 'slot', 'mv'], `${sp}.ch`); int(c.slot, 0, 4, `${sp}.ch.slot`); moveId(c.mv, `${sp}.ch.mv`); }
       else if (c.kind === 'switch') { only(c, ['kind', 'slot'], `${sp}.ch`); int(c.slot, 0, sd.team.length - 1, `${sp}.ch.slot`); }
       else if (c.kind === 'preview') {

@@ -45,7 +45,9 @@ function stopServer() { if (server) { try { server.kill(); } catch (_e) { /* ign
 const H = '(window.__arenaBattle)';
 const ev = (page, expr) => page.eval(expr);
 async function open(page, query, { wait = 'ready', timeoutMs = 90000 } = {}) {
-  await page.navigate(BASE + (query || ''));
+  // These cases are about the battle page as it plays; "Will you switch your Pokemon?" has its own tests (pokemonarena_switch_page_test.mjs), so they play on BATTLE STYLE: SET (no question).
+  const q = query || '';
+  await page.navigate(BASE + (/[?&]style=/.test(q) ? q : q + (q.includes('?') ? '&' : '?') + 'style=set'));
   await page.waitFor(`${H} && (${H}.state === "${wait}" || ${H}.state === "error")`, { timeoutMs });
   return ev(page, `${H}.state`);
 }
@@ -54,7 +56,7 @@ const mode = (page) => ev(page, `${H}.mode`);
 async function untilMode(page, modes, { max = 4000, press = false } = {}) {
   const list = JSON.stringify(Array.isArray(modes) ? modes : [modes]);
   for (let i = 0; i < 40; i++) {
-    const r = await ev(page, `(() => { const ms = ${list}; const a = ${H}; for (let k = 0; k < ${Math.floor(max / 40)}; k++) { if (ms.includes(a.mode)) return a.mode; a.scene.tick(); ${press ? "if (a.mode === 'steps') a.press('a');" : ''} } return ms.includes(a.mode) ? a.mode : 'timeout:' + a.mode; })()`);
+    const r = await ev(page, `(() => { const ms = ${list}; const a = ${H}; for (let k = 0; k < ${Math.floor(max / 40)}; k++) { if (ms.includes(a.mode)) return a.mode; a.scene.tick(); ${press ? "if (a.mode === 'steps') a.press('a'); else if (a.scene.S.preview && a.scene.S.preview.lead && (a.mode === 'preview' || (a.mode === 'confirm' && a.scene.S.confirm && a.scene.S.confirm.kind === 'team'))) a.press('a');" : ''} } return ms.includes(a.mode) ? a.mode : 'timeout:' + a.mode; })()`);
     if (!String(r).startsWith('timeout')) return r;
   }
   return 'timeout';
@@ -106,7 +108,7 @@ async function addInit(page, src) { await page.send('Page.addScriptToEvaluateOnN
 const MID_SRC = `(a, minDelta) => { let start = null; for (let k = 0; k < 20000; k++) { a.scene.tick(); const c = a.scene.S.cur; if (c && c.t === 'drain') { const d = a.scene.S.disp[c.side]; if (!d) { start = null; continue; } if (start === null || start.c !== c) start = { c, hp: d.hp }; if (start.hp - c.to >= minDelta && d.hp > c.to && d.hp <= start.hp - (start.hp - c.to) / 2) { a.tick(0); return { side: c.side, hp: d.hp, from: start.hp, to: c.to, max: d.maxHp }; } } else start = null; } return null; }`;
 const FAINT_SRC = `(a) => { for (let k = 0; k < 120000; k++) { a.scene.tick(); if (a.scene.S.mode === 'action') { a.press('a'); a.press('a'); continue; } if (a.mode === 'moves') { a.press('a'); continue; } if (a.mode === 'party') { a.press('a'); continue; } const c = a.scene.S.cur; if (c && (c.t === 'faint' || (c.t === 'sysevent' && c.kind === 'faint')) && c.n > 6) { a.tick(0); if (c.t === 'faint') return { side: c.side, sys: false, drop: a.scene.S.disp[c.side].drop }; return { side: c.side, sys: true, live: !!(c.run && !c.run.done), fxSys: a.scene.view().fxSys === true, drop: 0 }; } if (a.mode === 'result') return null; } return null; }`;
 const PARTY_SRC = `(a) => { for (let k = 0; k < 120000; k++) { a.scene.tick(); if (a.mode === 'party') { a.tick(0); return true; } if (a.scene.S.mode === 'action') { a.press('a'); a.press('a'); } else if (a.mode === 'moves') a.press('a'); else if (a.mode === 'result') return false; } return false; }`;
-const STATUS_SRC = `(a, seed) => { a.pause(true); for (let k = 0; k < 90000; k++) { a.scene.tick(); const st = a.getState(); if (st.mode === 'action') { if (((st.player && st.player.status) || (st.foe && st.foe.status)) && a.scene.S.req.moves.length >= 2) return { seed: seed, status: st.player && st.player.status, foe: st.foe && st.foe.status }; a.press('a'); a.press('a'); } else if (a.mode === 'moves') a.press('a'); else if (a.mode === 'party') a.press('a'); else if (a.mode === 'result') return null; } return null; }`;
+const STATUS_SRC = `(a, seed) => { a.pause(true); for (let k = 0; k < 90000; k++) { a.scene.tick(); const st = a.getState(); if (st.mode === 'action') { if (((st.player && st.player.status) || (st.foe && st.foe.status)) && a.scene.S.req.moves.length >= 2) return { seed: seed, status: st.player && st.player.status, foe: st.foe && st.foe.status }; a.press('a'); a.press('a'); } else if (a.mode === 'moves') a.press('a'); else if (a.mode === 'party') a.press('a'); else if (a.mode === 'preview' || (a.mode === 'confirm' && a.scene.S.preview)) a.press('a'); else if (a.mode === 'result') return null; } return null; }`;
 let LIBS = null;
 async function nodeBattle(query) {
   if (!LIBS) {
@@ -121,7 +123,7 @@ async function nodeBattle(query) {
   const p = boot.parseBattleQuery(query); if (!p.ok) throw new Error('bad query ' + query);
   const r = await boot.resolveBattle(pack, p.params); if (!r.ok) throw new Error('unresolvable ' + query);
   const spec = r.spec;
-  const ctl = mc.createMatchController({ pack, ruleset: spec.ruleset, teams: spec.teams, seed: spec.seed, pick: spec.pick, names: spec.names, sides: spec.sides }); ctl.start();
+  const ctl = mc.createMatchController({ pack, ruleset: spec.ruleset, teams: spec.teams, seed: spec.seed, pick: spec.pick, lead: spec.lead, names: spec.names, sides: spec.sides }); ctl.start();
   const scene = sc.createScene({ ui, pack, text, ctl, viewSide: 0, env: spec.seed % 9, textSpeed: p.params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', quitLabel: 'BACK TO HUB' });
   scene.begin(); if (scene.mode === 'steps') scene.tick();                       // as battle_boot does before 'ready'
   return { scene, press: (x) => scene.press(x), get mode() { return scene.mode; }, getState: () => scene.state(), tick() {}, pause() {} };
@@ -449,11 +451,11 @@ session('audio', { width: 1280, height: 800 }, async (page) => {
   ok(st && st.v === 1 && st.muted === true && (await ev(page, `document.getElementById('soundBtn').textContent`)) === 'Sound: off' && (await ev(page, `${H}.sound.on()`)) === false, 'audio: M mutes (arena.audio {v:1, muted:true}, the button reads "Sound: off")', JSON.stringify(st));
   await open(page, '?seed=7&format=6v6');                                          // reload: still muted, no context before a gesture
   ok((await ev(page, `window.__audioLog.ctor`)) === 0 && (await ev(page, `${H}.sound.on()`)) === false, 'audio: after a reload the muted setting is kept and no AudioContext exists before a gesture');
-  await key(page, 'a'); await sleep(150);
+  await key(page, 'b'); await sleep(150);                                          // (B, not A: a 6v6 battle now opens with the lead preview, where A would open its question and leave autoplay() waiting for the human's answer)
   ok((await ev(page, `window.__audioLog.ctor`)) === 1, 'audio: the first key press creates the AudioContext (even muted, so a controller can unmute later)');
   await ev(page, `localStorage.removeItem('arena.audio'); localStorage.removeItem('arena.sound')`);
   await open(page, '?seed=7&format=6v6');                                          // back to the default: sound on; a key creates the context and a played battle starts the cries on the double
-  await key(page, 'a'); await sleep(150);
+  await key(page, 'b'); await sleep(150);
   const r2 = await ev(page, `${H}.autoplay(300000)`);
   const log2 = await ev(page, `window.__audioLog`);
   ok(log2.ctor === 1 && log2.createBuffer > 0 && log2.start > 0, 'audio: with sound on the cries are decoded and started on the double (' + log2.start + ' starts)', JSON.stringify(log2));

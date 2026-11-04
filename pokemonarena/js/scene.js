@@ -43,12 +43,17 @@
 //             starting / ending ('tn.5.on', 'tn.5.off'). A code the engine emits and the ROM has no line for (heal block, throat chop, pp-drain ...) shows NOTHING: a missing key is never shown as its key
 //   Round 8: the engine now emits the switch-in announcements (Pressure, Mold Breaker, Turboblaze / Teravolt, the Auras, Cloud Nine / Air Lock, Anticipation, Forewarn, Frisk), Slow Start's end, Delta Stream's tick and its `winds` flag, and
 //   Rapid Spin's volatile-end events, and the scene shows each with the wording measured through the oracle (a binding move names itself everywhere: its start line, "hurt by", "freed from", "got free of").
-//   menus:    "Send out this team?" and the "Choose 3 (n/3)" counter on the team preview ('preview.title', 'confirm.team'), "Leave this battle?"
+//   menus:    "Send out this team?" and the "Choose 3 (n/3)" counter on the team preview ('preview.title', 'confirm.team'), "Send out this one first?" on the 6v6 LEAD preview ('confirm.lead'; its
+//             other line, "Choose a Pokemon.", is the ROM's own party-menu line 'party.choose', and the ROM has no question about the lead: searched, the battle text and the party-menu pool hold none, only
+//             overworld NPC dialogue that asks which Pokemon should go out first), "Leave this battle?"
 //             ('confirm.quit'), "Waiting for the other player..." ('wait'), choosing a living Pokemon on the Revival Blessing screen ('party.notfainted'), the result-screen buttons REMATCH / NEW BATTLE / LEAVE and the
 //             start-menu rows (drawn with the ROM font, worded here), the words SOUND / FORFEIT / QUIT, and 'submit.*' (a choice the engine refused)
 //   The party-menu prompt, "already in battle", "no energy left to battle", "already selected" and "can't be switched out" ARE ROM lines
 //   (the party-menu text pool at 0xf43700). Placeholder roles (which {id} is the move, the item, the foe) were inferred from the wording of
 //   the strings that use them, not from the ROM code (see battle_text.js).
+// THE FREE SWITCH ("<TRAINER> is about to send out <MON>. Will you switch your Pokemon?" YES / NO; opts.style = the BATTLE STYLE setting, style_settings.js): a REQUEST of the engine (reason 'free'),
+//   asked from idle() once what the events queued has played (see askFree below); every word of it is the ROM's own ('style.ask', 'opt.style' / 'opt.shift' / 'opt.set' in battle_text.js). SET answers
+//   { kind: 'stay' } by itself the moment the offer opens (autoStay), so a battle on SET plays frame for frame as before the feature. ENGINE.md `freeSwitch`, README.md "Will you switch your Pokemon?".
 // WHAT THE SCREENS ARE: the party / preview / result screens are composed from ROM pieces (window ring, 2-frame menu icons, HP-bar tiles,
 //   status icons, fonts, palette colours); the game's own party-menu background and panel art was NOT located, so those layouts are this
 //   module's composition, not a copy of the game's.
@@ -114,7 +119,7 @@ export function createScene(opts) {
     lastBox: { mode: 'message', text: ['', ''] },
     weather: 0, trickRoom: false, terrain: 0, gravity: false,
     cursor: 0, moveCursor: 0, partyCursor: 0, partyCancelSel: false,
-    party: null, preview: null, result: null, overlay: null, confirm: null, menu: null,
+    party: null, preview: null, result: null, overlay: null, confirm: null, menu: null, free: null,
     turn: 0, notes: { trap: ['', ''], disabled: ['', ''], lastItem: ['', ''], lastMove: ['', ''], gas: [false, false], hz: [new Set(), new Set()], ff: [false, false], pw: 0, stk: [0, 0] },
     ended: false, quit: false, hashLog: [],
     recap: null, career: null, careerVer: 0, matchEnded: false,
@@ -162,7 +167,7 @@ export function createScene(opts) {
 
   /* ----------------------------------------------------------------------------------------------- queue */
   const q = (step) => { S.queue.push(step); return step; };
-  const qText = (str, o) => q({ t: 'text', text: str, wait: !!(o && o.wait) });
+  const qText = (str, o) => q({ t: 'text', text: str, wait: !!(o && o.wait), ...(o && o.question ? { question: true } : {}) });
   const qMsg = (key, r, o) => { const m = msg(key, r, o); if (m) qText(m, o); };
   const qCall = (fn) => q({ t: 'call', fn });
   const qPause = (n) => q({ t: 'pause', n });
@@ -1108,7 +1113,7 @@ export function createScene(opts) {
         const tw = st.tw, fast = S.held.a || S.held.b;
         if (!tw.done && !tw.waiting) tw.tick(fast);
         else if (tw.waiting) { if (++st.waitN >= PAGE_AUTO || fast) { tw.next(); st.waitN = 0; } }
-        else if (++st.hold >= MSG_HOLD || (fast && st.hold >= 6)) { S.lastBox = { mode: 'message', text: tw.lines(), arrow: false }; return true; }
+        else if (st.question || ++st.hold >= MSG_HOLD || (fast && st.hold >= 6)) { S.lastBox = { mode: 'message', text: tw.lines(), arrow: false }; return true; }       // (a question, the free switch's, opens its YES / NO box the moment it is typed)
         return false;
       }
       case 'pause': return --st.n < 0;
@@ -1224,7 +1229,7 @@ export function createScene(opts) {
     });
     const foe = (ctl.previewInfo[foeSide] || []).map((f) => ({ species: f.sp, name: speciesName(f.sp), level: f.level, gender: null, shiny: false }));
     void origs;
-    S.preview = { req, pick: req.pick, mine, foe, picks: [], cursor: 0, confirming: false };
+    S.preview = { req, pick: req.pick, lead: !!req.lead, mine, foe, picks: [], cursor: 0, confirming: false };       // lead: the 6v6 preview asks for ONE Pokemon to send out first (pick is then 1) and the rest follow in team order
     S.mode = 'preview'; S.overlay = null; S.req = req;
   }
   function startResult() {
@@ -1261,15 +1266,61 @@ export function createScene(opts) {
     if (S.resume) { const r = S.resume; S.resume = null; S.mode = r.mode; if (r.fn) r.fn(); return; }
     if (S.ended) { if (S.mode !== 'result' && S.mode !== 'recap') startResult(); return; }
     // events that arrived while the scene was busy
+    autoStay();
     const ev = ctl.takeEvents();
     if (ev.length) { director(ev); S.mode = 'steps'; return; }
+    if (S.auto && S.free) {                                              // an automatic player (the page's autoplay, the tests) that takes over while the free question is open answers it for the human
+      const rq = pendingReq();
+      if (rq && rq.phase === 'switch' && rq.reason === 'free') { const c = S.auto.decide(rq); if (c) { S.party = null; S.confirm = null; submit(c); return; } }
+    }
     if (S.mode === 'confirm' || S.mode === 'menu') return;                // an overlay is open: leave the menus alone
     const req = pendingReq();
     if (S.auto && req && (req.phase === 'preview' || req.phase === 'move' || req.phase === 'switch')) { const c = S.auto.decide(req); if (c) { submit(c); return; } }
     if (!req) { if (ctl.winner !== null) { S.ended = true; return; } if (S.mode !== 'wait') S.mode = 'wait'; return; }
     if (req.phase === 'preview') { if (S.mode !== 'preview') enterPreview(req); }
     else if (req.phase === 'move') { if (S.mode !== 'action' && S.mode !== 'moves' && S.mode !== 'party') enterAction(req); else S.req = req; }
-    else if (req.phase === 'switch') { if (S.mode !== 'party') enterParty(req, true); }
+    else if (req.phase === 'switch') {
+      if (req.reason === 'free') askFree(req);                              // "Will you switch your Pokemon?": the foe's replacement is chosen and waiting, this side may change first (or answer NO)
+      else if (S.mode !== 'party') enterParty(req, true);
+    }
+  }
+
+  /* ----------------------------------------------------------------------------- the free switch: "<TRAINER> is about to send out <MON>. Will you switch your Pokemon?" YES / NO
+   * The engine (Battle.offerFree) offers it once the foe's Pokemon has fainted and the foe has chosen its replacement. It is a plain request ({ phase: 'switch', reason: 'free', next }), so this is
+   * asked from idle(), after everything the events queued has played: no event is involved, nothing is prepared ahead and the stale-picture rules of ANIM.md round 7 have nothing to say about it.
+   * The ROM's own two-page line is typed (the first page waits for a press like any message), then the YES / NO box opens over the second page with the cursor on YES. YES opens the party screen
+   * (CANCEL / B comes back to the question); a Pokemon chosen there is submitted as { kind: 'switch', slot }, NO or B answers { kind: 'stay' }. BATTLE STYLE: SET (opts.style) answers { kind: 'stay' }
+   * itself without a word, so that the setting can be changed in the middle of a battle and a saved battle replays the same either way. */
+  const styleNow = () => (opts.style && typeof opts.style.get === 'function' ? opts.style.get() : null);
+  // BATTLE STYLE: SET: if the engine is offering the free switch, say NO at once. Called the moment a choice has gone in and before the events it produced are read (submit, idle), so that the replacement's send-out
+  // arrives in the same batch of events it always did: a battle played on SET is, frame for frame, the battle that was played before the free switch existed (the choice log holds one { kind: 'stay' } more).
+  function autoStay() {
+    if (S.free) return false;
+    const cfg = styleNow();
+    if (!cfg || cfg.style !== 'set') return false;
+    const req = pendingReq();
+    if (!req || req.phase !== 'switch' || req.reason !== 'free') return false;
+    return ctl.submit(viewSide, { kind: 'stay' }).ok;
+  }
+  function askFree(req) {
+    if (S.free) return;                                                      // the question is on its way or on screen
+    if (autoStay()) return;
+    S.free = { box: null };
+    qText(msg('style.ask', roles(foeSide, { b2: req.next && req.next.name ? req.next.name : '?' })), { question: true });
+    qCall(openFreeConfirm);
+    S.mode = 'steps';
+  }
+  function openFreeConfirm() {
+    if (!S.free) return;
+    if (!S.free.box) S.free.box = S.lastBox;                                 // the second page, as typed: it stays under the YES / NO box and when B comes back from the party screen
+    S.confirm = { kind: 'free', cursor: 0, back: 'steps' };
+    S.overlay = { rows: ['YES', 'NO'], cursor: 0, w: 48, x: 176 };
+    S.mode = 'confirm';
+  }
+  function openFreeParty() {
+    const req = pendingReq();
+    if (!req || req.reason !== 'free') { submit({ kind: 'stay' }); return; }
+    enterParty(req, false); S.party.free = true;
   }
 
   // AN1: BATTLE SPEED 2x / 4x runs every step except a typed message that many times per frame; with animations off the speed is not applied
@@ -1309,7 +1360,8 @@ export function createScene(opts) {
   function submit(choice) {
     const r = ctl.submit(viewSide, choice);
     if (!r.ok) { flash(rawMsg('submit.' + r.code, 'That choice is not allowed (' + r.code + ').'), S.mode); return r; }
-    S.overlay = null; S.mode = 'steps'; S.party = null; S.preview = null;
+    S.overlay = null; S.mode = 'steps'; S.party = null; S.preview = null; S.free = null;
+    autoStay();
     return r;
   }
 
@@ -1364,6 +1416,7 @@ export function createScene(opts) {
       if (yes) submit({ kind: 'preview', order: S.preview.picks.map((i) => S.preview.mine[i].slot) });
       else { S.mode = 'preview'; if (S.preview) { S.preview.confirming = false; S.preview.picks = []; } }
     } else if (c.kind === 'quit') { if (yes) { S.quit = true; if (hooks.onQuit) hooks.onQuit(); } S.mode = c.back || 'action'; }
+    else if (c.kind === 'free') { if (yes) openFreeParty(); else submit({ kind: 'stay' }); }          // YES: pick who comes in (B comes back here); NO / B: nothing changes, the foe's Pokemon comes in
   }
 
   // W1: a page that can open the Controls panel passes hooks.onControls(done); the menu then lists CONTROLS (RESUME / CONTROLS / SOUND /
@@ -1378,15 +1431,20 @@ export function createScene(opts) {
     rows.push('SOUND: ' + (opts.sound && opts.sound.get() ? 'ON' : 'OFF'));
     const ac = animSettings();
     if (ac) rows.push('ANIMATION: ' + (ac.on ? 'ON' : 'OFF'), 'BATTLE SPEED: ' + ac.speed + 'X');                       // AN1
+    const bs = styleSetting();
+    if (bs) rows.push(styleLabel(bs));                                                                                  // the hack's own Options row: "Battle Style", Shift or Set (a battle against a person has no such row)
     if (!S.ended && ctl.winner === null && (S.mode === 'action' || S.mode === 'moves' || S.mode === 'party' || S.mode === 'wait' || S.mode === 'preview')) rows.push('FORFEIT');
     rows.push(quitLabel);
     const at = cursorLabel ? Math.max(0, rows.findIndex((r) => r.startsWith(cursorLabel))) : 0;
     S.menu = { rows, back: S.mode, cursor: at };
-    S.overlay = ac ? { rows, cursor: at, w: 104, x: 132, y: 8 } : menuWide ? { rows, cursor: at, w: 88, x: 148, y: 20 } : { rows, cursor: at, w: 76, x: 160, y: 20 };
+    S.overlay = bs ? { rows, cursor: at, w: 116, x: 120, y: 4 } : ac ? { rows, cursor: at, w: 104, x: 132, y: 8 } : menuWide ? { rows, cursor: at, w: 88, x: 148, y: 20 } : { rows, cursor: at, w: 76, x: 160, y: 20 };
     S.mode = 'menu';
   }
   // AN1: the settings object, when the page gave one the menu can change ({ get, set })
   const animSettings = () => (opts.anim && typeof opts.anim.get === 'function' && typeof opts.anim.set === 'function' ? opts.anim.get() : null);
+  // BATTLE STYLE (style_settings.js): the page's setting object, when it gave one the menu can change ({ get, set }). The words are the ROM's: the Options row "Battle Style" and its values "Shift" and "Set".
+  const styleSetting = () => (opts.style && typeof opts.style.get === 'function' && typeof opts.style.set === 'function' ? opts.style.get() : null);
+  const styleLabel = (c) => (msg('opt.style') || 'Battle Style').toUpperCase() + ': ' + (msg(c.style === 'set' ? 'opt.set' : 'opt.shift') || (c.style === 'set' ? 'Set' : 'Shift')).toUpperCase();
   function menuActivate(i) {
     const m = S.menu; if (!m) return;
     const label = m.rows[i];
@@ -1401,6 +1459,7 @@ export function createScene(opts) {
     else if (label.startsWith('SOUND') && opts.sound && typeof opts.sound.open === 'function') { close(); opts.sound.open(() => { if (S.mode === back) openMenu('SOUND'); }); }       // MU3: a page that has the volume panel opens it (done() when it closes); the menu comes back where it was
     else if (label.startsWith('SOUND')) { if (opts.sound) opts.sound.set(!opts.sound.get()); close(); openMenu('SOUND'); S.menu.back = back; }
     else if (label.startsWith('ANIMATION')) { const c = animSettings(); if (c) opts.anim.set({ on: !c.on }); close(); openMenu('ANIMATION'); S.menu.back = back; }
+    else if (label.startsWith((msg('opt.style') || 'Battle Style').toUpperCase())) { const c = styleSetting(); if (c) opts.style.set({ style: c.style === 'set' ? 'switch' : 'set' }); close(); openMenu('BATTLE STYLE'); S.menu.back = back; }
     else if (label.startsWith('BATTLE SPEED')) { const c = animSettings(); if (c) opts.anim.set({ speed: c.speed === 1 ? 2 : c.speed === 2 ? 4 : 1 }); close(); openMenu('BATTLE SPEED'); S.menu.back = back; }
     else if (label === 'FORFEIT') { S.menu = null; S.overlay = null; S.mode = back; openConfirm('forfeit', back); }   // always asks (YES / NO), from the action menu, the team preview and the waiting screen alike
     else if (label === quitLabel) { S.menu = null; S.overlay = null; S.mode = back; if (S.ended || ctl.winner !== null) { if (hooks.onQuit) hooks.onQuit(); } else openQuitConfirm(back); }
@@ -1480,7 +1539,11 @@ export function createScene(opts) {
     else if (a === 'b') { if (!p.forced) leaveParty(); }
     return true;
   }
-  function leaveParty() { S.party = null; S.partyCancelSel = false; S.mode = 'action'; }
+  function leaveParty() {
+    const free = !!(S.party && S.party.free);
+    S.party = null; S.partyCancelSel = false;
+    if (free) openFreeConfirm(); else S.mode = 'action';              // B / CANCEL on the free switch's party screen is back to "Will you switch your Pokemon?" YES / NO
+  }
 
   function previewInput(a) {
     const p = S.preview; if (!p) return false;
@@ -1491,6 +1554,8 @@ export function createScene(opts) {
     else if (a === 'b') { if (p.picks.length) p.picks.pop(); }
     return true;
   }
+  // the order the battle will send the team out in once `picks[0]` leads: the lead, then everyone else in team order (what the engine's applyPreview does for a lead battle)
+  const leadOrder = (p) => (p.picks.length ? [p.picks[0]].concat(p.mine.map((_, i) => i).filter((i) => i !== p.picks[0])) : []);
   function previewToggle(i) {
     const p = S.preview; if (!p) return;
     p.cursor = i;
@@ -1684,6 +1749,7 @@ export function createScene(opts) {
     }
     // tick: the frame counter, so the one move name too long for its 64 px window (a Z-move nobody can know) scrolls through it instead of being cut (battle_ui.js marqueeOffset)
     if (m === 'moves') { const rows = moveRows(); return { mode: 'moves', cursor: S.moveCursor, moves: rows.map((r) => ({ name: r.name, pp: r.pp, maxPp: r.maxPp, type: r.type, typeName: typeName(r.type) })), tick: S.tick }; }
+    if (m === 'confirm' && S.confirm && S.confirm.kind === 'free') return S.free && S.free.box ? S.free.box : S.lastBox;          // the typed question stays under the YES / NO box
     if (m === 'confirm' && S.confirm) {
       const k = S.confirm.kind;
       const s = k === 'forfeit' ? msg('forfeit.ask', roles(viewSide)).split(/(?<=[?!.]) /)[0] : k === 'team' ? 'Send out this team?' : 'Leave this battle?';
@@ -1710,9 +1776,12 @@ export function createScene(opts) {
     if ((m === 'preview' || (m === 'confirm' && S.preview && S.confirm && (S.confirm.kind === 'team' || ((S.confirm.kind === 'forfeit' || S.confirm.kind === 'quit') && S.confirm.back === 'preview')))) && S.preview) {
       const p = S.preview;
       const asking = m === 'confirm' && (S.confirm.kind === 'forfeit' || S.confirm.kind === 'quit');       // D3: leaving from the pause menu at the team preview keeps the preview behind its YES / NO too
-      const left = asking ? (S.confirm.kind === 'quit' ? 'Leave this battle?' : 'Give up this battle?') : p.picks.length >= p.pick ? 'Send out this team?' : 'Choose ' + p.pick + ' (' + p.picks.length + '/' + p.pick + ')';
-      fallbacks.add(asking ? (S.confirm.kind === 'quit' ? 'confirm.quit' : 'confirm.forfeit.preview') : 'preview.title');
-      return { screen: 'preview', overlay: ov, preview: { mine: p.mine, foe: p.foe, picks: p.picks, cursor: p.cursor, tick: S.tick, title: left, foeTitle: trainer, prompt: [] } };
+      // The lead preview (6v6) asks "Choose a Pokemon." in the ROM's own party-menu words, and its question ("Send out this one first?": the ROM has no line for it, so it is listed in fallbacks as
+      // 'confirm.lead') names no Pokemon so that it always fits the title row beside the foe's name; the whole team is numbered in the order the battle will send it out (the lead, then team order).
+      const leadAsk = p.lead && p.picks.length >= p.pick;
+      const left = asking ? (S.confirm.kind === 'quit' ? 'Leave this battle?' : 'Give up this battle?') : p.lead ? (leadAsk ? 'Send out this one first?' : (msg('party.choose', roles(viewSide)) || 'Choose a Pokemon.')) : p.picks.length >= p.pick ? 'Send out this team?' : 'Choose ' + p.pick + ' (' + p.picks.length + '/' + p.pick + ')';
+      if (asking || leadAsk || !p.lead) fallbacks.add(asking ? (S.confirm.kind === 'quit' ? 'confirm.quit' : 'confirm.forfeit.preview') : leadAsk ? 'confirm.lead' : 'preview.title');
+      return { screen: 'preview', overlay: ov, preview: { mine: p.mine, foe: p.foe, picks: p.lead ? leadOrder(p) : p.picks, cursor: p.cursor, tick: S.tick, title: left, foeTitle: trainer, prompt: [] } };
     }
     if (m === 'recap' && S.result && S.recap) {
       const pages = recapPages(), i = clamp(S.recap.page, 0, pages.length - 1);
