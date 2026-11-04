@@ -5,10 +5,11 @@
 // boot.js carries them out against the profile store (tower_session.js), so the screens stay a pure function of the data they are given:
 //
 //   { type: 'tower-new',    profileId, teamId | null, format, token }   START was chosen on NEW RUN (teamId null = a random team). `token` names the screen visit: the page runs each token ONCE (createOnceGate), so a
-//                                                                      double tap starts one run, not two
+//                                                                      double tap starts one run, not two; createStartGuard also allows one start at a time on the whole page (START, B, NEW RUN, START in one tick)
 //   { type: 'tower-fight',  profileId }                              FIGHT: go and fight the floor the run is waiting for (tower_launch.js launchFloorBattle)
 //   { type: 'tower-pick',   profileId, seed, id | null, floor, offer }   a ball was taken (id), or the offer was skipped (null). `floor` and `offer` name the offer it was shown in (summarizeTower's offer.key):
-//                                                                      an old screen cannot answer a newer offer
+//                                                                      an old screen cannot answer a newer offer. They are PINNED when the "take this buff?" question opens (with the ball and the run), not read when YES is pressed; if the
+//                                                                      offer in the data changes while the question is open, the question closes
 //   { type: 'tower-giveup', profileId }                              GIVE UP was answered YES
 //   { type: 'screen', path, back? }                                  (hub_model's) a screen change
 //
@@ -59,6 +60,35 @@ export function createOnceGate() {
     enter(token) { if (token === undefined || token === null) return true; if (seen.has(token)) return false; seen.add(token); return true; },
     release(token) { seen.delete(token); },
   };
+}
+
+/**
+ * One START at a time on the whole page. The once-gate alone is per VISIT to NEW RUN, so START, B, NEW RUN, START inside one tick (two visits, two tokens) ran two starts at once (two profiles, two runs). `enter(token)` lets a
+ * start through only if no other start is under way AND its token has not run; `done(token, started)` ends it: a start that did not happen releases the page and its token (the player can ask again), one that did stays
+ * locked (the page is leaving for the floor, and a second start must not make a second profile or run in the meantime). `reset()` ends that lock for a page that is NOT leaving after all: one restored from the browser's
+ * back / forward cache (pageshow, persisted) is the same page with the same state, and without it START would be silently ignored for ever. A token that already ran stays used (a new visit has a new one).
+ */
+export function createStartGuard() {
+  const gate = createOnceGate();
+  let busy = false;
+  return {
+    enter(token) { if (busy) return false; if (!gate.enter(token)) return false; busy = true; return true; },
+    done(token, started) { if (started) return; gate.release(token); busy = false; },
+    reset() { busy = false; },
+    isBusy: () => busy,
+  };
+}
+
+/**
+ * What the hub page must do about its browser history when it has just booted on `path`. -> { trail, write }
+ *   trail   the screens to walk through to reach `path` (arrivalTrail); the page stands on that many entries when it is done
+ *   write   true only for a FRESH arrival, whose history holds one entry: the page then gives it the entries it would have had if walked to. false when the current entry already carries the hub's marker (`state.arenaHub`):
+ *           a reload, or a back / forward step onto an entry this page wrote. Such a page already stands on the trail; writing it again would add two entries per reload and throw away the Forward entry.
+ */
+export function historySeedPlan(path, state) {
+  const trail = arrivalTrail(path);
+  const marked = !!state && typeof state === 'object' && typeof state.arenaHub === 'string';
+  return { trail, write: trail.length > 0 && !marked };
 }
 
 /** `text` as lines no wider than `px` (measure(s) -> pixels in the message font): words stay whole, a word wider than a line is cut where it must be. No word is ever dropped. */
@@ -263,13 +293,13 @@ export function createTowerHub(env) {
     const r = liveRun();
     if (path === 'tower-offer') {
       const balls = offerBalls(), c = S.offer.cursor;
-      const ball = c < balls.length ? balls[c] : null, d = S.offer.confirm;
+      const d = S.offer.confirm;
       out.tower = {
         kind: path, state: !tw() ? 'loading' : balls.length ? 'ready' : 'empty', floor: r ? r.floor - 1 : 0, floors: r ? r.floors : 30, balls: balls.map((b) => ({ ...b })), cursor: c, canSkip: true, hover: S.hover,
         confirm: d ? { kind: d.kind, cursor: d.cursor } : null,
       };
-      out.msg = d ? (d.kind === 'take' ? ['Take this buff?', ball ? ball.name : ''] : ['Take nothing this time?', 'The offer is gone for good.']) : balls.length ? ['Floor ' + (r.floor - 1) + ' cleared. Choose one.', 'A takes it. B: Tower menu.'] : ['No buff is waiting.', 'B goes back.'];
-      if (S.flash) out.msg = S.flash;
+      out.msg = d ? (d.kind === 'take' ? ['Take this buff?', d.name] : ['Take nothing this time?', 'The offer is gone for good.']) : balls.length ? ['Floor ' + (r.floor - 1) + ' cleared. Choose one.', 'A takes it. B: Tower menu.'] : ['No buff is waiting.', 'B goes back.'];
+      if (S.flash && !d) out.msg = S.flash;          // (a note replaces the idle prompt only: never the question that is open)
       return out;
     }
     if (path === 'tower-buffs') {
@@ -322,6 +352,7 @@ export function createTowerHub(env) {
     for (const p of Object.keys(S.cursor)) clampCursor(p);
     if (path === 'tower' && !S.autoDone && t && r && r.phase === 'offer' && env.arrivedByLink()) { return env.go('tower-offer'); }          // (once: entering the offer sets autoDone, see enter)
     if (path === 'tower-offer' && t && !(r && r.phase === 'offer')) { S.offer.confirm = null; return env.back(); }
+    if (path === 'tower-offer' && S.offer.confirm && !sameOffer(S.offer.confirm)) S.offer.confirm = null;          // the offer the question was about is gone (another tab answered it, or a newer one is up): the question closes
     if (path === 'tower-offer') S.offer.cursor = clamp(S.offer.cursor, 0, offerBalls().length);
     if (path === 'tower-buffs' && t && !r) return env.back();
     if (path === 'tower-last' && t && !t.last) return env.back();
@@ -401,6 +432,13 @@ export function createTowerHub(env) {
     }
   }
 
+  /** The question "take this buff?" / "take nothing?" names the offer it was opened on: the run, the floor, the offer's key and the ball. YES answers THAT offer, whatever the screen's data has become since. */
+  function pinOffer(kind, balls, c) {
+    const r = liveRun(), b = kind === 'take' ? balls[c] : null;
+    return { kind, cursor: 1, seed: r ? r.seed : null, floor: r ? r.floor : 0, key: r && r.offer ? r.offer.key : undefined, id: b ? b.id : null, name: b ? b.name : '' };
+  }
+  /** Is the offer in the data now the one the question was opened on? */
+  function sameOffer(c) { const r = liveRun(); return !!r && r.phase === 'offer' && !!r.offer && r.seed === c.seed && r.floor === c.floor && r.offer.key === c.key; }
   function pressOffer(a) {
     const balls = offerBalls(), n = balls.length, o = S.offer;
     if (!n) return a === 'b' || a === 'a' ? env.back() : [];
@@ -410,18 +448,18 @@ export function createTowerHub(env) {
       if (a === 'a') {
         const c = o.confirm; o.confirm = null;
         if (c.cursor !== 0) return [];
-        const p = prof(), r = liveRun();
-        return [{ type: 'tower-pick', profileId: p.id, seed: r.seed, id: c.kind === 'take' ? balls[o.cursor].id : null, floor: r.floor, offer: r.offer ? r.offer.key : undefined }];
+        const p = prof();
+        return [{ type: 'tower-pick', profileId: p.id, seed: c.seed, id: c.id, floor: c.floor, offer: c.key }];
       }
       return [];
     }
     switch (a) {
-      case 'left': case 'l': o.cursor = (o.cursor + n) % (n + 1); return [];
-      case 'right': case 'r': o.cursor = (o.cursor + 1) % (n + 1); return [];
-      case 'up': o.cursor = o.cursor === n ? n - 1 : o.cursor; return [];
-      case 'down': o.cursor = n; return [];
-      case 'a': o.confirm = { kind: o.cursor === n ? 'skip' : 'take', cursor: 1 }; return [];
-      case 'start': if (o.cursor !== n) { o.cursor = n; return []; } o.confirm = { kind: 'skip', cursor: 1 }; return [];
+      case 'left': case 'l': S.flash = null; o.cursor = (o.cursor + n) % (n + 1); return [];
+      case 'right': case 'r': S.flash = null; o.cursor = (o.cursor + 1) % (n + 1); return [];
+      case 'up': S.flash = null; o.cursor = o.cursor === n ? n - 1 : o.cursor; return [];
+      case 'down': S.flash = null; o.cursor = n; return [];
+      case 'a': S.flash = null; o.confirm = pinOffer(o.cursor === n ? 'skip' : 'take', balls, o.cursor); return [];
+      case 'start': S.flash = null; if (o.cursor !== n) { o.cursor = n; return []; } o.confirm = pinOffer('skip', balls, o.cursor); return [];
       case 'b': return env.back();          // the Tower menu: the offer is still waiting there (CHOOSE A BUFF), and MY BUFFS is the row under it
       default: return [];
     }
@@ -502,7 +540,7 @@ export function createTowerHub(env) {
       const o = S.offer;
       if (h.kind === 'yes' || h.kind === 'no') { if (o.confirm) o.confirm.cursor = h.kind === 'yes' ? 0 : 1; return moving ? [] : press(path, 'a'); }
       if (h.kind === 'ball') {
-        if (moving) { S.hover = h.index; if (!o.confirm) o.cursor = h.index; return []; }
+        if (moving) { S.hover = h.index; if (!o.confirm) { if (o.cursor !== h.index) S.flash = null; o.cursor = h.index; } return []; }
         if (ev.kind === 'click' && !o.confirm) { o.cursor = h.index; return press(path, 'a'); }
         return [];
       }

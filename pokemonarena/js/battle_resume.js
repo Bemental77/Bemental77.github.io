@@ -14,6 +14,8 @@
 //
 // A saved battle can carry a `tag` (a Tower floor's: the run, the floor, the lives spent and every buff held): a record is only used if its tag is exactly the one the page now computes, so a Tower fight can never
 // be resumed as another run's, with other buffs, or as a regular battle - and a regular battle's record (no tag) is never used by a Tower fight.
+// It can also carry the `attempt` of the page that fought it (a Tower floor's identity for its fight): a record is only used by a page whose attempt is exactly that one, so a second tab that was told it is a
+// duplicate (its choices are saved too, under its own number) cannot reload into the first tab's fight. A page that asks for no attempt (every regular battle) ignores the field.
 //
 // No DOM here: tools/pokemonarena_scene_test.mjs runs it in Node with a fake storage.
 
@@ -33,9 +35,9 @@ export function validRecord(rec, seed, tag) {
 }
 
 /** The record for a controller's present state: the human side's choices, in order, and the state hash they led to. */
-export function snapshotOf(ctl, seed, humanSide = 0, tag) {
+export function snapshotOf(ctl, seed, humanSide = 0, tag, attempt) {
   const i = ctl.info();
-  return { v: RESUME_VERSION, seed, ...(tag === undefined ? {} : { tag }), choices: i.choiceLog.filter((e) => e.s === humanSide).map((e) => JSON.parse(JSON.stringify(e.c))), hash: i.hash, turn: i.turn };
+  return { v: RESUME_VERSION, seed, ...(tag === undefined ? {} : { tag }), ...(attempt === undefined ? {} : { attempt }), choices: i.choiceLog.filter((e) => e.s === humanSide).map((e) => JSON.parse(JSON.stringify(e.c))), hash: i.hash, turn: i.turn };
 }
 
 /** 'navigate' | 'reload' | 'back_forward' | 'prerender' (what the browser says about how this page was reached); 'navigate' when it does not say. */
@@ -48,7 +50,7 @@ export function navigationType(perf) {
   return 'navigate';
 }
 
-export function createResumeStore({ storage, key, seed, humanSide = 0, tag }) {
+export function createResumeStore({ storage, key, seed, humanSide = 0, tag, attempt }) {
   let detach = null;
   const store = {
     key,
@@ -76,6 +78,8 @@ export function createResumeStore({ storage, key, seed, humanSide = 0, tag }) {
       if (rec === null) { info.reason = 'nothing saved'; return { ctl, info }; }
       if (info.navType !== 'reload' && info.navType !== 'back_forward') { store.clear(); info.reason = 'opened afresh (' + info.navType + ')'; return { ctl, info }; }
       if (!validRecord(rec, seed, tag)) { store.clear(); info.reason = 'the saved record is not usable'; return { ctl, info }; }
+      // a saved battle that names the page that fought it (a Tower floor's `attempt`) is resumed only by that page: a record written by another page of the same fight (a second tab) is thrown away, never taken over
+      if (attempt !== undefined && rec.attempt !== attempt) { store.clear(); info.reason = 'the saved battle belongs to another page of this fight'; return { ctl, info }; }
       info.tried = true;
       let why = '';
       try {
@@ -100,7 +104,7 @@ export function createResumeStore({ storage, key, seed, humanSide = 0, tag }) {
       let queued = false;
       const persist = () => {
         queued = false;
-        try { if (ctl.winner !== null) store.clear(); else store.write(snapshotOf(ctl, seed, humanSide, tag)); } catch (_e) { /* ignore */ }
+        try { if (ctl.winner !== null) store.clear(); else store.write(snapshotOf(ctl, seed, humanSide, tag, attempt)); } catch (_e) { /* ignore */ }
       };
       const offLocal = ctl.onLocalChoice(() => { if (!queued) { queued = true; Promise.resolve().then(persist); } });
       const offEnd = ctl.onEnd(() => store.clear());

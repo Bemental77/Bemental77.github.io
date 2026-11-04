@@ -94,19 +94,38 @@ const setOwn = (o, k, v) => Object.defineProperty(o, k, { value: v, enumerable: 
 /** A time stamp as the record keeps it: a whole number of milliseconds in range, else 0 (a clock that says -5, 1.5 or NaN must not make the record fail its own check). */
 export const sanitiseStamp = (at) => (Number.isInteger(at) && at >= 0 && at <= TOWER_LIMITS.timeMax ? at : 0);
 
+const bagCost = (k, v) => { try { return k.length + 4 + String(JSON.stringify(v)).length; } catch (_e) { return Infinity; } };          // what capBag charges for one key
+
 /**
  * Hold a bag of unknown values to `max` serialized characters: the OLDEST keys are dropped first, until what is left fits (a key bigger than the whole allowance goes too). A bag already inside the
  * allowance is returned as it is. Without this a hostile file could park megabytes in `tower._unknown`, and every later load, history revision, backup and export would carry them.
  */
 export function capBag(bag, max = TOWER_LIMITS.bagMax) {
   if (!isObj(bag)) return bag;
-  const keys = Object.keys(bag), cost = keys.map((k) => { try { return k.length + 4 + String(JSON.stringify(bag[k])).length; } catch (_e) { return Infinity; } });
+  const keys = Object.keys(bag), cost = keys.map((k) => bagCost(k, bag[k]));
   let total = 0; for (const c of cost) total += c;
   if (total <= max) return bag;
   const out = {}; let i = 0;
   for (; i < keys.length && total > max; i++) total -= cost[i];
   for (; i < keys.length; i++) setOwn(out, keys[i], bag[keys[i]]);
   return out;
+}
+
+/**
+ * What the repair hands back (`rejected`: the values it could not keep) as it will be parked under `towerRejected` in the bag `prior` the record already holds. It is cut down BEFORE it is merged, on its own, to the
+ * room that bag has left: capBag drops the OLDEST keys first, so a huge reject merged in whole would push out the record's own older unknown values (a legitimate `futureThing`) and then itself. Fields of the reject
+ * that do not fit are left out and named in `_dropped`. -> the object to store under `towerRejected`, or null when there is nothing to store (or not even the note fits).
+ */
+export function fitRejected(rejected, prior, max = TOWER_LIMITS.bagMax) {
+  if (!isObj(rejected) || !Object.keys(rejected).length) return null;
+  let held = 0; if (isObj(prior)) for (const k of Object.keys(prior)) held += bagCost(k, prior[k]);
+  const fits = (o) => held + bagCost('towerRejected', o) <= max;
+  if (fits(rejected)) return rejected;
+  const out = {}, dropped = [];
+  for (const k of Object.keys(rejected)) { setOwn(out, k, rejected[k]); if (!fits(out)) { delete out[k]; dropped.push(k); } }
+  setOwn(out, '_dropped', dropped.slice(0, 16).map((k) => String(k).slice(0, 24)));
+  if (!fits(out)) delete out._dropped;
+  return Object.keys(out).length ? out : null;
 }
 
 /**

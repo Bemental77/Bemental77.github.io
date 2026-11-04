@@ -18,6 +18,7 @@ const SRC = path.join(root, 'pokemonarena', 'js');
 const ROM_PATH = process.env.ARENA_ROM || path.join(root, 'gba', 'gbaWasm', 'roms', 'Pokemon SoulGold (v1.1.1).gba');
 const WANT_MUTANTS = process.argv.includes('--mutants');
 const ONLY = process.argv.slice(2).filter((a) => /^--only=/.test(a)).map((a) => a.slice(7).split(',')).flat();
+const MUT_ONLY = process.argv.slice(2).filter((a) => /^--mutant=/.test(a)).map((a) => a.slice(9).split(',')).flat();
 
 let pass = 0, fail = 0;
 const failures = [];
@@ -837,9 +838,12 @@ async function suite(S, tag, opt = {}) {
     ok(J(D1.nav.calls) === J([['hub']]), t('L9 BACK TO HUB goes to the hub'), J(D1.nav.calls));
     const E1 = await open(withLife, { floor: 2 }); E1.f.onMatchEnd({ summary: { ...summary, result: 'l' }, ticks: 1, winner: 1 }); await new Promise((r) => setTimeout(r, 20)); E1.f.onResult('RETRY FLOOR'); await new Promise((r) => setTimeout(r, 30));
     ok(E1.nav.calls.length === 1 && E1.nav.calls[0][0] === 'retry' && E1.nav.calls[0][1] === 2 && E1.per.peek().current.livesUsed === 1, t('L10 RETRY FLOOR after a loss with an Extra Life goes to the same floor again (the life is spent)'), J(E1.nav.calls));
-    // leaving in the middle of the fight is a loss
-    const F1 = await open(base); F1.f.onQuit(); await new Promise((r) => setTimeout(r, 30));
-    ok(J(F1.nav.calls) === J([['tower', 'over']]) && F1.per.peek().current === null && F1.per.peek().last.won === false, t('L11 leaving in the middle of the fight is a loss: recorded, and then the Tower\'s result screen'), J(F1.nav.calls));
+    // leaving in the middle of the fight (after the first choice) is a loss
+    const F1 = await open(base); F1.f.committed(); await new Promise((r) => setTimeout(r, 30)); F1.f.onQuit(); await new Promise((r) => setTimeout(r, 30));
+    ok(J(F1.nav.calls) === J([['tower', 'over']]) && F1.per.peek().current === null && F1.per.peek().last.won === false, t('L11 leaving in the middle of the fight (after the first choice) is a loss: recorded, and then the Tower\'s result screen'), J(F1.nav.calls));
+    // leaving BEFORE the first choice, on a run that cleared nothing, is not a played run: dropped, counted as nothing
+    const F2 = await open(base); F2.f.onQuit(); await new Promise((r) => setTimeout(r, 30));
+    ok(J(F2.nav.calls) === J([['tower', 'dropped']]) && F2.per.peek().current === null && F2.per.peek().runs === 0 && F2.per.peek().last === null && Object.keys(F2.per.peek().achievements).length === 0, t('L11b leaving before the first choice, on a run that cleared no floor, DROPS the run: nothing is counted (no run, no last run, no Rock Bottom), and the Tower menu opens'), J(F2.nav.calls));
     const G1 = await open(base); G1.f.onMatchEnd({ summary: { ...summary, result: 'l', viewSide: 0 } }); await new Promise((r) => setTimeout(r, 20)); G1.f.onQuit(); await new Promise((r) => setTimeout(r, 30));
     ok(G1.per.peek().runs === 1 && G1.nav.calls.length === 1, t('L12 leaving AFTER the fight ended counts nothing more: the result was already applied'), J(G1.nav.calls));
   }
@@ -1176,6 +1180,85 @@ async function suite(S, tag, opt = {}) {
       const stray = ['p=1', 'run=3', 'floor=2', 'life=1', 'p=x&floor=99&run=zz', 'floor=3&run=4&life=2&p=abc', 'p=%3Cscript%3E'];
       ok(stray.every((q) => { const r = pq(q); return r.ok && r.params.tower === null && r.params.quick === true; }) && TL.parseTowerParams(new URLSearchParams('floor=3&run=4')).tower === null && pq('seed=5&format=3v3&p=1').ok && pq('seed=5&format=3v3&p=1').params.tower === null && !pq('tower=1&floor=0&run=4').ok && !pq('tower=1&p=bad id&floor=1&run=4').ok && !pq('tower=2&floor=1&run=4').ok, t('Q37 an address with p, run, floor or life but NO tower=1 is a regular address and they are ignored, as the build before the Tower ignored them; with tower=1 every hostile value is still refused'), J(pq('p=1')));
     }
+
+    /* Q38-Q41: the tab-local resume record carries the attempt. A tab that was told it is a duplicate saves its own choices (under its own number) and, RELOADED, used to resume the first tab's fight and finish it. */
+    {
+      const sess = () => { const m = new Map(); return { getItem: (k) => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: (k) => m.delete(k) }; };
+      const key = RS.resumeKey('/pokemonarena/battle.html', '?tower=1&floor=1&run=777');
+      const mkCtl = (sp) => { const c = matchctl.createMatchController({ pack: PACK, ruleset: sp.ruleset, teams: sp.teams, seed: sp.seed, pick: sp.pick, names: sp.names, validate: false, sides: [{ kind: 'human' }, sp.sides[1]] }); c.start(); return c; };
+      // one TAB, wired as battle_boot.js wires it: its own session storage, a resume store that names the page's attempt, the fight's first-choice hook
+      const tab = async (per, o) => { const f = await openQ(per, o), st = sess(); return { f, st, rs: RS.createResumeStore({ storage: st, key, seed: f.spec.seed, tag: f.tag, attempt: f.attempt }), ctl: null }; };
+      const play = async (tb) => { tb.ctl = mkCtl(tb.f.spec); tb.rs.attach(tb.ctl); tb.ctl.onLocalChoice(() => tb.f.committed()); tb.ctl.submit(0, { kind: 'preview', order: [0, 1, 2] }); await ticks(); };
+      const reload = async (per, tb) => { const f = await openQ(per, { navType: 'reload' }); const rs = RS.createResumeStore({ storage: tb.st, key, seed: f.spec.seed, tag: f.tag, attempt: f.attempt }); return { f, r: rs.restore({ ctl: mkCtl(f.spec), makeCtl: () => mkCtl(f.spec), navType: 'reload' }) }; };
+      const per = fresh(); let dupB = 0;
+      const A = await tab(per, { nonce: () => 101 }), B = await tab(per, { nonce: () => 202, onDuplicate: () => { dupB++; } });
+      await play(A); await play(B);
+      const recA = JSON.parse(A.st.getItem(key)), recB = JSON.parse(B.st.getItem(key));
+      ok(dupB === 1 && per.peek().current.fighting === true && per.peek().current.attempt === 101 && recA.attempt === 101 && recB.attempt === 202 && A.f.attempt === 101 && B.f.attempt === 202, t('Q38 the resume record each tab keeps carries the attempt of the page that wrote it (tab A 101, the duplicate tab B 202), while the run keeps the first tab\'s 101'), J([recA.attempt, recB.attempt, dupB]));
+      // the duplicate tab is RELOADED: it must not resume (nor finish) the first tab's fight; the page then counts the unrestorable fight as LEFT
+      const rb = await reload(per, B);
+      const left = rb.f.status === 'resume' && !rb.r.info.restored ? await rb.f.leaveUnrestorable() : null;          // (battle_boot.js: status 'resume' and not restored -> leaveUnrestorable)
+      ok(rb.f.status === 'resume' && rb.f.attempt === 101 && rb.r.info.restored === false && /another page/.test(rb.r.info.reason) && B.st.getItem(key) === null && left && /counted as a loss/.test(left.message) && per.peek().current === null && per.peek().runs === 1 && per.peek().last.won === false, t('Q39 a duplicate tab that is RELOADED does not take over the first tab\'s fight: its saved battle is refused ("another page of this fight"), thrown away, and the fight counts as LEFT (a loss), never finished by it'), J([rb.f.status, rb.r.info.restored, rb.r.info.reason, per.peek().runs]));
+      // the first tab itself: its own reload still resumes and can finish
+      const perA = fresh(), A1 = await tab(perA, { nonce: () => 101 }); await play(A1);
+      const ra = await reload(perA, A1), endA = await ra.f.onMatchEnd({ summary: sumW(), ticks: 1, winner: 0 });
+      ok(ra.f.status === 'resume' && ra.r.info.restored === true && ra.r.info.choices === 1 && endA.applied === true && perA.peek().current.phase === 'offer' && perA.peek().current.history.length === 1, t('Q40 the tab that marked the fight, reloaded, still resumes it (same saved choices, same attempt) and finishes it once'), J([ra.r.info.restored, ra.r.info.reason, endA && endA.applied]));
+      // a saved battle that names no page at all (written before the attempt was part of it) is not believed by a page that has one: unrestorable, so the fight counts as left
+      const perL = fresh(), L1 = await tab(perL, { nonce: () => 101 }), stL = sess(); L1.ctl = mkCtl(L1.f.spec); RS.createResumeStore({ storage: stL, key, seed: L1.f.spec.seed, tag: L1.f.tag }).attach(L1.ctl); L1.ctl.onLocalChoice(() => L1.f.committed()); L1.ctl.submit(0, { kind: 'preview', order: [0, 1, 2] }); await ticks();
+      const recL = JSON.parse(stL.getItem(key)), rl = await reload(perL, { st: stL });
+      ok(!('attempt' in recL) && rl.f.status === 'resume' && rl.r.info.restored === false && stL.getItem(key) === null, t('Q40b a saved battle with no attempt in it is not used by a Tower page (it cannot be shown to be that page\'s own): unrestorable'), J(rl.r.info));
+      // a regular battle names no attempt: its record is written and read as it always was
+      const stg = sess(), c4 = matchctl.createMatchController({ pack: PACK, ruleset: CFG.ruleset, teams: [teams[0].recs, teams[1].recs], seed: 5, pick: 3, names: ['a', 'b'], sides: [{ kind: 'human' }, { kind: 'cpu', level: 'easy', seed: 1 }] }); c4.start();
+      const rs4 = RS.createResumeStore({ storage: stg, key: 'k', seed: 5 }); rs4.attach(c4); c4.submit(0, { kind: 'preview', order: [0, 1, 2] }); await ticks();
+      ok(stg.getItem('k') && !('attempt' in JSON.parse(stg.getItem('k'))) && !('tag' in JSON.parse(stg.getItem('k'))), t('Q41 a regular battle\'s saved record has no attempt (and no tag): the format regular pages have always written'), String(stg.getItem('k')).slice(0, 80));
+    }
+    {
+      const bb = fs.readFileSync(path.join(opt.dir || SRC, 'battle_boot.js'), 'utf8');
+      ok(/createResumeStore\(\{[^}]*attempt: towerFight \? towerFight\.attempt : undefined/.test(bb), t('Q42 the battle page gives its resume store the Tower fight\'s attempt (a regular battle has none)'), '');
+    }
+
+    /* Q43: attempt numbers at and above 2^31 (about half of all random 32-bit numbers) compare as the whole numbers they are */
+    {
+      const bad = [];
+      for (const N of [2147483648, 3e9, 4294967295]) {
+        const tw0 = SS.reduceStart(mkT(), startArgs()).tower, a = { floor: 1, seed: 777, lives: 0 };
+        const mA = SS.reduceMarkFight(tw0, { ...a, attempt: N }), again = SS.reduceMarkFight(mA.tower, { ...a, attempt: N }), other = SS.reduceMarkFight(mA.tower, { ...a, attempt: N - 1 });
+        if (!(mA.applied && mA.tower.current.attempt === N && again.applied === false && again.why === 'already marked' && !again.taken && other.applied === false && other.taken === true)) bad.push(N + ' mark: ' + J([again.why, again.taken, other.taken]));
+        const wrong = SS.reduceFinishFloor(mA.tower, { ...a, result: WIN(1), pack: PACK, now: 9, attempt: N - 1 }), fin = SS.reduceFinishFloor(mA.tower, { ...a, result: WIN(1), pack: PACK, now: 9, attempt: N });
+        if (!(wrong.applied === false && wrong.taken === true && fin.applied && fin.tower.current.phase === 'offer')) bad.push(N + ' finish: ' + J([wrong.taken, fin.applied]));
+        const lost = SS.reduceBeginFloor(mA.tower, { pack: PACK, floor: 1, seed: 777, navType: 'navigate', now: 20 });
+        if (!(lost.status === 'abandoned' && lost.applied && lost.tower.runs === 1)) bad.push(N + ' abandon: ' + lost.status);
+        const per = SS.memoryPersist(mA.tower), rl = await SS.startTowerFloor({ pack: PACK, persist: per, floor: 1, runId: 777, navType: 'reload', nonce: () => 5 }), done = rl.ok ? await rl.finish(WIN(1)) : null;
+        if (!(rl.ok && rl.status === 'resume' && rl.attempt === N && done && done.applied)) bad.push(N + ' resume: ' + J([rl.status, rl.attempt]));
+      }
+      ok(bad.length === 0, t('Q43 a fight marked by a page whose attempt number is 2147483648, 3000000000 or 4294967295: the same page may ask again (not "another tab"), another page is refused, only the owner finishes it, an abandoned one is finished on its behalf, and a reload takes the number over unchanged'), bad.join(' | '));
+    }
+
+    /* Q44: LEAVE TOWER before the first choice drops a run that cleared nothing (a quit after the first choice is a played loss) */
+    {
+      const tw0 = SS.reduceStart(mkT(), startArgs()).tower, F = { floor: 1, seed: 777, result: { floor: 1, result: 'f', turns: 0, faints: 0 }, pack: PACK, now: 9 };
+      const q0 = SS.reduceFinishFloor(tw0, F);
+      const mk = SS.reduceMarkFight(tw0, { floor: 1, seed: 777, attempt: 5, lives: 0 }), q1 = SS.reduceFinishFloor(mk.tower, { ...F, attempt: 5, lives: 0 });
+      const w1 = SS.reduceFinishFloor(tw0, { floor: 1, seed: 777, result: WIN(1), pack: PACK, now: 2000 }).tower, w2 = SS.reducePick(w1, PK(w1, null, { now: 3000 })).tower, q2 = SS.reduceFinishFloor(w2, { ...F, floor: 2, result: { floor: 2, result: 'f', turns: 0, faints: 0 } });
+      ok(q0.applied === true && q0.dropped === true && q0.finished === false && q0.tower.current === null && q0.tower.runs === 0 && q0.tower.last === null && Object.keys(q0.tower.achievements).length === 0 && q0.next.step === 'dropped' && q0.next.floor === 1 && REC.checkTowerShape(q0.tower).length === 0, t('Q44 a quit with no fight marked, on a run that cleared no floor, is DROPPED like the hub\'s give-up: no run counted, no last run, no achievement, a well-formed record'), J(q0).slice(0, 160));
+      ok(q1.applied === true && q1.finished === true && !q1.dropped && q1.tower.runs === 1 && q1.tower.last.won === false && q1.tower.last.cleared === 0 && 'rock-bottom' in q1.tower.achievements, t('Q45 ... but a quit AFTER the first choice (the fight is marked) is a played loss: counted, with Rock Bottom on floor 1'), J(q1).slice(0, 160));
+      ok(q2.applied === true && !q2.dropped && q2.tower.runs === 1 && q2.tower.last.cleared === 1 && q2.tower.current === null, t('Q46 ... and a quit before the first choice of a LATER floor (one floor was cleared) is the counted loss it always was'), J(q2).slice(0, 160));
+      let tw = mkT(), tp = mkT();
+      for (let i = 0; i < 25; i++) {
+        const mkF = async (base, quit) => { const per = SS.memoryPersist(SS.reduceStart(base, startArgs({ seed: 900 + i, now: 10 + i })).tower), f = await TF.createTowerFight({ pack: PACK, persist: per, floor: 1, runId: 900 + i, navType: 'navigate', nav: mkNav(), now: () => 7000 + i }); if (quit.choice) { f.committed(); await ticks(); } f.onQuit(); await ticks(); return per.peek(); };
+        tw = await mkF(tw, { choice: false }); tp = await mkF(tp, { choice: true });
+      }
+      ok(tw.runs === 0 && tw.last === null && tw.current === null && Object.keys(tw.achievements).length === 0 && tp.runs === 25 && 'rock-bottom' in tp.achievements && 'runs-3' in tp.achievements, t('Q47 start, open the floor and LEAVE TOWER 25 times with no choice made earns nothing (no run, no Rock Bottom, no run-count achievement); the same 25 climbs with a first choice are 25 played runs'), J({ runs: tw.runs, a: Object.keys(tw.achievements), played: tp.runs }));
+    }
+
+    /* Q48-Q50: the hub page's wiring of the start guard (and its release for a page restored from the back / forward cache) and of the history seeding (boot.js is page code; tower_hub.js holds the logic and the hub test proves it) */
+    {
+      const bt = fs.readFileSync(path.join(opt.dir || SRC, 'boot.js'), 'utf8');
+      ok(/import \{[^}]*createStartGuard[^}]*\} from '\.\/tower_hub\.js'/.test(bt) && /eff\.type === 'tower-new' && !startGuard\.enter\(eff\.token\)/.test(bt) && /startGuard\.done\(eff\.token, started\)/.test(bt) && !/createOnceGate|startGate/.test(bt), t('Q48 the hub page runs a START only through the start guard (one start under way on the page, one run per token) and ends it when the start did or did not happen'), '');
+      const sh = bt.slice(bt.indexOf('function seedHistory'), bt.indexOf('/* ---- the team list'));
+      ok(/historySeedPlan\(path, state\)/.test(sh) && /if \(!plan\.write\) \{ pushed = plan\.trail\.length; return; \}/.test(sh) && sh.indexOf('plan.write') > 0 && sh.indexOf('plan.write') < sh.indexOf('history.replaceState') && sh.indexOf('history.replaceState') < sh.indexOf('history.pushState'), t('Q49 the hub page seeds its history only when the plan says to write (a reload or a back / forward step onto an entry it wrote adds nothing), and counts the entries it stands on either way'), sh.slice(0, 80));
+      ok(/addEventListener\('pageshow', \(e\) => \{ if \(e\.persisted\) \{ startGuard\.reset\(\);/.test(bt), t('Q50 a hub page restored from the back / forward cache frees its start guard (START works again after START, browser Back, give up); without it the button is silently dead until a reload'), (bt.match(/addEventListener\('pageshow'[^\n]*/) || [''])[0].slice(0, 120));
+    }
   }
   void sleepTick;
 }
@@ -1249,7 +1332,7 @@ const MUTANTS = [
   // ---- phase 2: the session
   { id: 'session-mark-any-floor', why: 'the first-choice mark is applied to a floor the run is not waiting for', file: 'tower_session.js', from: "if (cur.phase !== 'battle' || cur.floor !== floor) return refuse('the run is not waiting for that fight');\n  if (!isAttempt(attempt))", to: 'if (!isAttempt(attempt))', groups: ['K'] },
   { id: 'session-reload-is-a-loss', why: 'a reload of a fight under way counts as leaving it', file: 'tower_session.js', from: "if (navType === 'reload' || navType === 'back_forward') return { applied: false, status: 'resume', run: cur };", to: '', groups: ['K'] },
-  { id: 'session-leaving-is-free', why: 'arriving at a marked fight afresh does not count the earlier one as a loss', file: 'tower_session.js', from: "const lost = reduceFinishFloor(tower, { floor, seed, result: { floor, result: 'l', turns: 0, faints: 0 }, pack, now, cfg, attempt: cur.attempt | 0, lives: cur.livesUsed });          // (on behalf of the fight that was left)\n    return { ...lost, status: 'abandoned' };", to: "return { applied: false, status: 'resume', run: cur };", groups: ['K', 'L'] },
+  { id: 'session-leaving-is-free', why: 'arriving at a marked fight afresh does not count the earlier one as a loss', file: 'tower_session.js', from: "const lost = reduceFinishFloor(tower, { floor, seed, result: { floor, result: 'l', turns: 0, faints: 0 }, pack, now, cfg, attempt: cur.attempt >>> 0, lives: cur.livesUsed });          // (on behalf of the fight that was left)\n    return { ...lost, status: 'abandoned' };", to: "return { applied: false, status: 'resume', run: cur };", groups: ['K', 'L'] },
   { id: 'session-run-not-folded', why: 'a finished run stays in current and is never counted', file: 'tower_session.js', from: "if (r.run.phase === 'over' || r.run.phase === 'won') {", to: 'if (false) {', groups: ['K'] },
   { id: 'session-achievements-unlisted', why: 'what a step earns is not listed in the run', file: 'tower_session.js', from: 'r.earned = r.earned.concat(ev.unlocked.filter((id) => !r.earned.includes(id)));', to: '', groups: ['K'] },
   { id: 'session-giveup-uncounted', why: 'giving a run up leaves no trace in the record', file: 'tower_session.js', from: 'const c = conclude(tower, abandonRun(cur), now, cfg);\n  return { tower: c.tower, applied: true, run: c.run, events: [{ type: \'run-over\', floor: cur.floor, gaveUp: true }]', to: 'const c = { tower: { ...clone(tower), current: null }, run: abandonRun(cur), newIds: [] };\n  return { tower: c.tower, applied: true, run: c.run, events: [{ type: \'run-over\', floor: cur.floor, gaveUp: true }]', groups: ['K'] },
@@ -1267,6 +1350,7 @@ const MUTANTS = [
   // ---- phase 2: the fight controller
   { id: 'fight-applied-twice', why: 'the finished battle is applied to the run every time it is announced', file: 'tower_fight.js', from: 'if (st.promise) return st.promise;\n      st.ended = true;', to: 'st.ended = true;', groups: ['L'] },
   { id: 'fight-quit-is-a-win', why: 'leaving in the middle of the fight is recorded as a win', file: 'tower_fight.js', from: "f.finish({ floor: spec.tower.floor, result: 'f', turns: 0, faints: 0 }).then((r) => { st.applied = r; return r; }, (e) =>", to: "f.finish({ floor: spec.tower.floor, result: 'w', turns: 0, faints: 0 }).then((r) => { st.applied = r; return r; }, (e) =>", groups: ['L'] },
+  { id: 'page-bfcache-keeps-start-locked', why: 'a hub page restored from the back / forward cache keeps its start guard locked (START is silently ignored)', file: 'boot.js', from: "if (e.persisted) { startGuard.reset(); refreshData(); }", to: "if (e.persisted) { refreshData(); }", groups: ['Q'] },
   { id: 'fight-unrestorable-is-a-win', why: 'a fight that cannot be resumed is recorded as a win', file: 'tower_fight.js', from: "f.finish({ floor: spec.tower.floor, result: 'f', turns: 0, faints: 0 }).then((r) => { st.applied = r; return r; }, () =>", to: "f.finish({ floor: spec.tower.floor, result: 'w', turns: 0, faints: 0 }).then((r) => { st.applied = r; return r; }, () =>", groups: ['Q'] },
   { id: 'fight-never-marked', why: 'the first choice never marks the fight (leaving it is free)', file: 'tower_fight.js', from: 'f.markFight().then((r) => {', to: 'Promise.resolve().then((r) => {', groups: ['L'] },
   { id: 'fight-win-button', why: 'a win offers the wrong button', file: 'tower_fight.js', from: "return [spec.tower.floor >= cfg.floors ? 'TO THE TOWER' : 'PICK A BUFF', 'BACK TO HUB'];", to: "return ['BACK TO HUB', 'TO THE TOWER'];", groups: ['L'] },
@@ -1286,7 +1370,7 @@ const MUTANTS = [
   { id: 'resolve-leaks-buffs', why: 'a regular battle\'s resolver applies a buff when it is handed a Tower run', file: 'battle_boot.js', from: "  if (pick && (mineTeam.recs.length < pick || foeTeam.recs.length < pick))", to: "  if (deps.towerRun && deps.towerRun.held && deps.towerRun.held.length) mineTeam = { ...mineTeam, recs: mineTeam.recs.map((r) => ({ ...r, evs: { ...r.evs, hp: 255 } })) };\n  if (pick && (mineTeam.recs.length < pick || foeTeam.recs.length < pick))", groups: ['N'] },
   { id: 'resolve-turns-validation-off', why: 'a regular spec turns the validation off', file: 'battle_boot.js', from: "trainer: CPU_NAMES[params.cpu],\n    },", to: "trainer: CPU_NAMES[params.cpu], validate: false,\n    },", groups: ['N'] },
   { id: 'page-drops-validate', why: 'the page forgets to hand the spec\'s validate flag to the match builder', file: 'battle_boot.js', from: "sides: spec.sides, validate: spec.validate });", to: "sides: spec.sides });", groups: ['N'] },
-  { id: 'page-drops-resume-tag', why: 'the page forgets the Tower fight\'s tag in the resume store', file: 'battle_boot.js', from: ", tag: towerFight ? towerFight.tag : undefined });", to: " });", groups: ['N'] },
+  { id: 'page-drops-resume-tag', why: 'the page forgets the Tower fight\'s tag in the resume store', file: 'battle_boot.js', from: ", tag: towerFight ? towerFight.tag : undefined, attempt:", to: ", attempt:", groups: ['N'] },
   { id: 'query-allows-tower-plus-team', why: 'a Tower address may also name a team, a seed, a format or a CPU', file: 'battle_boot.js', from: "if (tw.tower && (team !== null || foe !== null || seedS !== null || format !== null || cpu !== null || ['np', 'host', 'join', 'online'].some((k) => q.has(k)))) return bad(", to: "if (false) return bad(", groups: ['M'] },
   { id: 'resume-ignores-tag', why: 'a saved battle resumes whatever its tag', file: 'battle_resume.js', from: 'rec.seed === seed && rec.tag === tag', to: 'rec.seed === seed', groups: ['N'] },
   { id: 'resume-writes-no-tag', why: 'a Tower fight\'s saved battle carries no tag', file: 'battle_resume.js', from: '...(tag === undefined ? {} : { tag }),', to: '', groups: ['N'] },
@@ -1308,27 +1392,27 @@ const MUTANTS = [
   { id: "last-stamp-unsanitised", why: "the last run's stamp is stored as the clock gave it", file: "tower.js", from: "at: sanitiseStamp(at) };", to: "at };", groups: ["Q"] },
   { id: "sanitise-lets-fractions-through", why: "a fractional stamp is a stamp", file: "tower_record.js", from: "export const sanitiseStamp = (at) => (Number.isInteger(at) && at >= 0", to: "export const sanitiseStamp = (at) => (Number.isFinite(at) && at >= 0", groups: ["Q"] },
   // ---- unreadable runs are dropped, runs that cleared nothing are not runs
-  { id: "giveup-folds-unreadable-runs", why: "DROP THIS RUN folds a run that cannot be read (and throws)", file: "tower_session.js", from: "if (!countable(cur, cfg)) return { tower:", to: "if (false) return { tower:", groups: ["Q"] },
+  { id: "giveup-folds-unreadable-runs", why: "DROP THIS RUN folds a run that cannot be read (and throws)", file: "tower_session.js", from: "if (!countable(cur, cfg)) return dropped(tower, cur);", to: "if (false) return dropped(tower, cur);", groups: ["Q"] },
   { id: "replace-folds-unreadable-runs", why: "NEW RUN over a run that cannot be read folds it (and throws)", file: "tower_session.js", from: "t = countable(tower.current, cfg) ? conclude(", to: "t = true ? conclude(", groups: ["Q"] },
   { id: "countable-counts-empty-runs", why: "a run that cleared no floor counts as a run", file: "tower_session.js", from: "return p.ok && p.run.history.some((h) => h.result === 'w'); };", to: "return p.ok; };", groups: ["Q"] },
   { id: "countable-counts-unreadable-runs", why: "a run that cannot be parsed counts as a run", file: "tower_session.js", from: "return p.ok && p.run.history.some((h) => h.result === 'w'); };", to: "return !p.ok || p.run.history.some((h) => h.result === 'w'); };", groups: ["Q"] },
   { id: "begin-floor-opens-unreadable-runs", why: "a fight opens on a run that cannot be read", file: "tower_session.js", from: "  if (!parseRun(cur, { pack: null, cfg }).ok) return { applied: false, status: 'stale', why: 'the run cannot be read' };", to: "", groups: ["Q"] },
   // ---- the identity of a fight and of an offer
-  { id: "mark-any-page", why: "a second page may mark (and own) a fight that is already marked", file: "tower_session.js", from: "if (cur.fighting) return (cur.attempt | 0) === attempt ? { applied: false, why: 'already marked', run: cur } : refuse(", to: "if (cur.fighting) return true ? { applied: false, why: 'already marked', run: cur } : refuse(", groups: ["Q"] },
+  { id: "mark-any-page", why: "a second page may mark (and own) a fight that is already marked", file: "tower_session.js", from: "if (cur.fighting) return (cur.attempt >>> 0) === (attempt >>> 0) ? { applied: false, why: 'already marked', run: cur } : refuse(", to: "if (cur.fighting) return true ? { applied: false, why: 'already marked', run: cur } : refuse(", groups: ["Q"] },
   { id: "mark-needs-no-number", why: "a fight is marked without an attempt number", file: "tower_session.js", from: "  if (!isAttempt(attempt)) return refuse('a fight needs an attempt number');\n", to: "", groups: ["Q"] },
   { id: "mark-ignores-the-try", why: "a mark for another try of the floor is accepted", file: "tower_session.js", from: "  if (lives !== undefined && lives !== cur.livesUsed) return refuse('that try of the floor is over');\n  if (cur.fighting) return", to: "  if (cur.fighting) return", groups: ["Q"] },
-  { id: "finish-from-any-page", why: "a page that did not mark the fight can finish it", file: "tower_session.js", from: "if (cur.fighting && (cur.attempt | 0) !== (attempt | 0)) return refuse(", to: "if (false) return refuse(", groups: ["Q"] },
+  { id: "finish-from-any-page", why: "a page that did not mark the fight can finish it", file: "tower_session.js", from: "if (cur.fighting && (cur.attempt >>> 0) !== (attempt >>> 0)) return refuse(", to: "if (false) return refuse(", groups: ["Q"] },
   { id: "finish-ignores-the-try", why: "a result of an earlier try is applied after an Extra Life was spent", file: "tower_session.js", from: "  if (lives !== undefined && lives !== cur.livesUsed) return refuse('that try of the floor is over');          // a late", to: "  // a late", groups: ["Q"] },
-  { id: "abandon-forgets-the-owner", why: "the fight that was left is not finished on behalf of its own attempt", file: "tower_session.js", from: "attempt: cur.attempt | 0, lives: cur.livesUsed });          // (on behalf", to: "});          // (on behalf", groups: ["Q"] },
+  { id: "abandon-forgets-the-owner", why: "the fight that was left is not finished on behalf of its own attempt", file: "tower_session.js", from: "attempt: cur.attempt >>> 0, lives: cur.livesUsed });          // (on behalf", to: "});          // (on behalf", groups: ["Q"] },
   { id: "pick-answers-any-offer", why: "a pick is applied to whatever offer is open", file: "tower_session.js", from: "  if (floor !== cur.floor || offer !== offerKey(cur)) return refuse('that offer is gone', { stale: true });", to: "", groups: ["Q"] },
   { id: "pick-ignores-the-floor", why: "a pick is checked against the offer key but not the floor", file: "tower_session.js", from: "if (floor !== cur.floor || offer !== offerKey(cur))", to: "if (offer !== offerKey(cur))", groups: ["Q"] },
   { id: "offer-key-ignores-the-balls", why: "the offer key does not depend on the balls", file: "tower_session.js", from: "fnv(JSON.stringify(run.offer || [])).toString(16)", to: "fnv('').toString(16)", groups: ["Q"] },
   { id: "attempt-kept-after-the-result", why: "the mark of a fight survives its result", file: "tower.js", from: "r.fighting = false; r.attempt = 0;\n  r.history.push(", to: "r.fighting = false;\n  r.history.push(", groups: ["Q"] },
-  { id: "parse-attempt-without-fight", why: "a stored run may carry an attempt number with no fight", file: "tower.js", from: "  if (!r.fighting && (r.attempt | 0) !== 0) return bad('an attempt is marked without a fight');", to: "", groups: ["Q"] },
+  { id: "parse-attempt-without-fight", why: "a stored run may carry an attempt number with no fight", file: "tower.js", from: "  if (!r.fighting && (r.attempt >>> 0) !== 0) return bad('an attempt is marked without a fight');", to: "", groups: ["Q"] },
   { id: "parse-attempt-any-number", why: "a stored attempt may be any number", file: "tower.js", from: "if ('attempt' in r && !isInt(r.attempt, 0, 0xffffffff)) return bad('attempt');", to: "", groups: ["Q"] },
   { id: "shape-attempt-any-number", why: "the shallow check lets any attempt through", file: "tower_record.js", from: "  if (hasOwn.call(r, 'attempt') && !isInt(r.attempt, 0, 0xffffffff)) return false;\n", to: "", groups: ["Q"] },
   { id: "attempt-required", why: "a run stored before the attempt key existed is refused", file: "tower_record.js", from: "if (!hasOwn.call(r, k) && !RUN_KEYS_OPTIONAL.includes(k)) return false;", to: "if (!hasOwn.call(r, k)) return false;", groups: ["Q"] },
-  { id: "resume-makes-a-new-attempt", why: "a reload of a fight under way gets a fresh attempt number and so cannot finish it", file: "tower_session.js", from: "attempt = b.status === 'resume' ? (cur.attempt | 0) : newAttempt(nonce, now);", to: "attempt = newAttempt(nonce, now);", groups: ["Q"] },
+  { id: "resume-makes-a-new-attempt", why: "a reload of a fight under way gets a fresh attempt number and so cannot finish it", file: "tower_session.js", from: "attempt = b.status === 'resume' ? (cur.attempt >>> 0) : newAttempt(nonce, now);", to: "attempt = newAttempt(nonce, now);", groups: ["Q"] },
   { id: "finish-forgets-the-try", why: "the page's result does not say which try of the floor it is for", file: "tower_session.js", from: "s.finishFloor({ floor, seed: runId, result, attempt, lives })", to: "s.finishFloor({ floor, seed: runId, result, attempt })", groups: ["Q"] },
   // ---- the fight hears the engine; a fight that cannot be resumed is a loss
   { id: "fight-ignores-the-engine-end", why: "the Tower is not told when the engine ends the match (only the result screen tells it)", file: "tower_fight.js", from: "return ctl.onEnd(hear);", to: "return () => {};", groups: ["Q"] },
@@ -1344,11 +1428,29 @@ const MUTANTS = [
   { id: "page-spells-out-the-hub", why: "battle_boot.js names the hub's Tower address itself", file: "battle_boot.js", from: "const MAX_PARAM = 1100;", to: "const MAX_PARAM = 1100;\nconst __hub = '/pokemonarena/#tower';", groups: ["M"] },
   { id: "boot-spells-out-a-fight-address", why: "boot.js builds a Tower fight address itself", file: "boot.js", from: "export const SETTINGS_KEY = 'arena.hub';", to: "export const SETTINGS_KEY = 'arena.hub';\nconst __fight = '/pokemonarena/battle.html?tower=1';", groups: ["M"] },
   { id: "launch-refuses-stray-params", why: "floor / run / life / p on a regular address make it an error", file: "tower_launch.js", from: "  if (!has('tower')) return { ok: true, tower: null };", to: "  if (['floor', 'run', 'life', 'p'].some(has) && !has('tower')) return bad('tower', 'x');\n  if (!has('tower')) return { ok: true, tower: null };", groups: ["Q"] },
+  // ---- the second review's residual defects: the saved battle names its page, big attempt numbers, a quit before any choice, one start at a time, the history is seeded once
+  { id: "resume-ignores-the-attempt", why: "a reloaded duplicate tab resumes the first tab's fight (the saved battle is used whatever page wrote it)", file: "battle_resume.js", from: "if (attempt !== undefined && rec.attempt !== attempt) {", to: "if (false) {", groups: ["Q"] },
+  { id: "resume-writes-no-attempt", why: "the saved battle does not say which page wrote it", file: "battle_resume.js", from: "...(attempt === undefined ? {} : { attempt }),", to: "", groups: ["Q"] },
+  { id: "resume-store-forgets-its-attempt", why: "the resume store saves its snapshots without its page's attempt", file: "battle_resume.js", from: "snapshotOf(ctl, seed, humanSide, tag, attempt)", to: "snapshotOf(ctl, seed, humanSide, tag)", groups: ["Q"] },
+  { id: "resume-takes-records-with-no-attempt", why: "a saved battle that names no page is believed by a Tower page", file: "battle_resume.js", from: "rec.attempt !== attempt) {", to: "rec.attempt !== undefined && rec.attempt !== attempt) {", groups: ["Q"] },
+  { id: "fight-hides-its-attempt", why: "the fight controller does not hand the page its attempt (the resume store then asks for none)", file: "tower_fight.js", from: "tag: f.tag, attempt: f.attempt, nav,", to: "tag: f.tag, nav,", groups: ["Q"] },
+  { id: "page-drops-resume-attempt", why: "the battle page forgets to give its resume store the fight's attempt", file: "battle_boot.js", from: ", attempt: towerFight ? towerFight.attempt : undefined });", to: " });", groups: ["Q"] },
+  { id: "mark-compares-signed", why: "a page whose attempt number is 2^31 or more is not recognised as the owner of its own mark", file: "tower_session.js", from: "(cur.attempt >>> 0) === (attempt >>> 0) ? { applied: false, why: 'already marked'", to: "(cur.attempt | 0) === attempt ? { applied: false, why: 'already marked'", groups: ["Q"] },
+  { id: "finish-compares-signed", why: "the owner of a fight with an attempt number of 2^31 or more cannot finish it", file: "tower_session.js", from: "(cur.attempt >>> 0) !== (attempt >>> 0)) return refuse(", to: "(cur.attempt | 0) !== (attempt >>> 0)) return refuse(", groups: ["Q"] },
+  { id: "resume-adopts-a-signed-attempt", why: "a reload takes over a negative attempt number when the fight's is 2^31 or more", file: "tower_session.js", from: "b.status === 'resume' ? (cur.attempt >>> 0) :", to: "b.status === 'resume' ? (cur.attempt | 0) :", groups: ["Q"] },
+  { id: "quit-before-a-choice-counts", why: "leaving before the first choice is a played, lost run", file: "tower_session.js", from: "if (result && result.result === 'f' && !cur.fighting && !countable(cur, cfg)) return dropped(tower, cur);", to: "", groups: ["L", "Q"] },
+  { id: "quit-after-a-choice-is-dropped", why: "leaving after the first choice is dropped too (the loss is never counted)", file: "tower_session.js", from: "result.result === 'f' && !cur.fighting && !countable(cur, cfg)", to: "result.result === 'f' && !countable(cur, cfg)", groups: ["Q"] },
+  { id: "quit-of-a-played-run-is-dropped", why: "leaving a later floor, with floors cleared, drops the whole run", file: "tower_session.js", from: "result.result === 'f' && !cur.fighting && !countable(cur, cfg)", to: "result.result === 'f' && !cur.fighting", groups: ["Q"] },
+  { id: "boot-start-guard-never-ends", why: "the hub page never ends a start (a start that failed cannot be asked for again)", file: "boot.js", from: "startGuard.done(eff.token, started)", to: "void started", groups: ["Q"] },
+  { id: "boot-start-guard-is-skipped", why: "the hub page lets every START through", file: "boot.js", from: "eff.type === 'tower-new' && !startGuard.enter(eff.token)", to: "eff.type === 'tower-new' && !true", groups: ["Q"] },
+  { id: "boot-seeds-history-on-every-boot", why: "a reload adds two entries to the history", file: "boot.js", from: "if (!plan.write) { pushed = plan.trail.length; return; }", to: "", groups: ["Q"] },
+  { id: "boot-ignores-the-seed-plan", why: "the hub page seeds its history without asking the plan", file: "boot.js", from: "const plan = historySeedPlan(path, state);", to: "const plan = { trail: arrivalTrail(path), write: true };", groups: ["Q"] },
 ];
 
 async function runMutants() {
   const out = [];
   for (const mu of MUTANTS) {
+    if (MUT_ONLY.length && !MUT_ONLY.includes(mu.id)) continue;          // --mutant=id1,id2 runs just those
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arena-tower-mut-'));
     try {
       for (const f of fs.readdirSync(SRC)) { const p = path.join(SRC, f); if (fs.statSync(p).isFile()) fs.copyFileSync(p, path.join(dir, f)); }

@@ -9,6 +9,8 @@
 //            the LAST RUN and ACHIEVEMENTS screens; the profile's career record is byte-identical to before the climb; a plain Quick Battle in the same browser plays EXACTLY the battle it played before
 //   desktop  1280x800, keyboard + the synthetic controller: a mid-fight RELOAD resumes the floor (and the floor counts once); the offer by CONTROLLER; a fight LEFT by a typed address is a loss; hostile Tower
 //            addresses are refused and write nothing; NEW RUN from the hub (a random team) opens floor 1 by itself
+//   residual  1280x800: START, START, B, NEW RUN, START in one tick makes ONE profile and ONE run; LEAVE TOWER before any choice DROPS the run (nothing counted); TWO TABS on one floor (the second is told it is a
+//            duplicate, and RELOADED it does not take over the first's fight: the fight counts as left); three reloads at #tower-last add nothing to the history, B, B still ends on the main menu, a Back arrival keeps Forward
 //   integrity  1280x800: a double START with no profile makes ONE profile and ONE run; no OPEN TO BATTLES in a Tower fight; the Tower has the result when the ENGINE ends the match (before the result screen), and
 //            a reload there shows "already counted"; B, B from #tower-offer and from #tower-last stay inside the hub; the note after a ball is taken shows; a regular battle still mounts OPEN TO BATTLES
 // Every check that reads the store reads the REAL IndexedDB through the game's own store.js. Screenshots go to ARENA_OUT.
@@ -102,7 +104,9 @@ const playQuick = async (page) => {
   return { state: st, hash: r.hash, turns: r.turns, winner: r.winner, ...info, career: await ev(page, `${B}.career.state`) };
 };
 
+const ONLY_SESSIONS = (process.env.ARENA_SESSIONS || '').split(',').filter(Boolean);          // ARENA_SESSIONS=residual runs just the sessions whose name starts with one of these
 async function session(name, opts, fn) {
+  if (ONLY_SESSIONS.length && !ONLY_SESSIONS.some((s) => name.startsWith(s))) return;
   console.log('--- ' + name + ' (' + opts.width + 'x' + opts.height + (opts.dpr ? ' @' + opts.dpr + 'x' : '') + (opts.mobile ? ' mobile' : '') + ') ' + L.loadPct());
   try {
     await withBrowser({ port: opts.port, width: opts.width, height: opts.height, mobile: !!opts.mobile }, async (page) => {
@@ -353,7 +357,7 @@ try {
     await page.waitFor(`location.pathname.endsWith('/pokemonarena/') && window.__arenaHub && ${HUB}.state === 'ready'`, { timeoutMs: 60000 });
     await hubReady(page);
     const t5 = await tw(page, pid);
-    ok(t5.current === null && t5.runs === 2 && t5.last.cleared === 0, tag + 'leaving at once ends that run with nothing cleared (two runs counted)', J({ cur: t5.current, runs: t5.runs }));
+    ok(t5.current === null && t5.runs === 1 && J(t5.last) === J(t3.last), tag + 'leaving at once (no choice made) DROPS that run: nothing is counted (still one run, the last run is the earlier one)', J({ cur: t5.current, runs: t5.runs }));
     ok(errsOf(page).filter((e) => !/status of (4\d\d)|Failed to load resource/.test(e)).length === 0, tag + 'no console errors', errsOf(page).slice(0, 2).join(' | '));
   });
 
@@ -441,6 +445,84 @@ try {
     // ---- a regular battle still mounts OPEN TO BATTLES (the Tower's exception is only the Tower's)
     await openBattle(page, QUICK);
     ok(!!(await page.waitFor(`${B}.presence`, { timeoutMs: 20000 }).then(() => true, () => false)), tag + 'a regular Quick Battle still mounts OPEN TO BATTLES', '');
+    ok(errsOf(page).filter((e) => !/status of (4\d\d)|Failed to load resource/.test(e)).length === 0, tag + 'no console errors', errsOf(page).slice(0, 2).join(' | '));
+  });
+
+  /* ================================================================================================================ residual */
+  await session('residual: one START, a quit before any choice, two tabs, the history', { width: 1280, height: 800, port: cdp++ }, async (page) => {
+    const tag = 'residual: ';
+    const PROFILES = `(async () => { const S = await import('/pokemonarena/js/store.js'); const store = await S.openStore(); try { const ps = await store.listProfiles(); const out = []; for (const p of ps) { const l = await store.loadProfile(p.id); out.push({ id: p.id, tower: l.profile.tower }); } return out; } finally { await store.close(); } })()`;
+    const toHubFromBattle = async () => { await page.waitFor(`location.pathname.endsWith('/pokemonarena/') && window.__arenaHub && ${HUB}.state === 'ready'`, { timeoutMs: 60000 }); await hubReady(page); };
+    const tower1 = async () => { const ps = await ev(page, PROFILES); return ps.length === 1 ? ps[0] : null; };
+    await openHub(page);
+    // ---- START, B, NEW RUN, START inside ONE tick: two visits to NEW RUN (two tokens), and still ONE profile and ONE run (the guard is page-wide, not per token)
+    await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(300);
+    await key(page, 'a'); await sleep(250);
+    ok((await where(page)) === 'tower-new', tag + 'with no profile NEW RUN opens the team screen');
+    await key(page, 'down'); await key(page, 'down');
+    await ev(page, `(() => { ${HUB}.press('a'); ${HUB}.press('a'); ${HUB}.press('b'); ${HUB}.press('a'); ${HUB}.press('down'); ${HUB}.press('down'); ${HUB}.press('a'); return true; })()`);          // START (twice: a double tap), B, NEW RUN, START
+    ok((await toBattle(page)) === 'ready', tag + 'START opens floor 1');
+    const ps1 = await ev(page, PROFILES);
+    ok(ps1.length === 1 && ps1[0].tower.current && ps1[0].tower.current.floor === 1 && ps1[0].tower.runs === 0 && ps1[0].tower.last === null, tag + 'START, START, B, NEW RUN, START in one tick made exactly ONE profile and ONE run (none made and abandoned, none counted)', J(ps1.map((p) => [p.id, p.tower.runs, !!p.tower.current])));
+    ok((await ev(page, `${B}.tower && ${B}.tower.status`)) === 'ok', tag + 'and the page that opened is the fight of that run (status ok: nothing was fighting)');
+    // ---- LEAVE TOWER before any choice: the run is DROPPED (no run counted, no Rock Bottom, no last run)
+    await ev(page, LEAVE);
+    await toHubFromBattle();
+    const pq = await tower1();
+    ok(pq && pq.tower.current === null && pq.tower.runs === 0 && pq.tower.last === null && Object.keys(pq.tower.achievements).length === 0, tag + 'LEAVE TOWER with no choice made DROPPED the run: no current run, no run counted, no last run, no achievement', J(pq && { cur: pq.tower.current, runs: pq.tower.runs, last: !!pq.tower.last, ach: Object.keys(pq.tower.achievements) }));
+    ok((await where(page)) === 'tower', tag + 'and the hub opens on the Tower screen (not on a last-run screen: there is none)', await where(page));
+    // ---- a new run, tab A on its floor 1
+    const pid = pq.id;
+    await key(page, 'a'); await sleep(250);
+    ok((await where(page)) === 'tower-new', tag + 'NEW RUN opens the team screen again');
+    await key(page, 'down'); await key(page, 'down'); await key(page, 'a');
+    ok((await toBattle(page)) === 'ready', tag + 'START opens floor 1 of the new run (tab A)');
+    const search = await ev(page, 'location.search');
+    // ---- TWO TABS: the second tab opens the same floor BEFORE any choice (so it is not told the fight is left); A chooses first and marks the fight; B's first choice is refused as a duplicate
+    const tabB = await page.openTab();
+    await addInit(tabB, AUDIO_DOUBLE);
+    ok((await openBattle(tabB, search)) === 'ready', tag + 'tab B opens the same floor 1 (the fight has not begun yet)');
+    ok((await ev(page, DRIVE("a.mode === 'action' && a.ctl.turn >= 1"))) === 'action', tag + 'tab A plays to turn 1: it made the first choice');
+    const marked = await until(async () => { const t = await tw(page, pid); return t.current && t.current.fighting ? t : null; });
+    const attemptA = marked && marked.current.attempt;
+    ok(!!marked && Number.isInteger(attemptA) && attemptA >= 1, tag + 'the run is marked as fighting with tab A\'s attempt number', String(attemptA));
+    ok((await ev(tabB, DRIVE("a.mode === 'action' && a.ctl.turn >= 1"))) === 'action', tag + 'tab B plays to turn 1 as well (its first choice)');
+    ok(!!(await tabB.waitFor(`${B}.towerDuplicate === true`, { timeoutMs: 15000 }).then(() => true, () => false)), tag + 'tab B is told it is a duplicate (the fight is being fought in another tab)');
+    const stillA = (await tw(page, pid)).current;
+    ok(stillA && stillA.fighting === true && stillA.attempt === attemptA && stillA.history.length === 0, tag + 'and the run still carries tab A\'s attempt (B did not take the fight over)', J(stillA && [stillA.fighting, stillA.attempt, attemptA]));
+    // ---- the duplicate tab is RELOADED: it must NOT resume (and finish) A's fight; the fight counts as left
+    await tabB.eval(`window.__marker = 1; true`);
+    await tabB.send('Page.reload', {});
+    await tabB.waitFor(`window.__marker === undefined && window.__arenaBattle && (${B}.state === 'ready' || ${B}.state === 'error')`, { timeoutMs: 90000 });
+    const bState = await ev(tabB, `({ state: ${B}.state, restored: ${B}.resume ? ${B}.resume.restored : null, reason: ${B}.resume ? ${B}.resume.reason : null, refused: ${B}.towerRefused || null })`);
+    ok(bState.state === 'error' && bState.restored === false && /another page/.test(String(bState.reason)) && bState.refused && bState.refused.status === 'abandoned', tag + 'tab B reloaded does NOT take over tab A\'s fight: its saved battle is refused as another page\'s, and the fight is counted as left', J(bState));
+    const afterB = await tw(page, pid);
+    ok(afterB.current === null && afterB.runs === 1 && afterB.last && afterB.last.won === false && afterB.last.cleared === 0, tag + 'so the abandoned scouting costs what leaving costs: the run is over, one run counted, a loss on floor 1', J({ cur: afterB.current, runs: afterB.runs, last: afterB.last && afterB.last.won }));
+    try { tabB.ws.close(); } catch (_e) { /* the tab dies with the browser */ }
+
+    // ---- THE HISTORY: a hub screen opened by address is seeded ONCE; reloads add nothing, and B, B still ends on the main menu
+    await page.navigate(BASE + '/pokemonarena/#tower-last');
+    await hubReady(page);
+    ok((await where(page)) === 'tower-last', tag + 'the hub opens at #tower-last (the run just ended)', await where(page));
+    const len0 = await ev(page, 'history.length');
+    ok((await ev(page, `history.state && history.state.arenaHub`)) === 'tower-last', tag + 'the current history entry carries the hub\'s marker', J(await ev(page, 'history.state')));
+    const lens = [];
+    for (let i = 0; i < 3; i++) { await page.send('Page.reload', {}); await hubReady(page); lens.push(await ev(page, 'history.length')); }
+    ok(lens.every((n) => n === len0) && (await where(page)) === 'tower-last', tag + 'three reloads at #tower-last add NOTHING to the history (it stays ' + len0 + ')', J({ len0, lens }));
+    await ev(page, `window.__m = 9; true`);
+    await ev(page, `${HUB}.press('b')`); await sleep(300);
+    ok((await where(page)) === 'tower', tag + 'B on the last-run screen is the Tower menu');
+    await ev(page, `${HUB}.press('b')`); await sleep(300);
+    ok((await where(page)) === 'main' && (await ev(page, `location.pathname.endsWith('/pokemonarena/') && window.__m === 9`)) === true, tag + 'B again is the MAIN MENU, in the same page, after the reloads: B, B never leaves the hub for the page before it', J({ path: await where(page), href: await ev(page, 'location.href') }));
+    // the Forward entry survives a back arrival (the hub is rebooted or restored; either way nothing is rewritten)
+    await ev(page, `${HUB}.press('down')`); await ev(page, `${HUB}.press('down')`); await ev(page, `${HUB}.press('a')`); await sleep(300);
+    const lenIn = await ev(page, 'history.length');
+    await page.navigate(BASE + '/pokemonarena/js/battle_resume.js');
+    await ev(page, `history.back()`); await sleep(500);
+    await hubReady(page);
+    ok((await ev(page, 'history.length')) === lenIn + 1 && (await ev(page, `history.state && history.state.arenaHub`)) === 'tower', tag + 'a Back arrival onto a hub entry adds nothing to the history and keeps the entry it came from as Forward (' + lenIn + ' + 1)', J({ lenIn, now: await ev(page, 'history.length'), state: await ev(page, 'history.state') }));
+    await ev(page, `history.forward()`); await sleep(500);
+    ok(/battle_resume\.js$/.test(await ev(page, 'location.pathname')), tag + 'and Forward still goes to it', await ev(page, 'location.pathname'));
     ok(errsOf(page).filter((e) => !/status of (4\d\d)|Failed to load resource/.test(e)).length === 0, tag + 'no console errors', errsOf(page).slice(0, 2).join(' | '));
   });
 } finally {

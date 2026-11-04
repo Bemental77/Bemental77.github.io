@@ -55,7 +55,7 @@ import { resolveRuleset, validateMon, validateTeam, DEFAULT_RULESET_ID } from '.
 import { defaultCodec } from './charset.js';
 import { PINNED, sha256Hex } from './rom.js';
 import { emptyCareer, CAREER_KEYS, checkCareer, normalizeCareer, foldMatch, matchIssue, battleCount } from './career_stats.js';
-import { emptyTower, checkTowerShape, normalizeTower, capBag } from './tower_record.js';
+import { emptyTower, checkTowerShape, normalizeTower, capBag, fitRejected } from './tower_record.js';
 
 // ---------------------------------------------------------------------------------------------
 // constants
@@ -733,8 +733,9 @@ export function normalizeProfile(input, opts = {}) {
   { const tw = normalizeTower(input.tower, P, true);
     out.tower = tw.value;
     if (Object.keys(tw.rejected).length) {          // (what could not be kept goes in the record's bag, which is held to tower_record.js TOWER_LIMITS.bagMax: a hostile file cannot park megabytes there)
-      const bag = capBag(mergeBag(isObj(out.tower._unknown) ? out.tower._unknown : null, { towerRejected: tw.rejected }));
-      if (Object.keys(bag).length) out.tower._unknown = bag; else delete out.tower._unknown;
+      const prior = isObj(out.tower._unknown) ? out.tower._unknown : null, rej = fitRejected(tw.rejected, prior);          // (the reject is cut down on its own first: merged in whole, a huge one would push the record's own older unknown values out of the bag)
+      const bag = capBag(mergeBag(prior, rej ? { towerRejected: rej } : null));
+      if (bag && Object.keys(bag).length) out.tower._unknown = bag; else delete out.tower._unknown;
     }
   }
 

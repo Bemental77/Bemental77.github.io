@@ -518,7 +518,7 @@ async function main() {
       // D11: a RELOAD (or a back / forward step) of a battle that was under way replays the human's saved choices into the controller, proves the result is the saved state, and lets
       // the scene play the history at speed and silently; anything doubtful starts the battle from the team preview as before (hook.resume.reason says why). A fresh visit never resumes.
       let store = null; try { store = window.sessionStorage; } catch (_e) { store = null; }
-      resumeStore = createResumeStore({ storage: store, key: resumeKey(location.pathname, location.search), seed: spec.seed, tag: towerFight ? towerFight.tag : undefined });
+      resumeStore = createResumeStore({ storage: store, key: resumeKey(location.pathname, location.search), seed: spec.seed, tag: towerFight ? towerFight.tag : undefined, attempt: towerFight ? towerFight.attempt : undefined });
       const rs = resumeStore.restore({ ctl, makeCtl, navType: navigationType() });
       ctl = rs.ctl; hook.resume = rs.info; resuming = rs.info.restored;
       // A Tower fight that was marked, reloaded, and has NOTHING TO RESUME FROM (no saved choices, or they no longer replay) was left: it counts as a loss. It is never a free restart at the preview.

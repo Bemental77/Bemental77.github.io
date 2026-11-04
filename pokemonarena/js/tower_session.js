@@ -20,7 +20,8 @@
 //     the first tab's fight, nor mark one of its own: the first tab's abandoned fight still counts as a loss). A result also names the try of the floor it is for (`lives`, the lives spent when the
 //     fight began), so a late or replayed result of an earlier try is refused after an Extra Life was spent. A ball is taken by the OFFER it was shown in (floor + offer key): an old screen cannot answer a new offer.
 //   * A run that cannot be read (a stored run that passes the shallow check but not the deep parser) is DROPPED by give-up and by a new run, never folded; so is a run that cleared no floor (a run
-//     counts only when a floor was cleared, so starting and abandoning runs earns nothing).
+//     counts only when a floor was cleared, so starting and abandoning runs earns nothing). Leaving a floor on which no choice was made (the fight was never marked) is the same thing: on a run that cleared no
+//     floor it is DROPPED, not counted (reduceFinishFloor); once the first choice was made, leaving is a played loss.
 //   * Achievements are evaluated after every step, stamped with the caller's clock, and listed in the run that earned them.
 //   * A run that ends is folded into the record (best floor, wins, buffs seen...) and summarised in `last`; `current` is emptied.
 //   * NOTHING here writes the regular career. Tower results have no slot in `stats`.
@@ -65,6 +66,9 @@ const nextOf = (run) => (run.phase === 'offer' ? { step: 'offer', floor: run.flo
 /** Can this stored run be folded into the record? Only a run that PARSES and cleared at least one floor counts as a run (a broken one would throw inside the fold; one that cleared nothing is farmable). */
 const countable = (run, cfg) => { const p = parseRun(run, { pack: null, cfg }); return p.ok && p.run.history.some((h) => h.result === 'w'); };
 
+/** The step that drops a run without counting it (an unreadable run, or one that cleared no floor): the record loses `current` and gains nothing else. */
+const dropped = (tower, cur) => { const floor = Number.isInteger(cur.floor) ? cur.floor : 1; return { tower: { ...clone(tower), current: null }, applied: true, run: null, events: [{ type: 'run-dropped', floor }], next: { step: 'dropped', floor }, newIds: [], finished: false, dropped: true }; };
+
 /** The identity of an offer: its floor and the balls in it (a stale screen's answer names the offer it was shown). */
 export const offerKey = (run) => run.floor + ':' + fnv(JSON.stringify(run.offer || [])).toString(16);
 const isAttempt = (a) => Number.isInteger(a) && a >= 1 && a <= 0xffffffff;
@@ -104,7 +108,7 @@ export function reduceBeginFloor(tower, { pack, floor, seed, navType = 'navigate
   if (!parseRun(cur, { pack: null, cfg }).ok) return { applied: false, status: 'stale', why: 'the run cannot be read' };          // a stored run that passes the shallow check but not the deep parser never opens a fight (the hub offers to drop it)
   if (cur.fighting) {
     if (navType === 'reload' || navType === 'back_forward') return { applied: false, status: 'resume', run: cur };
-    const lost = reduceFinishFloor(tower, { floor, seed, result: { floor, result: 'l', turns: 0, faints: 0 }, pack, now, cfg, attempt: cur.attempt | 0, lives: cur.livesUsed });          // (on behalf of the fight that was left)
+    const lost = reduceFinishFloor(tower, { floor, seed, result: { floor, result: 'l', turns: 0, faints: 0 }, pack, now, cfg, attempt: cur.attempt >>> 0, lives: cur.livesUsed });          // (on behalf of the fight that was left)
     return { ...lost, status: 'abandoned' };
   }
   return { applied: false, status: 'ok', run: cur };
@@ -120,7 +124,7 @@ export function reduceMarkFight(tower, { floor, seed, attempt, lives }) {
   if (cur.phase !== 'battle' || cur.floor !== floor) return refuse('the run is not waiting for that fight');
   if (!isAttempt(attempt)) return refuse('a fight needs an attempt number');
   if (lives !== undefined && lives !== cur.livesUsed) return refuse('that try of the floor is over');
-  if (cur.fighting) return (cur.attempt | 0) === attempt ? { applied: false, why: 'already marked', run: cur } : refuse('this floor is being fought in another page', { taken: true });
+  if (cur.fighting) return (cur.attempt >>> 0) === (attempt >>> 0) ? { applied: false, why: 'already marked', run: cur } : refuse('this floor is being fought in another page', { taken: true });
   const m = markFighting(cur, attempt);
   return { tower: { ...clone(tower), current: m.run }, applied: true, run: m.run };
 }
@@ -134,7 +138,9 @@ export function reduceFinishFloor(tower, { floor, seed, result, pack = null, now
   if (!cur || cur.seed !== seed) return refuse('no such run');
   if (cur.phase !== 'battle' || cur.floor !== floor) return refuse('the run is not waiting for that fight');
   if (lives !== undefined && lives !== cur.livesUsed) return refuse('that try of the floor is over');          // a late or replayed result of an earlier try (an Extra Life has been spent since)
-  if (cur.fighting && (cur.attempt | 0) !== (attempt | 0)) return refuse('this floor is being fought in another page', { taken: true });          // only the page that marked the fight can finish it
+  if (cur.fighting && (cur.attempt >>> 0) !== (attempt >>> 0)) return refuse('this floor is being fought in another page', { taken: true });          // only the page that marked the fight can finish it
+  // LEAVING BEFORE THE FIRST CHOICE: a quit ('f') of a floor whose fight was never marked, on a run that has cleared no floor, is not a played run: it is dropped exactly as the hub's give-up drops it (counted as nothing)
+  if (result && result.result === 'f' && !cur.fighting && !countable(cur, cfg)) return dropped(tower, cur);
   const r = recordFloorResult(cur, result, { pack, cfg });
   if (!r.applied) return refuse(r.why || 'the result was not applied');
   if (r.run.phase === 'over' || r.run.phase === 'won') {
@@ -161,7 +167,7 @@ export function reducePick(tower, { seed, id, floor, offer, now = 0, cfg = CONFI
 export function reduceGiveUp(tower, { seed = null, now = 0, cfg = CONFIG }) {
   const cur = tower.current;
   if (!cur || (seed !== null && cur.seed !== seed)) return refuse('no such run');
-  if (!countable(cur, cfg)) return { tower: { ...clone(tower), current: null }, applied: true, run: null, events: [{ type: 'run-dropped', floor: Number.isInteger(cur.floor) ? cur.floor : 1 }], next: { step: 'dropped', floor: Number.isInteger(cur.floor) ? cur.floor : 1 }, newIds: [], finished: false, dropped: true };          // unreadable, or nothing cleared: dropped, not counted
+  if (!countable(cur, cfg)) return dropped(tower, cur);          // unreadable, or nothing cleared: dropped, not counted
   const c = conclude(tower, abandonRun(cur), now, cfg);
   return { tower: c.tower, applied: true, run: c.run, events: [{ type: 'run-over', floor: cur.floor, gaveUp: true }], next: { step: 'over', floor: cur.floor }, newIds: c.newIds, finished: true };
 }
@@ -258,7 +264,7 @@ export async function startTowerFloor({ pack, persist, floor, runId, navType = '
   let spec;
   try { spec = towerFloorSpec(pack, cur, cfg); } catch (e) { return { ok: false, status: 'error', why: String(e && e.message ? e.message : e).slice(0, 120) }; }
   // THE IDENTITY OF THIS FIGHT: a reload of a fight under way takes over the attempt the run already carries (it IS that fight); any other page makes its own number, which is what lets the run tell two pages apart
-  const lives = cur.livesUsed, attempt = b.status === 'resume' ? (cur.attempt | 0) : newAttempt(nonce, now);
+  const lives = cur.livesUsed, attempt = b.status === 'resume' ? (cur.attempt >>> 0) : newAttempt(nonce, now);
   return { ok: true, status: b.status, run: cur, spec, tag: spec.tower.tag, attempt, lives, markFight: () => s.markFight({ floor, seed: runId, attempt, lives }), finish: (result) => s.finishFloor({ floor, seed: runId, result, attempt, lives }) };
 }
 

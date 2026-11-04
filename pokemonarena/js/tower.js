@@ -278,7 +278,7 @@ export function parseRun(input, { pack = null, cfg = CONFIG } = {}) {
   if (!isInt(r.seed, 0, 0xffffffff) || !cfg.formats.includes(r.format) || r.ruleset !== cfg.ruleset) return bad('seed, format or ruleset');
   if (!['battle', 'offer', 'over', 'won'].includes(r.phase) || !isInt(r.floor, 1, cfg.floors) || typeof r.folded !== 'boolean' || typeof r.fighting !== 'boolean') return bad('phase, floor or folded');
   if (r.fighting && r.phase !== 'battle') return bad('a fight is marked outside the battle phase');
-  if (!r.fighting && (r.attempt | 0) !== 0) return bad('an attempt is marked without a fight');
+  if (!r.fighting && (r.attempt >>> 0) !== 0) return bad('an attempt is marked without a fight');
   if (!Array.isArray(r.earned) || r.earned.length > 200 || !r.earned.every((x) => typeof x === 'string' && /^[a-z0-9][a-z0-9-]{0,39}$/.test(x)) || new Set(r.earned).size !== r.earned.length) return bad('earned');
   if (!isObj(r.team) || typeof r.team.name !== 'string' || r.team.name.length > 24 || !Array.isArray(r.team.recs) || r.team.recs.length < 1 || r.team.recs.length > 6 || !r.team.recs.every(checkRec)) return bad('team');
   if (FORMATS[r.format].pick && r.team.recs.length < FORMATS[r.format].pick) return bad('team too small for the format');

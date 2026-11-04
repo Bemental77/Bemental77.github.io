@@ -22,7 +22,7 @@ import { describeRomError, showRomError } from './rom_error.js';
 import { watchHints } from './hints.js';
 import { fitScale, fitPicture, createFullscreen, stackBelow } from './screenfit.js';
 import { launchFloorBattle } from './tower_launch.js';          // the one place the Tower names a page (the fight is still its own page; tomorrow this mounts it here)
-import { arrivalTrail, createOnceGate, speakTower } from './tower_hub.js';          // the Tower screens' pure helpers: the history a screen opened by address should have, the once-only gate for START, the screen-reader words
+import { arrivalTrail, createStartGuard, historySeedPlan, speakTower } from './tower_hub.js';          // the Tower screens' pure helpers: the history a screen opened by address should have (and whether it needs writing), the one-start-at-a-time guard for START, the screen-reader words
 
 export const GBA_FPS = 59.7275;                 // the hardware frame rate; the menu's idle-animation clock, not a speed-up knob
 const STEP_MS = 1000 / GBA_FPS;
@@ -229,13 +229,16 @@ async function main() {
   window.addEventListener('popstate', () => { if (!model) return; pushed = arrivalTrail(pathFromHash(location.hash)).length; model.goto(pathFromHash(location.hash)); syncTitle(); dirty = true; });
   // The page was OPENED at a screen other than the menu (the way back from a Tower fight lands on #tower-offer or #tower-last, and a link may name any screen). Its history then holds only that one entry, so B
   // (history.back) would leave the hub for the page that was just left. Give it the entries the screen would have had if it had been walked to from the menu: the menu's own, then each screen on the way.
+  // ONLY on a fresh arrival (historySeedPlan): a reload, or a back / forward step onto an entry this page wrote, already stands on the trail (its history.state carries the marker), so nothing is added and the Forward entry is kept.
   function seedHistory(path) {
-    const trail = arrivalTrail(path);
-    if (!trail.length) return;
+    let state = null; try { state = history.state; } catch (_e) { state = null; }
+    const plan = historySeedPlan(path, state);
+    if (!plan.trail.length) return;
+    if (!plan.write) { pushed = plan.trail.length; return; }
     try {
       history.replaceState({ arenaHub: 'main' }, '', hashFor('main'));
-      for (const p of trail) history.pushState({ arenaHub: p }, '', hashFor(p));
-      pushed = trail.length;
+      for (const p of plan.trail) history.pushState({ arenaHub: p }, '', hashFor(p));
+      pushed = plan.trail.length;
     } catch (_e) { /* a sandboxed frame: B falls back to pushing the menu */ }
   }
 
@@ -256,9 +259,9 @@ async function main() {
     return towerLoading;
   }
   const towerNote = (a, b) => { if (model) { model.tower.notify([a, b || '']); dirty = true; } };
-  const startGate = createOnceGate();
+  const startGuard = createStartGuard();
   async function towerEffect(eff) {
-    if (eff.type === 'tower-new' && !startGate.enter(eff.token)) { hook.towerIgnored = (hook.towerIgnored | 0) + 1; return; }          // a double tap on START is ONE start (not a run that is made and at once given up, nor two profiles)
+    if (eff.type === 'tower-new' && !startGuard.enter(eff.token)) { hook.towerIgnored = (hook.towerIgnored | 0) + 1; return; }          // a double tap on START is ONE start (not a run that is made and at once given up, nor two profiles)
     hook.towerEffects = (hook.towerEffects || []).concat([eff.type]);
     let started = false;
     try {
@@ -286,7 +289,7 @@ async function main() {
         }
       }
     } catch (e) { towerNote('The Tower hit a problem:', String(e && e.message ? e.message : e).slice(0, 30)); }
-    finally { if (eff.type === 'tower-new' && !started) startGate.release(eff.token); }          // a start that did not happen can be asked for again
+    finally { if (eff.type === 'tower-new') startGuard.done(eff.token, started); }          // a start that did not happen can be asked for again; one that did keeps the page locked (it is leaving for the floor)
   }
   async function towerStart(m, eff) {
     let pid = eff.profileId;
@@ -503,7 +506,7 @@ async function main() {
       });
     }).catch((e) => { console.warn('[presence] not available', e); const b = $('openToggle'); if (b) b.hidden = true; });      // arena.css gives #openToggle[hidden] its own display:none: .textbtn's display would otherwise win and leave a dead switch
     document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshData(); });
-    window.addEventListener('pageshow', (e) => { if (e.persisted) refreshData(); });
+    window.addEventListener('pageshow', (e) => { if (e.persisted) { startGuard.reset(); refreshData(); } });          // restored from the back / forward cache: not leaving for the floor any more, so START works again
     window.addEventListener('pagehide', saveSettings);
   }
 

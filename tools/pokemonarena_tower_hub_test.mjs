@@ -146,6 +146,41 @@ function checkModelBody(HM, f, TH) {
   m.tower.notify(['You took Power Training!', 'Floor 4 is next.']); e = m.setData(D(F.fight));
   t('note: a note set before the data refresh ("You took X!") is what the Tower screen says after the offer closes', () => (m.path() === 'tower' && e.length === 1 && J(m.view().msg) === J(['You took Power Training!', 'Floor 4 is next.'])), () => (m.path() + ' ' + J(m.view().msg)));
   press(m, 'down'); t('note: ... until the cursor moves', () => (J(m.view().msg) !== J(['You took Power Training!', 'Floor 4 is next.'])), () => (J(m.view().msg)));
+  // ---- a refused pick's note does not stay on the offer screen
+  {
+    const NOTE = ['That could not be applied:', 'that offer is gone'], mid2 = (r) => ({ x: r.x + r.w / 2, y: r.y + r.h / 2 });
+    m = mk(D(F.offer3)); tower(m); m.press('a'); m.tower.notify(NOTE);
+    t('offer note: a note (a refused pick) shows over the idle prompt', () => (J(m.view().msg) === J(NOTE)), () => (J(m.view().msg)));
+    press(m, 'right');
+    t('offer note: ... until the cursor moves: then the prompt is back', () => (J(m.view().msg) !== J(NOTE) && /Floor 3 cleared/.test(m.view().msg[0])), () => (J(m.view().msg)));
+    m.tower.notify(NOTE); press(m, 'a');
+    t('offer note: a note set before the question opens is gone when it opens: the screen asks "Take this buff?"', () => (m.view().tower.confirm && m.view().tower.confirm.kind === 'take' && /Take this buff/.test(m.view().msg[0]) && m.view().msg[1] === F.offer3.run.offer.balls[1].name), () => (J(m.view().msg)));
+    m.press('b');
+    t('offer note: a note set before the question opens does not come back when the question is answered NO', () => (m.view().tower.confirm === null && J(m.view().msg) !== J(NOTE) && /Floor 3 cleared/.test(m.view().msg[0])), () => (J(m.view().msg)));
+    m.press('a'); m.tower.notify(NOTE);
+    t('offer note: a note that arrives while the question is open does not hide it', () => (/Take this buff/.test(m.view().msg[0])), () => (J(m.view().msg)));
+    m = mk(D(F.offer3)); tower(m); m.press('a'); m.tower.notify(NOTE); press(m, 'start');
+    t('offer note: START (moves to SKIP) clears it too', () => (J(m.view().msg) !== J(NOTE) && m.view().tower.cursor === 3), () => (J(m.view().msg)));
+    m = mk(D(F.offer3)); tower(m); m.press('a'); m.tower.notify(NOTE); m.pointer({ kind: 'move', ...mid2(m.rects()[1]) });
+    t('offer note: a pointer moving onto another ball clears it', () => (J(m.view().msg) !== J(NOTE) && m.view().tower.cursor === 1), () => (J(m.view().msg)));
+  }
+  // ---- the question pins the offer it was opened on
+  {
+    const d1 = D(F.offer3), d2 = clone(d1), r2 = d2.profiles[0].tower.run, r1 = d1.profiles[0].tower.run;
+    r2.offer = { ...r2.offer, key: r2.floor + ':0badf00d', balls: r2.offer.balls.slice().reverse() };
+    m = mk(d1); tower(m); m.press('a'); m.press('a');
+    const same = m.setData(clone(d1));
+    t('pin: a data refresh that leaves the offer as it was does not close the question', () => (same.length === 0 && m.view().tower.confirm && m.view().tower.confirm.kind === 'take' && (e = press(m, 'left', 'a'), e.length === 1 && e[0].id === r1.offer.balls[0].id && e[0].offer === r1.offer.key)), () => (J(m.view().tower.confirm) + J(e)));
+    m = mk(d1); tower(m); m.press('a'); m.press('a');
+    const moved = m.setData(d2);
+    t('pin: when the offer changes under an open "take this buff?" (another tab answered it, a newer offer is up) the question closes and nothing is sent', () => (moved.length === 0 && m.path() === 'tower-offer' && m.view().tower.confirm === null && m.view().tower.balls[0].id === r2.offer.balls[0].id && (e = press(m, 'a'), e.length === 0)), () => (m.path() + ' ' + J(m.view().tower.confirm) + J(e)));
+    let cur = d1;                                                    // the data moves with NO refresh notice: YES must still answer the offer the question was opened on
+    const hub = TH.createTowerHub({ profiles: () => cur.profiles, activeId: () => cur.activeId, dataState: () => cur.state, go: () => [], back: () => [], path: () => 'tower-offer', arrivedByLink: () => false });
+    hub.enter('tower-offer'); hub.press('tower-offer', 'a'); cur = d2; hub.press('tower-offer', 'left'); const yes = hub.press('tower-offer', 'a');
+    t('pin: YES answers the offer the question was opened on (run, floor, key and ball are pinned when it opens, not read from the data when YES is pressed)', () => (yes.length === 1 && yes[0].type === 'tower-pick' && yes[0].id === r1.offer.balls[0].id && yes[0].offer === r1.offer.key && yes[0].floor === r1.floor && yes[0].seed === r1.seed), () => (J(yes)));
+    cur = d1; hub.enter('tower-offer'); hub.press('tower-offer', 'down'); hub.press('tower-offer', 'a'); cur = d2; hub.press('tower-offer', 'left'); const yes2 = hub.press('tower-offer', 'a');
+    t('pin: the same for "take nothing?" (a skip names the offer it was asked on)', () => (yes2.length === 1 && yes2[0].id === null && yes2[0].offer === r1.offer.key), () => (J(yes2)));
+  }
   // ---- NEW RUN: one token per visit, one run per token
   m = mk(D(F.none)); tower(m); toRow(m, 'new'); m.press('a'); toRow(m, 'start'); const tk1 = m.press('a'); const tk1b = m.press('a');
   t('new: START carries a token naming the visit (a double tap sends the SAME token twice)', () => (tk1.length === 1 && tk1[0].type === 'tower-new' && Number.isInteger(tk1[0].token) && tk1b.length === 1 && tk1b[0].token === tk1[0].token), () => (J([tk1, tk1b])));
@@ -155,6 +190,24 @@ function checkModelBody(HM, f, TH) {
     const g = TH.createOnceGate();
     t('gate: a token goes through once; a repeat is refused; a released token goes through again; no token always passes', () => (g.enter(5) === true && g.enter(5) === false && g.enter(6) === true && (g.release(5), g.enter(5) === true) && g.enter(undefined) === true && g.enter(undefined) === true), () => (''));
   }
+  // ---- ONE start at a time on the page: START, B, NEW RUN, START inside one tick has two visits (two tokens), and used to make two profiles and two runs
+  {
+    let s1 = [], s2 = [];
+    try { m = mk(D(F.none)); tower(m); toRow(m, 'new'); m.press('a'); toRow(m, 'start'); s1 = m.press('a'); m.press('b'); toRow(m, 'new'); m.press('a'); toRow(m, 'start'); s2 = m.press('a'); } catch (_e) { /* a screen that does not behave: the checks below say so */ }
+    const g = TH.createStartGuard(), k1 = s1[0] ? s1[0].token : -1, k2 = s2[0] ? s2[0].token : -2;
+    t('guard: START, B, NEW RUN, START are two visits with two tokens; the guard lets only the first through while it is under way (and the same token never twice)', () => (s1.length === 1 && s2.length === 1 && k1 !== k2 && g.enter(k1) === true && g.isBusy() === true && g.enter(k2) === false && g.enter(k1) === false), () => (J([s1, s2])));
+    g.done(k1, false);
+    t('guard: a start that did not happen releases the page and its token: either START may be asked for again', () => (g.isBusy() === false && g.enter(k2) === true && (g.done(k2, false), g.enter(k1) === true)), () => (''));
+    g.done(k1, true);
+    t('guard: a start that happened keeps the page locked (it is leaving for the floor: no second profile, no second run)', () => (g.isBusy() === true && g.enter(99) === false && g.enter(undefined) === false), () => (''));
+    t('guard: reset() (a page restored from the back / forward cache is not leaving) frees the page for a NEW token, and a token that already ran stays used', () => (g.reset(), g.isBusy() === false && g.enter(k1) === false && g.enter(k2) === true && g.isBusy() === true), () => (''));
+  }
+  // ---- the history seeding is written once, on a fresh arrival
+  t('history: a fresh arrival (no marker on the current entry) is seeded; a reload or a back / forward step onto an entry the hub wrote is not (its trail is still the page\'s depth); the main menu never is', () => {
+    const fresh = TH.historySeedPlan('tower-offer', null), re = TH.historySeedPlan('tower-offer', { arenaHub: 'tower-offer' }), back = TH.historySeedPlan('tower-last', { arenaHub: 'tower-last' });
+    const other = TH.historySeedPlan('tower-offer', { somebodyElse: 1 }), str = TH.historySeedPlan('tower-offer', 'x'), main = TH.historySeedPlan('main', null), home = TH.historySeedPlan('tower', undefined), mainMarked = TH.historySeedPlan('tower', { arenaHub: 'main' });
+    return fresh.write === true && J(fresh.trail) === J(['tower', 'tower-offer']) && re.write === false && J(re.trail) === J(['tower', 'tower-offer']) && back.write === false && J(back.trail) === J(['tower', 'tower-last']) && other.write === true && str.write === true && main.write === false && main.trail.length === 0 && home.write === true && J(home.trail) === J(['tower']) && mainMarked.write === false;
+  }, () => (J(TH.historySeedPlan('tower-offer', { arenaHub: 'tower-offer' }))));
   // ---- the history of a screen the page was opened at
   t('trail: a screen opened by address has the entries it would have had if walked to (the menu\'s own, then each screen on the way)', () => (J(TH.arrivalTrail('tower-offer')) === J(['tower', 'tower-offer']) && J(TH.arrivalTrail('tower-last')) === J(['tower', 'tower-last']) && J(TH.arrivalTrail('tower')) === J(['tower']) && J(TH.arrivalTrail('quick')) === J(['quick']) && J(TH.arrivalTrail('main')) === J([])), () => (J(TH.arrivalTrail('tower-offer'))));
   // ---- long texts: wrapped by words, paged, never cut
@@ -264,13 +317,13 @@ const MUTANTS = [
   { file: 'tower_hub.js', name: 'the team list offers illegal teams', find: "const teamsOf = (p) => (p ? p.teams.filter((t) => t.legal && t.ruleset === TOWER_RULESET && t.size >= 1) : []);", replace: "const teamsOf = (p) => (p ? p.teams.filter((t) => t.size >= 1) : []);", expect: 'the legal standard-rules teams only' },
   { file: 'tower_hub.js', name: 'a team of two may play 3v3', find: "return c && c.size < 3 ? ['6v6'] : FORMATS;", replace: "return FORMATS;", expect: 'a team of two plays 6v6 only' },
   { file: 'tower_hub.js', name: 'START forgets the team', find: "teamId: S.nw.team === 'random' ? null : S.nw.team, format: S.nw.format, token", replace: "teamId: null, format: S.nw.format, token", expect: 'START asks the page to start a run with that team and format' },
-  { file: 'tower_hub.js', name: 'A on a ball takes it without asking', find: "case 'a': o.confirm = { kind: o.cursor === n ? 'skip' : 'take', cursor: 1 }; return [];", replace: "case 'a': if (o.cursor !== n) { const p = prof(), r = liveRun(); return [{ type: 'tower-pick', profileId: p.id, seed: r.seed, id: balls[o.cursor].id }]; } o.confirm = { kind: 'skip', cursor: 1 }; return [];", expect: 'A on a ball asks' },
-  { file: 'tower_hub.js', name: 'the take question is answered YES by default', find: "case 'a': o.confirm = { kind: o.cursor === n ? 'skip' : 'take', cursor: 1 }; return [];", replace: "case 'a': o.confirm = { kind: o.cursor === n ? 'skip' : 'take', cursor: 0 }; return [];", expect: 'NO is chosen' },
-  { file: 'tower_hub.js', name: 'a pick carries the wrong ball', find: "id: c.kind === 'take' ? balls[o.cursor].id : null, floor", replace: "id: c.kind === 'take' ? balls[0].id : null, floor", expect: 'the second ball is taken by its own id' },
-  { file: 'tower_hub.js', name: 'a skip carries a ball', find: "id: c.kind === 'take' ? balls[o.cursor].id : null, floor", replace: "id: balls[Math.min(o.cursor, n - 1)].id, floor", expect: 'YES to that skips' },
-  { file: 'tower_hub.js', name: 'the cursor cannot reach SKIP', find: "case 'right': case 'r': o.cursor = (o.cursor + 1) % (n + 1); return [];", replace: "case 'right': case 'r': o.cursor = (o.cursor + 1) % n; return [];", expect: 'right walks the balls, then the SKIP slot' },
+  { file: 'tower_hub.js', name: 'A on a ball takes it without asking', find: "case 'a': S.flash = null; o.confirm = pinOffer(o.cursor === n ? 'skip' : 'take', balls, o.cursor); return [];", replace: "case 'a': S.flash = null; if (o.cursor !== n) { const p = prof(), r = liveRun(); return [{ type: 'tower-pick', profileId: p.id, seed: r.seed, id: balls[o.cursor].id }]; } o.confirm = pinOffer('skip', balls, o.cursor); return [];", expect: 'A on a ball asks' },
+  { file: 'tower_hub.js', name: 'the take question is answered YES by default', find: "case 'a': S.flash = null; o.confirm = pinOffer(o.cursor === n ? 'skip' : 'take', balls, o.cursor); return [];", replace: "case 'a': S.flash = null; o.confirm = pinOffer(o.cursor === n ? 'skip' : 'take', balls, o.cursor); o.confirm.cursor = 0; return [];", expect: 'NO is chosen' },
+  { file: 'tower_hub.js', name: 'a pick carries the wrong ball', find: "id: c.id, floor: c.floor", replace: "id: balls[0].id, floor: c.floor", expect: 'the second ball is taken by its own id' },
+  { file: 'tower_hub.js', name: 'a skip carries a ball', find: "id: c.id, floor: c.floor", replace: "id: balls[Math.min(o.cursor, n - 1)].id, floor: c.floor", expect: 'YES to that skips' },
+  { file: 'tower_hub.js', name: 'the cursor cannot reach SKIP', find: "case 'right': case 'r': S.flash = null; o.cursor = (o.cursor + 1) % (n + 1); return [];", replace: "case 'right': case 'r': S.flash = null; o.cursor = (o.cursor + 1) % n; return [];", expect: 'right walks the balls, then the SKIP slot' },
   { file: 'tower_hub.js', name: 'a click on a ball takes it at once', find: "if (ev.kind === 'click' && !o.confirm) { o.cursor = h.index; return press(path, 'a'); }", replace: "if (ev.kind === 'click' && !o.confirm) { o.cursor = h.index; press(path, 'a'); o.confirm.cursor = 0; return press(path, 'a'); }", expect: 'a click on a ball highlights it and opens the' },
-  { file: 'tower_hub.js', name: 'a hover does not highlight', find: "if (moving) { S.hover = h.index; if (!o.confirm) o.cursor = h.index; return []; }", replace: "if (moving) { S.hover = h.index; return []; }", expect: 'hovering a ball highlights it' },
+  { file: 'tower_hub.js', name: 'a hover does not highlight', find: "if (moving) { S.hover = h.index; if (!o.confirm) { if (o.cursor !== h.index) S.flash = null; o.cursor = h.index; } return []; }", replace: "if (moving) { S.hover = h.index; return []; }", expect: 'hovering a ball highlights it' },
   { file: 'tower_hub.js', name: 'the offer stays up after the ball is taken', find: "if (path === 'tower-offer' && t && !(r && r.phase === 'offer')) { S.offer.confirm = null; return env.back(); }", replace: "", expect: 'steps back to the Tower screen' },
   { file: 'tower_hub.js', name: 'a refresh opens the offer by itself', find: "&& t && r && r.phase === 'offer' && env.arrivedByLink()) {", replace: "&& t && r && r.phase === 'offer') {", expect: 'does NOT open the offer by itself' },
   { file: 'tower_hub.js', name: 'a link never opens the offer', find: "&& t && r && r.phase === 'offer' && env.arrivedByLink()) {", replace: "&& t && r && r.phase === 'offer' && false) {", expect: 'arriving at the Tower screen by a link' },
@@ -287,7 +340,24 @@ const MUTANTS = [
   { file: 'hub_model.js', name: 'setData forgets the Tower', find: "      return tower.onData();", replace: "      return [];", expect: 'when the offer has been taken' },
   { file: 'hub_model.js', name: 'the Tower data is not kept', find: "readOnly: !!p.readOnly, tower: p.tower && typeof p.tower === 'object' ? JSON.parse(JSON.stringify(p.tower)) : null })) : [],", replace: "readOnly: !!p.readOnly, tower: null })) : [],", expect: 'a run waiting for its fight shows FIGHT' },
   { file: 'tower_hub.js', name: 'B on the offer asks to skip again', find: "      case 'b': return env.back();          // the Tower menu: the offer is still waiting there (CHOOSE A BUFF), and MY BUFFS is the row under it\n", replace: "      case 'b': if (o.cursor !== n) { o.cursor = n; return []; } o.confirm = { kind: 'skip', cursor: 1 }; return [];\n", expect: 'offer: B steps back to the Tower menu' },
-  { file: 'tower_hub.js', name: 'a pick forgets which offer it answers', find: ", floor: r.floor, offer: r.offer ? r.offer.key : undefined }];", replace: " }];", expect: 'offer: the pick carries the floor and the key' },
+  { file: 'tower_hub.js', name: 'a pick forgets which offer it answers', find: ", floor: c.floor, offer: c.key }];", replace: ", floor: c.floor }];", expect: 'offer: the pick carries the floor and the key' },
+  // ---- the second review's residual defects: the note, the pinned question, one start at a time, the history seeded once
+  { file: 'tower_hub.js', name: 'the offer note sticks when the cursor moves', find: "case 'right': case 'r': S.flash = null; o.cursor", replace: "case 'right': case 'r': o.cursor", expect: 'offer note: ... until the cursor moves' },
+  { file: 'tower_hub.js', name: 'the offer note sticks when the question opens', find: "case 'a': S.flash = null; o.confirm = pinOffer(", replace: "case 'a': o.confirm = pinOffer(", expect: 'a note set before the question opens' },
+  { file: 'tower_hub.js', name: 'START on the offer keeps the note', find: "case 'start': S.flash = null; if (o.cursor !== n)", replace: "case 'start': if (o.cursor !== n)", expect: 'offer note: START' },
+  { file: 'tower_hub.js', name: 'a note hides the open question', find: "if (S.flash && !d) out.msg = S.flash;", replace: "if (S.flash) out.msg = S.flash;", expect: 'a note that arrives while the question is open does not hide it' },
+  { file: 'tower_hub.js', name: 'a pointer move keeps the offer note', find: "if (!o.confirm) { if (o.cursor !== h.index) S.flash = null; o.cursor = h.index; }", replace: "if (!o.confirm) o.cursor = h.index;", expect: 'a pointer moving onto another ball clears it' },
+  { file: 'tower_hub.js', name: 'YES reads the offer from the data now, not from the question', find: "return [{ type: 'tower-pick', profileId: p.id, seed: c.seed, id: c.id, floor: c.floor, offer: c.key }];", replace: "{ const r = liveRun(); return [{ type: 'tower-pick', profileId: p.id, seed: r.seed, id: c.kind === 'take' ? balls[o.cursor].id : null, floor: r.floor, offer: r.offer ? r.offer.key : undefined }]; }", expect: 'pin: YES answers the offer the question was opened on' },
+  { file: 'tower_hub.js', name: 'the question survives an offer that changed', find: "if (path === 'tower-offer' && S.offer.confirm && !sameOffer(S.offer.confirm)) S.offer.confirm = null;", replace: "", expect: 'when the offer changes under an open' },
+  { file: 'tower_hub.js', name: 'any data refresh closes the question', find: "S.offer.confirm && !sameOffer(S.offer.confirm)) S.offer.confirm = null;", replace: "S.offer.confirm) S.offer.confirm = null;", expect: 'a data refresh that leaves the offer as it was does not close the question' },
+  { file: 'tower_hub.js', name: 'the question does not pin the offer key', find: "key: r && r.offer ? r.offer.key : undefined, id: b ? b.id : null", replace: "key: undefined, id: b ? b.id : null", expect: 'pin: YES answers the offer the question was opened on' },
+  { file: 'tower_hub.js', name: 'the start guard lets a second start through', find: "enter(token) { if (busy) return false; if (!gate.enter(token)) return false; busy = true; return true; },", replace: "enter(token) { if (!gate.enter(token)) return false; busy = true; return true; },", expect: 'guard: START, B, NEW RUN, START' },
+  { file: 'tower_hub.js', name: 'the start guard never lets go', find: "done(token, started) { if (started) return; gate.release(token); busy = false; },", replace: "done(token, started) { if (started) return; },", expect: 'a start that did not happen releases the page' },
+  { file: 'tower_hub.js', name: 'the start guard cannot be reset (a page restored from the back / forward cache stays locked)', find: "reset() { busy = false; },", replace: "reset() { },", expect: 'guard: reset()' },
+  { file: 'tower_hub.js', name: 'a start that happened frees the page', find: "done(token, started) { if (started) return; gate.release(token); busy = false; },", replace: "done(token, started) { gate.release(token); busy = false; },", expect: 'a start that happened keeps the page locked' },
+  { file: 'tower_hub.js', name: 'the history is written on every arrival', find: "return { trail, write: trail.length > 0 && !marked };", replace: "return { trail, write: trail.length > 0 };", expect: 'history: a fresh arrival' },
+  { file: 'tower_hub.js', name: 'the history is never written', find: "return { trail, write: trail.length > 0 && !marked };", replace: "return { trail, write: false };", expect: 'history: a fresh arrival' },
+  { file: 'tower_hub.js', name: 'a reload forgets the depth it stands on', find: "return { trail, write: trail.length > 0 && !marked };", replace: "return { trail: marked ? [] : trail, write: trail.length > 0 && !marked };", expect: 'history: a fresh arrival' },
   { file: 'tower_hub.js', name: 'a data refresh drops the note', find: "    if (keep && fx.length) S.flash = keep;\n", replace: "", expect: 'note: a note set before the data refresh' },
   { file: 'tower_hub.js', name: 'the home opens the offer again after another Tower screen', find: "    if (path !== 'tower') S.autoDone = true;", replace: "", expect: 'data: after B from an offer the player opened by address' },
   { file: 'tower_hub.js', name: 'START carries no token', find: "format: S.nw.format, token: S.nw.token }]; }", replace: "format: S.nw.format }]; }", expect: 'new: START carries a token' },

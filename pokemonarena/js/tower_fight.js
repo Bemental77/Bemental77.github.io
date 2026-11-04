@@ -4,7 +4,8 @@
 //
 //   const f = await createTowerFight({ pack, persist, floor, runId, navType, nav: { toTower(), toHub(), retry(run) }, now, nonce, onDuplicate });
 //   if (!f.ok) { /* f.status 'stale' | 'abandoned' | 'error', f.message: show it, offer f.nav.toTower */ }
-//   f.spec                 -> the battle to build (tower_session.js towerFloorSpec); f.tag -> what a saved battle must agree with (battle_resume.js)
+//   f.spec                 -> the battle to build (tower_session.js towerFloorSpec); f.tag -> what a saved battle must agree with (battle_resume.js); f.attempt -> this page's identity for the fight (a saved battle must carry it too:
+//                          a tab that is not the one that marked the fight cannot resume it)
 //   f.bar()                -> the status line text ("TOWER  FLOOR 7/30  Hiker Marco ...")
 //   f.resultOptions(winner)-> the result buttons for a battle that ended with that winner (0 = you)
 //   f.committed()          -> the player made the first choice of the fight (ctl.onLocalChoice): marks it, so leaving it from now on counts as a loss (idempotent)
@@ -39,7 +40,7 @@ export async function createTowerFight({ pack, persist, floor, runId, navType = 
   const st = { ended: false, result: null, applied: null, promise: null, choice: null, marked: false, duplicate: false };
 
   const fight = {
-    ok: true, status: f.status, run: f.run, spec, tag: f.tag, nav, state: st,
+    ok: true, status: f.status, run: f.run, spec, tag: f.tag, attempt: f.attempt, nav, state: st,          // (`attempt`: this page's identity for the fight; the battle page keeps it in its tab-local resume record, see battle_resume.js)
     bar() {
       const t = spec.tower;
       return 'TOWER  FLOOR ' + t.floor + '/' + cfg.floors + (t.boss ? '  BOSS' : '') + '  ' + spec.trainer + '  BUFFS ' + t.buffs + (lives0 > 0 || t.livesUsed > 0 ? '  LIVES ' + lives0 : '');
