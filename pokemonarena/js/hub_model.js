@@ -15,7 +15,7 @@
 //           team    [PROFILE], TEAM, FORMAT, CPU, START, BACK   (one of the player's saved teams against a random CPU team)
 //           record  the trainer's battle record, in pages (record_model.js); left / right turn the page, up / down switch trainer (several profiles) or turn it (one),
 //                   A turns it, on the last page RESET RECORD asks YES / NO; B goes back
-//           about   pages of text (what is from the ROM, what is approximate)
+//           about   pages of text (what the Arena is, what comes from the ROM, playing online, where your data is kept)
 // INPUT     one vocabulary for every device: the twelve actions of input.js (up down left right a b x y l r start select) and, for
 //           canvas pointers, hit(x, y) / pointer({ kind: 'move' | 'click' | 'wheel' }). Mouse, touch, keyboard and controller therefore
 //           reach exactly the same states.
@@ -58,7 +58,7 @@ const MAIN_ITEMS = Object.freeze([
   { id: 'import', label: 'IMPORT SAVE', help: ['Bring Pokemon from your own', 'SoulGold save file. It stays here.'] },
   { id: 'controls', label: 'CONTROLS', help: ['Mouse, keyboard, controller and', 'touch all work. Change the keys here.'] },
   { id: 'sound', label: 'SOUND', help: ['Volume, music, effects, soundtrack.', 'The M key mutes on any page.'] },
-  { id: 'about', label: 'ABOUT', help: ['What comes from the ROM and what', 'is only an approximation.'] },
+  { id: 'about', label: 'ABOUT', help: ['How the Arena works, and where your', 'profile and teams are kept.'] },
 ]);
 export const MAIN_LABELS = Object.freeze(MAIN_ITEMS.map((i) => i.label));
 
@@ -66,8 +66,8 @@ export const MAIN_LABELS = Object.freeze(MAIN_ITEMS.map((i) => i.label));
 export const ABOUT_PAGES = Object.freeze([
   ['POK{E}MON ARENA', 'A Gen 3 style battle game. Fight a CPU with', 'random teams, or with teams you build.', 'It all runs in this browser. Nothing you', 'make is uploaded anywhere.'],
   ['FROM THE ROM', 'Every picture, font, window, menu and cry', 'is read from the Pokemon SoulGold v1.1.1', 'ROM this site already serves, in your', 'browser. Battle messages use the ROM text;', 'a few menu words are written by this site.'],
-  ['APPROXIMATE', 'The battle engine is this site\'s own, built', 'on the ROM data. Moves play the game\'s own', 'animations. Mega, Z-moves, Dynamax and Tera', 'are not here; a few species and abilities', 'are refused with a reason. Damage is modern.'],
-  ['NOT HERE', 'Doubles battles and online play are not', 'available. Your profile, teams and battle', 'record stay in this browser only: use Export', 'in the TEAM BUILDER to keep a copy. Clearing', 'the site data in your browser erases them.'],
+  ['PLAY ONLINE', 'Play online: battle a friend with a room', 'code, or find someone who is open to battle.', 'Turn Open on to be listed with your trainer', 'name and record, so anyone can challenge you.'],
+  ['YOUR DATA', 'Your profile, teams and battle record stay', 'in this browser only. Use Export in the', 'TEAM BUILDER to keep a copy; clearing the', 'site data in your browser erases them.'],
 ]);
 
 // what each CPU level does (ai.js header): easy = a random legal move; normal = best expected damage plus some tactics; hard = normal plus a
