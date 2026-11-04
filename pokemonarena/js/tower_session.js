@@ -193,7 +193,7 @@ export function towerTag(run) { return 'tower:' + run.seed + ':' + run.floor + '
 export function towerFloorSpec(pack, run, cfg = CONFIG) {
   const s = battleSetup(pack, run, cfg);
   return {
-    pack, ruleset: s.ruleset, teams: [s.player.recs, s.foe.recs], meta: [s.player.meta, s.foe.meta], seed: s.seed, pick: s.pick, names: ['You', s.names[1]],
+    pack, ruleset: s.ruleset, teams: [s.player.recs, s.foe.recs], meta: [s.player.meta, s.foe.meta], seed: s.seed, pick: s.pick, lead: s.lead, names: ['You', s.names[1]],
     sides: [{ kind: 'human' }, { kind: 'cpu', level: s.cpu.level, seed: s.cpu.seed }], cpu: s.cpu.level, format: run.format, trainer: s.names[1], validate: false,
     tower: { floor: run.floor, boss: s.boss, seed: run.seed, lives: livesLeft(run, cfg), livesUsed: run.livesUsed, buffs: run.held.length, tag: towerTag(run), trainer: s.trainer, effects: s.effects },
   };

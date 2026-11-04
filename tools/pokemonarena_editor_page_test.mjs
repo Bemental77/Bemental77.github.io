@@ -1827,7 +1827,7 @@ try {
   const ST_CHECKS = (r) => [
     ['the seeded team is Pikachu, Charizard, Snorlax', J(r.start) === J([PIKACHU, CHARIZARD, SNORLAX])],
     ['a team out of type order has an enabled "Sort team by type" button', r.enabled],
-    ['its hover text says it is the SLOT order: the first Pokemon leads in 6v6, in 3v3 you choose the lead at team preview (it must not say the first Pokemon leads, flat)', typeof r.title === 'string' && /6v6/.test(r.title) && /3v3/.test(r.title) && /team preview/.test(r.title) && !/The first Pokemon leads\./.test(r.title), r.title],
+    ['its hover text says it is the SLOT order: in 6v6 you choose the lead at team preview and the rest follow in that order (since the lead preview), in 3v3 you choose the lead among your picks (it must not say the first Pokemon leads, flat)', typeof r.title === 'string' && /6v6/.test(r.title) && /3v3/.test(r.title) && /team preview/.test(r.title) && !/The first Pokemon leads\./.test(r.title), r.title],
     ['keyboard: Enter puts Normal (Snorlax), Fire/Flying (Charizard), Electric (Pikachu) in that order', J(r.after) === J([SNORLAX, CHARIZARD, PIKACHU]), J(r.after)],
     ['the slots on screen follow', r.domOk],
     ['keyboard focus is still on the Sort button after the redraw replaced it (it must not fall to the page)', r.activeAfter === 'sort-team-type', r.activeAfter],

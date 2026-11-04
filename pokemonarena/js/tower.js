@@ -99,7 +99,7 @@ export function battleSetup(pack, run, cfg = CONFIG) {
   const player = applyTeam(pack, run.team.recs, run.held, { cfg, salt });
   const foeRecs = applyFoe(pack, trainer.recs, run.held, { cfg, salt });
   return {
-    floor: run.floor, boss: trainer.boss, ruleset: cfg.ruleset, format: run.format, pick: FORMATS[run.format].pick, validate: false, seed: run.livesUsed ? mix(run.seed, run.floor, 0xb477, run.livesUsed) : mix(run.seed, run.floor, 0xb477),
+    floor: run.floor, boss: trainer.boss, ruleset: cfg.ruleset, format: run.format, pick: FORMATS[run.format].pick, lead: !!FORMATS[run.format].lead, validate: false, seed: run.livesUsed ? mix(run.seed, run.floor, 0xb477, run.livesUsed) : mix(run.seed, run.floor, 0xb477),
     names: [run.team.name, trainer.name], cpu: trainer.cpu,
     player: { recs: player, meta: clone(run.team.meta) }, foe: { recs: foeRecs, meta: trainer.meta },
     trainer: { name: trainer.name, boss: trainer.boss, spec: trainer.spec }, effects: runEffects(run.held, { cfg }),

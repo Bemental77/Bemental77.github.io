@@ -23,7 +23,7 @@ import { loadVerifiedRom, romUrl, RomLoadError } from './romfetch.js';
 import { loadPack } from './tables.js';
 import { createBattleUi } from './battle_ui.js';
 import { loadBattleText } from './battle_text.js';
-import { createMatchController, randomTeam, teamFromMons, FORMATS } from './matchctl.js';
+import { createMatchController, randomTeam, teamFromMons, FORMATS, opensOnPreview } from './matchctl.js';
 import { createScene, GBA_FPS, RESULT_OPTIONS } from './scene.js';
 import { decodeTeamCode, validateDecodedTeam } from './teamcode.js';
 import { DEFAULT_RULESET_ID } from './rules.js';
@@ -33,6 +33,7 @@ import { createControlsDialog } from './controls_dialog.js';
 import { describeRomError, showRomError } from './rom_error.js';
 import { watchHints } from './hints.js';
 import { createAnimSettings, parseAnimQuery } from './anim_settings.js';
+import { createStyleSettings, parseStyleQuery } from './style_settings.js';           // BATTLE STYLE: SHIFT (the free switch, "Will you switch your Pokemon?") or SET; ?style=switch|set
 import { prewarmSystem, trainerChoices } from './anim_sys.js';
 import { matchFromSummary, onlineMatchId } from './career_stats.js';  // ST1: the finished match as the career wants it (and the id of a battle against a person)
 import { cleanName } from './netmatch.js';                              // an online opponent's name as the career keeps it (the same reduction the match used)
@@ -77,6 +78,7 @@ export function parseBattleQuery(search) {
   if (speed !== null && !['slow', 'mid', 'fast', '1', '2', '4'].includes(speed)) return bad('speed', 'That text speed cannot be used', 'The text speed must be slow, mid or fast.');
   if (parseAnimQuery(search).errors.includes('anim')) return bad('anim', 'That animation setting cannot be used', 'The animation setting must be 0 or 1.');
   if (parseAnimQuery(search).errors.includes('animskip')) return bad('animskip', 'That animation setting cannot be used', 'The animation skip setting must be 0 or 1.');
+  if (parseStyleQuery(search).errors.includes('style')) return bad('style', 'That battle style cannot be used', 'The battle style must be switch or set.');
   const tw = parseTowerParams(q);
   if (!tw.ok) return bad(tw.error.param, tw.error.title, tw.error.message);
   if (tw.tower && (team !== null || foe !== null || seedS !== null || format !== null || cpu !== null || ['np', 'host', 'join', 'online'].some((k) => q.has(k)))) return bad('tower', 'That Tower address cannot be used', 'A Tower fight takes its teams, seed, format and CPU level from the run, so the address cannot also name them or ask for an online battle.');
@@ -124,7 +126,7 @@ export async function resolveBattle(pack, params, deps = {}) {
   return {
     ok: true,
     spec: {
-      pack, ruleset, teams: [mineTeam.recs, foeTeam.recs], meta: [mineTeam.meta, foeTeam.meta], seed, pick, names: ['You', CPU_NAMES[params.cpu]],
+      pack, ruleset, teams: [mineTeam.recs, foeTeam.recs], meta: [mineTeam.meta, foeTeam.meta], seed, pick, lead: !!FORMATS[params.format].lead, names: ['You', CPU_NAMES[params.cpu]],
       sides: [{ kind: 'human' }, { kind: 'cpu', level: params.cpu, seed: mix(seed, 3) }], cpu: params.cpu, format: params.format, trainer: CPU_NAMES[params.cpu],
     },
   };
@@ -415,6 +417,7 @@ async function main() {
     // animations are on; a module that is missing or throws leaves the battle on the old lunge + blink and says why in hook.animError.
     const animCfg = createAnimSettings({ storage: (() => { try { return window.localStorage; } catch (_e) { return null; } })(), search: location.search });
     hook.anim = animCfg; hook.animError = null; hook.animReady = false;
+    const styleCfg = createStyleSettings({ storage: (() => { try { return window.localStorage; } catch (_e) { return null; } })(), search: location.search }); hook.style = styleCfg;
     let animTried = false;
     async function loadAnimator() {
       if (animTried) return null;
@@ -513,7 +516,7 @@ async function main() {
     try {
       const spec = r.spec;
       battleRuleset = spec.ruleset;
-      const makeCtl = () => createMatchController({ pack: packRef, ruleset: spec.ruleset, teams: spec.teams, seed: spec.seed, pick: spec.pick, names: spec.names, sides: spec.sides, validate: spec.validate });          // spec.validate is undefined for every regular spec (the default, full validation); only a Tower floor sets it
+      const makeCtl = () => createMatchController({ pack: packRef, ruleset: spec.ruleset, teams: spec.teams, seed: spec.seed, pick: spec.pick, lead: spec.lead, freeSwitch: true, names: spec.names, sides: spec.sides, validate: spec.validate });          // spec.validate is undefined for every regular spec (the default, full validation); only a Tower floor sets it
       ctl = makeCtl(); ctl.start();
       // D11: a RELOAD (or a back / forward step) of a battle that was under way replays the human's saved choices into the controller, proves the result is the saved state, and lets
       // the scene play the history at speed and silently; anything doubtful starts the battle from the team preview as before (hook.resume.reason says why). A fresh visit never resumes.
@@ -526,7 +529,7 @@ async function main() {
         const left = await towerFight.leaveUnrestorable(); resumeStore.clear(); hook.towerRefused = { status: 'abandoned', why: 'the saved fight could not be resumed' };
         towerError(left.message, 'The last fight was left'); return;
       }
-      const sceneOpts = { ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: towerFight ? 'LEAVE TOWER' : 'BACK TO HUB', anim: animCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: mkHooks({ onResult: onResult, onMatchEnd: towerFight ? towerMatchEnd : recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); if (towerFight) { towerFight.onQuit(); return; } whenCareerSettled(() => navigate(HUB_PAGE_URL)); } }) };
+      const sceneOpts = { ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: towerFight ? 'LEAVE TOWER' : 'BACK TO HUB', anim: animCfg, style: styleCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: mkHooks({ onResult: onResult, onMatchEnd: towerFight ? towerMatchEnd : recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); if (towerFight) { towerFight.onQuit(); return; } whenCareerSettled(() => navigate(HUB_PAGE_URL)); } }) };
       // the result buttons are read when the result screen comes up (scene.js startResult), so a Tower floor's can follow who won
       if (towerFight) Object.defineProperty(sceneOpts, 'resultOptions', { enumerable: true, get: () => resultOptionsFor() });
       scene = createScene(sceneOpts);
@@ -611,7 +614,7 @@ async function main() {
         scene.hold(input.isDown('a'), input.isDown('b'));
       }
       draw(false); syncChips();
-      if (soundSys) soundSys.battleFrame(scene, params.cpu, params.format !== '6v6');       // MU3: team preview / battle / result music follows the scene's mode; the pause menu ducks it
+      if (soundSys) soundSys.battleFrame(scene, params.cpu, opensOnPreview(ctl));       // MU3: team preview / battle / result music follows the scene's mode; the pause menu ducks it
       requestAnimationFrame(loop);
     };
     draw(true);

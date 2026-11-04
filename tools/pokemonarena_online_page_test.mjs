@@ -3,7 +3,7 @@
 //
 //   node tools/pokemonarena_online_page_test.mjs            starts its own dev server (ARENA_PORT, default 8097) and one muted headless Chrome (ARENA_CDP, default 9283)
 //   ARENA_OUT=<dir> for screenshots (judged by eye); ARENA_SKIP_SHOTS=1 to skip them
-//   groups (name some to run a subset): profile hub lobby match leaving rejoin resume timeout refusals teams layout open openlayout presence presenceui onlineux; `profile --mutants`, `open --mutants`, `presenceui --mutants`
+//   groups (name some to run a subset): profile hub lobby match leaving rejoin resume timeout refusals teams lead layout open openlayout presence presenceui onlineux; `profile --mutants`, `open --mutants`, `presenceui --mutants`
 //   and `onlineux --mutants` also run a copy of the game with ONE defect at a time, each of which must fail the case it names.
 //   EVERY CASE ID BELONGS TO ONE GROUP (checkCaseIds, ID1, reads this file): a failure is named by its id, and two groups sharing one made "B3 failed" mean either of two things.
 //
@@ -18,6 +18,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { withBrowser } from './headless_cdp.mjs';
 import { loadStack } from './pokemonarena_netmatch_lib.mjs';
+import { PROTO } from '../pokemonarena/js/netmatch.js';          // the protocol version the pages speak (2 since the 6v6 lead preview): the messages these cases forge by hand carry it, so they are refused for what they say, not for their version
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
@@ -395,7 +396,7 @@ async function groupTimeout(S) {
     await guest.waitFor('document.querySelector("#nbClock").textContent.length > 0', { timeoutMs: 5000 }).catch(() => {});
     const g0 = await bar(guest);
     // with a 2.5 s clock the "10 seconds left" announcement (which a screen reader gets instead of the per-second clock) is already due, and it takes the message line
-    ok(/Your move|seconds left to choose/.test(g0.msg) && /\d:\d\d/.test(g0.clock), 'T2 the player being waited for sees their own countdown', JSON.stringify(g0));
+    ok(/Your move|Choose your Pokemon|seconds left to choose/.test(g0.msg) && /\d:\d\d/.test(g0.clock), 'T2 the player being waited for sees their own countdown', JSON.stringify(g0));
     const ariaOk = await guest.eval('(() => { const b = document.getElementById("netbar"); return b.getAttribute("role") === "group" && document.getElementById("nbMsg").getAttribute("aria-live") === "polite" && document.getElementById("nbClock").getAttribute("aria-hidden") === "true"; })()');
     ok(ariaOk === true, 'T2b only the message is a live region: the per-second clock is hidden from screen readers', '');
     await host.waitFor('window.__arenaOnline.nm().status().phase === "over"', { timeoutMs: 30000 }).catch(() => {});
@@ -464,7 +465,7 @@ async function groupTeams(S) {
   await withBrowser({ port: CDP0 + 7, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (host) => {
     const guest = await host.openTab({ width: 900, height: 760 });
     const ph = await pair(host, guest, 'ASIX1', { hostTeam: 'paste', hostCode: full, guestTeam: 'paste', guestCode: small, fmt: '6v6' });
-    ok(ph[0] === 'playing' && ph[1] === 'playing', 'P4 a 2-Pokemon team can play 6v6 against a full team (no team preview)', JSON.stringify(ph));
+    ok(ph[0] === 'playing' && ph[1] === 'playing', 'P4 a 2-Pokemon team can play 6v6 against a full team (each side chooses its lead; no 3-pick team preview)', JSON.stringify(ph));
     await host.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
     await guest.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
     const modes = await Promise.all([drive(host), drive(guest)]);
@@ -474,6 +475,112 @@ async function groupTeams(S) {
     ok((await host.eval('window.__arenaOnline.state.fmt')) === '6v6' && (await guest.eval('window.__arenaOnline.nm().fmt')) === '6v6', 'P6 the guest uses the format the host chose', '');
   });
 }
+
+// ---- LD: the 6v6 LEAD preview between two real tabs. Each player chooses which Pokemon is sent out first; the two choices are committed and revealed together (so the first to choose is not seen), a page
+// that reloads in the middle of the round comes back to the same question, and both machines then hold one position with each chosen Pokemon in front. (The protocol itself is pokemonarena_netmatch_test.mjs case S.)
+async function leadSession(origin, rec) {
+  const base = origin + '/pokemonarena/battle.html';
+  ANIM = '&anim=0';
+  await withBrowser({ port: CDP0 + 39, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (host) => {
+    const guest = await host.openTab({ width: 900, height: 760 });
+    await openRoom(host, 'ALEAD', 'host', '', base); await openRoom(guest, 'ALEAD', 'guest', '', base);
+    await fillAndGo(host, { name: 'Alice', team: 'random', fmt: '6v6' });
+    await host.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
+    await fillAndGo(guest, { name: 'Bob', team: 'random' });
+    await approve(host, true);
+    let ph = [null, null];
+    for (let i = 0; i < 120; i++) { ph = [await phase(host), await phase(guest)]; if ((ph[0] === 'playing' || ph[0] === 'failed') && (ph[1] === 'playing' || ph[1] === 'failed')) break; await sleep(250); }
+    rec(ph[0] === 'playing' && ph[1] === 'playing', 'LD1 two tabs pair for a 6v6 match', J(ph));
+    await host.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 }); await guest.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
+    const toPreview = (p) => p.eval(`(() => { const H = window.__arenaBattle; for (let i = 0; i < 6000 && H.scene.mode !== 'preview'; i++) { H.scene.tick(); if (H.scene.mode === 'steps' && H.scene.S.cur && H.scene.S.cur.t === 'text') H.scene.press('a'); } return H.scene.mode; })()`);
+    const pressKeys = (p, ...ks) => p.eval(`(() => { const H = window.__arenaBattle; for (const k of ${J(ks)}) { H.scene.press(k); H.scene.tick(); } return H.scene.mode; })()`);
+    const snap = (p) => p.eval(`(() => { const H = window.__arenaBattle, side = window.__arenaOnline.state.info.mySide, v = H.scene.view(), b = H.ctl.battle;
+      return { mode: H.scene.mode, title: v.preview ? v.preview.title : null, picks: v.preview ? v.preview.picks : null, rows: v.preview ? v.preview.mine.length : 0, names: v.preview ? v.preview.mine.map((m) => m.name) : null, lead: !!(H.scene.S.preview && H.scene.S.preview.lead),
+        req: H.ctl.pending(side) ? { phase: H.ctl.pending(side).phase, lead: H.ctl.pending(side).lead, pick: H.ctl.pending(side).pick } : null, side, phase: b.s.phase, order: [0, 1].map((s) => b.s.sides[s].team.map((m) => m.orig)), mine: b.s.sides[side].team.map((m) => m.name),
+        log: b.choiceLog.map((e) => e.s + ':' + e.c.kind + ':' + (e.c.order || e.c.slot)), hash: b.hash(), shown: H.scene.state().player ? H.scene.state().player.name : null }; })()`);
+    const asked = await Promise.all([toPreview(host), toPreview(guest)]);
+    const [h0, g0] = [await snap(host), await snap(guest)];
+    rec(asked.every((m) => m === 'preview') && h0.lead && g0.lead && h0.rows === 6 && g0.rows === 6 && h0.req && h0.req.lead === true && h0.req.pick === 1 && g0.req && g0.req.lead === true, 'LD2 both screens open on the LEAD preview: six rows each, the request is { preview, pick 1, lead }', J([asked, h0.req, g0.req, h0.rows, g0.rows]));
+    rec(/^Choose a Pok/.test(h0.title) && /^Choose a Pok/.test(g0.title) && J(h0.picks) === '[]', 'LD3 the title is the ROM\'s own line "Choose a Pokemon." (not the 3v3 counter) and nothing is numbered yet', J([h0.title, g0.title, h0.picks]));
+    await shot(host, 'LD_host_lead_preview'); await shot(guest, 'LD_guest_lead_preview');
+    // the host picks the 4th: the question, the numbered order, YES
+    await pressKeys(host, 'down', 'down', 'down', 'a');
+    const hq = await snap(host);
+    rec(hq.mode === 'confirm' && hq.title === 'Send out this one first?' && J(hq.picks) === '[3,0,1,2,4,5]', 'LD4 A on the 4th row asks "Send out this one first?" and numbers the whole team in the order the battle will use', J([hq.mode, hq.title, hq.picks]));
+    await shot(host, 'LD_host_lead_confirm');
+    await pressKeys(host, 'a');
+    await host.eval(`(() => { const H = window.__arenaBattle; for (let i = 0; i < 400 && H.scene.mode !== 'wait'; i++) H.scene.tick(); return H.scene.mode; })()`);
+    const hw = await snap(host), hs = await nmStatus(host);
+    rec(hw.mode === 'wait' && J(hs.waitingOn) === '[1]' && hw.phase === 'preview', 'LD5 after YES the host waits for the other player (the battle has not started on its machine)', J([hw.mode, hs.waitingOn, hw.phase]));
+    // BLIND: the guest holds the host's commitment and nothing it could read the lead from
+    await guest.waitFor('(() => { const r = window.__arenaOnline.nm()._debug.round; return !!r && !!r.theirs && !!r.theirs.c; })()', { timeoutMs: 20000 }).catch(() => {});
+    const blind = await guest.eval('(() => { const r = window.__arenaOnline.nm()._debug.round; const b = window.__arenaBattle.ctl.battle; return { committed: !!(r && r.theirs && r.theirs.c), revealed: !!(r && r.theirs && r.theirs.w !== undefined), phase: b.s.phase, hostChoices: b.choiceLog.filter((e) => e.s === 0).length, order: b.s.sides[0].team.map((m) => m.orig) }; })()');
+    rec(blind.committed && !blind.revealed && blind.phase === 'preview' && blind.hostChoices === 0 && J(blind.order) === '[0,1,2,3,4,5]', 'LD6 the guest has the host\'s commitment and NOT its lead: nothing in its engine or its log says which Pokemon the host chose', J(blind));
+    // the guest reloads while it still owes its lead: it comes back to the same question (the host's lead is still unseen)
+    const gNames = g0.names;
+    await guest.send('Page.reload', { ignoreCache: false });
+    const back = await guest.waitFor('window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "ready" && window.__arenaBattle.resume && window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 45000 }).then(() => true, () => false);
+    if (!back) { rec(false, 'LD7 a guest that reloads while it still owes its lead comes back to the same lead preview', 'the reloaded page never got back into the battle: ' + await guest.eval('(window.__arenaBattle && window.__arenaBattle.state) + " " + (window.__arenaOnline && window.__arenaOnline.state.stage)').catch(() => '?')); return; }
+    await host.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 60000 });
+    await toPreview(guest);
+    const g1 = await snap(guest);
+    rec(g1.mode === 'preview' && g1.lead && g1.rows === 6 && J(g1.names) === J(gNames) && g1.phase === 'preview' && g1.log.every((e) => !e.startsWith('0:')), 'LD7 a guest that reloads while it still owes its lead comes back to the same lead preview (the same team, nothing chosen, the host\'s lead still unseen)', J([g1.mode, g1.lead, g1.rows, g1.phase, g1.log]));
+    // the guest chooses its 3rd
+    await pressKeys(guest, 'down', 'down', 'a');
+    rec((await snap(guest)).title === 'Send out this one first?', 'LD8 the guest\'s question is the same one', J(await snap(guest)));
+    await pressKeys(guest, 'a');
+    for (let i = 0; i < 120; i++) { const [a, b] = [await snap(host), await snap(guest)]; if (a.phase === 'move' && b.phase === 'move') break; await sleep(150); }
+    const [h1, g2] = [await snap(host), await snap(guest)];
+    rec(h1.phase === 'move' && g2.phase === 'move' && J(h1.order) === '[[3,0,1,2,4,5],[2,0,1,3,4,5]]' && J(g2.order) === J(h1.order) && h1.hash === g2.hash, 'LD9 both machines then hold one position: the host\'s 4th and the guest\'s 3rd in front, the rest in team order', J([h1.phase, g2.phase, h1.order, g2.order, h1.hash === g2.hash]));
+    rec(h1.mine[0] === h0.names[3] && g2.mine[0] === gNames[2], 'LD10 and the Pokemon in front on each side is the one that player chose (the host\'s ' + h0.names[3] + ', the guest\'s ' + gNames[2] + ')', J([h1.mine[0], h0.names[3], g2.mine[0], gNames[2]]));
+    rec(['0:preview:3', '1:preview:2'].every((e) => h1.log.includes(e) && g2.log.includes(e)) && h1.log.length === 2, 'LD11 the lead choices are the first two entries of the choice log on both machines (one-slot previews)', J([h1.log, g2.log]));
+    // into the first menu: the Pokemon on the player's box is the lead
+    for (const p of [host, guest]) await p.eval(`(() => { const H = window.__arenaBattle; for (let i = 0; i < 30000 && H.scene.mode !== 'action'; i++) { H.scene.tick(); if (H.scene.mode === 'steps' && H.scene.S.cur && H.scene.S.cur.t === 'text') H.scene.press('a'); } return H.scene.mode; })()`);
+    const [h2, g3] = [await snap(host), await snap(guest)];
+    rec(h2.mode === 'action' && g3.mode === 'action' && h2.shown === h0.names[3] && g3.shown === gNames[2], 'LD12 each screen\'s first menu shows its own lead on the player\'s box', J([h2.mode, h2.shown, g3.mode, g3.shown]));
+    await shot(host, 'LD_host_first_menu');
+    const modes = await Promise.all([drive(host, 240000), drive(guest, 240000)]);
+    await sleep(400);
+    const [sa, sb] = [await nmStatus(host), await nmStatus(guest)];
+    rec(modes.every((m) => m === 'result') && sa.phase === 'over' && sb.phase === 'over' && !sa.error && !sb.error && sa.result.hash === sb.result.hash, 'LD13 the match plays to the end in agreement', J([modes, sa.phase, sb.phase, sa.error, sb.error]));
+    rec(host.errors.length === 0 && guest.errors.length === 0, 'LD14 no page errors', J(host.errors.concat(guest.errors)).slice(0, 200));
+  });
+}
+async function groupLead(S) {
+  await leadSession(ORIGIN, ok);
+  if (!process.argv.includes('--mutants')) return;
+  if (REMOTE) { ok(true, 'LDMUT (skipped against a deployed site)'); return; }
+  const { copyTree, mutateFile, startOverlay } = await import('./pokemonarena_overlay.mjs');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'arena-lead-mut-'));
+  let killed = 0, ran = 0;
+  try {
+    for (const mu of LEAD_MUTANTS) {
+      const failed = [];
+      const rec = (cond, name, detail) => { if (!cond) failed.push(name + (detail ? ' :: ' + String(detail).slice(0, 160) : '')); };
+      ran++;
+      const dir = copyTree(path.join(root, 'pokemonarena'), path.join(tmp, mu.id));
+      let ov = null;
+      try {
+        try { mutateFile(dir, mu.file, mu.from, mu.to); } catch (e) { ok(false, 'LDMUT ' + mu.id + ' could not be applied', e.message); continue; }
+        ov = await startOverlay({ dir, port: PORT + 22, upstream: ORIGIN });
+        try { await leadSession(ov.url, rec); } catch (e) { failed.push('session crashed :: ' + String(e && e.message ? e.message : e).slice(0, 120)); }
+      } finally { if (ov) ov.stop(); }
+      const hit = failed.find((f) => f.startsWith(mu.fails + ' '));
+      ok(!!hit, 'LDMUT ' + mu.id + ' (' + mu.what + ') fails ' + mu.fails, hit ? '' : 'it did NOT: failed cases = ' + J(failed.map((f) => f.slice(0, 60))));
+      if (hit) killed++;
+    }
+  } finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_e) { /* ignore */ } }
+  console.log(`lead mutants: ${killed}/${ran} killed`);
+}
+// every defect below must fail the NAMED case (the session is run against a copy of the game with only that defect in it)
+const LEAD_MUTANTS = [
+  { id: 'LM1', what: 'the networked controller is built without the lead preview', file: 'js/online_match.js', from: 'seed: seed >>> 0, ...formatOpts(fmt), names:', to: 'seed: seed >>> 0, pick: FORMATS[fmt].pick, names:', fails: 'LD2' },
+  { id: 'LM2', what: 'the scene does not know the request is a lead preview (it shows the 3v3 counter)', file: 'js/scene.js', from: 'lead: !!req.lead, mine,', to: 'lead: false, mine,', fails: 'LD3' },
+  { id: 'LM3', what: 'the numbers show only the lead, not the order the battle will use', file: 'js/scene.js', from: 'picks: p.lead ? leadOrder(p) : p.picks,', to: 'picks: p.picks,', fails: 'LD4' },
+  { id: 'LM4', what: 'the lead round is sent as a plain choice, so the first player to choose shows the other their lead', file: 'js/netmatch.js', from: 'if (round.need[0] && round.need[1]) {\n      const nonce = hex(rbytes(16));', to: "if (round.need[0] && round.need[1] && round.kind !== 'preview') {\n      const nonce = hex(rbytes(16));", fails: 'LD6' },
+  { id: 'LM5', what: 'a stored reload record is never accepted back (a reload does not come back to the question)', file: 'js/netmatch.js', from: 'if (!rec || rec.v !== PROTO || rec.role !== role', to: 'if (!rec || rec.role !== "nobody"', fails: 'LD7' },
+  { id: 'LM6', what: 'the engine puts the rest in reverse order behind the lead', file: 'js/engine.js', from: 'for (let i = 0; i < sd.team.length; i++) if (i !== lead) order.push(i);', to: 'for (let i = sd.team.length - 1; i >= 0; i--) if (i !== lead) order.push(i);', fails: 'LD9' },
+];
 
 async function groupLayout(S) {
   await withBrowser({ port: CDP0 + 8, width: 390, height: 844, mobile: true, lock: false, args: NO_THROTTLE }, async (host) => {
@@ -768,7 +875,7 @@ async function groupOpen(S) {
     await h.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
     const room1 = (await h.eval('document.getElementById("olCode").textContent')).trim();
     // a bare lib/netplay.js session that is let in and then says a hello the host must refuse (a ROM that is not ours)
-    await raw.eval('(async () => { const s = new Netplay.Session({ code: ' + JSON.stringify(room1) + ', host: false, portCount: 2, transport: "local" }); window.__rawS = s; const up = new Promise((res) => s.on("status", (e) => { if (e.state === "connected") res(true); })); s.start(); await up; s._send({ t: "lsarena", v: 1, mn: 1, k: "hello", rom: "0".repeat(64), fp: "x", rs: "x", name: "Mallory", team: "x", fmt: null }); return true; })()');
+    await raw.eval('(async () => { const s = new Netplay.Session({ code: ' + JSON.stringify(room1) + ', host: false, portCount: 2, transport: "local" }); window.__rawS = s; const up = new Promise((res) => s.on("status", (e) => { if (e.state === "connected") res(true); })); s.start(); await up; s._send({ t: "lsarena", v: ' + PROTO + ', mn: 1, k: "hello", rom: "0".repeat(64), fp: "x", rs: "x", name: "Mallory", team: "x", fmt: null }); return true; })()');
     await h.waitFor('window.__arenaOnline.state.room !== ' + JSON.stringify(room1) + ' && window.__arenaOnline.state.stage === "open"', { timeoutMs: 60000 });
     const room2 = (await h.eval('document.getElementById("olCode").textContent')).trim();
     ok(room2 !== room1 && (await h.eval('document.getElementById("error").hidden')), 'OV1 a joiner whose game does not match is turned away and the host is NOT shown an error: the game is open again under a new code', room1 + ' -> ' + room2);
@@ -1564,7 +1671,7 @@ async function groupProfile(S) {
     await approve(host, true);
     for (let i = 0; i < 160 && !((await phase(host)) === 'playing' && (await phase(guest)) === 'playing'); i++) await sleep(250);
     await host.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 }); await guest.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
-    await guest.eval('window.__arenaOnline.session()._send({ t: "lsarena", v: 1, mn: 1, k: "bye", why: "cheat" })');
+    await guest.eval('window.__arenaOnline.session()._send({ t: "lsarena", v: ' + PROTO + ', mn: 1, k: "bye", why: "cheat" })');
     await host.waitFor('window.__arenaOnline.state.stage === "failed"', { timeoutMs: 30000 });
     await sleep(1800);
     const sum = (r) => r.w + r.l + r.dr + r.f;
@@ -1602,7 +1709,7 @@ async function profileDesync(c) {
     await approve(host, true);
     for (let i = 0; i < 160 && !((await phase(host)) === 'playing' && (await phase(guest)) === 'playing'); i++) await sleep(250);
     await host.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 }); await guest.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
-    await host.eval(`(() => { const O = window.__arenaOnline; O.nm().receive({ t: 'lsarena', v: 1, mn: O.state.info.mn, k: 'end', win: 0, h: 'forged-final-position', why: 'result' }); return true; })()`);
+    await host.eval(`(() => { const O = window.__arenaOnline; O.nm().receive({ t: 'lsarena', v: ${PROTO}, mn: O.state.info.mn, k: 'end', win: 0, h: 'forged-final-position', why: 'result' }); return true; })()`);
     const modes = await Promise.all([drive(host, 240000), drive(guest, 240000)]);
     await host.waitFor('(() => { const c = window.__arenaBattle.career; return !!c && c.state !== "idle" && c.state !== "pending"; })()', { timeoutMs: 15000 }).catch(() => {});
     await guest.waitFor('(() => { const c = window.__arenaBattle.career; return !!c && c.state === "saved"; })()', { timeoutMs: 30000 }).catch(() => {});
@@ -2721,7 +2828,7 @@ async function uxGiveUp(c) {
   const { ok } = c;
   await withBrowser({ port: c.cdp(0), width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (g) => {
     await uxRoom(c, g, 'AGIVU', 'guest');
-    await g.eval('sessionStorage.setItem("arena.online:AGIVU:guest", JSON.stringify({ v: 1, room: "AGIVU", role: "guest", myTeam: "ARENA1.not-a-team", oppTeam: "ARENA1.not-a-team", myName: "Zed", fmt: "3v3", at: Date.now() })); true');
+    await g.eval('sessionStorage.setItem("arena.online:AGIVU:guest", JSON.stringify({ v: ' + PROTO + ', room: "AGIVU", role: "guest", myTeam: "ARENA1.not-a-team", oppTeam: "ARENA1.not-a-team", myName: "Zed", fmt: "3v3", at: Date.now() })); true');
     await g.send('Page.reload', { ignoreCache: false });
     await g.waitFor(UX_READY, { timeoutMs: 90000 });
     await sleep(800);
@@ -2839,7 +2946,7 @@ const started = await startServer();
 const S = await loadStack();
 const t0 = Date.now();
 checkCaseIds();
-const groups = { profile: groupProfile, hub: groupHub, lobby: groupLobby, match: groupMatch, leaving: groupLeaving, rejoin: groupRejoin, resume: groupResume, timeout: groupTimeout, refusals: groupRefusals, teams: groupTeams, layout: groupLayout, open: async (S) => { if (!process.env.ARENA_OP) await groupOpen(S); await groupOpenSessions(S); }, openlayout: groupOpenLayout, presence: groupPresence, presenceui: groupPresenceUi, onlineux: groupOnlineUx };
+const groups = { profile: groupProfile, hub: groupHub, lobby: groupLobby, match: groupMatch, leaving: groupLeaving, rejoin: groupRejoin, resume: groupResume, timeout: groupTimeout, refusals: groupRefusals, teams: groupTeams, lead: groupLead, layout: groupLayout, open: async (S) => { if (!process.env.ARENA_OP) await groupOpen(S); await groupOpenSessions(S); }, openlayout: groupOpenLayout, presence: groupPresence, presenceui: groupPresenceUi, onlineux: groupOnlineUx };
 let crashed = null;
 try {
   for (const [name, fn] of Object.entries(groups)) {

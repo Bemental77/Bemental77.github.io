@@ -58,7 +58,9 @@ const MATCH_JS = (o) => `Object.assign({ id: 'x', at: 1800000000000, fmt: '3v3',
 
 /* ---------------------------------------------------------------------------------------------------------------- battle page helpers */
 const openBattle = async (page, query, { nav = true } = {}) => {
-  await page.navigate(BASE + '/pokemonarena/battle.html' + (query || ''));
+  // these cases are about the recap and the record; "Will you switch your Pokemon?" has its own tests (pokemonarena_switch_page_test.mjs), so a battle here is played on BATTLE STYLE: SET (no question)
+  const q = query || '';
+  await page.navigate(BASE + '/pokemonarena/battle.html' + (/[?&]style=/.test(q) ? q : q + (q.includes('?') ? '&' : '?') + 'style=set'));
   await page.waitFor(`${B} && (${B}.state === 'ready' || ${B}.state === 'error')`, { timeoutMs: 90000 });
   const st = await ev(page, `${B}.state`);
   if (nav && st === 'ready') await ev(page, `window.__nav = []; window.__arenaNavigate = (u) => { window.__nav.push(u); }; true`);

@@ -316,6 +316,7 @@ async function suite(S, tag, opt = {}) {
     const su = T.battleSetup(PACK, rb), su2 = T.battleSetup(PACK, rb), su3 = T.battleSetup(PACK, { ...rb, floor: 13 });
     ok(su.validate === false && su.pick === 3 && su.ruleset === CFG.ruleset && su.names[0] === 'Me' && su.names[1] === su.trainer.name && J(su) === J(su2) && su.seed !== su3.seed && J(rb.team.recs) === J(run.team.recs) && su.player.recs.some((r, i) => J(r) !== J(run.team.recs[i])) && su.foe.recs.length === 5 - 1, t('F7 the battle setup is deterministic, built with validate:false for the right pick, applies the buffs to a COPY (the run\'s team is untouched), and shrinks the foe by the buff'), su.foe.recs.length + ' foes');
     ok(T.battleSetup(PACK, { ...clone(mkTeamRun(5, '6v6')), floor: 3 }).pick === 0, t('F8 a 6v6 setup plays the whole team (pick 0)'), '');
+    ok(T.battleSetup(PACK, { ...clone(mkTeamRun(5, '6v6')), floor: 3 }).lead === true && T.battleSetup(PACK, { ...clone(mkTeamRun(5, '3v3')), floor: 3 }).lead === false && SS.towerFloorSpec(PACK, mkTeamRun(5, '6v6')).lead === true && SS.towerFloorSpec(PACK, mkTeamRun(5, '3v3')).lead === false, t('F8b a 6v6 Tower fight opens with the LEAD choice (who is sent out first), as every 6v6 battle does; a 3v3 one does not'), '');
     // results
     const win = (r, floor, o) => T.recordFloorResult(r, { floor, result: 'w', turns: 6, faints: 1, ...(o || {}) }, { pack: PACK });
     const w1 = win(run, 1);
@@ -1301,6 +1302,7 @@ const MUTANTS = [
   // the run
   { id: 'boss-floors', why: 'bosses fall on the wrong floors', file: 'tower.js', from: 'floor >= 1 && floor % cfg.bossEvery === 0;', to: 'floor >= 1 && floor % (cfg.bossEvery + 1) === 0;', groups: ['E', 'F'] },
   { id: 'foe-size-ignores-buffs', why: 'Intimidating Presence does not shrink the trainer\'s team', file: 'tower.js', from: 'const size = clamp(spec.size + m.sizeAdd, cfg.minFoe[format], 6);', to: 'const size = clamp(spec.size, cfg.minFoe[format], 6);', groups: ['F'] },
+  { id: 'setup-drops-lead', why: 'a 6v6 Tower fight skips the lead choice that every other 6v6 battle has', file: 'tower.js', from: "lead: !!FORMATS[run.format].lead, validate: false,", to: "validate: false,", groups: ['F'] },
   { id: 'result-guard-removed', why: 'a result for any floor or phase is applied', file: 'tower.js', from: "if (run.phase !== 'battle' || res.floor !== run.floor) return {", to: 'if (false) return {', groups: ['F'] },
   { id: 'loss-keeps-going', why: 'a lost floor does not end the run', file: 'tower.js', from: "else { r.phase = 'over'; events.push({ type: 'run-over', floor: run.floor }); }", to: "else { events.push({ type: 'run-over', floor: run.floor }); }", groups: ['F'] },
   { id: 'life-not-spent', why: 'an extra life is never used up', file: 'tower.js', from: 'r.livesUsed += 1;', to: 'r.livesUsed += 0;', groups: ['F'] },

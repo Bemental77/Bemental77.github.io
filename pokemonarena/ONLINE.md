@@ -33,7 +33,7 @@ This protocol is message driven, so a hidden tab costs nothing.
 
 ## The protocol (`netmatch.js`)
 
-Every message is `{ t:'lsarena', v:1, k, mn, ... }`; `mn` counts rematches. Every inbound message is shape-checked (`checkMessage`) before anything reads it.
+Every message is `{ t:'lsarena', v:2, k, mn, ... }`; `mn` counts rematches. Every inbound message is shape-checked (`checkMessage`) before anything reads it. **The version is 2 since the 6v6 lead preview** (a 6v6 match now opens with a round that the build before it never ran): a message of any other version is refused as `version` ("The other player is on a different version of the Arena. Reload the page on both sides and try again."), the refuser tells the other side (`bye`: `version`), and no battle is built. The reload record in `sessionStorage` carries the same number, so a record saved by the older build is not replayed (`nm.resume` refuses it by name; `online.js` ignores it and shows the setup form).
 
 | kind | from | meaning |
 |---|---|---|
@@ -41,14 +41,22 @@ Every message is `{ t:'lsarena', v:1, k, mn, ... }`; `mn` counts rematches. Ever
 | `seedc` `seedb` `seedr` | host, guest, host | the shared seed: the host commits to its half, the guest answers with its own, the host opens. `seed = mix(a, b)`: the host is bound before it sees `b`, the guest never sees `a` until `b` is fixed |
 | `go` | both | hash of the freshly started battle; both must agree before turn 1 |
 | `rdy` | both | "my screen can take a choice": the other side's clock starts here, not while the last turn is still animating |
-| `commit` `reveal` | both | a round where **both** sides choose (every turn, the team preview): `commit = sha256(room#match, round, side, choice, nonce)` with the state hash the round opened on; the choice is opened only after **both** commitments are in |
-| `choice` | both | a round where only **one** side chooses (a replacement after a faint): nothing to hide, so no commitment |
+| `commit` `reveal` | both | a round where **both** sides choose (every turn, the 3v3 team preview, the 6v6 lead preview): `commit = sha256(room#match, round, side, choice, nonce)` with the state hash the round opened on; the choice is opened only after **both** commitments are in |
+| `choice` | both | a round where only **one** side chooses (a replacement after a faint; the lead preview when the other team has one Pokemon and so is not asked): nothing to hide, so no commitment |
 | `bye` `end` | both | leaving (the leaver forfeits) / the match is over, with the final hash |
 | `rematch` | both | both must ask; then the seed handshake runs again with the same teams |
 | `sync` | both | after a dropped link or a reload: "I am here, resend me from round N" |
 
 **Rounds** are numbered identically on both machines (a round opens each time the engine has advanced and someone has a choice to make). A round is applied only when
 everything it needs is verified: the commitment opens correctly, the choice is legal (`ctl.submitRemote` is the engine's own `choose`), and the opening state hash equals ours.
+
+### The 6v6 lead preview
+
+A 6v6 match opens with a **lead round**: each player chooses which of their Pokemon is sent out first (`createBattle({ lead: true })`; the choice is a one-slot preview, `{ kind: 'preview', order: [slot] }`, one 16-bit word like every other choice, so the protocol needed no new message kind; the rest of the team follows in team order). It is an ordinary both-choose round (the `preview` phase of the engine, `round.kind` `preview`, the 3-minute preview clock): the two leads are **committed and revealed together**, so the player who chooses first is not seen (`pokemonarena_netmatch_test.mjs` case S sends the first commitment and checks that nothing but a digest crosses until the other one arrives; the page test `lead` checks that the other tab's engine and log hold no trace of the lead). A side whose team has **one** Pokemon is not asked (the engine marks it automatic): the other player's lead then travels as a plain `choice`, and two teams of one have no lead round at all. A lead that names a Pokemon the player does not have, two Pokemon, or a move is `illegal` and stops the match; a lead revealed that is not the one committed is `cheat`. A reload around the lead round comes back to the same question (case S reloads each player at each of the first twelve steps, with and without the messages in flight).
+
+### No free-switch question online
+
+The Gen 3 trainer-battle question "Will you switch your Pokemon?" (`ENGINE.md` `freeSwitch`) is asked only of a human seat that fights a CPU. `online_match.js buildNetController` never passes the option and `matchctl.js` offers it to no seat whose opponent is not a CPU, so an online battle's state has no `fs` key, no request is ever `reason: 'free'`, and the new `stay` choice (wire word 7) is never sent: a `stay` word on the wire in an ordinary round is refused by the engine as `wrong-phase` like any choice out of turn. (`pokemonarena_switch_test.mjs` plays 8 online matches through both machines' controllers and checks all of that.) The protocol version is unchanged by it.
 
 ### Clocks and leaving
 
@@ -139,9 +147,9 @@ An online battle is kept in the trainer's profile like a battle against the CPU 
 ## Tests
 
 ```bash
-node tools/pokemonarena_netmatch_test.mjs             # the protocol on the real engine, in Node (279 cases; measured 2026-11-04 on a loaded Windows box: 8.6 to 13.9 s over six runs, not 1.5 s)
-node tools/pokemonarena_netmatch_test.mjs --mutants   # ... and prove it is not vacuous: break netmatch.js / matchctl.js / engine.js / career_stats.js 33 ways, each must fail a named case
-node tools/pokemonarena_online_page_test.mjs          # two real Chrome tabs; groups: profile hub lobby match leaving rejoin resume timeout refusals teams layout open openlayout presence presenceui onlineux (name them to run a subset; `presenceui --mutants` and `onlineux --mutants` also serve a copy of the game with one defect at a time and each must fail a named case: 36 and 22 of them; `profile --mutants` does the same for the write of a match the end-of-match comparison stopped, 2 of them; `open --mutants` does the same for the open games (the cooldown after a failed defection against a forger that rotates its code, the host told a player is joining, a re-knocking player not relisted over, the record of a player the library re-admits by itself, Cancel's address), 10 of them, cases OP0 to OP4; every case id belongs to one group, and the run checks that)
+node tools/pokemonarena_netmatch_test.mjs             # the protocol on the real engine, in Node (333 cases; measured 2026-11-04 on a loaded Windows box: 8.7 and 11.6 s in the two runs made with the lead cases, 8.6 to 13.9 s over six runs for the 279 before them, not 1.5 s)
+node tools/pokemonarena_netmatch_test.mjs --mutants   # ... and prove it is not vacuous: break netmatch.js / online_match.js / matchctl.js / engine.js / career_stats.js 39 ways, each must fail a named case
+node tools/pokemonarena_online_page_test.mjs          # two real Chrome tabs; groups: profile hub lobby match leaving rejoin resume timeout refusals teams lead layout open openlayout presence presenceui onlineux (name them to run a subset; `lead --mutants` serves a copy of the game with one defect at a time too, 6 of them, cases LD2 to LD9; `presenceui --mutants` and `onlineux --mutants` also serve a copy of the game with one defect at a time and each must fail a named case: 36 and 22 of them; `profile --mutants` does the same for the write of a match the end-of-match comparison stopped, 2 of them; `open --mutants` does the same for the open games (the cooldown after a failed defection against a forger that rotates its code, the host told a player is joining, a re-knocking player not relisted over, the record of a player the library re-admits by itself, Cancel's address), 10 of them, cases OP0 to OP4; every case id belongs to one group, and the run checks that)
 node tools/pokemonarena_openlobby_test.mjs --mutants  # the notice board in Node: shape, ttl, caps, rate limits, ask/answer, tie-break, confirmed rivals, sealed directed messages, both buses, the cooldown after a failed defection; breaks it 56 ways
 node tools/pokemonarena_presence_test.mjs --mutants   # the challenge protocol across three boards, the sealed room (real WebCrypto), the accept token, who an open game admits, the address of an accepted-challenge page and the plain address a cancelled join goes back to; breaks presence.js and the pure parts of online.js 50 ways
 node tools/multiplayer_page_test.mjs                  # the lobby catalogue and hand-off, Arena included

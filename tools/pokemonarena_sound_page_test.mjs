@@ -534,7 +534,7 @@ async function scnEditor(page, R, base, { padSession = false } = {}) {
 async function scnRealBattleStart(page, R, base) {
   const MAPM = await import(pathToFileURL(path.join(PA, 'js', 'music_map.js')).href);
   const idx = (k) => MAPM.songFor('soulgold', k).index;
-  for (const [cpu, fmt, key, label] of [['easy', '3v3', 'battle_easy', 'wild-style (cpu easy), 3v3 with a team preview'], ['normal', '6v6', 'battle_normal', 'trainer-style (cpu normal), 6v6 without one'], ['hard', '3v3', 'battle_hard', 'leader-style (cpu hard), 3v3 with a team preview']]) {
+  for (const [cpu, fmt, key, label] of [['easy', '3v3', 'battle_easy', 'wild-style (cpu easy), 3v3 with a team preview'], ['normal', '6v6', 'battle_normal', 'trainer-style (cpu normal), 6v6 (lead choice)'], ['hard', '3v3', 'battle_hard', 'leader-style (cpu hard), 3v3 with a team preview']]) {
     await open(page, base + '/pokemonarena/battle.html?cpu=' + cpu + '&format=' + fmt + '&seed=7&speed=fast&nostubs=1&realaudio=1');
     await batReady(page);
     await page.waitFor('(() => { const d = window.__arenaSound.state().director; return d.cur || d.error; })()', { timeoutMs: 120000 });

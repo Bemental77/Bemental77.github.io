@@ -5,7 +5,7 @@
   4440396,
   4472832
  ],
- "count": 408,
+ "count": 412,
  "notFound": [],
  "ambiguous": [
   "charge.sky",
@@ -2058,6 +2058,26 @@
    "off": 4440680,
    "len": 5,
    "sha1": "c2cbd3b2a5d71d469b06f450c4e7d4b4f1765768"
+  },
+  "style.ask": {
+   "off": 4463488,
+   "len": 58,
+   "sha1": "57315955442f462ebdd80d7bf7efaad4a3cf8859"
+  },
+  "opt.style": {
+   "off": 15990660,
+   "len": 13,
+   "sha1": "500cacf629254cdc3e3d08a075aed7efaebada07"
+  },
+  "opt.shift": {
+   "off": 7909704,
+   "len": 12,
+   "sha1": "df6baceb44432f18d95eb6808f8a9b482bffa69c"
+  },
+  "opt.set": {
+   "off": 7909716,
+   "len": 10,
+   "sha1": "754990495eb8dfa496957afc0c68928665495d98"
   }
  }
 }

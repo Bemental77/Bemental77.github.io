@@ -64,6 +64,12 @@ const RAW_MESSAGES = {
   'run.no': "No! There's no running from a Trainer battle!<PARA>",
   'draggedout': '{10} was dragged out!<PARA>',
   'wentback': '{f} went back to {35}!',
+  // the Gen 3 trainer-battle prompt (Battle Style SWITCH): the foe's next Pokemon is named, then the question; the YES / NO box is the scene's. {1} is the Pokemon about to be sent out (role b2)
+  'style.ask': '{42} is about to send out {1}.<PARA>Will you switch your Pok<E>mon?',
+  // the hack's own Options menu: the row "Battle Style" and its two values "Shift" (a free switch when an opposing Pokemon faints) and "Set" (the next foe comes in with none). Their strings live outside the battle text region
+  'opt.style': { s: 'Battle Style', region: [0xf3ff00, 0xf40000] },
+  'opt.shift': { s: '<FC 01 06><FC 03 07>Shift', region: [0x78b100, 0x78b200] },       // (these two carry the options menu's colour codes, FC 01 / FC 03)
+  'opt.set': { s: '<FC 01 06><FC 03 07>Set', region: [0x78b100, 0x78b200] },
   // ---- attacking
   'used': '{f} used {34}!',
   'miss': "{f}'s attack missed!",

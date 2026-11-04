@@ -8,6 +8,20 @@
 //   ctl.submit(0, { kind: 'move', slot: 1 })   // -> { ok, code }; the CPU side answers by itself, the engine advances when ready
 //   ctl.takeEvents()             // engine events produced since the last call (what the scene plays)
 //
+// PREVIEWS. `pick: 3` is the 3v3 team preview: each side submits { kind: 'preview', order: [3 team slots] } and only those three fight, the first leads.
+// `lead: true` is the 6v6 LEAD preview: each side submits { kind: 'preview', order: [one team slot] }, that Pokemon is sent out first and the rest of the team follows in
+// team order (the request says { phase: 'preview', pick: 1, lead: true, team }). A side whose team has ONE Pokemon is not asked. FORMATS says which format uses which;
+// formatOpts(fmt) is the pair to spread into the options here, so the Tower (or any caller) gets the lead preview from the same place the battle page and the online match do:
+//   createMatchController({ pack, teams, seed, ...formatOpts('6v6'), sides })
+// With neither option there is no preview and the first Pokemon of each team leads (the battle the Arena played before the lead preview existed).
+//
+// THE FREE SWITCH. `freeSwitch: true` offers a human seat that fights a CPU the Gen 3 prompt "<TRAINER> is about to send out <MON>. Will you switch your Pokemon?" (Battle Style SHIFT, the ROM's word): when the
+// CPU's Pokemon has fainted and it has another, the CPU chooses its replacement first (as ever, in this controller's pump), and then ctl.pending(seat) is { phase: 'switch', reason: 'free', switches,
+// next: { slot, sp, name, level } } until the seat answers ctl.submit(seat, { kind: 'switch', slot }) (it comes in now, uses no turn and takes its entry hazards and abilities; the CPU's replacement
+// follows) or ctl.submit(seat, { kind: 'stay' }). Both answers are ordinary recorded choices (battle.choiceLog, onLocalChoice, the resume record). A seat the offer does not apply to (a remote seat,
+// a CPU, or a human seat whose opponent is a person) never sees it, so an online battle is unchanged; without the option nothing differs from a controller that never heard of it. A page whose
+// player chose Battle Style SET passes the option all the same and lets the scene answer { kind: 'stay' } for them (scene.js), so that changing the style in the middle of a battle is exact.
+//
 // SIDE KINDS
 //   { kind: 'human' }   choices come from the local UI through ctl.submit(side, choice); each accepted one fires onLocalChoice
 //   { kind: 'human', concede: true }   the same, and a FORFEIT from this seat goes through ctl.concede() so it works even while the seat is
@@ -22,7 +36,22 @@ import { createAi, createRng } from './ai.js';
 import { engineSupports, engineExcludedSpecies, blankRec, legalMoves, resolveRuleset, DEFAULT_RULESET_ID } from './rules.js';
 import { evsToPoints } from './stats.js';
 
-export const FORMATS = Object.freeze({ '6v6': { pick: 0 }, '3v3': { pick: 3 } });
+export const FORMATS = Object.freeze({ '6v6': Object.freeze({ pick: 0, lead: true }), '3v3': Object.freeze({ pick: 3 }) });
+
+/** The preview options of a format, to spread into createMatchController / replay: { pick, lead }. Throws RangeError for a format the Arena does not play. */
+export function formatOpts(fmt) {
+  if (typeof fmt !== 'string' || !Object.prototype.hasOwnProperty.call(FORMATS, fmt)) throw new RangeError('format must be 6v6 or 3v3');
+  const f = FORMATS[fmt];
+  return { pick: f.pick, lead: !!f.lead };
+}
+
+/** Does this controller's battle open on a preview for its human seat: the 3v3 team preview (both sides choose), or the 6v6 lead preview (a seat whose team is one Pokemon is not asked)? Read from the engine's start event. */
+export function opensOnPreview(c) {
+  try {
+    const st = c.battle.events.find((e) => e.t === 'start'), me = c.sides.findIndex((x) => x.kind === 'human');
+    return !!st && (st.lead ? me >= 0 && st.sizes[me] > 1 : !!st.pick);
+  } catch (_e) { return false; }
+}
 
 /* ------------------------------------------------------------------------------------------ teams: records */
 
@@ -132,7 +161,10 @@ export function createMatchController(opts) {
   const ruleset = opts.ruleset || DEFAULT_RULESET_ID;
   const sidesSpec = opts.sides || [{ kind: 'human' }, { kind: 'cpu', level: 'normal', seed: 1 }];
   const names = opts.names || ['You', 'CPU'];
-  const battle = createBattle({ pack, ruleset, teams: opts.teams, seed: opts.seed, pick: opts.pick || 0, names, validate: opts.validate !== false });
+  // freeSwitch: true offers "Will you switch your Pokemon?" (the Gen 3 trainer-battle prompt) to a HUMAN seat whose opponent is a CPU, and to no other seat: a battle against a person (a remote seat) has none, as in the real game.
+  if (opts.freeSwitch !== undefined && opts.freeSwitch !== null && typeof opts.freeSwitch !== 'boolean') throw new RangeError('freeSwitch must be true or false');
+  const freeSwitch = opts.freeSwitch === true ? [0, 1].map((side) => sidesSpec[side].kind === 'human' && sidesSpec[side ^ 1].kind === 'cpu') : undefined;
+  const battle = createBattle({ pack, ruleset, teams: opts.teams, seed: opts.seed, pick: opts.pick || 0, lead: opts.lead, freeSwitch, names, validate: opts.validate !== false });
   const ais = sidesSpec.map((s) => (s.kind === 'cpu' ? createAi({ pack, level: s.level || 'normal', seed: s.seed === undefined ? 1 : s.seed }) : null));
   // the public team-preview information each side sees of the other: species and (normalised) level, nothing else
   const previewInfo = [0, 1].map((side) => battle.s.sides[side].team.map((m) => ({ sp: m.sp, level: m.level })));

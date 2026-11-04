@@ -417,15 +417,32 @@ async function edgeCheck(dev, kind, n, cursorKey) {
 }
 
 /* ================================================================================================ the battle routines shared by the journeys */
-// run the text until the scene wants an ACTION (or the battle is over); a forced switch (a Pokemon fainted) is answered with the first healthy teammate
+// run the text until the scene wants an ACTION (or the battle is over). On the way it answers what a player is asked, with THIS device: a forced switch (a Pokemon fainted) takes the first healthy
+// teammate; a preview the journey did not choose itself (a 6v6 lead preview, a 3v3 team preview) takes the first Pokemon and says YES; and "Will you switch your Pokemon?" (the free switch, asked when the
+// CPU's Pokemon has fainted) is answered YES + the first healthy Pokemon the first time (dev.freeSwitched records which one, so a journey can check it came in) and NO every time after.
 async function toAction(dev) {
-  for (let g = 0; g < 8; g++) {
-    const s = await dev.untilMode(['action', 'party', 'result']);
-    if (s.mode !== 'party') return s;
-    const i = await dev.page.eval(`(() => { const m = ${BAT}.scene.S.party.mons; return m.findIndex((x) => !x.fainted && !x.active); })()`);
+  const firstHealthy = () => dev.page.eval(`(() => { const m = ${BAT}.scene.S.party.mons; return m.findIndex((x) => !x.fainted && !x.active); })()`);
+  for (let g = 0; g < 24; g++) {
+    const s = await dev.untilMode(['action', 'party', 'result', 'preview', 'confirm']);
+    if (s.mode === 'action' || s.mode === 'result') return s;
+    if (s.mode === 'preview') { for (let k = 0; k < (s.pick || 1); k++) await dev.choose('preview', k); continue; }
+    if (s.mode === 'confirm') {
+      if (s.confirm === 'free') {
+        if (!dev.freeAsked) {
+          dev.freeAsked = 1;
+          await dev.choose('overlay', 0);                                                          // YES
+          const j = await firstHealthy();
+          const slot = await dev.page.eval(`${BAT}.scene.S.party.mons[${j < 0 ? 0 : j}].slot`);
+          await dev.choose('party', j < 0 ? 0 : j);
+          dev.freeSwitched = { slot, front: await dev.page.eval(`(() => { const sd = ${BAT}.ctl.battle.s.sides[0]; return sd.team[sd.act].slot; })()`) };
+        } else await dev.choose('overlay', 1);                                                     // NO
+      } else await dev.choose('overlay', 0);                                                       // "Send out this team / this one first?": YES
+      continue;
+    }
+    const i = await firstHealthy();
     await dev.choose('party', i < 0 ? 0 : i);
   }
-  throw new Error(dev.tag('could not get past the forced switches'));
+  throw new Error(dev.tag('could not get past the forced switches and questions'));
 }
 // FIGHT with move `m`, through the text, until the next decision; asserts the engine moved on
 async function fightTurn(dev, tag, m = 0) {
@@ -523,6 +540,18 @@ async function journeyA(dev, page) {
   ok((await page.eval(`${BAT}.state`)) === 'ready' && (await page.eval(`${BAT}.params.format`)) === '6v6' && (await page.eval(`${BAT}.params.quick`)) === true, dev.tag('A: START opens battle.html as a 6v6 Quick Battle'), await page.eval(`${BAT}.state + ' ' + ${BAT}.error`));
   await sleep(200);
   await noDemoWords(dev, 'the battle page');
+  // Since the 6v6 LEAD preview a 6v6 battle opens by asking which Pokemon goes out first. This device chooses the 4th (the question, then YES); the battle must send exactly that one out first.
+  let lead = await dev.untilMode(['preview']);
+  ok(lead.mode === 'preview' && lead.npreview === 6 && lead.pick === 1, dev.tag('A: the 6v6 battle opens on the lead preview: six Pokemon, one to choose'), J({ n: lead.npreview, pick: lead.pick }));
+  await dev.shot('battle_lead_preview');
+  await dev.choose('preview', 3);
+  lead = await dev.menuState();
+  ok(lead.mode === 'confirm' && J(lead.picks) === '[3]', dev.tag('A: choosing the 4th Pokemon asks "Send out this one first?" (YES / NO)'), J({ mode: lead.mode, picks: lead.picks }));
+  await dev.shot('battle_lead_question');
+  await dev.choose('overlay', 0);                                                          // YES
+  await dev.untilMode(['action']);
+  const front = await page.eval(`(() => { const sd = ${BAT}.ctl.battle.s.sides[0]; return { orig: sd.team[sd.act].orig, order: sd.team.map((m) => m.orig) }; })()`);
+  ok(front.orig === 3 && J(front.order) === '[3,0,1,2,4,5]', dev.tag('A: the 4th Pokemon is sent out first and the rest follow in team order'), J(front));
   if (dev.family === 'mouse') { await dev.untilMode(['action']); await edgeCheck(dev, 'action', 4, 'action'); }
   // two turns of FIGHT / move
   await fightTurn(dev, 'A turn 1');
@@ -540,10 +569,13 @@ async function journeyA(dev, page) {
   await dev.choose('party', target);
   s = await dev.untilMode(['action', 'party', 'result']);
   const after = await page.eval(`${BAT}.ctl.view(0).you.active`);
-  ok(after !== before, dev.tag('A: the switch happened: the active Pokemon changed (slot ' + before + ' -> ' + after + ')'), J({ before, after, mode: s.mode }));
+  const why = after !== before ? null : await page.eval(`(() => { const S = ${BAT}.scene.S; return { trapped: !!(S.party && S.party.req && S.party.req.trapped), text: (S.lastBox && S.lastBox.text || []).join(' ') }; })()`);       // (a Pokemon held by the foe's Shadow Tag / Arena Trap / Magnet Pull cannot leave: the screen says so and stays)
+  ok(after !== before, dev.tag('A: the switch happened: the active Pokemon changed (slot ' + before + ' -> ' + after + ')'), J({ before, after, mode: s.mode, why }));
   s = await toAction(dev);
   await pauseMenuTour(dev, 'A');
   const fin = await forfeitByRun(dev, 'A');
+  // (only when the CPU's Pokemon fainted in this journey's turns: toAction answers the question with this device, and it must have brought the chosen Pokemon in)
+  if (dev.freeSwitched) ok(dev.freeSwitched.front === dev.freeSwitched.slot, dev.tag('A: "Will you switch your Pokemon?" was asked, this device said YES and picked a Pokemon: that one came in'), J(dev.freeSwitched));
   await dev.shot('battle_result');
   await mashResult(dev, 'A');
   ok(fin.nopt === 3 && J(fin.optLabels) === J(['REMATCH', 'NEW BATTLE', 'BACK TO HUB']), dev.tag('A: the result screen offers REMATCH / NEW BATTLE / BACK TO HUB'), J(fin.optLabels));

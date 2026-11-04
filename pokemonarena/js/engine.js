@@ -6,10 +6,15 @@
 // A turn is therefore a pure function of (state, choices): see stepBattle().
 //
 // API (details and the event list are in pokemonarena/ENGINE.md):
-//   createBattle({ pack, ruleset, teams:[A,B], seed, pick, names, validate })  -> Battle
+//   createBattle({ pack, ruleset, teams:[A,B], seed, pick, lead, freeSwitch, names, validate })  -> Battle
+//        freeSwitch: true | false | [boolean, boolean], the sides that are offered "Will you switch your Pokemon?" (the ROM's words) when the foe's Pokemon has fainted and the foe has a replacement (Battle.offerFree).
+//                    The answer is { kind: 'switch', slot } (a switch that uses no turn) or { kind: 'stay' }. Absent, nothing about the battle differs from one that never heard of it.
+//        pick: 1..4, a Stadium-style team preview: each side picks `pick` members in order and only those fight.
+//        lead: true, a LEAD preview (6v6): each side picks ONE member to send out first; the whole team fights, the others follow in team order. A team of
+//              one member has nothing to choose and takes no part in the preview. `pick` and `lead` are alternatives.
 //   battle.requests()      -> [reqA, reqB]   what each side may choose now ({phase, moves, switches, canForfeit, ...})
 //   battle.choose(side, choice) -> { ok, code }          choices: {kind:'move',slot} | {kind:'switch',slot}
-//                                                         | {kind:'preview',order:[...]} | {kind:'forfeit'}
+//                                                         | {kind:'preview',order:[...]} | {kind:'forfeit'} | {kind:'stay'} (only as the answer to a reason:'free' switch request)
 //   battle.ready() / battle.advance() -> new events      resolve once every needed side has chosen
 //   battle.events, battle.winner (null | 0 | 1 | -1 draw), battle.hash(), battle.snapshot(), restoreBattle(snap, {pack})
 //   battle.viewFor(side)   -> the state as one side may see it (no foe hidden info)
@@ -33,7 +38,7 @@ import { engineSupport } from './engine_support.js';
 export { MECHANICS, ENGINE_VERSION, E, EngineError };
 
 export const REQUEST_PHASES = Object.freeze(['preview', 'move', 'switch', 'wait', 'end']);
-export const CHOICE_KINDS = Object.freeze(['move', 'switch', 'preview', 'forfeit']);
+export const CHOICE_KINDS = Object.freeze(['move', 'switch', 'preview', 'forfeit', 'stay']);
 export const STRUGGLE_SLOT = 4;
 // Every event `t` the engine can emit (tools/pokemonarena_engine_test.mjs fails if a fuzzed battle emits a code that is not listed).
 export const EVENT_CODES = Object.freeze([
@@ -66,12 +71,13 @@ export function hash64(str) {
   return a.toString(16).padStart(8, '0') + b.toString(16).padStart(8, '0');
 }
 
-/** Encode a choice into an unsigned 16-bit integer. Layout: bits 0-1 kind (0 move, 1 switch, 2 preview, 3 forfeit);
+/** Encode a choice into an unsigned 16-bit integer. Layout: bits 0-1 kind (0 move, 1 switch, 2 preview, 3 forfeit or stay);
  *  move/switch: slot in bits 2-4 (move slot 0..3, 4 = Struggle; switch slot 0..5); preview: bits 2-3 = k-1, then k 3-bit team
- *  indexes from bit 4. Returns -1 for something that is not a valid choice. */
+ *  indexes from bit 4; kind 3: 3 is a forfeit and 7 is `stay` (the answer NO to the free-switch offer, see Battle.offerFree). Returns -1 for something that is not a valid choice. */
 export function encodeChoice(c) {
   if (!c || typeof c !== 'object') return -1;
   if (c.kind === 'forfeit') return 3;
+  if (c.kind === 'stay') return 7;
   if (c.kind === 'move') return Number.isInteger(c.slot) && c.slot >= 0 && c.slot <= 4 ? (c.slot << 2) : -1;
   if (c.kind === 'switch') return Number.isInteger(c.slot) && c.slot >= 0 && c.slot <= 5 ? (c.slot << 2) | 1 : -1;
   if (c.kind === 'preview') {
@@ -87,7 +93,7 @@ export function encodeChoice(c) {
 export function decodeChoice(v) {
   if (!Number.isInteger(v) || v < 0 || v > 0xffff) return null;
   const k = v & 3;
-  if (k === 3) return v === 3 ? { kind: 'forfeit' } : null;
+  if (k === 3) return v === 3 ? { kind: 'forfeit' } : v === 7 ? { kind: 'stay' } : null;
   if (k === 0 || k === 1) {
     if (v >> 5) return null;
     const slot = (v >> 2) & 7;
@@ -177,7 +183,7 @@ function readChoice(x) {
     if (x === null || typeof x !== 'object' || Array.isArray(x)) return null;
     const kind = x.kind;
     if (typeof kind !== 'string' || CHOICE_KINDS.indexOf(kind) < 0) return null;
-    if (kind === 'forfeit') return { kind };
+    if (kind === 'forfeit' || kind === 'stay') return { kind };
     if (kind === 'preview') {
       const o = x.order;
       if (!Array.isArray(o) || o.length > 16) return { kind, order: null };
@@ -232,7 +238,16 @@ export class Battle {
     const S = this.s;
     this.emit({
       t: 'start', names: [S.sides[0].name, S.sides[1].name], sizes: [S.sides[0].team.length, S.sides[1].team.length], pick: S.pick, rules: S.ruleset,
+      ...(S.lead ? { lead: 1 } : {}),          // only a lead battle carries the flag, so every other battle keeps its old event (and its old digest)
     });
+    if (S.lead) {
+      // A side with one member has no lead to choose: it is not asked (its choice is the automatic one, like a side locked into a charge). When neither side is asked the preview is
+      // over before it began and the battle starts at once, exactly as a 6v6 battle without a preview does.
+      S.phase = 'preview';
+      for (let side = 0; side < 2; side++) { const one = S.sides[side].team.length < 2; S.need[side] = !one; S.sides[side].ch = one ? { kind: 'auto' } : null; }
+      if (!S.need[0] && !S.need[1]) this.applyPreview();
+      return;
+    }
     if (S.pick) { S.phase = 'preview'; S.need = [true, true]; return; }
     this.beginLeads();
   }
@@ -270,6 +285,7 @@ export class Battle {
     S.winner = winner;
     S.phase = 'end';
     S.need = [false, false];
+    delete S.fo;                       // a free-switch offer that was open when the battle ended (a forfeit) goes with it
     if (winner === -1) this.emit({ t: 'draw' });
     else this.emit({ t: 'win', s: winner });
   }
@@ -419,7 +435,7 @@ export class Battle {
       const cf = !sd.ch || sd.ch.kind === 'auto' || this.resolvable();
       if (S.phase === 'preview') {
         out.push({
-          side, phase: sd.ch ? 'wait' : 'preview', pick: S.pick, canForfeit: cf,
+          side, phase: sd.ch ? 'wait' : 'preview', pick: S.pick, ...(S.lead ? { lead: true } : {}), canForfeit: cf,
           team: sd.team.map((m, i) => ({ slot: i, sp: m.sp, name: m.name, level: m.level })),
         });
         continue;
@@ -430,6 +446,11 @@ export class Battle {
         continue;
       }
       if (S.phase === 'switch') {
+        if (S.fo === side) {                                // the free switch: the foe's replacement is already chosen (the CPU answers first) and is named here, as the real game names it before it asks
+          const fx = S.sides[side ^ 1], pick = fx.ch && fx.ch.kind === 'switch' ? fx.team[fx.ch.slot] : null;
+          out.push({ side, phase: 'switch', reason: 'free', switches: this.switchOptions(side), next: pick ? { slot: pick.slot, sp: pick.sp, name: pick.name, level: pick.level } : null, canForfeit: cf });
+          continue;
+        }
         out.push({ side, phase: 'switch', reason: S.reason, switches: this.switchOptions(side), canForfeit: cf });
         continue;
       }
@@ -466,6 +487,12 @@ export class Battle {
     }
     if (sd.ch) return { ok: false, code: 'already-chosen' };
     if (!S.need[side]) return { ok: false, code: 'not-needed' };
+    if (c.kind === 'stay') {                            // NO to "Will you switch your Pokemon?" (the ROM's words): only the side that is being offered the free switch can say it
+      if (S.fo !== side) return { ok: false, code: 'wrong-phase' };
+      sd.ch = { kind: 'stay' };
+      this.choiceLog.push({ s: side, c: { kind: 'stay' } });
+      return { ok: true, code: 'ok' };
+    }
     if (S.phase === 'preview') {
       if (c.kind !== 'preview') return { ok: false, code: 'wrong-phase' };
       const o = c.order;
@@ -570,7 +597,12 @@ export class Battle {
     const S = this.s;
     for (let side = 0; side < 2; side++) {
       const sd = S.sides[side];
-      const order = sd.ch.order;
+      let order = sd.ch && sd.ch.kind === 'preview' ? sd.ch.order : [0];          // (a side that was not asked in a lead preview has no choice: its first member leads)
+      if (S.lead) {                                                    // the chosen member leads and the rest keep team order behind it: the whole team fights
+        const lead = order[0];
+        order = [lead];
+        for (let i = 0; i < sd.team.length; i++) if (i !== lead) order.push(i);
+      }
       sd.team = order.map((i, pos) => { const m = sd.team[i]; m.slot = pos; return m; });
       sd.ch = null;
       this.emit({ t: 'preview', s: side, order: order.slice() });
@@ -605,6 +637,20 @@ export class Battle {
       this.checkWinner();
       if (S.phase !== 'end') this.continueTurn();
       return;
+    }
+    // THE FREE SWITCH (offerFree): the offered side answers first. A switch happens now, exactly like a switch at the start of a turn (switch-out, switch-in, entry hazards and abilities), but the
+    // foe's replacement is not in yet and no turn is used; then the foe's replacement (already chosen, still in its `ch`) is sent out below. If the new Pokemon faints on entering and a living one
+    // is left, the offered side must choose a replacement like after any faint, and both come in together as in a double faint.
+    if (S.fo !== undefined) {
+      const fo = S.fo, fd = S.sides[fo], ch = fd.ch;
+      delete S.fo; fd.ch = null; S.need[fo] = false;
+      const t = todo.indexOf(fo); if (t >= 0) todo.splice(t, 1);
+      if (ch && ch.kind === 'switch') {
+        this.doSwitch(fo, ch.slot, {});
+        this.checkWinner();
+        if (S.phase === 'end') return;
+        if (this.act(fo).hp <= 0 && this.aliveCount(fo) > 0) { S.need[fo] = true; return; }
+      }
     }
     // faint replacements: all chosen simultaneously
     const slots = {};
@@ -792,9 +838,27 @@ export class Battle {
     for (let side = 0; side < 2; side++) if (this.act(side).hp <= 0 && this.aliveCount(side) > 0) need[side] = true;
     if (need[0] || need[1]) {
       S.phase = 'switch'; S.reason = 'faint'; S.need = need;
+      this.offerFree();
       return;
     }
     this.startTurn();
+  }
+  /**
+   * THE FREE SWITCH ("Will you switch your Pokemon?" (the ROM's words), the Gen 3 trainer-battle prompt, Battle Style SHIFT). Only when the battle was created with `freeSwitch` for a side (S.fs[side] = 1): while the
+   * faint-replacement phase is open, if exactly ONE side needs a replacement and the OTHER side's active Pokemon is alive, can leave the field and has a living Pokemon on the bench, that other
+   * side is offered the switch: its request is { phase: 'switch', reason: 'free', switches, next } where `next` is the Pokemon the foe has already chosen to send out. It answers with
+   * { kind: 'switch', slot } (that Pokemon comes in NOW, takes its entry hazards and abilities, and uses no move and no turn) or { kind: 'stay' } (nothing happens). Either way the foe's
+   * replacement is sent out afterwards, as chosen. A side that is not offered (S.fs absent or 0, both fainted, trapped, nobody on the bench) sees the phase exactly as it was.
+   */
+  offerFree() {
+    const S = this.s;
+    if (!S.fs) return;
+    for (let y = 0; y < 2; y++) {
+      if (!S.fs[y] || !S.need[y ^ 1] || S.need[y]) continue;
+      if (!this.canSwitch(y) || this.switchOptions(y).length === 0) continue;                // (a side whose own Pokemon fainted needs a replacement itself, S.need[y], and is skipped above)
+      S.fo = y; S.need[y] = true;
+      return;
+    }
   }
   residual(order) {
     const S = this.s;
@@ -1090,7 +1154,19 @@ export function createBattle(opts) {
   } catch (e) { if (e instanceof EngineError) throw e; throw new EngineError('createBattle: bad ruleset: ' + String((e && e.message) || e), null, 'bad-argument'); }
   const teams = opts.teams;
   if (!Array.isArray(teams) || teams.length !== 2) throw new EngineError('teams must be [teamA, teamB]', null, 'bad-argument');
-  const pick = opts.pick || 0;
+  const lead = opts.lead === true;
+  if (opts.lead !== undefined && opts.lead !== null && typeof opts.lead !== 'boolean') throw new EngineError('lead must be true or false', null, 'bad-argument');
+  if (lead && opts.pick) throw new EngineError('lead and pick are alternatives: a lead preview picks the one member to send out first, a pick preview chooses which members fight', null, 'bad-argument');
+  const pick = lead ? 1 : (opts.pick || 0);        // a lead preview asks for ONE member: the request says pick 1 (the length of the choice's order) and lead true (the rest follow in team order)
+  // freeSwitch: true (both sides), false, or [boolean, boolean]: which sides are offered the free switch ("Will you switch your Pokemon?" (the ROM's words), Battle.offerFree). Anything else is refused.
+  let fs = null;
+  if (opts.freeSwitch !== undefined && opts.freeSwitch !== null && opts.freeSwitch !== false) {
+    const f = opts.freeSwitch;
+    if (f === true) fs = [1, 1];
+    else if (Array.isArray(f) && f.length === 2 && f.every((x) => typeof x === 'boolean')) fs = [f[0] ? 1 : 0, f[1] ? 1 : 0];
+    else throw new EngineError('freeSwitch must be true, false or [boolean, boolean]', null, 'bad-argument');
+    if (!fs[0] && !fs[1]) fs = null;               // nobody is offered anything: the battle is exactly the one without the option
+  }
   if (pick && (!Number.isInteger(pick) || pick < 1 || pick > E.pickMax)) throw new RangeError(`pick must be 1..${E.pickMax}`);
   for (let i = 0; i < 2; i++) {
     const tm = teams[i];
@@ -1116,6 +1192,8 @@ export function createBattle(opts) {
     v: ENGINE_VERSION, ruleset: R.id, seed, rng: seed, turn: 0, phase: 'preview', reason: '', need: [false, false], pause: -1, mb: false,
     pick, wx: [WX.NONE, 0], tr: 0, sides, q: [], winner: null,
   };
+  if (lead) s.lead = 1;                            // present only in a lead battle: every other battle's state, hash and digest are what they always were
+  if (fs) s.fs = fs;                               // likewise present only when some side is offered the free switch
   const b = new Battle(s, pack, R, [], []);
   b.startBattle();
   return b;
@@ -1155,7 +1233,7 @@ export function restoreBattle(snap, opts) {
  */
 export function replay(o) {
   if (!o || typeof o !== 'object' || !Array.isArray(o.choiceLog)) throw new EngineError('replay needs { pack, teams, seed, choiceLog: [...] }', null, 'bad-argument');
-  const b = createBattle({ pack: o.pack, ruleset: o.ruleset, teams: o.teams, seed: o.seed, pick: o.pick, names: o.names, validate: o.validate });
+  const b = createBattle({ pack: o.pack, ruleset: o.ruleset, teams: o.teams, seed: o.seed, pick: o.pick, lead: o.lead, freeSwitch: o.freeSwitch, names: o.names, validate: o.validate });
   const settle = () => { while (b.winner === null && !b.forfeitPending() && b.ready()) b.advance(); };
   for (const e of o.choiceLog) {
     if (!e || typeof e !== 'object' || !e.c) throw new EngineError('replay: bad choice log entry', e, 'bad-argument');
