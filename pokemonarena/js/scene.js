@@ -909,11 +909,18 @@ export function createScene(opts) {
   //     the effect shows it (every frame of a send-out is identical for any HP or species of it, ANIM.md "Round 7b"), so that one keeps the plain read of the display the effect was measured with.
   //  2. sysEventStart re-checks a prepared effect against what is on screen NOW (ctxSig, over the same Pokemon) and prepares it again if they differ (a drain that finished meanwhile, a case nobody foresaw): a
   //     late picture is a brief hold of the previous one (A.waited), a wrong picture is the defect.
+  //  3. (ANIM.md "Round 10", reported: "when a pokemon faints, it shows while the trainer's next pokemon is being chosen".) A Pokemon that has FAINTED and not been replaced is not on the field, but the
+  //     run's battle is set up from both parties at the action selection, so it stood on its spot with its empty healthbox for the whole of the OTHER side's event: the player's recall and send-out
+  //     after answering YES to "Will you switch your Pokemon?", the first send-out and the second faint of a double faint, a Volt Switch that knocked the foe out. eventCtx names that side in ctx.absent
+  //     (battle_sys.js plays its faint, hidden, in the preparation, as the real game has); the projection marks a faint ahead of the event as down (projectStep), and ctxSig covers it, so the re-check
+  //     sees a difference in it too.
   const drawsLead = (kind) => kind !== 'sendout';
-  const ctxSig = (ctx, kind, st) => JSON.stringify(drawsLead(kind) ? [ctx.foe, ctx.player] : (st.side === viewSide ? [ctx.foe, null] : [null, ctx.player]));
+  const ctxSig = (ctx, kind, st) => JSON.stringify([...(drawsLead(kind) ? [ctx.foe, ctx.player] : (st.side === viewSide ? [ctx.foe, null] : [null, ctx.player])), ...(ctx.absent ? [ctx.absent] : [])]);
+  // fainted and not replaced: a faint that has finished hides the sprite AND the healthbox (finishSysEvent, runStep 'faint'); nothing else hides both (a hit blink and a ball release hide the sprite only)
+  const downNow = (side) => { const d = S.disp[side]; return !!d && d.visible === false && d.showBox === false; };
   // what differs between two signatures, for the diagnostics: 'player.hp 175->40'
-  const sigDiff = (a, b) => { try { const x = JSON.parse(a), y = JSON.parse(b), out = []; ['foe', 'player'].forEach((k, i) => { const m = x[i] || {}, n = y[i] || {}; for (const f of new Set([...Object.keys(m), ...Object.keys(n)])) if (JSON.stringify(m[f]) !== JSON.stringify(n[f])) out.push(k + '.' + f + ' ' + JSON.stringify(m[f]) + '->' + JSON.stringify(n[f])); }); return out.slice(0, 4).join(', '); } catch (_e) { return ''; } };
-  // what a step does to the Pokemon on screen, applied to proj = [side 0, side 1] (undefined = whatever S.disp shows; null = nobody; else a Pokemon record)
+  const sigDiff = (a, b) => { try { const x = JSON.parse(a), y = JSON.parse(b), out = []; ['foe', 'player'].forEach((k, i) => { const m = x[i] || {}, n = y[i] || {}; for (const f of new Set([...Object.keys(m), ...Object.keys(n)])) if (JSON.stringify(m[f]) !== JSON.stringify(n[f])) out.push(k + '.' + f + ' ' + JSON.stringify(m[f]) + '->' + JSON.stringify(n[f])); }); if (JSON.stringify(x[2] || null) !== JSON.stringify(y[2] || null)) out.push('absent ' + JSON.stringify(x[2] || []) + '->' + JSON.stringify(y[2] || [])); return out.slice(0, 4).join(', '); } catch (_e) { return ''; } };
+  // what a step does to the Pokemon on screen, applied to proj = [side 0, side 1] (undefined = whatever S.disp shows; null = nobody; else a Pokemon record, with down: true once it has fainted)
   function projectStep(proj, step) {
     if (!step) return;
     const t = step.t === 'sysevent' ? step.orig : step.t, k = step.t === 'sysevent' ? step.kind : null;
@@ -923,6 +930,10 @@ export function createScene(opts) {
       const base = proj[step.side] !== undefined ? proj[step.side] : (S.disp[step.side] || A.lastMon[step.side]);       // bar nor the new one, and a picture seeded with it shows a bar that went back up for the length of the effect (the second half of the defect)
       if (base && Number.isInteger(step.to)) proj[step.side] = Object.assign({}, base, { hp: step.to });
     }
+    else if (t === 'faint' || k === 'faint') {     // round 10: once its faint has played the Pokemon is off the field (sprite and healthbox) until its replacement's send-out
+      const base = proj[step.side] !== undefined ? proj[step.side] : (S.disp[step.side] || A.lastMon[step.side]);
+      if (base) proj[step.side] = Object.assign({}, base, { hp: 0, down: true });
+    }
   }
   function eventCtx(st, kind, id, proj) {
     const mine = st.side === viewSide, other = st.side ^ 1;
@@ -931,6 +942,9 @@ export function createScene(opts) {
     if (!lead || !foeOther) return null;
     const own = pspec(lead, kind === 'faint' ? { hp: 0 } : undefined), oth = pspec(foeOther);
     const ctx = { foe: mine ? oth : own, player: mine ? own : oth, environment: opts.env | 0, trainer: id >= 8 ? (trainerId() > 1 ? trainerId() : 1) : 0, seed: sysSeed(), maxFrames: SYS_MAX };         // ids 8 / 9 are the trainer's own; for 2..7 a WILD-style pre-roll keeps the foe's stored HP (a trainer-mode setup recomputes the foe's max HP and shifts its bar by 1-2 px, measured)
+    // round 10: the OTHER side has fainted and is not replaced yet (projected, or on screen now): the run must not draw it (the event's own side is never absent: it is the one that faints, is hit, is recalled or is replaced)
+    const pmOther = proj ? proj[other] : undefined;
+    if (pmOther ? !!pmOther.down : downNow(other)) ctx.absent = [other === viewSide ? 'player' : 'foe'];
     if (kind === 'sendout') ctx.switchIn = pspec(st.mon);
     if (opts.playerGender === 'F' || opts.playerGender === 'M') ctx.gender = opts.playerGender;
     if (opts.sysClock) ctx.clock = opts.sysClock;

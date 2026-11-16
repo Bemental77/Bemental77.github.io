@@ -39,6 +39,18 @@ const PLANS = Object.freeze({
   [SYS_ID.sendOutFoe]: { trainer: true, pre: [{ battler: 1, cmd: [CMD.returnMonToBall, 1] }], main: [{ battler: 1, cmd: [CMD.switchInAnim, 1, 0], foeParty1: true }] },
   [SYS_ID.sendOutPlayer]: { pre: [{ battler: 0, cmd: [CMD.returnMonToBall, 1] }], main: [{ battler: 0, cmd: [CMD.switchInAnim, 1, 0], party1: true }] },
 });
+// ctx.absent = ['foe'] / ['player'] / both: that side's Pokemon has FAINTED and nobody has replaced it yet (a double faint; the free switch "Will you switch your Pokemon?" answered YES;
+// a Volt Switch / U-turn that knocked the foe out). The event's own battle starts from both parties at the action selection, so without this the run drew the fainted Pokemon standing on its spot with its
+// empty healthbox for the whole event, beside a send-out / recall / faint of the OTHER side (ANIM.md "Round 10"). The real game has played that Pokemon's faint animation, which slides the
+// sprite away, destroys it and hides its healthbox (the controller's own faint command, CMD.faintAnimation): so the preparation plays exactly that, hidden, before the plan's own preparation.
+// The event's own battler is never made absent (it is the one that faints / is hit / is recalled / is replaced). A plan with no absent battler is the plan itself (same cache key, same frames).
+function withAbsent(plan, absent) {
+  if (!plan || plan.warm || !Array.isArray(absent) || !absent.length) return plan;
+  const own = new Set(plan.main.map((c) => c.battler));
+  const gone = [...new Set(absent.map((a) => (a === 'foe' || a === 1 ? 1 : a === 'player' || a === 0 ? 0 : -1)))].filter((b) => b >= 0 && !own.has(b)).sort();
+  if (!gone.length) return plan;
+  return Object.assign({}, plan, { pre: [...gone.map((b) => ({ battler: b, cmd: [CMD.faintAnimation] })), ...(plan.pre || [])], preKey: ':absent' + gone.join('') });
+}
 export const KEY = Object.freeze({ A: 1, B: 2, SELECT: 4, START: 8, RIGHT: 16, LEFT: 32, UP: 64, DOWN: 128, R: 256, L: 512 });
 
 export const SYS = Object.freeze({
@@ -230,7 +242,8 @@ export class SystemRun {
     this.begun = false; this.evicted = false; this.frozen = null; this.reclaimed = false;
     this.maxFrames = ctx.maxFrames || 1500;
     this.handlers = new Map(); this.sePlayers = [null, null, null, null]; this.cry = null; this.messages = [];
-    this.plan = PLANS[id] || (id === 'battle' ? { main: [], warm: true, trainer: !!ctx.trainer } : null);
+    this.plan = withAbsent(PLANS[id] || (id === 'battle' ? { main: [], warm: true, trainer: !!ctx.trainer } : null), ctx.absent);
+    this.preKey = this.plan && this.plan.preKey ? id + this.plan.preKey : id;          // the battle-state cache keeps one 'b' snapshot per plan AND absent battler (the faint is part of that preparation)
     this.cryModel = ctx.cryModel || 'sample'; this.cryLatency = ctx.cryLatency === undefined ? 1 : ctx.cryLatency; this.seExtra = ctx.seExtra === undefined ? (this.plan ? 2 : 0) : ctx.seExtra;
     this.isSEPlayingFn = typeof ctx.isSEPlaying === 'function' ? ctx.isSEPlaying : null;
     this.keysFn = typeof ctx.keys === 'function' ? ctx.keys : (ctx.keys === null ? () => 0 : DEFAULT_KEYS);
@@ -441,7 +454,7 @@ export class SystemRun {
             const entry = this.animator.cache.get(this._fp);
             if (entry) {
               this.animator.cache.delete(this._fp); this.animator.cache.set(this._fp, entry);   // most recently used
-              const b = plan.pre ? entry.b.get(this.id) : null;
+              const b = plan.pre ? entry.b.get(this.preKey) : null;
               this.animator.cacheHits++;
               if (b) { this.restoreCached(b); this.cacheUsed = 'B'; this.prepPhase = 'finish'; } else { this.restoreCached(entry.a); this.cacheUsed = 'A'; this.prepPhase = plan.pre ? 'pre' : 'finish'; }
               if (plan.warm) { this.prepPhase = 'finish'; }
@@ -486,7 +499,7 @@ export class SystemRun {
             st.n++; eng.events.length = 0;
           }
           eng.events.length = 0;
-          if (this.cacheable) this.cachePut('b', this.id, this.captureCached());
+          if (this.cacheable) this.cachePut('b', this.preKey, this.captureCached());
           this.prepPhase = 'finish';
           break;
         }
