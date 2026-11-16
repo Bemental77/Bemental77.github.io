@@ -398,6 +398,37 @@ async function core(M, romBytes, opts = {}) {
     }
   }
   {
+    // the move menu opens on the move this Pokemon chose last turn (each Pokemon remembers its own); one that has not chosen yet starts on the first
+    const { ctl, A, B } = mkCtl(31, 0);
+    const text = M.BT.loadBattleText(romBytes, manifest);
+    const scene = M.SC.createScene({ ui, pack, text, ctl, viewSide: 0, env: 0, textSpeed: 'fast', meta: [A.meta, B.meta], trainer: 'CPU', playerName: 'You' });
+    ctl.start(); scene.begin();
+    const toMenu = () => { let g = 0; while (g++ < 60000 && scene.mode !== 'action' && !scene.ended && scene.mode !== 'party' && scene.mode !== 'result') { scene.tick(); if (scene.mode === 'steps' && scene.S.cur && scene.S.cur.t === 'text') scene.press('a'); } return scene.mode; };
+    t('move memory: the first turn reaches the action menu', toMenu() === 'action', scene.mode);
+    scene.press('a');
+    t('move memory: a Pokemon that has not chosen yet opens on the first move', scene.mode === 'moves' && scene.state().moveCursor === 0, scene.mode + ' ' + scene.state().moveCursor);
+    const rows = scene.S.req.moves, want = rows.length > 1 && !rows[1].disabled ? 1 : 0;
+    const who = ctl.view(0).you.active;
+    if (want === 1) scene.press('right');
+    scene.press('a');
+    const m2 = toMenu();
+    if (m2 === 'action' && ctl.view(0).you.active === who) {
+      t('move memory: the action menu carries the remembered move', scene.state().moveCursor === want, String(scene.state().moveCursor));
+      scene.press('a');
+      t('move memory: FIGHT on the next turn opens on the move chosen last turn', scene.mode === 'moves' && scene.state().moveCursor === want, scene.mode + ' ' + scene.state().moveCursor + ' want ' + want);
+      t('move memory: the test chose a move other than the first (so it is not vacuous)', want === 1, 'want ' + want);
+      scene.press('b');
+      // a different Pokemon starts on its own first move
+      scene.press('down'); scene.press('a');                                        // POKeMON
+      if (scene.mode === 'party') {
+        const p = scene.S.party; const k = p.mons.findIndex((m) => !m.fainted && !m.active);
+        if (k >= 0) { while (p.cursor !== k) scene.press(p.cursor < k ? 'down' : 'up'); scene.press('a'); }
+        const m3 = toMenu();
+        if (m3 === 'action' && ctl.view(0).you.active !== who) { scene.press('a'); t('move memory: a Pokemon switched in opens on ITS first move, not the other Pokemon\'s', scene.state().moveCursor === 0, String(scene.state().moveCursor)); }
+      }
+    } else t('move memory: seed 31 keeps the same Pokemon in after turn 1 (the test needs it)', false, m2);
+  }
+  {
     // menus, hit tests and pointer events on a fresh scene
     const { ctl, A, B } = mkCtl(30, 0);
     const text = M.BT.loadBattleText(romBytes, manifest);
@@ -674,6 +705,8 @@ if (process.env.ARENA_SKIP_MUTANTS !== '1') {
     ['scene.js', 'W1 A4: a tap beside an open menu does nothing', (s) => s.replace("return { kind: 'back', index: 0 };          // W1 fix A4: a tap beside an open menu", 'return null;          // W1 fix A4: a tap beside an open menu')],
     ['scene.js', 'W1 A5: the INFO target is not acted on', (s) => s.replace("case 'info': press('x'); break;", "case 'info': break;")],
     ['scene.js', 'W1 A4: a BACK target is not acted on', (s) => s.replace("case 'back': press('b'); break;", "case 'back': break;")],
+    ['scene.js', 'move memory: FIGHT always opens on the first move', (s) => s.replace("S.mode = 'moves'; S.moveCursor = rememberedMove();", "S.mode = 'moves'; S.moveCursor = 0;")],
+    ['scene.js', 'move memory: a chosen move is not remembered', (s) => s.replace('if (res && res.ok) S.lastMove.set(who, i);', 'void res; void who;')],
     ['battle_ui.js', 'W1 A4: ui.hitTest does not know the BACK target above the move menu', (s) => s.replace("return y < R.mv[0].y ? { kind: 'back', index: 0 } : null; }", 'return null; }')],
     ['scene.js', 'forfeit confirm defaults to YES',(s) => s.replace("S.confirm = { kind, cursor: 1, back: back || 'action' };", "S.confirm = { kind, cursor: 0, back: back || 'action' };")],
     ['matchctl.js', 'submit does not pump (CPU never answers)', (s) => s.replace("    announce(side, choice);\n    pump();\n    return r;", "    announce(side, choice);\n    return r;")],

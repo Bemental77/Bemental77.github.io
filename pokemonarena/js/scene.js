@@ -118,7 +118,7 @@ export function createScene(opts) {
     P: [freshPlan(), freshPlan()],       // the director's picture of each side AFTER every event queued so far
     lastBox: { mode: 'message', text: ['', ''] },
     weather: 0, trickRoom: false, terrain: 0, gravity: false,
-    cursor: 0, moveCursor: 0, partyCursor: 0, partyCancelSel: false,
+    cursor: 0, moveCursor: 0, partyCursor: 0, partyCancelSel: false, lastMove: new Map(),
     party: null, preview: null, result: null, overlay: null, confirm: null, menu: null, free: null,
     turn: 0, notes: { trap: ['', ''], disabled: ['', ''], lastItem: ['', ''], lastMove: ['', ''], gas: [false, false], hz: [new Set(), new Set()], ff: [false, false], pw: 0, stk: [0, 0] },
     ended: false, quit: false, hashLog: [],
@@ -1209,8 +1209,15 @@ export function createScene(opts) {
     });
   }
 
+  // The move menu opens on the move this Pokemon used last (each Pokemon remembers its own; a Pokemon that has not chosen a move yet starts on the first).
+  // Keyed by the battle-team slot of the Pokemon on the field, so switching out and back in keeps it.
+  const activeSlot = () => { try { const v = ctl.view(viewSide); return v && v.you ? v.you.active : -1; } catch (_e) { return -1; } };
+  function rememberedMove() {
+    const i = S.lastMove.get(activeSlot());
+    return Number.isInteger(i) && i >= 0 && i < moveRows().length ? i : 0;
+  }
   function enterAction(req) {
-    S.mode = 'action'; S.overlay = null; S.cursor = 0; S.moveCursor = 0; S.req = req;
+    S.mode = 'action'; S.overlay = null; S.cursor = 0; S.req = req; S.moveCursor = rememberedMove();
   }
   function enterParty(req, forced) {
     const mons = buildPartyMons(req);
@@ -1384,7 +1391,9 @@ export function createScene(opts) {
       flash(k ? msg(k, r) : rawMsg('sel.' + m.reason, 'That move cannot be used.'), 'moves');
       return;
     }
-    submit({ kind: 'move', slot: m.slot });
+    const who = activeSlot();
+    const res = submit({ kind: 'move', slot: m.slot });
+    if (res && res.ok) S.lastMove.set(who, i);
   }
 
   function chooseParty(i) {
@@ -1509,7 +1518,7 @@ export function createScene(opts) {
     const req = S.req;
     if (c === 0) {
       if (req && req.struggle) { submit({ kind: 'move', slot: req.moves[0].slot }); return; }
-      S.mode = 'moves'; S.moveCursor = 0;
+      S.mode = 'moves'; S.moveCursor = rememberedMove();
     } else if (c === 1) flash(msg('bag.no', roles(viewSide)), 'action');
     else if (c === 2) { enterParty(req, false); S.party.fromAction = true; }
     else openConfirm('forfeit');

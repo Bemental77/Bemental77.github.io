@@ -76,10 +76,8 @@ async function fillAndGo(page, { name, team = 'random', code = '', fmt }) {
     document.getElementById('olGo').click();
     return document.getElementById('olStatus').textContent; })()`);
 }
-async function approve(host, allow = true) {
-  await host.waitFor('document.getElementById("npApproveAllow")', { timeoutMs: 60000 });
-  await host.eval(`document.getElementById(${JSON.stringify(allow ? 'npApproveAllow' : 'npApproveDeny')}).click()`);
-}
+// a room lets the first player in by itself (there is no Allow prompt any more): nothing to press. Kept as a seam so a case can say where the old prompt was.
+async function approve(_host) { /* nothing to answer */ }
 // two tabs paired and past the handshake (or failed): returns the final phases
 async function pair(host, guest, room, o = {}) {
   await openRoom(host, room, 'host', o.hostExtra || '');
@@ -87,8 +85,7 @@ async function pair(host, guest, room, o = {}) {
   await fillAndGo(host, { name: o.hostName || 'Alice', team: o.hostTeam || 'random', code: o.hostCode, fmt: o.fmt || '3v3' });
   await host.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });      // the room is open: now a friend may knock
   await fillAndGo(guest, { name: o.guestName || 'Bob', team: o.guestTeam || 'random', code: o.guestCode });
-  if (o.deny) { await approve(host, false); return; }
-  await approve(host, true);
+  await approve(host);
   for (let i = 0; i < 120; i++) {
     const [a, b] = [await phase(host), await phase(guest)];
     if ((a === 'playing' || a === 'failed') && (b === 'playing' || b === 'failed')) return [a, b];
@@ -287,11 +284,9 @@ async function groupRejoin(S) {
     await host.waitFor('window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "ready" && window.__arenaBattle.resume', { timeoutMs: 90000 });
     const after = await host.eval('({ turn: window.__arenaBattle.ctl.turn, hash: window.__arenaBattle.ctl.battle.hash(), resumed: window.__arenaOnline.state.info.resumed })');
     ok(after.resumed === true && after.turn === before.turn && after.hash === before.hash, 'J11 the reloaded HOST is back in exactly the position it left', JSON.stringify([before, after]));
-    // the new host session knows nobody: the guest knocks again by itself and the host is asked once
-    await host.waitFor('document.getElementById("npApproveAllow")', { timeoutMs: 90000 });
-    ok(true, 'J12 the returning guest knocks by itself and the host is asked to allow it', '');
-    await host.eval('document.getElementById("npApproveAllow").click()');
-    await host.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 60000 });
+    // the new host session knows the player from the resume record: the guest knocks again by itself and is let back in with no prompt
+    await host.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 90000 });
+    ok(!(await host.eval('!!document.getElementById("npApprove")')), 'J12 the returning guest knocks by itself and the reloaded host lets them back in without asking anyone', '');
     await guest.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 60000 });
     const [a, b] = await finish(host, guest, 'J13');
     ok(host.errors.length === 0 && guest.errors.length === 0, 'J14 no page errors through the host reload', JSON.stringify(host.errors.concat(guest.errors)).slice(0, 200));
@@ -360,10 +355,9 @@ async function groupResume(S) {
     const after = resumed ? await host.eval('({ info: window.__arenaOnline.state.info, restored: window.__arenaBattle.resume.restored })') : null;
     ok(resumed && after.restored === true && after.info.resumed === true && matchIdOf(after.info) === id1, 'RS3 the reloaded HOST picks the match up (it did not start a new setup) and it is the same match: the same id as before the reload', J({ id1, after: after && matchIdOf(after.info), restored: after && after.restored }));
     if (!resumed) return;
-    const allowed = await host.waitFor('document.getElementById("npApproveAllow")', { timeoutMs: 90000 }).then(() => true, () => false);
-    ok(allowed, 'RS4 the returning guest knocks by itself and the host is asked once to allow it', '');
-    if (!allowed) return;
-    await host.eval('document.getElementById("npApproveAllow").click()');
+    const relinked = await host.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 90000 }).then(() => true, () => false);
+    ok(relinked && !(await host.eval('!!document.getElementById("npApprove")')), 'RS4 the returning guest knocks by itself and the reloaded host lets them back in (no prompt)', '');
+    if (!relinked) return;
     const linked = await Promise.all([host, guest].map((p) => p.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 60000 }).then(() => true, () => false)));
     ok(linked[0] && linked[1], 'RS5 both sides report the link up again', J(linked));
     if (!(linked[0] && linked[1])) return;
@@ -412,16 +406,71 @@ async function groupTimeout(S) {
   });
 }
 
+// EZ: the joining flow the player sees. Create a room from the plain Play online page, send the invite link, the friend opens it and presses ONE button; nobody presses Allow. Every step under way
+// is one card with numbered steps (#olSteps, the current one marked), one sentence and a way out (Cancel / Close the room).
+async function groupEasyJoin(S) {
+  ANIM = '&anim=0';
+  await withBrowser({ port: CDP0 + 12, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (host) => {
+    const guest = await host.openTab({ width: 390, height: 844 });
+    await host.navigate(BASE + '?online=1&net=local' + ANIM);
+    await host.waitFor('window.__arenaOnline && document.getElementById("olGo") && !document.getElementById("olGo").disabled && window.__arenaBattle && window.__arenaBattle.state === "online"', { timeoutMs: 90000 });
+    const v0 = await host.eval('({ go: document.getElementById("olGo").textContent, quick: document.getElementById("olQuick").textContent, cards: !document.getElementById("olCards").hidden, prog: !document.getElementById("olProgress").hidden })');
+    ok(v0.go === 'Create a room' && v0.quick === 'Find an opponent' && v0.cards && !v0.prog, 'EZ1 the Play online page offers Create a room and Find an opponent, and no progress card yet', J(v0));
+    // a bad code is refused on the spot, in words, without connecting anywhere
+    await host.eval('document.getElementById("olRoom").value = "zz"; document.getElementById("olJoin").click()');
+    await sleep(300);
+    const bad = await host.eval('({ st: document.getElementById("olStatus").textContent, stage: window.__arenaOnline.state.stage, sess: !!window.__arenaOnline.session() })');
+    ok(/not a room code/.test(bad.st) && bad.stage === 'setup' && !bad.sess, 'EZ2 a code that cannot be one is refused at once, with what a code looks like, and nothing connects', J(bad));
+    // a whole invite link pasted into the code box is read for its code
+    await host.eval('const r = document.getElementById("olRoom"); r.value = "https://caseybement.com/pokemonarena/battle.html?np=k7q2p&join=1"; r.dispatchEvent(new Event("input", { bubbles: true }))');
+    ok((await host.eval('document.getElementById("olRoom").value')) === 'K7Q2P', 'EZ3 an invite link pasted into the code box becomes its code', await host.eval('document.getElementById("olRoom").value'));
+    await host.eval('document.getElementById("olRoom").value = ""');
+    // Create a room: the code at once, big, with the invite link; steps say the room is open and the friend is next
+    await host.eval('document.getElementById("olGo").click()');
+    await host.waitFor('!document.getElementById("olCode").hidden', { timeoutMs: 30000 });
+    const v1 = await host.eval('({ code: document.getElementById("olCode").textContent.trim(), prog: !document.getElementById("olProgress").hidden, cards: !document.getElementById("olCards").hidden, at: document.getElementById("olSteps").dataset.at, steps: [...document.querySelectorAll("#olSteps li")].map((li) => li.className + ":" + li.textContent), cur: (document.querySelector("#olSteps [aria-current=step]") || {}).textContent, link: !!document.getElementById("olCopyLink") && document.getElementById("olCopyLink").offsetParent !== null, close: document.getElementById("olCancelAsk").textContent, closeShown: !document.getElementById("olCancelAsk").hidden, st: document.getElementById("olStatus").textContent })');
+    ok(v1.prog && !v1.cards && /^[A-Z0-9]{4,8}$/.test(v1.code) && v1.link, 'EZ4 Create a room replaces the form with one card: the room code and Copy invite link', J(v1));
+    ok(v1.at === '1' && v1.steps.length === 4 && /^done/.test(v1.steps[0]) && /Friend joins/.test(v1.cur || ''), 'EZ5 the steps show the room open (done) and "Friend joins" as the current step', J(v1.steps) + ' ' + v1.cur);
+    ok(/Waiting for your friend/.test(v1.st) && !/allow/i.test(v1.st), 'EZ6 the sentence says who is awaited and that nobody has to allow anything', v1.st);
+    ok(v1.closeShown && v1.close === 'Close the room', 'EZ7 a host can close a room nobody has come to', J(v1));
+    // Close the room: back to the form, nothing left open
+    await host.eval('document.getElementById("olCancelAsk").click()');
+    await sleep(400);
+    const v2 = await host.eval('({ stage: window.__arenaOnline.state.stage, sess: !!window.__arenaOnline.session(), cards: !document.getElementById("olCards").hidden, code: !document.getElementById("olCode").hidden, st: document.getElementById("olStatus").textContent, search: location.search })');
+    ok(v2.stage === 'setup' && !v2.sess && v2.cards && !v2.code && /Room closed/.test(v2.st) && /online=1/.test(v2.search), 'EZ8 Close the room goes back to the Play online page with no session left and says so', J(v2));
+    // a fresh room for the real join (a NEW code: the closed one is not reused)
+    await host.eval('document.getElementById("olGo").click()');
+    await host.waitFor('!document.getElementById("olCode").hidden', { timeoutMs: 30000 });
+    const code = (await host.eval('document.getElementById("olCode").textContent')).trim();
+    ok(code !== v1.code, 'EZ9 a room created after closing one gets a new code', code + ' vs ' + v1.code);
+    // the friend opens the invite link: one page, one button
+    const link = await host.eval('window.__arenaOnline.state.transport') === 'local' ? BASE + '?np=' + code + '&join=1&net=local' + ANIM : null;
+    await guest.navigate(link);
+    await guest.waitFor('window.__arenaOnline && document.getElementById("olGo") && !document.getElementById("olGo").disabled && window.__arenaBattle && window.__arenaBattle.state === "online"', { timeoutMs: 90000 });
+    const g0 = await guest.eval('({ title: document.getElementById("olTitle").textContent, go: document.getElementById("olGo").textContent, cards: !document.getElementById("olCards").hidden, fmt: !document.getElementById("olFmt").closest("label").hidden })');
+    ok(g0.title === 'Join room ' + code && g0.go === 'Join the battle' && !g0.cards && !g0.fmt, 'EZ10 the invite link opens a page that names the room and has one button, Join the battle (no format, no other choices)', J(g0));
+    await shot(guest, 'EZ_invite');
+    await guest.eval('document.getElementById("olGo").click()');
+    const r = await bothPlaying(host, guest, 60000, host);
+    ok(r.phases[0] === 'playing' && r.phases[1] === 'playing' && !r.prompted, 'EZ11 one press and both are in the battle; the host never saw an Allow prompt', J(r));
+    ok(host.errors.length === 0 && guest.errors.length === 0, 'EZ12 no page errors', J(host.errors.concat(guest.errors)).slice(0, 200));
+  });
+}
+
 async function groupRefusals(S) {
   await withBrowser({ port: CDP0 + 4, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (host) => {
     const guest = await host.openTab({ width: 900, height: 760 });
-    // the host says no
-    await pair(host, guest, 'ADENY', { deny: true });
-    await guest.waitFor('document.getElementById("olStatus").textContent.length > 0 && !document.getElementById("olGo").disabled', { timeoutMs: 30000 }).catch(() => {});
-    const st = await guest.eval('document.getElementById("olStatus").textContent');
-    ok(/did not let you in|declin|denied/i.test(st), 'R1 a joiner who is refused is told so', st);
-    ok(await guest.eval('!document.getElementById("olGo").disabled'), 'R2 and can try again', '');
-    await shot(guest, 'R_denied');
+    // a room lets the first player in by itself and nobody is asked; a THIRD player with the same code is told the room is taken, and can try again
+    const ph = await pair(host, guest, 'ADENY');
+    ok(ph && ph[0] === 'playing' && ph[1] === 'playing' && !(await host.eval('!!document.getElementById("npApprove")')), 'R0 the host was never asked to press Allow: the code is the key', J(ph));
+    const third = await host.openTab({ width: 900, height: 760 });
+    await openRoom(third, 'ADENY', 'guest');
+    await fillAndGo(third, { name: 'Cat' });
+    await third.waitFor('document.getElementById("olStatus").textContent.length > 0 && !document.getElementById("olGo").disabled && window.__arenaOnline.state.stage === "setup"', { timeoutMs: 60000 }).catch(() => {});
+    const st = await third.eval('document.getElementById("olStatus").textContent');
+    ok(/already has two players|did not let you in|taken/i.test(st), 'R1 a third player with the code is told the room is taken', st);
+    ok(await third.eval('!document.getElementById("olGo").disabled'), 'R2 and can try again', '');
+    await shot(third, 'R_denied');
   });
   await withBrowser({ port: CDP0 + 5, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (host) => {
     // bad inputs never reach the network
@@ -676,7 +725,7 @@ async function openPanel(page, extra = '') {
 // (the name is set the way a player sets it: the page hears an `input` event, which is what makes it THEIR name - one the panel remembers - rather than one it filled in itself)
 const setForm = (page, { name, fmt, pub = false, role }) => page.eval('(() => {' +
   'document.getElementById("olName").value = ' + JSON.stringify(name) + '; document.getElementById("olName").dispatchEvent(new Event("input", { bubbles: true }));' +
-  (role ? 'document.getElementById(' + JSON.stringify(role === 'host' ? 'olHost' : 'olJoin') + ').click();' : '') +
+  (void role, '') +          // (role: 'host' is the default of the Play online page now: #olGo is Create a room)
   (fmt ? 'document.getElementById("olFmt").value = ' + JSON.stringify(fmt) + ';' : '') +
   (pub ? 'if (document.getElementById("olPublic").getAttribute("aria-pressed") !== "true") document.getElementById("olPublic").click();' : '') +
   'return true; })()');
@@ -715,7 +764,7 @@ async function groupOpen(S) {
     const guest = await host.openTab({ width: 900, height: 760 });
     await openPanel(host, '&openquick=500&openjoin=6000'); await openPanel(guest, '&openquick=500&openjoin=6000');
     const vis = await host.eval('({ board: !document.getElementById("olOpen").hidden, pubBox: !document.getElementById("olPublicBox").hidden, roomField: !document.getElementById("olRoom").closest("label").hidden, quick: !document.getElementById("olQuick").hidden })');
-    ok(vis.board && vis.pubBox && !vis.roomField && vis.quick, 'O1 the setup panel shows the board, Find a battle and the Open-to-anyone switch (the code field only for Join)', J(vis));
+    ok(vis.board && vis.pubBox && vis.roomField && vis.quick, 'O1 the Play online page shows the board, Find an opponent, the list-it switch and the code box for a friend\'s code', J(vis));
     ok((await board(guest)).length === 0 && /Nobody is waiting/.test(await boardNote(guest)), 'O2 with nobody listed the board says so, and what to do', await boardNote(guest));
     await setForm(host, { name: 'Alice', fmt: '3v3', pub: true, role: 'host' });
     ok((await host.eval('document.getElementById("olPublic").getAttribute("aria-pressed")')) === 'true' && /On:/.test(await host.eval('document.getElementById("olPublicNote").textContent')), 'O3 the switch says what On means', '');
@@ -834,7 +883,7 @@ async function groupOpen(S) {
     await a.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
     await sleep(1800);
     ok((await board(b)).length === 0 && (await a.eval('window.__arenaOnline.lobbies()')) === null, 'OL2 a private game is never listed (and opens no connection to the board)', J(await board(b)));
-    ok(/allow/i.test(await statusText(a)), 'OL3 and still waits for the host to press Allow', await statusText(a));
+    ok(/Waiting for your friend/.test(await statusText(a)) && !/allow/i.test(await statusText(a)), 'OL3 and waits for the friend (nobody has to press Allow)', await statusText(a));
     await b.navigate(BASE + '?np=ABCDE&host=1&net=local' + ANIM);
     await b.waitFor('window.__arenaOnline && document.getElementById("olGo") && !document.getElementById("olGo").disabled', { timeoutMs: 60000 });
     const hv = await b.eval('({ board: !document.getElementById("olOpen").hidden, pub: !document.getElementById("olPublicBox").hidden })');
@@ -1212,7 +1261,7 @@ async function opCancel(c) {
     await a.send('Page.reload', { ignoreCache: false });
     await a.waitFor(UX_READY + ' && !document.getElementById("olQuick").disabled', { timeoutMs: 90000 });
     const reloaded = await a.eval('({ board: !document.getElementById("olOpen").hidden, room: document.getElementById("olRoom").value, roomField: !document.getElementById("olRoom").closest("label").hidden, stage: window.__arenaOnline.state.stage, role: window.__arenaOnline.state.role })');
-    ok(reloaded.board === true && reloaded.room === '' && reloaded.roomField === false && reloaded.stage === 'setup' && reloaded.role !== 'guest', 'OP4b a reload after Cancel is the Play online page with the Open games board (not the join-by-code form with the cancelled room filled in)', J(reloaded));
+    ok(reloaded.board === true && reloaded.room === '' && reloaded.roomField === true && reloaded.stage === 'setup' && reloaded.role !== 'guest', 'OP4b a reload after Cancel is the Play online page with the Open games board (not the join-by-code form with the cancelled room filled in)', J(reloaded));
     // a game that never answers is given up on after the wait: the address comes back the same way
     await a.waitFor('document.querySelector(\'#olOpenList li[data-room="AGHOP"]\')', { timeoutMs: 10000 });
     await clickJoin(a, 'AGHOP');
@@ -1236,7 +1285,7 @@ const OP_SESSIONS = { forger: opForger, joining: opJoining, readmit: opReadmit, 
 // every defect below must fail the NAMED case; the session that holds it is run against a copy of the game with only that defect in it
 const OPEN_MUTANTS = [
   { id: 'P01', what: 'a failed defection is remembered by room code only (no cooldown for every rival)', file: 'js/online.js', from: 'if (state.defecting) lobbies.muteRivals(DEFECT_MUTE_MS);', to: '', run: 'forger', fails: 'OP1' },
-  { id: 'P02', what: 'the host of an open game that let somebody in is not told a player is joining', file: 'js/online.js', from: "if (first && state.open && !state.nm) { openText = ''; say('A player is joining your game. It is off the list of open games while they connect.'); }", to: '', run: 'joining', fails: 'OP2' },
+  { id: 'P02', what: 'the host of an open game that let somebody in is not told a player is joining', file: 'js/online.js', from: "say(state.open ? 'A player is joining your game. It is off the list of open games while they connect.' : ", to: "say(state.open ? '' : ", run: 'joining', fails: 'OP2' },
   { id: 'P03', what: 'a player who knocks again (peer-reloaded) releases the seat and relists the game at once', file: 'js/online.js', from: 'if (e && REKNOCK.includes(e.why)) { holdAdmission(state.session); return; }', to: '', run: 'joining', fails: 'OP2b' },
   { id: 'P04', what: 'the seat held for a player who knocked again is never given up', file: 'js/online.js', from: 'if (links > 0) holdAdmission(session); else releaseAdmission();', to: 'holdAdmission(session);', run: 'joining', fails: 'OP2e' },
   { id: 'P05', what: 'a seat that is given up lists the game again but keeps saying a player is joining', file: 'js/online.js', from: 'try { listGame(state.room); const n = openNote(state.room); openText = n.text; say(n.text, n.bad); }', to: 'try { listGame(state.room); }', run: 'joining', fails: 'OP2c' },
@@ -1369,10 +1418,8 @@ async function groupPresence(S) {
     if (!resumed) return;
     const back = await hub.eval('({ room: window.__arenaOnline.state.room, role: window.__arenaOnline.state.role, resumed: window.__arenaOnline.state.info.resumed, restored: window.__arenaBattle.resume.restored })');
     ok(back.resumed === true && back.restored === true && back.room === room && back.role === 'host', 'PB12 reloading the accepted-challenge page resumes the battle in the SAME room', J(back));
-    await hub.waitFor('document.getElementById("npApproveAllow")', { timeoutMs: 90000 });
-    await hub.eval('document.getElementById("npApproveAllow").click()');
-    await hub.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 60000 }); await ch.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 60000 });
-    ok((await spied(spy)).filter((m) => m && m.k === 'acc').length === accsBefore, 'PB13 the reloaded host is an ordinary host (asked once to allow the returning player), the link is back up, and no second room was announced', '');
+    await hub.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 90000 }); await ch.waitFor('window.__arenaOnline.nm().status().link === "up"', { timeoutMs: 60000 });
+    ok((await spied(spy)).filter((m) => m && m.k === 'acc').length === accsBefore, 'PB13 the reloaded host is an ordinary host (it lets the returning player back in by itself), the link is back up, and no second room was announced', '');
     // the Accept address is not a standing command: opened again (Back, a restored tab, a pasted link) it has no token left and hosts nothing
     await hub.navigate(u.href);
     await hub.waitFor('window.__arenaOnline && document.getElementById("olGo") && window.__arenaBattle && window.__arenaBattle.state === "online" && (!document.getElementById("olOpen").hidden || !document.getElementById("olCode").hidden || window.__arenaOnline.state.stage !== "setup")', { timeoutMs: 90000 });       // (settled, one way or the other: a page that hosted a game for the address must fail PB14, not time out)
@@ -2863,8 +2910,8 @@ const UX_MUTANTS = [
   { id: 'X01', what: 'Join (from the list) can be entered twice', file: 'js/online.js', from: 'const joinListed = exclusive(async function joinListed(g) {', to: 'const joinListed = (async function joinListed(g) {', run: 'join', fails: 'OXR1' },
   { id: 'X02', what: 'Find a battle can be entered while another way in is still reading the team', file: 'js/online.js', from: 'const quick = exclusive(async function quick() {', to: 'const quick = (async function quick() {', run: 'quick', fails: 'OXR2' },
   { id: 'X03', what: 'Challenge can be entered twice', file: 'js/online.js', from: 'const challengeResident = exclusive(async function challengeResident(g) {', to: 'const challengeResident = (async function challengeResident(g) {', run: 'challenge', fails: 'OXR3' },
-  { id: 'X04', what: 'a join shows no Cancel', file: 'js/online.js', from: "ui.cancelAsk.hidden = role !== 'guest'; ui.cancelAsk.disabled = false;", to: 'ui.cancelAsk.hidden = true; ui.cancelAsk.disabled = false;', run: 'cancel', fails: 'OXC1' },
-  { id: 'X05', what: 'Cancel does nothing for a join', file: 'js/online.js', from: "if (state.stage === 'waiting' && state.role === 'guest' && !state.nm && state.session && !closed) { reopenSetup(); say('Cancelled.'); }", to: "if (false) { reopenSetup(); say('Cancelled.'); }", run: 'cancel', fails: 'OXC2' },
+  { id: 'X04', what: 'a join shows no Cancel', file: 'js/online.js', from: "    ui.cancelAsk.hidden = false; ui.cancelAsk.disabled = false;\n    ui.cancelAsk.textContent = role === 'host'", to: "    ui.cancelAsk.hidden = true; ui.cancelAsk.disabled = false;\n    ui.cancelAsk.textContent = role === 'host'", run: 'cancel', fails: 'OXC1' },
+  { id: 'X05', what: 'Cancel does nothing for a join', file: 'js/online.js', from: "if (state.stage === 'waiting' && state.role === 'guest' && !state.nm && state.session && !closed) { reopenSetup(); say('Cancelled.'); return; }", to: "if (false) { reopenSetup(); say('Cancelled.'); return; }", run: 'cancel', fails: 'OXC2' },
   { id: 'X06', what: 'the list is rebuilt from nothing at every change', file: 'js/online.js', from: 'const list = ui.openList, have = new Map(), want = new Set(shown.map((g) => g.room));', to: 'const list = ui.openList, have = new Map(), want = new Set(shown.map((g) => g.room)); list.replaceChildren();', run: 'focus', fails: 'OXF1' },
   { id: 'X07', what: 'a focused row that leaves drops the focus to the body', file: 'js/online.js', from: "if (heir) { const t = heir === ui.quick ? heir : heir.querySelector('button'); if (t && !t.disabled) t.focus(); }", to: '', run: 'focus', fails: 'OXF2' },
   { id: 'X08', what: 'games on another build are counted only when the list is empty', file: 'js/online.js', from: "' waiting for an opponent.' + hiddenNote", to: "' waiting for an opponent.'", run: 'focus', fails: 'OXF3' },
@@ -2875,12 +2922,12 @@ const UX_MUTANTS = [
   { id: 'X13', what: 'the pre-selected team\'s owner does not name the player', file: 'js/online.js', from: 'ui.team.value = choices[0].key;\n    nameFollowsTeam();', to: 'ui.team.value = choices[0].key;', run: 'names', fails: 'OXN4' },
   { id: 'X14', what: 'a challenge from the panel carries the previous attempt\'s record (state.rec), not this one\'s', file: 'js/online.js', from: 'rec: p.rec || null, now, timing', to: 'rec: state.rec || null, now, timing', run: 'rec', fails: 'OXP1' },
   { id: 'X15', what: 'a random team reads the active profile\'s record (and opens the store for it)', file: 'js/online.js', from: 'profileId: choice.profileId || null, rec: tc.rec || null };', to: 'profileId: choice.profileId || null, rec: tc.rec || (await (async () => { const s = await openStore(); try { return await onlineRecOf(s, await s.getActiveId()); } finally { await s.close(); } })()) };', run: 'rec', fails: 'OXI1' },
-  { id: 'X16', what: 'the match record keeps no profile', file: 'js/online.js', from: 'myName: state.name, profileId: state.profileId || null, at: Date.now()', to: 'myName: state.name, at: Date.now()', run: 'resume', fails: 'OXM1' },
+  { id: 'X16', what: 'the match record keeps no profile', file: 'js/online.js', from: 'myName: state.name, profileId: state.profileId || null, admittedId:', to: 'myName: state.name, admittedId:', run: 'resume', fails: 'OXM1' },
   { id: 'X17', what: 'a resumed page forgets the profile it read', file: 'js/online.js', from: 'state.profileId = isId(rec.profileId) ? rec.profileId : null;', to: 'state.profileId = null;', run: 'resume', fails: 'OXM1' },
   { id: 'X18', what: 'a resume that is given up builds the setup form twice', file: 'js/online.js', from: "{ await resumeFlow(rec); return; }", to: '{ if (await resumeFlow(rec)) return; }', run: 'giveup', fails: 'OXG1' },
   { id: 'X19', what: 'the panel says only choices travel, straight to the friend', file: 'js/online.js', from: 'Your teams stay in your browser until a battle starts; then the team you play and your choices go to the other player, directly when your browsers can reach each other and through a public relay when they cannot.', to: 'Your teams stay in your browser; only your choices travel, straight to your friend.', run: 'text', fails: 'OXT1' },
-  { id: 'X20', what: 'the Open games list says nothing about the public servers', file: 'js/online.js', from: 'el(doc, \'h3\', { id: \'olOpenTitle\', text: \'Open games\' }), ui.openPrivacy, ui.openNote', to: 'el(doc, \'h3\', { id: \'olOpenTitle\', text: \'Open games\' }), ui.openNote', run: 'text', fails: 'OXT2' },
-  { id: 'X21', what: 'the Open-to-anyone text names the trainer name but not the record', file: 'js/online.js', from: 'with your trainer name and your online record (wins and losses, if you have one), readable by anyone; and', to: 'with your trainer name, readable by anyone; and', run: 'text', fails: 'OXT3b' },
+  { id: 'X20', what: 'the Play online page says nothing about the public servers', file: 'js/online.js', from: "ui.privacy = el(doc, 'div', { class: 'olfoot', id: 'olPrivacy' }, ui.openPrivacy);", to: "ui.privacy = el(doc, 'div', { class: 'olfoot', id: 'olPrivacy' });", run: 'text', fails: 'OXT2' },
+  { id: 'X21', what: 'the Open-to-anyone text names the trainer name but not the record', file: 'js/online.js', from: 'with your trainer name and your online record (wins and losses, if you have one), readable by anyone, and anyone', to: 'with your trainer name, readable by anyone, and anyone', run: 'text', fails: 'OXT3b' },
   { id: 'X22', what: 'the hub\'s switch title names only the trainer name', file: 'index.html', from: 'list your trainer name and online record on public servers', to: 'list your trainer name on public servers', run: 'text', fails: 'OXT4' },
 ];
 const UX_SESSIONS = { join: uxJoin, quick: uxQuick, challenge: uxChallenge, cancel: uxCancel, focus: uxFocus, relist: uxRelist, names: uxNames, rec: uxRec, resume: uxResume, giveup: uxGiveUp, text: uxText };
@@ -2946,7 +2993,7 @@ const started = await startServer();
 const S = await loadStack();
 const t0 = Date.now();
 checkCaseIds();
-const groups = { profile: groupProfile, hub: groupHub, lobby: groupLobby, match: groupMatch, leaving: groupLeaving, rejoin: groupRejoin, resume: groupResume, timeout: groupTimeout, refusals: groupRefusals, teams: groupTeams, lead: groupLead, layout: groupLayout, open: async (S) => { if (!process.env.ARENA_OP) await groupOpen(S); await groupOpenSessions(S); }, openlayout: groupOpenLayout, presence: groupPresence, presenceui: groupPresenceUi, onlineux: groupOnlineUx };
+const groups = { profile: groupProfile, hub: groupHub, lobby: groupLobby, match: groupMatch, leaving: groupLeaving, rejoin: groupRejoin, resume: groupResume, timeout: groupTimeout, easyjoin: groupEasyJoin, refusals: groupRefusals, teams: groupTeams, lead: groupLead, layout: groupLayout, open: async (S) => { if (!process.env.ARENA_OP) await groupOpen(S); await groupOpenSessions(S); }, openlayout: groupOpenLayout, presence: groupPresence, presenceui: groupPresenceUi, onlineux: groupOnlineUx };
 let crashed = null;
 try {
   for (const [name, fn] of Object.entries(groups)) {
