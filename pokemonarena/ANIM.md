@@ -9,6 +9,43 @@ map / DMA / open bus), `js/anim_ppu.js` (OBJ / BG / blend / window renderer), `j
 estimates from the ROM's own song / cry tables), `js/anim_coverage.json` + `js/anim.golden.json` (statuses / hashes only), tools `tools/pokemonarena_anim_*.mjs`
 (`_oracle_batch / _compare / _scenarios / _probe / _stat / _diag`, `_readset`, `_coverage`, `_sheet`, `_test / _cpu_test / _ppu_test / _compare_test`, round 6: `_field_compare`).
 
+## Round 10 -- a fainted Pokemon stood on the field again: the OTHER side's send-out / recall / faint drew it (`ctx.absent`)
+
+**The report (the player):** "Still seeing bugs of when a pokemon faints, it shows while the trainers next pokemon is being chosen."
+
+**Reproduced, not guessed.** Headless Chrome, the real battle page with animations on (`battle.html?seed=3&format=3v3&cpu=normal&anim=1`, the engine AI on the human seat, YES at the free-switch offer), every `putImageData` frame recorded from
+each faint to the end of the replacement's send-out (contact sheets). The foe's Manectric faints and is gone (frames 3640-3658); the player answers YES; on the FIRST frame of the player's recall (3664) Manectric is back on its spot
+with its healthbox and an empty bar, and it stays there through the whole recall and the whole send-out of the player's Leavanny (3664-3850), until the foe's own send-out replaces it (3856). The same in Node with the real ROM
+animator over 12 battles without the free switch: a DOUBLE FAINT (seeds 8 and 10: the foe faints, then the player's Pokemon, from Future Sight; the player's faint and the player's replacement are drawn beside the dead Darmanitan,
+0 HP), a Volt Switch that knocks the foe out (seed 11: move 521, then the engine's `pivot` event; the player's recall and send-out beside the dead foe), and the foe's faint after the player's (seed 5: drawn beside the dead player Pokemon). Between the runs the
+scene's own frames were right (a finished faint hides both the sprite and the healthbox, `monView`); only the system runs were wrong.
+
+**Cause.** A system run (ids 2-9) is the ROM's battle set up from BOTH parties up to the action selection (`battle_sys.js`, `hidden` phase), then the plan's controller command. Nothing told it that one of the two Pokemon had
+already fainted, so it stood there, drawn by the ROM, for the length of any run of the OTHER side (`scene.js eventCtx` built `ctx.foe` / `ctx.player` from the display, which still holds the fainted Pokemon with `visible` and
+`showBox` false). Before the free switch (Round 9) this needed a double faint or a knock-out by a pivoting move; a YES to "Will you switch your Pokemon?" makes it happen every time, which is why it was noticed now. Round 7b's
+measurement ("a send-out never shows the side that sends out") is still true; this is the other side.
+
+**The fix.**
+- `battle_sys.js`: `ctx.absent = ['foe' | 'player']` names a side whose Pokemon has fainted and is not replaced. The preparation then plays that battler's own faint (`CMD.faintAnimation`, the controller command the real game ran: it slides the
+  sprite away, destroys it and hides the healthbox) hidden, before the plan's own preparation (`withAbsent`); the event's own battler is never made absent. The battle-state cache keeps the `b` snapshot per plan and absent side
+  (`preKey`, e.g. `3:absent1`). A ctx without `absent` is the plan of before (same cache key, same frames: every golden is unchanged).
+- `scene.js`: `eventCtx` sets `ctx.absent` for the OTHER side when it is down: projected (`projectStep` now marks a faint queued ahead as `down`, so an effect prepared before the faint has played is right the first time) or on
+  screen now (`downNow`: `visible` and `showBox` both false; only a finished faint does that, a hit blink and a ball release hide the sprite only). `ctxSig` covers `absent`, so the re-check at start catches a side that went down
+  unforeseen (noted as `system 3 stale: absent []->["foe"]`).
+
+**After.** The same Chrome battle: Manectric sinks (3547-3595) and the recall, the send-out of Leavanny and the foe's send-out play on an empty foe spot (3607-3871); `animInfo().log` empty, `restale` 0, in both battles recorded
+(seeds 3 and 8). With the ROM engine every one of the seven runs a fainted Pokemon can sit beside (ids 2, 3, 4, 5, 6, 8, 9) is identical in every frame for any species or HP of the absent side and as long as without it (150, 53,
+26, 29, 42, 185, 53 frames). Cost: the hidden faint adds instructions to a cold preparation (id 2: 3,709,113 -> 3,789,664; id 3: 3,655,401 -> 4,536,029) and nothing once its snapshot is cached; on the test's deterministic clock
+(1 ms per 1000 instructions) that is a hold of up to ~38 ticks before the first such run of a battle (Node seed 8). In the two Chrome battles the ticks waited did not grow (651 -> 601, 80 -> 60; real clock, not a matched pair).
+
+**Proof (`tools/pokemonarena_anim_scene_test.mjs`).** Group `system/absent` (stub animator): 4 hand-built cases (free switch YES, double faint both ways, a control switch with nobody fainted): every run names absent exactly the side
+the screen shows down when it begins, and none was prepared again; a side that goes down while a recall waits prepared (tampered) is caught at start; live battles with YES at every offer: 232 runs, 39 of them beside a fainted
+Pokemon (16 YES answers, 3 double faints), all right, 0 re-prepared, nothing logged. `4. draws` (ROM engine): the seven rows above plus "absent naming the event's own side is ignored". On the origin/prod scene and battle_sys (`ARENA_JS=` a copy)
+the test fails 12 checks (the 4 group checks, the 7 draws rows, and the real-tree summary) and nothing else. Three new mutants are listed (absent never set; a faint ahead not projected; the re-check blind to absent). The first is the origin/prod scene behaviour, which fails the 4 group checks above. The full mutant pass was NOT completed for this round (the run was stopped by the machine for low memory), so the other two are unverified.
+
+**Not covered.** An online match (`net=local`) was not recorded in a browser; it builds its runs through the same `eventCtx`. The ROM's frames with `absent` were not compared with the real game's (mGBA) frames of a double faint.
+Seen while recording and not touched: during the foe's send-out (id 8) of Chrome seed 3 the field is a different terrain (orange stripes) from the rest of the battle (the trainer's own background?), before and after this change alike.
+
 ## Round 9 -- the free switch ("Will you switch your Pokemon?") adds no event and no prepared effect
 
 The question is a REQUEST of the engine (`{ phase 'switch', reason 'free', next }`), asked by the scene from `idle()`, after everything the events queued has played: no event code is new (`EVENT_CODES` is unchanged), the director queues nothing for it, and `prepareSys` has nothing to prepare, so the stale-picture rules of Round 7 / 7b have nothing to say about the question itself. What follows an answer is ordinary: a YES gives `switch-out` / `switch-in` of the player's Pokemon and then the foe's `switch-in` (a recall, a send-out and a send-out), which are prepared and projected like any other switch. **Checked** by `tools/pokemonarena_anim_scene_test.mjs` (group `system/free-switch`): battles in which the player answers YES or NO at every offer, with the stub animator, and the same with the UI-driven answers, each recall / send-out / hit / faint run begins with the Pokemon the screen shows (0 prepared again), the log of animation problems is empty. Under BATTLE STYLE: SET the scene answers `stay` the moment the choice that opened the offer has gone in (`autoStay`, called from `submit` and `idle` before the events are read), so the replacement's send-out arrives in the same batch as ever: the frames of a battle on SET are the frames of the battle before the feature (`pokemonarena_switch_test.mjs`, 6 battles compared frame by frame, events too). Had the answer been left to `idle()` the replacement's events would have arrived a batch later (2 to 4 frames, and the foe's send-out effect would not be prepared during the faint).

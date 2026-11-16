@@ -306,7 +306,8 @@ async function findSeeds(M, pred, n, max = 80) { const out = []; for (let sd = S
 /* ================================================================================================ the checks */
 async function core(M, opts = {}) {
   const f = [];
-  const t = (name, cond, detail) => { nChecks++; if (cond !== true) f.push(name + (detail ? ' [' + String(detail).slice(0, 110) + ']' : '')); };
+  const t = (name, cond, detail) => { nChecks++; if (cond !== true) f.push(name + (detail ? ' [' + String(detail).slice(0, 110) + ']' : '')); else if (process.env.ARENA_VERBOSE && !opts.fast) console.log('ok   core:', name.slice(0, 260), detail ? ':: ' + String(detail).slice(0, 140) : ''); };
+  const J = (x) => JSON.stringify(x);
   const quick = !!opts.fast;
   const seeds = quick ? SEL.move.slice(0, 1) : SEL.move;
 
@@ -683,7 +684,7 @@ async function core(M, opts = {}) {
         let sceneRef = null;
         const mon = (d) => (d ? { species: d.species, level: d.level, hp: d.hp, maxHp: d.maxHp } : null);
         const prep = st.prepare.bind(st);
-        st.prepare = (kind, id, ctx) => { const h = prep(kind, id, ctx); if (kind === 'system' && id >= 2 && id <= 9 && h && typeof h.begin === 'function') { const b = h.begin; h.begin = function () { const d = sceneRef.S.disp; runs.push({ id, ctx, disp: [mon(d[0]), mon(d[1])] }); return b.apply(this, arguments); }; } return h; };
+        st.prepare = (kind, id, ctx) => { const h = prep(kind, id, ctx); if (kind === 'system' && id >= 2 && id <= 9 && h && typeof h.begin === 'function') { const b = h.begin; h.begin = function () { const d = sceneRef.S.disp; runs.push({ id, ctx, disp: [mon(d[0]), mon(d[1])], down: [0, 1].map((s) => !!d[s] && d[s].visible === false && d[s].showBox === false) }); return b.apply(this, arguments); }; } return h; };
         const b = makeBattle(M, { seed: o.seed || 1, cfg: mkCfg(onSys), animator: st });
         const scene = sceneRef = b.scene, auto = scene.S.auto, decide = auto.decide;
         auto.decide = (req) => (req.phase === 'move' ? null : decide(req));                 // the preview is answered as always, the first action menu is left alone
@@ -749,6 +750,60 @@ async function core(M, opts = {}) {
         if (!ok1) tbad.push(name + ' -- restale ' + (r ? r.restale : '-') + ' wanted ' + want + (run ? ', ctx ' + JSON.stringify([run.ctx.player.hp, run.ctx.foe.hp]) + ' screen ' + JSON.stringify(run.disp.map((m) => m && m.hp)) : ', no run') + (moved ? '' : ', nothing moved'));
       }
       t('system/stale: a change nobody foresaw while a SEND-OUT / RECALL waits prepared is caught when it starts (prepared again, begins with what is on screen), a change to the Pokemon being replaced is not (no frame shows it), and nothing moves the count by itself' + (tbad.length ? ' -- ' + tbad[0] : ''), tbad.length === 0, tbad.join(' | ') || trows.join('; '));
+      // round 10: A FAINTED POKEMON THAT IS NOT REPLACED YET IS NOT ON THE FIELD. Reported: "when a pokemon faints, it shows while the trainer's next pokemon is being chosen" (reproduced in Chrome, ANIM.md "Round 10": after
+      // YES to "Will you switch your Pokemon?" the player's recall and send-out were drawn with the fainted foe standing on its spot with an empty healthbox; the same in a double faint). The run of the OTHER side's
+      // event must name that side in ctx.absent (battle_sys.js then plays its faint, hidden, in the preparation). Hand-built, prepared ahead of the faint (so the projection must know), checked at begin.
+      // [name, steps, { id: absent wanted }]
+      const AB = [
+        ['free switch YES: the foe faints, then the player\'s recall + send-out, then the foe\'s send-out', (x) => [{ t: 'drain', side: 1, to: 0 }, { t: 'faint', side: 1 }, { t: 'slideout', side: 0 }, { t: 'slidein', side: 0, mon: x.newPlayer }, { t: 'slidein', side: 1, mon: x.newFoe }], { 3: ['foe'], 2: ['foe'], 8: null }],
+        ['double faint: the foe faints, the player faints, the player\'s replacement, the foe\'s replacement', (x) => [{ t: 'drain', side: 1, to: 0 }, { t: 'faint', side: 1 }, { t: 'drain', side: 0, to: 0 }, { t: 'faint', side: 0 }, { t: 'slidein', side: 0, mon: x.newPlayer }, { t: 'slidein', side: 1, mon: x.newFoe }], { 4: ['foe'], 2: ['foe'], 8: null }],
+        ['double faint the other way: the player faints, the foe faints, the player\'s replacement, the foe\'s replacement', (x) => [{ t: 'drain', side: 0, to: 0 }, { t: 'faint', side: 0 }, { t: 'drain', side: 1, to: 0 }, { t: 'faint', side: 1 }, { t: 'slidein', side: 0, mon: x.newPlayer }, { t: 'slidein', side: 1, mon: x.newFoe }], { 5: ['player'], 2: ['foe'], 8: null }],
+        ['control: a switch with nobody fainted', (x) => [{ t: 'slideout', side: 0 }, { t: 'slidein', side: 0, mon: x.newPlayer }, { t: 'pause', n: 10 }, { t: 'slideout', side: 1 }, { t: 'slidein', side: 1, mon: x.newFoe }], { 3: null, 2: null, 9: null, 8: null }],
+      ];
+      const abad = [], arows = []; let aredone = 0;
+      for (const [name, build, want] of AB) {
+        const r = await hand(build);
+        const ids = Object.keys(want).map(Number);
+        const got = r ? ids.map((id) => r.runs.find((q) => q.id === id)) : [];
+        // every run begins with ctx.absent naming exactly the side the screen shows fainted and not replaced (never the run's own side), as the case expects
+        const fine = !!r && got.every(Boolean) && ids.every((id, i) => { const run = got[i], own = [2, 3, 4, 6].includes(id) ? 0 : 1, oth = own ^ 1, shown = run.down[oth] ? [oth === 0 ? 'player' : 'foe'] : null; return J(run.ctx.absent || null) === J(want[id]) && J(shown) === J(want[id]); });
+        if (r) aredone += r.restale;
+        arows.push(name.split(':')[0] + ': ' + (r ? ids.map((id, i) => id + '=' + (got[i] ? J(got[i].ctx.absent || null) : 'none')).join(' ') : 'no scene'));
+        if (!fine || !r || r.restale !== 0 || r.log.length) abad.push(name + ' -- ' + arows[arows.length - 1] + (r ? ', restale ' + r.restale + ', log ' + r.log.length : ''));
+      }
+      t('system/absent: a send-out / recall / faint of one side, while the OTHER side\'s Pokemon has fainted and is not replaced yet, names that side absent (free switch YES, a double faint either way), and only then (' + abad.length + ' of ' + AB.length + ' hand-built cases wrong)' + (abad.length ? ' -- ' + abad[0] : ''), abad.length === 0, abad.join(' | ') || arows.join('; '));
+      t('system/absent: ...right the first time, though each was prepared before the faint had played: the projection knows a faint ahead (' + aredone + ' prepared again)', aredone === 0 && abad.length === 0, String(aredone));
+      // ...and a Pokemon that goes down while an effect of the other side waits prepared, by something the projection cannot know, is caught when the effect starts (the re-check covers ctx.absent)
+      {
+        let moved = 0;
+        const r = await hand((x) => [{ t: 'pause', n: 40 }, { t: 'slideout', side: 0 }], { onTick: (scene) => { if (moved) return; const q = scene.S.queue.find((y) => y.t === 'slideout' && y.side === 0 && y.prep && !y.prep.failed), d = scene.S.disp[1]; if (q && d) { d.visible = false; d.showBox = false; moved = 1; } } });
+        const run = r && r.runs.find((q) => q.id === 3);
+        t('system/absent: the foe going down while the player\'s recall waits prepared (tampered) is caught when the recall starts: prepared again, and it begins with the foe absent', !!run && moved === 1 && r.restale === 1 && J(run.ctx.absent || null) === J(['foe']) && r.log.length === 0 && r.notes.length === 1 && /absent/.test(r.notes[0]), run ? J({ absent: run.ctx.absent || null, restale: r.restale, notes: r.notes }) : 'no run');
+      }
+    }
+    // round 10, live: battles in which the player answers YES at every free-switch offer (and double faints happen as the engine plays them): EVERY system run is checked, at the moment it begins, for ctx.absent
+    // against what the screen shows (the other side fainted and not replaced <=> absent; the run's own side never)
+    {
+      const bad = [], logs = []; let runs = 0, absentRuns = 0, restale = 0, yes = 0, doubles = 0;
+      for (const sd of (quick ? SEL.sys.slice(0, 1).concat([3, 8]) : SEL.sys.concat([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]))) {
+        const st = await makeAnimator({ system: true });
+        let sceneRef = null;
+        const snap = (id, ctx) => {
+          const d = sceneRef.S.disp, own = [2, 3, 4, 6].includes(id) ? 0 : 1, oth = own ^ 1;
+          const shown = !!d[oth] && d[oth].visible === false && d[oth].showBox === false ? [oth === 0 ? 'player' : 'foe'] : null;
+          runs++; if (shown) { absentRuns++; if (id === 4 || id === 5) doubles++; }
+          if (J(ctx.absent || null) !== J(shown)) bad.push({ seed: sd, id, absent: ctx.absent || null, shown });
+        };
+        const wrap = (h, id, ctx) => { if (id >= 2 && id <= 9 && h && typeof h.begin === 'function') { const b = h.begin; h.begin = function () { snap(id, ctx); return b.apply(this, arguments); }; } return h; };
+        const prep = st.prepare && st.prepare.bind(st), start = st.start.bind(st);
+        if (prep) st.prepare = (kind, id, ctx) => (kind === 'system' ? wrap(prep(kind, id, ctx), id, ctx) : prep(kind, id, ctx));
+        st.start = (kind, id, ctx) => { const r = start(kind, id, ctx); if (kind === 'system' && id >= 2 && id <= 9) snap(id, ctx); return r; };
+        const r = playBattle(M, { seed: sd, cfg: mkCfg(onSys), animator: st, freeSwitch: true, maxFrames: quick ? 30000 : undefined, onTick: (scene) => { sceneRef = scene; },
+          decide: (req, def) => { if (req.phase === 'switch' && req.reason === 'free') { if (req.switches && req.switches.length) { yes++; return { kind: 'switch', slot: req.switches[0].slot }; } return { kind: 'stay' }; } return def; } });
+        logs.push(...r.scene.animInfo().log); restale += r.scene.animInfo().restale | 0;
+      }
+      t('system/absent: ' + runs + ' system runs in battles with ' + yes + ' free switches answered YES and ' + doubles + ' second faints of a double faint each name absent exactly the side the screen shows fainted and not replaced (' + absentRuns + ' such runs)' + (bad.length ? ' -- ' + J(bad[0]).slice(0, 200) : ''), bad.length === 0 && absentRuns >= (quick ? 2 : 10) && yes >= (quick ? 1 : 5), runs + ' runs, ' + absentRuns + ' absent, ' + bad.length + ' wrong');
+      t('system/absent: ...none had to be prepared again (' + restale + ') and nothing was logged as a problem (' + logs.length + ')', restale === 0 && logs.length === 0, restale + ' / ' + J(logs.slice(0, 2)));
     }
     // round 4: PREPARED system runs (animator.prepare -> advance once per tick -> begin when the step before is done and the handle is ready)
     {
@@ -1058,6 +1113,17 @@ ok(realFails.length === 0, '1. every anim-scene check passes on the real tree ('
       if (sendOut) ok(leadHp === base && leadSp === base && otherHp !== base, '4. draws: a ' + name + ' (id ' + id + ', ' + base.split(':')[1] + ' frames) is identical in every frame for any HP (37) or species of the side that sends out (the Pokemon it replaces), and different for the other side\'s HP', 'lead hp ' + (leadHp === base) + ', lead species ' + (leadSp === base) + ', other hp differs ' + (otherHp !== base));
       else ok(leadHp !== base && otherHp !== base, '4. draws: a ' + name + ' (id ' + id + ', ' + base.split(':')[1] + ' frames) draws BOTH Pokemon: the recalled one\'s HP and the other side\'s HP each change frames', 'lead hp differs ' + (leadHp !== base) + ', other hp differs ' + (otherHp !== base));
     }
+    // round 10: ctx.absent. With the OTHER side named absent (fainted, not replaced), no frame of the effect shows that side: every frame is identical for any species or HP of it, and the effect is as long as
+    // without it. The control (no ctx.absent) differs for its species: before round 10 the fainted Pokemon stood there, with its empty healthbox, for the whole effect (ANIM.md "Round 10").
+    for (const [name, id, gone, extra] of [['player send-out', 2, 'foe', { switchIn: spec(NEW_ME) }], ['player recall', 3, 'foe', {}], ['player faint', 4, 'foe', {}], ['foe faint', 5, 'player', {}], ['foe send-out', 8, 'player', { switchIn: spec(NEW_FOE) }], ['foe recall', 9, 'player', {}], ['player hit', 6, 'foe', {}]]) {
+      const goneMon = gone === 'foe' ? FOE : ME, other = gone === 'foe' ? NEW_FOE : NEW_ME;
+      const mk = (o, ab) => Object.assign({ foe: spec(FOE), player: spec(ME), environment: ENV, trainer: id >= 8 ? 1 : 0, seed: 1 }, o, extra, ab ? { absent: [gone] } : {});
+      const dead = spec(Object.assign({}, goneMon, { hp: 0 })), dead2 = spec(Object.assign({}, other, { hp: 37 }));
+      const a1 = hashAll(id, mk({ [gone]: dead }, true)), a2 = hashAll(id, mk({ [gone]: dead2 }, true)), p1 = hashAll(id, mk({ [gone]: dead }, false)), p2 = hashAll(id, mk({ [gone]: dead2 }, false));
+      ok(a1 === a2 && p1 !== p2 && a1.split(':')[1] === p1.split(':')[1], '4. draws: a ' + name + ' (id ' + id + ', ' + p1.split(':')[1] + ' frames) with the ' + gone + ' absent never shows the ' + gone + ' (every frame identical for any species / HP of it, same length), while without ctx.absent it does', 'absent same ' + (a1 === a2) + ', plain differs ' + (p1 !== p2) + ', frames ' + a1.split(':')[1] + ' / ' + p1.split(':')[1]);
+    }
+    // ...and naming the event's OWN side absent changes nothing (it is the one that faints / is hit / is recalled / is replaced)
+    ok(hashAll(2, { foe: spec(FOE), player: spec(ME), environment: ENV, trainer: 0, seed: 1, switchIn: spec(NEW_ME), absent: ['player'] }) === hashAll(2, { foe: spec(FOE), player: spec(ME), environment: ENV, trainer: 0, seed: 1, switchIn: spec(NEW_ME) }), '4. draws: ctx.absent naming the event\'s own side is ignored (a player send-out with the player absent = the plain send-out)');
   }
   // ---- round 4: the trainer pictures, with the real engine
   {
@@ -1237,6 +1303,9 @@ if (process.env.ARENA_SKIP_MUTANTS !== '1') {
     ['anim_mon.js', 'Desolate Land plays the rain animation', (s) => s.replace('7: GENERAL.SUN_CONTINUES, 8:', '7: GENERAL.RAIN_CONTINUES, 8:')],
     ['anim_mon.js', 'animation durations ignored (every picture 1 frame)', (s) => s.replace('out.push({ img: t, dur: x & 0xff,', 'out.push({ img: t, dur: 1,')],
     ['anim_mon.js', 'delay ignored', (s) => s.replace('let n = t - info.delay;', 'let n = t;')],
+    ['scene.js', 'SYSTEM/absent: a fainted Pokemon that is not replaced is never named absent (it stands beside the other side\'s send-out / recall / faint, the round 10 report)', (s) => s.replace("    if (pmOther ? !!pmOther.down : downNow(other)) ctx.absent = [other === viewSide ? 'player' : 'foe'];", '')],
+    ['scene.js', 'SYSTEM/absent: a faint queued ahead of the event is not projected (prepared without absent, prepared again at start)', (s) => s.replace("else if (t === 'faint' || k === 'faint') {", 'else if (false) {')],
+    ['scene.js', 'SYSTEM/absent: the re-check at start does not compare ctx.absent (a Pokemon that went down unforeseen is drawn)', (s) => s.replace(', ...(ctx.absent ? [ctx.absent] : [])]', ']')],
     ['anim_settings.js', 'speed accepts anything', (s) => s.replace("if (patch && ANIM_SPEEDS.includes(patch.speed)) cur.speed = patch.speed;", 'if (patch && patch.speed) cur.speed = patch.speed;')],
     ['anim_settings.js', 'default is OFF', (s) => s.replace('return { v: ANIM_VERSION, on: true, speed: 1, skip: false };', 'return { v: ANIM_VERSION, on: false, speed: 1, skip: false };')],
     ['anim_settings.js', 'query values are written back to storage', (s) => s.replace('const cur = Object.assign({}, stored);', 'const cur = Object.assign({}, stored); setTimeout(() => {}, 0);').replace("if (q.skip !== undefined) cur.skip = q.skip;", "if (q.skip !== undefined) cur.skip = q.skip; if (storage) { try { storage.setItem(ANIM_KEY, JSON.stringify({ v: 1, on: cur.on, speed: cur.speed })); } catch (_e) { /* */ } }")],
