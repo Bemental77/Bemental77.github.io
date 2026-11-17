@@ -47,7 +47,7 @@ export function boardPrivacyText(brokers, scriptUrl) {
   const names = [...new Set((Array.isArray(brokers) ? brokers : []).map(host).filter(Boolean))];
   return 'The list comes from public servers. While this page is open it connects to ' + (names.length ? names.length + ' third-party MQTT brokers (' + names.join(', ') + ')' : 'third-party MQTT brokers') + ' and loads a script from ' + (host(scriptUrl) || 'a public CDN')
     + '; they can see your IP address, and your browser asks "who is open?" under a random id. '
-    + 'If you open a game (Open to anyone, or Find a battle when nobody is waiting) or challenge someone, your trainer name and your online record (wins and losses, if you have one) go on those servers for anyone to read. A private game with a code is never listed.';
+    + 'If you open a game (Find an opponent when nobody is waiting) or challenge someone, your trainer name and your online record (wins and losses, if you have one) go on those servers for anyone to read. A private game with a code is never listed.';
 }
 
 /** -> null (not an online address) | { error } | { role: 'host' | 'guest' | null, room, transport, limits }. Never throws. */
@@ -182,20 +182,22 @@ export function createOnline(cfg) {
   }
 
   /* ---------------------------------------------------------------------------------------------- the setup panel */
-  /* THE PANEL HAS THREE VIEWS, and only one is on screen at a time (renderView):
-   *   choose    the plain Play online page (?online=1): YOUR TRAINER (team, name, format), then two cards - PLAY A FRIEND (Create a room; or type a code and Join) and QUICK MATCH (Find an
-   *             opponent) - then PLAYERS ONLINE (the board) and, at the foot, what going online shares.
-   *   address   a page whose address already says what to do (an invite link ?np=CODE&join=1, the lobby's hand-off ?np=CODE&host=1): YOUR TRAINER and ONE button (#olGo).
-   *   progress  anything under way: the room code (a host), a row of steps that says where the connection is (#olSteps), one sentence of what is happening (#olStatus), how long it has
-   *             taken, and Cancel. A player is never left looking at a disabled form wondering whether anything is happening.
-   * #olGo is the main button of the first two views (Create a room / Open the room / Join the battle). Every id the page tests drive is kept. */
+  /* THE PANEL HAS THREE VIEWS, and only one is on screen at a time (renderView). The rule: ONE QUESTION PER SCREEN, and while anything is under way the screen says WHO YOU ARE in it
+   * (hosting / joining / matching) and WHAT IS HAPPENING NOW, in a heading, never in a sentence under a form.
+   *   choose    the plain Play online page (?online=1): YOUR TEAM (team, name, battle size), then three separate cards, one per way in - INVITE A FRIEND (#olGo: Get an invite link),
+   *             JOIN A FRIEND (their code or link, Join) and BATTLE ANYONE (#olQuick: Find an opponent) - then PLAYERS ONLINE (the board) and, at the foot, what going online shares.
+   *             Friends and strangers never share a card: a room made for a friend is private, full stop; the only public way in is Battle anyone.
+   *   address   a page whose address already says what to do (an invite link ?np=CODE&join=1, the lobby's hand-off ?np=CODE&host=1): YOUR TEAM and ONE button (#olGo).
+   *   progress  anything under way: who you are in it (#olRole), what is happening now (#olProgTitle), for a host the invite link itself with Copy / Share and the room code, a row of steps
+   *             (#olSteps), one sentence (#olStatus), how long it has taken, a hint when a join is slow (#olHint), and Cancel. */
   const ui = {};
   const card = (id, title, ...kids) => el(doc, 'section', { class: 'olcard', id, 'aria-labelledby': id + 'T' }, el(doc, 'h3', { id: id + 'T', text: title }), ...kids);
+  const HOME_LEDE = 'Battle someone on another phone or computer. Pick how:';
   function buildPanel() {
     panel = el(doc, 'section', { id: 'online', 'aria-labelledby': 'olTitle' });
     ui.title = el(doc, 'h2', { id: 'olTitle', text: 'Battle online' });
-    ui.lede = el(doc, 'p', { class: 'dim', id: 'olLede', text: 'Battle a friend with a room code, or anyone who is online right now. ' + LEDE.replace(/^Two players, each on their own device, one battle\. /, '') });
-    // YOUR TRAINER
+    ui.lede = el(doc, 'p', { class: 'dim', id: 'olLede', text: HOME_LEDE });
+    // YOUR TEAM
     ui.teamField = el(doc, 'label', { class: 'field' }, el(doc, 'span', { text: 'Team' }));
     ui.team = el(doc, 'select', { id: 'olTeam', onchange: () => { ui.pasteField.hidden = ui.team.value !== 'paste'; refreshFormats(); nameFollowsTeam(); } });
     ui.teamField.append(ui.team);
@@ -205,28 +207,28 @@ export function createOnline(cfg) {
     ui.nameField = el(doc, 'label', { class: 'field' }, el(doc, 'span', { text: 'Name' }));
     ui.name = el(doc, 'input', { id: 'olName', type: 'text', maxlength: String(NAME_MAX), autocomplete: 'nickname', spellcheck: 'false', oninput: () => { nameTouched = true; } });
     ui.nameField.append(ui.name);
-    ui.fmtField = el(doc, 'label', { class: 'field' }, el(doc, 'span', { text: 'Format (when you host)' }));
+    ui.fmtField = el(doc, 'label', { class: 'field' }, el(doc, 'span', { text: 'Battle size' }));
     ui.fmt = el(doc, 'select', { id: 'olFmt' }, el(doc, 'option', { value: '3v3', text: '3 v 3 (pick 3 of 6)' }), el(doc, 'option', { value: '6v6', text: '6 v 6 (whole team)' }));
     ui.fmtField.append(ui.fmt);
-    ui.you = el(doc, 'section', { class: 'olyou', id: 'olYou', 'aria-label': 'Your trainer' }, ui.teamField, ui.nameField, ui.fmtField, ui.pasteField);
-    // the status line: under the trainer in the first two views (a refusal, "Checking your team..."), inside the progress card while something is under way
+    ui.you = el(doc, 'section', { class: 'olyou', id: 'olYou', 'aria-label': 'Your team' }, ui.teamField, ui.nameField, ui.fmtField, ui.pasteField);
+    // the status line: under the team in the first two views (a refusal, "Checking your team..."), inside the progress card while something is under way
     ui.status = el(doc, 'p', { id: 'olStatus', class: 'status', role: 'status', 'aria-live': 'polite' });
     ui.setupSlot = el(doc, 'div', { class: 'olslot' });
-    // PLAY A FRIEND
-    ui.go = el(doc, 'button', { type: 'button', class: 'textbtn primary big', id: 'olGo', text: 'Create a room', disabled: true, onclick: () => (boardPage() ? startAs('host') : go()) });      // enabled once the team list has loaded (begin)
-    ui.room = el(doc, 'input', { id: 'olRoom', type: 'text', maxlength: '64', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false', placeholder: 'ROOM CODE', 'aria-label': 'Room code',
+    // INVITE A FRIEND (a private room: only the link or the code gets anyone in)
+    ui.go = el(doc, 'button', { type: 'button', class: 'textbtn primary big', id: 'olGo', text: 'Get an invite link', disabled: true, onclick: () => (boardPage() ? startAs('host') : go()) });      // enabled once the team list has loaded (begin)
+    ui.goSlot = el(doc, 'div', { class: 'row' });
+    ui.friendCard = card('olFriend', 'Invite a friend', el(doc, 'p', { class: 'dim', text: 'You get a link to send them. They open it, press Join, and the battle starts.' }), ui.goSlot);
+    // JOIN A FRIEND
+    ui.room = el(doc, 'input', { id: 'olRoom', type: 'text', maxlength: '300', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false', placeholder: 'CODE', 'aria-label': 'Your friend\'s room code or link', enterkeyhint: 'go',
       oninput: () => { const v = roomFromInput(ui.room.value); if (v !== null && v !== ui.room.value) ui.room.value = v; },
       onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); startAs('guest'); } } });
-    ui.joinBtn = el(doc, 'button', { type: 'button', class: 'textbtn', id: 'olJoin', text: 'Join', onclick: () => startAs('guest') });
-    ui.roomField = el(doc, 'label', { class: 'field codefield' }, el(doc, 'span', { text: 'Got a code from a friend?' }), el(doc, 'span', { class: 'coderow' }, ui.room, ui.joinBtn));
-    ui.pub = el(doc, 'button', { type: 'button', class: 'textbtn toggle', id: 'olPublic', 'aria-pressed': 'false', text: 'Also list it for anyone: off', onclick: () => setOpenWanted(!state.openWanted) });
-    ui.pubNote = el(doc, 'p', { class: 'dim small', id: 'olPublicNote' });
-    ui.pubBox = el(doc, 'div', { id: 'olPublicBox', hidden: true }, el(doc, 'div', { class: 'row' }, ui.pub), ui.pubNote);
-    ui.friendCard = card('olFriend', 'Play a friend', el(doc, 'p', { class: 'dim', text: 'Create a room, then send your friend the link. They open it, press Join, and you are battling. No accounts, nothing to approve.' }), ui.goSlot = el(doc, 'div', { class: 'row' }), ui.pubBox, el(doc, 'div', { class: 'or', 'aria-hidden': 'true', text: 'or' }), ui.roomField);
-    // QUICK MATCH
+    ui.joinBtn = el(doc, 'button', { type: 'button', class: 'textbtn primary', id: 'olJoin', text: 'Join', onclick: () => startAs('guest') });
+    ui.roomField = el(doc, 'label', { class: 'field codefield' }, el(doc, 'span', { text: 'Their room code (or paste their link)' }), el(doc, 'span', { class: 'coderow' }, ui.room, ui.joinBtn));
+    ui.joinCard = card('olJoinCard', 'Join a friend', el(doc, 'p', { class: 'dim', text: 'Your friend made a room and sent you a code or a link.' }), ui.roomField);
+    // BATTLE ANYONE (the only public way in: what it shows other players is said right here)
     ui.quick = el(doc, 'button', { type: 'button', class: 'textbtn primary big', id: 'olQuick', text: 'Find an opponent', disabled: true, onclick: () => quick() });
-    ui.quickCard = card('olQuickCard', 'Quick match', el(doc, 'p', { class: 'dim', text: 'Battle whoever is looking right now. If nobody is, you wait at the top of Players online until someone joins you.' }), el(doc, 'div', { class: 'row' }, ui.quick));
-    ui.cards = el(doc, 'div', { class: 'olcards', id: 'olCards' }, ui.friendCard, ui.quickCard);
+    ui.quickCard = card('olQuickCard', 'Battle anyone', el(doc, 'p', { class: 'dim', id: 'olQuickNote', text: 'Get matched with whoever is looking right now. Other players see your trainer name and your online record (wins and losses).' }), el(doc, 'div', { class: 'row' }, ui.quick));
+    ui.cards = el(doc, 'div', { class: 'olcards', id: 'olCards' }, ui.friendCard, ui.joinCard, ui.quickCard);
     ui.addrBox = el(doc, 'div', { class: 'row', id: 'olAddr' });
     // PLAYERS ONLINE (the board)
     ui.openNote = el(doc, 'p', { class: 'dim', id: 'olOpenNote', role: 'status', 'aria-live': 'polite' });
@@ -234,21 +236,25 @@ export function createOnline(cfg) {
     ui.openBox = el(doc, 'section', { id: 'olOpen', 'aria-labelledby': 'olOpenTitle', hidden: true }, el(doc, 'h3', { id: 'olOpenTitle', text: 'Players online' }), ui.openNote, ui.openList);
     // what going online does, in words, on screen (a tooltip is not disclosure); small, at the foot, out of the way of the buttons
     ui.openPrivacy = el(doc, 'p', { class: 'dim small', id: 'olOpenPrivacy', text: boardPrivacyText((() => { try { const N = Netplay(); return N && typeof N.signalBrokers === 'function' ? N.signalBrokers() : []; } catch (_e) { return []; } })(), MQTT_LIB) });
-    ui.privacy = el(doc, 'div', { class: 'olfoot', id: 'olPrivacy' }, ui.openPrivacy);
+    ui.privacy = el(doc, 'div', { class: 'olfoot', id: 'olPrivacy' }, el(doc, 'p', { class: 'dim small', id: 'olShares', text: LEDE }), ui.openPrivacy);
     // PROGRESS
+    ui.role = el(doc, 'p', { class: 'olrole', id: 'olRole' });
     ui.progTitle = el(doc, 'h3', { id: 'olProgTitle' });
     ui.codeBox = el(doc, 'div', { id: 'olCode', class: 'code', hidden: true, 'aria-live': 'polite' });
-    ui.codeLabel = el(doc, 'p', { class: 'dim small codelabel', hidden: true, text: 'Room code' });
-    ui.share = el(doc, 'button', { type: 'button', class: 'textbtn primary', id: 'olShare', text: 'Share invite link', hidden: true, onclick: () => share() });
-    ui.invite = el(doc, 'div', { class: 'row invite', hidden: true },
-      el(doc, 'button', { type: 'button', class: 'textbtn primary', id: 'olCopyLink', text: 'Copy invite link', onclick: () => copy(inviteLink(), 'Invite link copied. Send it to your friend.') }),
-      ui.share,
-      el(doc, 'button', { type: 'button', class: 'textbtn', id: 'olCopyCode', text: 'Copy code', onclick: () => copy(state.room, 'Code copied.') }));
+    ui.codeLabel = el(doc, 'p', { class: 'dim small codelabel', hidden: true, text: 'or tell them the room code' });
+    ui.share = el(doc, 'button', { type: 'button', class: 'textbtn primary', id: 'olShare', text: 'Share', hidden: true, onclick: () => share() });
+    ui.inviteHead = el(doc, 'p', { class: 'invitehead', id: 'olInviteHead', text: 'Send your friend this link' });
+    ui.linkText = el(doc, 'input', { id: 'olLinkText', type: 'text', readonly: true, 'aria-label': 'Invite link', onfocus: () => { try { ui.linkText.select(); } catch (_e) { /* ignore */ } } });
+    ui.copyLink = el(doc, 'button', { type: 'button', class: 'textbtn primary', id: 'olCopyLink', text: 'Copy link', onclick: () => copy(inviteLink(), ui.copyLink) });
+    ui.copyCode = el(doc, 'button', { type: 'button', class: 'textbtn', id: 'olCopyCode', text: 'Copy code', onclick: () => copy(state.room, ui.copyCode) });
+    ui.linkBox = el(doc, 'div', { class: 'linkbox', id: 'olLinkBox' }, ui.inviteHead, el(doc, 'div', { class: 'linkrow' }, ui.linkText), el(doc, 'div', { class: 'row invite' }, ui.copyLink, ui.share));
+    ui.invite = el(doc, 'div', { class: 'invitebox', id: 'olInvite', hidden: true }, ui.linkBox, ui.codeLabel, el(doc, 'div', { class: 'coderow2' }, ui.codeBox, ui.copyCode));
     ui.steps = el(doc, 'ol', { id: 'olSteps', class: 'steps', 'aria-label': 'Progress' });
     ui.elapsed = el(doc, 'span', { id: 'olElapsed', class: 'elapsed', 'aria-hidden': 'true' });
     ui.progSlot = el(doc, 'div', { class: 'olslot progslot' });
+    ui.hint = el(doc, 'p', { class: 'dim small olhint', id: 'olHint', hidden: true });
     ui.cancelAsk = el(doc, 'button', { type: 'button', class: 'textbtn', id: 'olCancelAsk', text: 'Cancel', hidden: true, onclick: () => cancelAsk() });
-    ui.progress = el(doc, 'section', { id: 'olProgress', class: 'olcard progress', hidden: true, 'aria-labelledby': 'olProgTitle' }, ui.progTitle, ui.codeLabel, ui.codeBox, ui.invite, ui.steps, el(doc, 'div', { class: 'progline' }, ui.progSlot, ui.elapsed), el(doc, 'div', { class: 'row' }, ui.cancelAsk));
+    ui.progress = el(doc, 'section', { id: 'olProgress', class: 'olcard progress', hidden: true, 'aria-labelledby': 'olProgTitle' }, ui.role, ui.progTitle, ui.invite, ui.steps, el(doc, 'div', { class: 'progline' }, ui.progSlot, ui.elapsed), ui.hint, el(doc, 'div', { class: 'row' }, ui.cancelAsk));
     ui.cancel = el(doc, 'a', { class: 'textbtn', id: 'olBack', href: '/pokemonarena/', text: 'Back to the Arena' });
     ui.actions = el(doc, 'div', { class: 'row foot' }, ui.cancel);
     panel.append(ui.title, ui.lede, ui.you, ui.setupSlot, ui.addrBox, ui.cards, ui.progress, ui.openBox, ui.actions, ui.privacy);
@@ -256,14 +262,23 @@ export function createOnline(cfg) {
     root.append(panel);
   }
   const say = (t, bad) => { ui.status.textContent = t || ''; ui.status.classList.toggle('bad', !!bad); };
-  const formControls = () => [ui.room, ui.joinBtn, ui.team, ui.paste, ui.name, ui.fmt, ui.go, ui.quick, ui.pub];
+  const formControls = () => [ui.room, ui.joinBtn, ui.team, ui.paste, ui.name, ui.fmt, ui.go, ui.quick];
   const inviteLink = () => win.location.origin + '/pokemonarena/battle.html?np=' + encodeURIComponent(state.room) + '&join=1' + (state.transport === 'local' ? '&net=local' : '');
-  async function copy(text, done) {
-    try { await win.navigator.clipboard.writeText(text); say(done || 'Copied.'); } catch (_e) { say('Select it and copy it yourself - the clipboard is not available here.'); }
+  /** Copy, and say so ON THE BUTTON for two seconds: the sentence under the steps says what is happening, and a "Copied." there used to replace "Waiting for your friend...". */
+  const copyTimers = new WeakMap();
+  async function copy(text, btn) {
+    let ok = false;
+    try { await win.navigator.clipboard.writeText(text); ok = true; } catch (_e) { ok = false; }
+    if (!ok) { try { ui.linkText.focus(); ui.linkText.select(); } catch (_e) { /* ignore */ } say('Your browser would not let the page copy. The link is selected above: copy it yourself.', true); return; }
+    if (!btn) return;
+    if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+    btn.textContent = 'Copied ✓'; btn.classList.add('copied');
+    win.clearTimeout(copyTimers.get(btn));
+    copyTimers.set(btn, win.setTimeout(() => { btn.textContent = btn.dataset.label; btn.classList.remove('copied'); }, 2000));
   }
   async function share() {
     try { await win.navigator.share({ title: 'Pokemon Arena battle', text: 'Battle me in Pokemon Arena! Room ' + state.room, url: inviteLink() }); }
-    catch (e) { if (!e || e.name !== 'AbortError') copy(inviteLink(), 'Invite link copied. Send it to your friend.'); }
+    catch (e) { if (!e || e.name !== 'AbortError') copy(inviteLink(), ui.copyLink); }
   }
   /** What the code box was given: a code (any case, spaces and dashes dropped) or a whole invite link pasted in (its np= is taken). -> the code to show, or null to leave the text alone. */
   function roomFromInput(raw) {
@@ -377,7 +392,7 @@ export function createOnline(cfg) {
   }
   const go = exclusive(async function go() {
     if (state.stage !== 'setup' || !state.choices) return;
-    if (!state.role) { say('Create a room, or type a code and press Join.', true); return; }
+    if (!state.role) { say('Get an invite link, or type the code your friend sent and press Join.', true); return; }
     if (!supportedHere()) { say(UNSUPPORTED, true); return; }
     const role = state.role;
     // a host on the plain Play online page always gets a FRESH room (state.room may still hold the code of a join or a room that was just cancelled); the lobby's hand-off names its room in the address
@@ -387,7 +402,7 @@ export function createOnline(cfg) {
     if (!p) return;
     const fmt = role === 'host' ? ui.fmt.value : null;
     if (fmt === '3v3' && p.mine.size < 3) { p.release(); say('A 3v3 battle needs at least 3 Pokemon on your team.', true); return; }
-    launch({ role, room, p, fmt, open: role === 'host' && state.openWanted, quick: false, listed: null });
+    launch({ role, room, p, fmt, open: false, quick: false, listed: null });
   });
   /** Everything is decided: open the session. open = this host's game is listed; quick = it was opened by Find a battle; listed = the board entry a guest is joining. */
   function launch({ role, room, p, fmt, open, quick, listed, invite }) {
@@ -405,12 +420,12 @@ export function createOnline(cfg) {
   function lockSetup(role, room) {
     state.stage = 'waiting';
     for (const n of formControls()) n.disabled = true;
-    ui.openBox.hidden = true; ui.pubBox.hidden = true;
+    ui.openBox.hidden = true;
     // The host's code is shown only once the room is open (openedRoom): a friend who is handed it earlier would knock on a door that is not there yet.
     // Anything under way can be cancelled until the other player is connected: a join (the board is public, so a listed game may be made up: it used to hold the joiner for the whole watchdog with only
     // the page's Back link as a way out), and a host's room that nobody has come to.
     ui.cancelAsk.hidden = false; ui.cancelAsk.disabled = false;
-    ui.cancelAsk.textContent = role === 'host' ? 'Close the room' : 'Cancel';
+    ui.cancelAsk.textContent = role === 'host' ? (state.quick ? 'Stop looking' : 'Close the room') : 'Cancel';
     say(role === 'host' ? 'Opening your room...' : state.listed ? 'Joining ' + state.listed.name + '... It gives up after ' + Math.round(joinGiveUpMs() / 1000) + ' seconds if nobody answers; Cancel stops it sooner.' : 'Connecting to the room ' + room + '...');
     setStage('waiting');
   }
@@ -429,27 +444,22 @@ export function createOnline(cfg) {
     return lobbies;
   }
   function closeLobbies() { if (acceptor) { acceptor.stop(); acceptor = null; } if (lobbies) { const l = lobbies; lobbies = null; try { l.close(); } catch (_e) { /* ignore */ } } }
-  function setOpenWanted(v) { state.openWanted = !!v; syncSetupUi(); }
   /** Which parts of the setup form show, for the stage and the role. */
   function syncSetupUi() {
     const setup = state.stage === 'setup', ok = supportedHere();
     ui.openBox.hidden = !(setup && ok && boardPage());
-    ui.pubBox.hidden = !(setup && ok && (boardPage() || state.role === 'host'));          // (the lobby's host hand-off can list its room too)
-    ui.pub.setAttribute('aria-pressed', String(state.openWanted));
-    ui.pub.textContent = 'Also list it for anyone: ' + (state.openWanted ? 'on' : 'off');
-    // what the switch publishes is said HERE, beside it, in full: the trainer name AND the online record (wins and losses, when the chosen team is a saved one that has played online), on public servers
-    ui.pubNote.textContent = state.openWanted
-      ? 'On: your room is listed under Players online on public servers, with your trainer name and your online record (wins and losses, if you have one), readable by anyone, and anyone can join it. Closing this page takes it off the list.'
-      : 'Off: only someone with your code or link can join; nothing is listed. On: your trainer name and online record are listed on public servers and anyone can join from Players online.';
     renderView();
   }
   /* ---------------------------------------------------------------------------------------------- which view, and the steps */
   const UNDER_WAY = ['waiting', 'open', 'searching', 'asking', 'handshake', 'resuming'];
+  const GO_HOME_LABEL = 'Get an invite link';
   let viewTimer = 0, stageAt = 0, stageWas = '';
   function renderView() {
     if (!panel) return;
     const st = state.stage, setup = st === 'setup', going = UNDER_WAY.includes(st), board = boardPage();
     if (st !== stageWas) { stageWas = st; stageAt = going ? now() : 0; }          // the clock counts from the start of THIS step ("Waiting for your friend... 0:42")
+    // under way, the progress card IS the page: the page's own heading, the form, the cards, the board and the way back all go (Cancel is the way out of anything under way)
+    ui.title.hidden = going;
     ui.lede.hidden = !setup;
     ui.you.hidden = !setup;
     ui.fmtField.hidden = !(board || state.role === 'host');
@@ -457,50 +467,63 @@ export function createOnline(cfg) {
     ui.addrBox.hidden = !(setup && !board);
     ui.progress.hidden = !going;
     ui.privacy.hidden = !(setup && board);
+    ui.actions.hidden = going;
+    panel.dataset.going = going ? '1' : '';
     const goHome = board ? ui.goSlot : ui.addrBox;
     if (ui.go.parentNode !== goHome) goHome.append(ui.go);
-    const pubHome = board ? ui.friendCard : ui.addrBox;
-    if (ui.pubBox.parentNode !== pubHome) { if (board) ui.goSlot.after(ui.pubBox); else ui.addrBox.prepend(ui.pubBox); }
-    if (board && ui.go.textContent !== 'Create a room') ui.go.textContent = 'Create a room';
-    // the room code field belongs to the PLAY A FRIEND card; on an invite page the code is in the title and the field is not needed
-    ui.roomField.hidden = !board;
+    if (board && ui.go.textContent !== GO_HOME_LABEL) ui.go.textContent = GO_HOME_LABEL;
     const slot = going ? ui.progSlot : ui.setupSlot;
     if (ui.status.parentNode !== slot) slot.append(ui.status);
     if (!board && setup) {
-      ui.title.textContent = state.role === 'guest' ? 'Join ' + (state.room ? 'room ' + state.room : 'a battle') : 'Your room' + (state.room ? ' ' + state.room : '');
-      ui.lede.textContent = state.role === 'guest' ? 'You were invited to a battle. Pick your team and press Join the battle.' : 'Pick your team and the format, then open the room; your friend joins with the code ' + (state.room || '') + '.';
-      ui.lede.hidden = false;
-    } else ui.title.textContent = 'Battle online';          // (under way, the progress card has its own title)
+      ui.title.textContent = state.role === 'guest' ? 'You\'re invited to a battle' : 'Your room' + (state.room ? ' ' + state.room : '');
+      ui.lede.textContent = state.role === 'guest' ? 'Room ' + (state.room || '') + '. Check your team, then press Join the battle.' : 'Pick your team and the battle size, then open the room. Your friend joins with the code ' + (state.room || '') + '.';
+    } else { ui.title.textContent = 'Battle online'; ui.lede.textContent = HOME_LEDE; }
+    // the invite (link, Copy / Share, the code) is for a PRIVATE room a friend is coming to. A game waiting for anyone (Battle anyone) shows its code small, as a fallback, under a heading that says so.
+    const friendRoom = state.role === 'host' && !state.open && !state.quick;
+    ui.linkBox.hidden = !friendRoom;
+    ui.codeLabel.textContent = friendRoom ? 'or tell them the room code' : 'Your room code (a friend can use it too)';
     renderSteps();
     if (going && !viewTimer) viewTimer = win.setInterval(renderElapsed, 1000);
     if (!going && viewTimer) { win.clearInterval(viewTimer); viewTimer = 0; }
     renderElapsed();
   }
+  const SLOW_JOIN_MS = 12000;
   function renderElapsed() {
     if (!ui.elapsed) return;
-    const t = stageAt && UNDER_WAY.includes(state.stage) ? fmtClock(Math.max(0, now() - stageAt)) : '';
+    const going = stageAt && UNDER_WAY.includes(state.stage), ms = going ? Math.max(0, now() - stageAt) : 0;
+    const t = going ? fmtClock(ms) : '';
     if (ui.elapsed.textContent !== t) ui.elapsed.textContent = t;
+    // A JOIN BY CODE THAT IS TAKING A WHILE says what to check. A code nobody has opened is not refused by the network at once (lib/netplay.js keeps trying), so the player is told what usually causes it.
+    let hint = '';
+    if (going && ms >= SLOW_JOIN_MS && state.stage === 'waiting' && state.role === 'guest' && !state.listed) hint = 'Taking a while? Check the code ' + (state.room || '') + ' with your friend, and that their screen still says "Waiting for your friend". If they closed it, ask them for a new link.';
+    if (ui.hint.textContent !== hint) ui.hint.textContent = hint;
+    ui.hint.hidden = !hint;
   }
-  /** The steps of what is under way, and which one it is at: a list the player can read at a glance, with the current one marked (aria-current). */
+  /** Who the player is in what is under way (#olRole), and what is happening now (#olProgTitle), with the steps and which one it is at (aria-current). */
   function stepsNow() {
-    const st = state.stage, host = state.role === 'host';
-    if (st === 'resuming') return { title: 'Picking your battle up again', steps: ['Reconnect', 'Battle'], at: 0 };
-    if (st === 'asking') return { title: 'Challenge sent', steps: ['Ask', 'They accept', 'Check teams', 'Battle'], at: 1 };
+    const st = state.stage, host = state.role === 'host', room = state.room || '';
+    if (st === 'resuming') return { role: 'Your battle', title: 'Reconnecting to your battle...', steps: ['Reconnect', 'Battle'], at: 0 };
+    if (st === 'asking') return { role: 'Challenge', title: 'Waiting for an answer...', steps: ['Ask', 'They accept', 'Check teams', 'Battle'], at: 1 };
     if (state.quick || st === 'searching' || (state.defecting && !host)) {
       const at = st === 'searching' ? 0 : st === 'handshake' ? 2 : 1;
-      return { title: st === 'searching' ? 'Finding an opponent' : host ? 'Waiting for an opponent' : 'Opponent found', steps: ['Search', 'Opponent joins', 'Check teams', 'Battle'], at };
+      const title = st === 'searching' ? 'Looking for an opponent...' : st === 'handshake' ? 'Opponent found! Checking the teams...' : host ? (state.admitted ? 'Someone is joining...' : 'Waiting for an opponent...') : 'Opponent found! Connecting...';
+      return { role: 'Battle anyone', title, steps: ['Search', 'Opponent joins', 'Check teams', 'Battle'], at };
     }
     if (host) {
       const at = st === 'waiting' ? 0 : st === 'open' ? 1 : 2;
-      return { title: st === 'handshake' ? 'Your friend is here' : state.open ? 'Your room is open' : 'Your room', steps: ['Open room', state.open ? 'Someone joins' : 'Friend joins', 'Check teams', 'Battle'], at };
+      const who = state.open ? 'Someone' : state.invite ? 'Your challenger' : 'Your friend';
+      const title = st === 'waiting' ? 'Opening your room...' : st === 'handshake' ? who + ' is here! Checking the teams...' : state.admitted ? who + ' is joining...' : state.invite ? 'Waiting for your challenger...' : state.open ? 'Waiting for someone to join...' : 'Waiting for your friend to join';
+      return { role: 'You\'re hosting' + (room && st !== 'waiting' ? ' · room ' + room : ''), title, steps: ['Open room', state.open ? 'Someone joins' : state.invite ? 'They join' : 'Friend joins', 'Check teams', 'Battle'], at };
     }
     const g = state.listed;
-    return { title: g ? 'Joining ' + g.name : 'Joining room ' + (state.room || ''), steps: ['Connect', 'Check teams', 'Battle'], at: st === 'handshake' ? 1 : 0 };
+    return { role: g ? 'You\'re joining ' + g.name : 'You\'re joining · room ' + room, title: st === 'handshake' ? 'Connected! Checking the teams...' : g ? 'Joining ' + g.name + '...' : 'Connecting to your friend...', steps: ['Connect', 'Check teams', 'Battle'], at: st === 'handshake' ? 1 : 0 };
   }
   function renderSteps() {
     if (!UNDER_WAY.includes(state.stage)) { if (ui.steps.childElementCount) ui.steps.replaceChildren(); return; }
     const s = stepsNow();
     if (ui.progTitle.textContent !== s.title) ui.progTitle.textContent = s.title;
+    if (ui.role.textContent !== s.role) ui.role.textContent = s.role;
+    ui.progress.dataset.role = state.role === 'host' ? 'host' : state.role === 'guest' ? 'guest' : 'either';
     const sig = s.steps.join('|') + '#' + s.at;
     if (ui.steps.dataset.sig === sig) return;
     ui.steps.dataset.sig = sig; ui.steps.dataset.at = String(s.at);
@@ -519,7 +542,7 @@ export function createOnline(cfg) {
     const hiddenNote = hidden ? ' (' + hidden + ' open on a different version of the Arena, hidden.)' : '';
     const note = st === 'down' ? 'The list of open games could not be reached. You can still host a game and give a friend the code.'
       : shown.length ? (shown.length === 1 ? '1 game is' : shown.length + ' games are') + ' waiting for an opponent.' + hiddenNote
-      : (st === 'connecting' ? 'Looking for open games...' : 'Nobody is waiting right now. Find an opponent puts you at the top of this list, or create a room and send a friend the link.') + hiddenNote;
+      : (st === 'connecting' ? 'Looking for open games...' : 'Nobody is waiting right now. Press Find an opponent and you will be first on this list, or invite a friend.') + hiddenNote;
     if (ui.openNote.textContent !== note) ui.openNote.textContent = note;          // (a live region: the same words again would be read out again at every beacon)
   }
   // THE LIST IS UPDATED IN PLACE, by room: a row that is still on the board keeps its <li> and its button, so a keyboard / switch / gamepad user who is on a Join button keeps their place when some
@@ -586,7 +609,7 @@ export function createOnline(cfg) {
     if (why) { p.release(); say(why, true); return; }
     state.stage = 'asking'; setStage('asking');
     for (const n of formControls()) n.disabled = true;
-    ui.cancelAsk.hidden = false; ui.cancelAsk.disabled = false; ui.cancelAsk.textContent = 'Cancel'; ui.pubBox.hidden = true;
+    ui.cancelAsk.hidden = false; ui.cancelAsk.disabled = false; ui.cancelAsk.textContent = 'Cancel';
     say('Asked ' + g.name + ' to battle. Waiting for an answer...');
     const lim = query.limits || {};
     const timing = lim.chalMs ? { ...PRESENCE_TIMING, answerMs: lim.chalMs, connectMs: lim.chalMs * 2 } : PRESENCE_TIMING;
@@ -647,7 +670,7 @@ export function createOnline(cfg) {
     if (closed || state.stage !== 'searching') return;
     state.stage = 'setup'; renderView();
     if (g) { ui.room.value = g.room; launch({ role: 'guest', room: g.room, p, fmt: null, open: false, quick: false, listed: g }); return; }
-    if (!lobbies || lobbies.status() === 'down') { reopenSetup(); say('The list of players online could not be reached, so there is nobody to find. Create a room and send a friend the link, or try again.', true); return; }
+    if (!lobbies || lobbies.status() === 'down') { reopenSetup(); say('The list of players online could not be reached, so there is nobody to find. Invite a friend instead, or try again.', true); return; }
     const fmt = ui.fmt.value === '3v3' && p.mine.size < 3 ? '6v6' : ui.fmt.value;
     quickCtx = { p, fmt };
     launch({ role: 'host', room: null, p, fmt, open: true, quick: true, listed: null });
@@ -813,7 +836,7 @@ export function createOnline(cfg) {
   function openedRoom(room) {
     relisting = false;
     state.stage = 'open'; state.roomOpen = true;
-    ui.codeBox.hidden = false; ui.codeBox.textContent = room; ui.invite.hidden = false;
+    ui.codeBox.hidden = false; ui.codeBox.textContent = room; ui.invite.hidden = false; ui.linkText.value = inviteLink();
     if (state.open && lobbies) {
       try {
         listGame(room);
@@ -831,14 +854,14 @@ export function createOnline(cfg) {
     setStage('open');
     maybeDefect();
   }
-  const friendWaitText = (room) => 'Waiting for your friend. Send them the invite link (or the code ' + room + '); they are in as soon as they open it and press Join.';
+  const friendWaitText = (room) => 'Waiting for your friend. The battle starts by itself as soon as they open your link (or type the code ' + room + ') and press Join.';
   function listGame(room) {
     lobbies.host({ room, name: state.name, fmt: state.fmt, rom: PINNED.sha256, fp: cfg.fingerprint, rs: state.mine.rs, q: state.quick, rec: state.rec || null });
   }
   /** What the host of an OPEN game is told, true to what the board can do right now (a board that lost every broker cannot show the game to anybody). */
   function openNote(room) {
     const st = lobbies ? lobbies.status() : 'down';
-    if (st === 'up') return { bad: false, text: openLead + (state.quick ? 'Nobody was waiting, so your game is open. The next player to press Find an opponent, or to pick you under Players online, joins you.' : 'Your game is open: anyone can join it from Open games. A friend can also use the code ' + room + ' or the invite link.') };
+    if (st === 'up') return { bad: false, text: openLead + (state.quick ? 'Nobody was waiting, so your game is open: anyone can join it. The next player who presses Find an opponent, or picks you under Players online, joins you.' : 'Your game is open: anyone can join it from Players online. A friend can also use the code ' + room + ' or the invite link.') };
     if (st === 'connecting') return { bad: false, text: openLead + 'Your room is open, but the list of open games is not connected yet, so nobody can see your game yet. A friend can use the code ' + room + '.' };
     return { bad: true, text: openLead + 'Your room is open, but the list of open games cannot be reached, so nobody can find your game. A friend can still use the code ' + room + '.' };
   }
@@ -860,6 +883,7 @@ export function createOnline(cfg) {
       try { listGame(state.room); const n = openNote(state.room); openText = n.text; say(n.text, n.bad); }          // listed again, and the words are the open game's again (not "a player is joining")
       catch (_e) { /* the next beacon tries again */ }
     } else if (!state.invite) say('The player who tried to join could not connect. ' + friendWaitText(state.room));
+    renderView();
   }
   /** Somebody is in (the join-request handler let them in, or the library re-admitted them by itself): the seat is taken and the game comes off the board; a host of an open game is told, because "your game is open" is not true now. */
   function noteAdmitted(id) {
@@ -869,6 +893,7 @@ export function createOnline(cfg) {
     if (lobbies) lobbies.unhost();
     if (first && !state.nm && state.stage === 'open') {
       openText = '';
+      renderView();
       say(state.open ? 'A player is joining your game. It is off the list of open games while they connect.' : state.invite ? 'The player who challenged you is connecting...' : 'Someone is joining with your code. Connecting...');
     }
   }
