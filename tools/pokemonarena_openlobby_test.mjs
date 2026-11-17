@@ -661,7 +661,7 @@ const MUTANTS = [
   { id: 'rival-cooldown-end-silent', why: 'the board never announces the end of the cooldown, so a real rival listed during it waits for an unrelated change', from: 'if (!closed) emit(); }, Math.max(0, rivalsMutedUntil - clock()) + 1);', to: 'if (false) emit(); }, Math.max(0, rivalsMutedUntil - clock()) + 1);' },
   { id: 'confirmed-at-first-beacon', why: 'a listing is confirmed the moment it is heard', from: 'first: t, since: t, confirmed: false, seen: t', to: 'first: t, since: t, confirmed: true, seen: t' },
   { id: 'confirmed-without-interval', why: 'two beacons in the same instant confirm a listing', from: 'if (!g.confirmed && t - g.since >= confirmMs)', to: 'if (!g.confirmed)' },
-  { id: 'changed-listing-stays-confirmed', why: 'a confirmed listing can change into anything and stay confirmed', from: 'rec: b.rec, since: t, confirmed: false });', to: 'rec: b.rec });' },
+  { id: 'changed-listing-stays-confirmed', why: 'a confirmed listing can change into anything and stay confirmed', from: 'rec: b.rec, av: b.av || null, since: t, confirmed: false });', to: 'rec: b.rec, av: b.av || null });' },
   { id: 'sender-many-rooms', why: 'one sender can fill the board with rooms of its own', from: 'for (const [r, o] of games) if (o.s === b.s) { games.delete(r); changed = true; }', to: '' },
   { id: 'compatible-always', why: 'every game is marked compatible', from: 'compatible: !!mine && g.rom === mine.rom && g.fp === mine.fp', to: 'compatible: true' },
   { id: 'newest-first', why: 'the game that has waited longest is last', from: 'a.first - b.first ||', to: 'b.first - a.first ||' },

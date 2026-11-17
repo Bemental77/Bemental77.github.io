@@ -30,6 +30,8 @@ import { ROOM_RE, PK_RE } from './openlobby.js';
 export const OPEN_KEY = 'arena.open';
 export const ACCEPT_KEY = 'arena.accept';             // sessionStorage: the one-time hand-off from the dialog's Accept to the battle page it opens (this tab only)
 export const ACCEPT_MAX_AGE_MS = 120000;              // a token older than this was not written for the page that is reading it
+export const MEET_KEY = 'arena.meet';                 // sessionStorage: the Trainer Center's hand-off to the battle page that JOINS a room it was let into (this tab only)
+export const MEET_MAX_AGE_MS = 60000;
 export const SEAL_INFO = 'bemental/pokemonarena/acc/1';           // the fixed HKDF label of the sealed room
 export const TIMING = Object.freeze({
   answerMs: 25000,        // a dialog nobody answers is declined after this long (and a challenger gives up on an owner who never answers after about this long)
@@ -58,6 +60,29 @@ export function writeAcceptToken(storage, { for: forSid, rq, ck }, nowMs) {
     return true;
   } catch (_e) { return false; }
 }
+/**
+ * THE MEET TOKEN (the Trainer Center, center_boot.js). A challenge accepted from the Center, or a listed game joined from it, ends on the battle page as an ordinary join (?np=ROOM&join=1).
+ * That page presses Join by itself only if THIS TAB holds a fresh token for THAT room, written by the Center just before it navigated: { room, at (wall-clock ms) }. A link from anywhere
+ * else (?np=ROOM&join=1&meet=1) has no token and is the ordinary invite page, where the player presses Join the battle. -> true when stored.
+ */
+export function writeMeetToken(storage, room, nowMs) {
+  try { if (!storage || typeof room !== 'string' || !ROOM_RE.test(room) || !Number.isFinite(nowMs)) return false; storage.setItem(MEET_KEY, JSON.stringify({ room: room.toUpperCase(), at: nowMs })); return true; } catch (_e) { return false; }
+}
+/** -> true (and the token is gone) when this tab holds a fresh token for `room`; false otherwise. Any token found is removed: one use or no use. */
+export function takeMeetToken(storage, room, nowMs, maxAgeMs = MEET_MAX_AGE_MS) {
+  try {
+    if (!storage) return false;
+    const raw = storage.getItem(MEET_KEY);
+    if (raw === null || raw === undefined) return false;
+    storage.removeItem(MEET_KEY);
+    if (storage.getItem(MEET_KEY) !== null) return false;
+    let t = null; try { t = JSON.parse(raw); } catch (_e) { t = null; }
+    if (!t || typeof t.room !== 'string' || !Number.isFinite(t.at) || typeof room !== 'string') return false;
+    const age = nowMs - t.at;
+    return t.room === room.toUpperCase() && age <= maxAgeMs && age >= -5000;
+  } catch (_e) { return false; }
+}
+
 /**
  * -> { ck } and the token is gone, or null (none, another challenge's, expired, malformed, from the future, or storage that will not let it be removed: one use or no use).
  * An expired or unreadable token is removed; one that is merely for another challenge is left alone (its own page may still be on its way).
@@ -189,7 +214,7 @@ export function createPresence({ lobbies, identity, ui, navigate, hrefFor, now, 
   function list() {
     who = identity();
     if (label === null) label = residentLabel(rnd);
-    lobbies.host({ room: label, name: who.name, fmt: who.fmt, rom: who.rom, fp: who.fp, rs: who.rs, q: false, h: true, rec: who.rec || null });
+    lobbies.host({ room: label, name: who.name, fmt: who.fmt, rom: who.rom, fp: who.fp, rs: who.rs, q: false, h: true, rec: who.rec || null, ...(who.av ? { av: who.av } : {}) });
   }
   function handle(m) {
     if (!on) return;

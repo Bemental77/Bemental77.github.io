@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Trainer Center</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="description" content="Pokemon Arena's Trainer Center: walk around a little room with every trainer who is open to battles, change your look, and challenge anyone you meet." />
+  <meta name="color-scheme" content="dark" />
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/pokemonarena/arena.css" />
+  <link rel="stylesheet" href="/pokemonarena/input.css" />
+  <link rel="stylesheet" href="/pokemonarena/center.css" />
+  <!-- The game library's origin (lib/asset_base.js): the ROM is read for the battle board's version check -->
+  <script src="/lib/asset_base.js"></script>
+</head>
+<body data-layout="portrait" data-pad="off">
+  <header id="top">
+    <a class="home" id="homeLink" href="/pokemonarena/">&lsaquo; Arena</a>
+    <h1>Trainer Center</h1>
+    <button id="fullBtn" class="textbtn iconbtn" type="button" aria-pressed="false" aria-label="Fullscreen" title="Fullscreen"><svg class="ic ic-enter" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" /></svg><svg class="ic ic-exit" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9 4v5H4M20 9h-5V4M15 20v-5h5M4 15h5v5" /></svg></button>
+  </header>
+  <button id="fullExit" class="textbtn iconbtn" type="button" aria-pressed="true" aria-label="Exit fullscreen" title="Exit fullscreen"><svg class="ic ic-exit" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M9 4v5H4M20 9h-5V4M15 20v-5h5M4 15h5v5" /></svg></button>
+
+  <main id="play">
+    <div id="dpad" class="cluster" aria-label="Directional pad">
+      <button class="pbtn" data-btn="up" id="bUp" aria-label="Up" type="button">&#9650;</button>
+      <button class="pbtn" data-btn="left" id="bLeft" aria-label="Left" type="button">&#9664;</button>
+      <button class="pbtn" data-btn="right" id="bRight" aria-label="Right" type="button">&#9654;</button>
+      <button class="pbtn" data-btn="down" id="bDown" aria-label="Down" type="button">&#9660;</button>
+    </div>
+    <div id="screenWrap">
+      <canvas id="center" width="960" height="640" tabindex="0" data-input-target aria-label="The Trainer Center: a room with the trainers who are open to battles. Arrow keys or WASD walk, Z or Enter talks to the trainer in front of you, C shows an emote, V changes your look. Click or tap a trainer to walk to them."></canvas>
+    </div>
+    <p id="ctrHint" class="ctrhint"></p>
+    <div id="ab" class="cluster" aria-label="Action buttons">
+      <div class="abrow">
+        <button class="pbtn" data-btn="b" id="bB" aria-label="B (back)" type="button">B</button>
+        <button class="pbtn" data-btn="a" id="bA" aria-label="A (talk)" type="button">A</button>
+      </div>
+    </div>
+  </main>
+
+  <div id="ctrBar" class="ctrbar">
+    <button id="ctrLook" class="textbtn" type="button" title="Change what your trainer looks like (V)">Your look</button>
+    <button id="ctrEmote" class="textbtn" type="button" title="Show an emote over your head (C)">Emote</button>
+    <button id="ctrOnline" class="textbtn" type="button" title="Invite a friend with a link, or join a friend's code">Battle online</button>
+    <button id="ctrLeave" class="textbtn" type="button">Leave</button>
+  </div>
+  <p id="ctrStatus" class="dim" role="status" aria-live="polite">Opening the door...</p>
+  <p id="keys" class="dim">Arrows or WASD walk &middot; Z / Enter talks to the trainer in front of you &middot; C emote &middot; V your look &middot; click a trainer to walk over</p>
+  <div id="live" class="sr" role="status" aria-live="polite"></div>
+
+  <div id="ctrDlg" class="ctrdlg" role="dialog" aria-modal="true" aria-labelledby="ctrDlgTitle" hidden>
+    <div class="dlg">
+      <h2 id="ctrDlgTitle"></h2>
+      <div id="ctrDlgBody"></div>
+      <div class="row" id="ctrDlgBtns"></div>
+    </div>
+  </div>
+
+  <noscript><p class="warn">The Trainer Center needs JavaScript.</p></noscript>
+  <script type="module" src="/pokemonarena/js/center_boot.js"></script>
+</body>
+</html>

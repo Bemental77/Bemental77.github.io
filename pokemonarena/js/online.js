@@ -31,7 +31,7 @@ import { PINNED } from './rom.js';
 import { isId } from './profile.js';
 import { navigationType } from './battle_resume.js';
 import { createOpenLobbies, createLocalBus, createMqttBus, ROOM_RE, MQTT_LIB } from './openlobby.js';
-import { createChallenge, createAcceptor, takeAcceptToken, admission, canSeal, ACCEPT_MAX_AGE_MS, TIMING as PRESENCE_TIMING } from './presence.js';
+import { createChallenge, createAcceptor, takeAcceptToken, takeMeetToken, admission, canSeal, ACCEPT_MAX_AGE_MS, TIMING as PRESENCE_TIMING } from './presence.js';
 
 export const GAME_KEY = 'Pokemon Arena';
 export { ROOM_RE };
@@ -78,7 +78,7 @@ export function parseOnlineQuery(search) {
     const jm = Number(q.get('openjoin')); if (Number.isInteger(jm) && jm >= 500 && jm <= 120000) limits.joinMs = jm;                                          // how long a listed game may stay silent before the joiner gives up on it
     const hm = Number(q.get('openhold')); if (Number.isInteger(hm) && hm >= 300 && hm <= 120000) limits.holdMs = hm;                                          // how long an admitted player who knocks again may take to be let back in before the seat is given up on
   }
-  return { role: auto || host ? 'host' : join ? 'guest' : null, room: auto ? null : room, transport, limits, auto };
+  return { role: auto || host ? 'host' : join ? 'guest' : null, room: auto ? null : room, transport, limits, auto, meet: q.get('meet') === '1' && join && room !== null };
 }
 
 /**
@@ -88,7 +88,7 @@ export function parseOnlineQuery(search) {
  */
 export function canonicalAddress(href, role, room) {
   const u = new URL(href);
-  for (const k of ['online', 'host', 'join', 'auto', 'for', 'rq', 'ck']) u.searchParams.delete(k);
+  for (const k of ['online', 'host', 'join', 'auto', 'for', 'rq', 'ck', 'meet']) u.searchParams.delete(k);
   u.searchParams.set('np', room); u.searchParams.set(role === 'host' ? 'host' : 'join', '1');
   return u.pathname + u.search + u.hash;
 }
@@ -100,7 +100,7 @@ export function canonicalAddress(href, role, room) {
  */
 export function boardAddress(href) {
   const u = new URL(href);
-  for (const k of ['np', 'host', 'join', 'rq', 'for', 'ck', 'auto']) u.searchParams.delete(k);
+  for (const k of ['np', 'host', 'join', 'rq', 'for', 'ck', 'auto', 'meet']) u.searchParams.delete(k);
   u.searchParams.set('online', '1');
   return u.pathname + u.search + u.hash;
 }
@@ -134,6 +134,9 @@ export function createOnline(cfg) {
     acceptTok = takeAcceptToken(ss, query.auto, Date.now(), ACCEPT_MAX_AGE_MS);        // wall clock: the token was written by the PREVIOUS page, and a monotonic clock does not span a page load
     if (!acceptTok) { query = { ...query, role: null, room: null, auto: null }; autoNotice = 'That address tried to open a game for you without you pressing Accept, so it was ignored. Host a game, or pick one below.'; }
   }
+  // THE TRAINER CENTER'S HAND-OFF: a join it was let into (an accepted challenge, a listed game) presses Join by itself, but only against the one-time token the Center left in THIS tab (presence.js takeMeetToken)
+  let meetTok = false;
+  if (query.meet) { let ss = null; try { ss = win.sessionStorage; } catch (_e) { ss = null; } meetTok = takeMeetToken(ss, query.room, Date.now()); }
   // every use of the clock here is a DURATION (a turn's allowance, a link's grace), so it is the monotonic one: a wall-clock step (NTP, a changed timezone) must not time anyone out
   const now = cfg.now || (() => (win.performance && typeof win.performance.now === 'function' ? win.performance.now() : Date.now()));
   const state = { stage: 'setup', role: query.role, room: query.room, transport: query.transport, nm: null, session: null, mine: null, name: null, fmt: null, error: null, info: null, matches: 0, open: false, quick: false, listed: null, openWanted: false, admitted: false, admittedId: null, defecting: false, invite: null, profileId: null, rec: null };
@@ -1140,6 +1143,7 @@ export function createOnline(cfg) {
     syncSetupUi();
     if (!ui.openBox.hidden) { ensureLobbies(); lobbies.startWatching(); renderOpenList(); ui.quick.disabled = false; }
     if (query.auto) autoStart(name); else if (autoNotice) say(autoNotice);
+    else if (meetTok && state.role === 'guest' && state.room) { meetTok = false; startAs('guest'); }
   }
 
   // (flashNow: the one-line notice the bar would show this instant, '' when there is none; the page test reads it)

@@ -48,6 +48,8 @@ export const TIMING = Object.freeze({
 });
 
 const HEX16 = /^[0-9a-f]{16}$/, HEX64 = /^[0-9a-f]{64}$/;
+// the trainer's look in the Trainer Center (avatar.js: seven base-36 digits). Shape only here; what each digit may be is avatar.js parseAvatar's, and a look it refuses is drawn as the default one
+const AV_RE = /^[0-9a-z]{7}$/;
 const CONFIRM_SLACK_MS = 250;      // two beacons a beacon interval apart arrive a few ms either side of it (timer jitter, the network): that is still "a beacon interval apart"
 // A one-time P-256 public key as its two base64url coordinates, 'x.y' (43 characters each); the AES-GCM iv (12 bytes); the sealed room (4..8 characters + the 16-byte tag = 20..24 bytes).
 // Shape only: whether the point is on the curve is WebCrypto's to refuse when the key is imported (presence.js).
@@ -69,7 +71,7 @@ function recOf(x) {
 
 /**
  * Strict shape check of ONE message from the board. Nothing here trusts the sender.
- * -> { ok:true, b } with b = { k:'ask', s } | { k:'gone', s, room } | { k:'open', s, room, name, fmt, rom, fp, rs, q, h, rec } | a directed kind (DIRECTED: chal adds name, rec, pk; dec adds why; acc adds pk, iv, ct) | { ok:false, why }
+ * -> { ok:true, b } with b = { k:'ask', s } | { k:'gone', s, room } | { k:'open', s, room, name, fmt, rom, fp, rs, q, h, rec, av } | a directed kind (DIRECTED: chal adds name, rec, pk; dec adds why; acc adds pk, iv, ct) | { ok:false, why }
  */
 export function checkBeacon(m) {
   if (!m || typeof m !== 'object' || Array.isArray(m)) return bad('not an object');
@@ -112,7 +114,8 @@ export function checkBeacon(m) {
   // the trainer's online record, [wins, losses]: self-reported and shown beside the name, never used for anything else
   const rr = recOf(m.rec);
   if (!rr.ok) return bad('record');
-  return { ok: true, b: { k: 'open', s: m.s, room, name: cleanName(m.name, 'Player'), fmt: m.fmt, rom: m.rom, fp: m.fp, rs: m.rs, q: m.q === 1 ? 1 : 0, h: m.h === 1 ? 1 : 0, rec: rr.rec } };
+  if (!(m.av === undefined || m.av === null || (typeof m.av === 'string' && AV_RE.test(m.av)))) return bad('look');
+  return { ok: true, b: { k: 'open', s: m.s, room, name: cleanName(m.name, 'Player'), fmt: m.fmt, rom: m.rom, fp: m.fp, rs: m.rs, q: m.q === 1 ? 1 : 0, h: m.h === 1 ? 1 : 0, rec: rr.rec, av: typeof m.av === 'string' ? m.av : null } };
 }
 
 /**
@@ -138,16 +141,17 @@ export function createDirectory({ now, ttlMs = TIMING.ttlMs, max = TIMING.maxLis
         if (g.s !== b.s) return false;                    // the first sender keeps the room; a second one claiming it is a copy or a hijack
         g.seen = t;
         if (g.name === b.name && g.fmt === b.fmt && g.rom === b.rom && g.fp === b.fp && g.rs === b.rs && g.q === b.q && g.h === b.h && JSON.stringify(g.rec) === JSON.stringify(b.rec)) {
+          if ((g.av || null) !== (b.av || null)) { g.av = b.av || null; return true; }          // a new look is news for the Center, but not a different listing (it does not restart the confirmation)
           if (!g.confirmed && t - g.since >= confirmMs) { g.confirmed = true; return true; }
           return false;
         }
-        Object.assign(g, { name: b.name, fmt: b.fmt, rom: b.rom, fp: b.fp, rs: b.rs, q: b.q, h: b.h, rec: b.rec, since: t, confirmed: false });
+        Object.assign(g, { name: b.name, fmt: b.fmt, rom: b.rom, fp: b.fp, rs: b.rs, q: b.q, h: b.h, rec: b.rec, av: b.av || null, since: t, confirmed: false });
         return true;
       }
       let changed = false;
       for (const [r, o] of games) if (o.s === b.s) { games.delete(r); changed = true; }
       if (games.size >= max) return changed;
-      games.set(b.room, { room: b.room, s: b.s, name: b.name, fmt: b.fmt, rom: b.rom, fp: b.fp, rs: b.rs, q: b.q, h: b.h, rec: b.rec, first: t, since: t, confirmed: false, seen: t });
+      games.set(b.room, { room: b.room, s: b.s, name: b.name, fmt: b.fmt, rom: b.rom, fp: b.fp, rs: b.rs, q: b.q, h: b.h, rec: b.rec, av: b.av || null, first: t, since: t, confirmed: false, seen: t });
       return true;
     },
     /** A game says it is gone. Only the sender that listed it can take it down. */
@@ -191,7 +195,7 @@ export function createOpenLobbies({ bus, now, mine, timers, random = defaultRand
   let hosting = null, beaconTimer = 0, askTimer = 0, pruneTimer = 0, lastAnswer = -Infinity, answerTimer = 0, closed = false, watching = false;
   let winStart = -Infinity, winCount = 0, rivalsMutedUntil = -Infinity, muteWake = 0;
   const emit = () => { for (const f of [...listeners]) { try { f(); } catch (_e) { /* a listener must not break the board */ } } };
-  const beaconOf = (k) => (k === 'ask' ? { t: BEACON, v: BEACON_V, k, s: sid } : { t: BEACON, v: BEACON_V, k, s: sid, room: hosting.room, name: hosting.name, fmt: hosting.fmt, rom: hosting.rom, fp: hosting.fp, rs: hosting.rs, q: hosting.q ? 1 : 0, ...(hosting.h ? { h: 1 } : {}), ...(hosting.rec ? { rec: hosting.rec } : {}) });
+  const beaconOf = (k) => (k === 'ask' ? { t: BEACON, v: BEACON_V, k, s: sid } : { t: BEACON, v: BEACON_V, k, s: sid, room: hosting.room, name: hosting.name, fmt: hosting.fmt, rom: hosting.rom, fp: hosting.fp, rs: hosting.rs, q: hosting.q ? 1 : 0, ...(hosting.h ? { h: 1 } : {}), ...(hosting.rec ? { rec: hosting.rec } : {}), ...(hosting.av ? { av: hosting.av } : {}) });
   const sendBeacon = () => { if (closed || !hosting) return; try { bus.send(beaconOf('open')); } catch (_e) { /* the bus is down: the next beacon tries again */ } };
 
   bus.onMessage((raw) => {
@@ -250,9 +254,9 @@ export function createOpenLobbies({ bus, now, mine, timers, random = defaultRand
     /** List MY game: info { room, name, fmt, rom, fp, rs, q }. Re-listing replaces the previous one. */
     host(info) {
       if (closed) return false;
-      const next = info && { room: String(info.room).toUpperCase(), name: cleanName(info.name, 'Player'), fmt: info.fmt, rom: info.rom, fp: info.fp, rs: info.rs, q: !!info.q, h: !!info.h, rec: info.rec || null };
+      const next = info && { room: String(info.room).toUpperCase(), name: cleanName(info.name, 'Player'), fmt: info.fmt, rom: info.rom, fp: info.fp, rs: info.rs, q: !!info.q, h: !!info.h, rec: info.rec || null, av: info.av || null };
       // the SAME check every other browser will apply: a listing they would drop is a bug here, not a quiet failure there
-      const probe = next && checkBeacon({ t: BEACON, v: BEACON_V, k: 'open', s: sid, room: next.room, name: next.name, fmt: next.fmt, rom: next.rom, fp: next.fp, rs: next.rs, q: next.q ? 1 : 0, h: next.h ? 1 : 0, rec: next.rec });
+      const probe = next && checkBeacon({ t: BEACON, v: BEACON_V, k: 'open', s: sid, room: next.room, name: next.name, fmt: next.fmt, rom: next.rom, fp: next.fp, rs: next.rs, q: next.q ? 1 : 0, h: next.h ? 1 : 0, rec: next.rec, ...(next.av ? { av: next.av } : {}) });
       if (!probe || !probe.ok) throw new RangeError('host(): the listing would be rejected by the board (' + (probe ? probe.why : 'nothing given') + ')');
       L.unhost();
       hosting = next;
