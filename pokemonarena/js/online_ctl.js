@@ -5,21 +5,24 @@
 // createCtl(env) -> { effect(eff), enter(path), leave(path), dispose(), state() }
 //
 // WHAT IT DOES
-//   * OPEN TO BATTLES. It tells the model the status of the hub page's ONE presence service (hub_presence.js) every time that changes, on every screen: the PLAY ONLINE row of the main menu then
-//     says whether the player is open, and "<name> wants to battle you" is the service's own question, over whatever is on the screen. The switch itself is svc.toggle(): the first ON asks the
-//     disclosure in the picture, and nothing is published before its YES.
+//   * OPEN TO BATTLES. It tells the model the status of the hub page's ONE presence service (hub_presence.js) every time that changes, on every screen, and the NAME ITS LISTING CARRIES (the
+//     active trainer's: the menu says which name is listed): the PLAY ONLINE row of the main menu then says whether the player is open, and "<name> wants to battle you" is the service's own
+//     question, over whatever is on the screen. The switch itself is svc.toggle(): the first ON asks the disclosure in the picture, and nothing is published before its YES.
 //   * FROM THE HUB TO THE BATTLE PAGE (INAPP.md "Contract 1"). "An address does not start a game": the one-time token is written into THIS tab first (hub_presence.js battleStart), then the page
 //     leaves. INVITE A FRIEND -> START { host }, ?online=1 ... BATTLE ANYONE -> START { quick }, ?online=1 ... JOIN -> MEET { room }, ?np=ROOM&join=1&meet=1 ... OPEN THE ROOM -> START { host, room },
-//     ?np=ROOM&host=1. WHEN THE TOKEN CANNOT BE WRITTEN (the browser blocks the storage) the model says so in the picture and asks GO ON / BACK; GO ON opens the fallback address, where the battle
+//     ?np=ROOM&host=1. Every one of them is the YES of a question the model asked first (what that page connects to and what it shows of the player): this file only carries the answer out.
+//     WHEN THE TOKEN CANNOT BE WRITTEN (the browser blocks the storage) the model says so in the picture and asks GO ON / BACK; GO ON opens the fallback address, where the battle
 //     page asks one question itself (?online=1&ask=host, &ask=quick, the plain ?np=ROOM&join=1 / &host=1). It never opens a bare ?online=1 without a token.
-//     A TOKEN OF A START THAT DID NOT LEAVE THE PAGE IS TAKEN BACK (a navigation the browser cancelled, a page that comes back from the back / forward cache): the restore, or the next thing the
-//     player does here STALE_MS after the start, removes it, so it cannot start a battle page they open later by hand.
+//     A TOKEN OF A START THAT DID NOT LEAVE THE PAGE IS TAKEN BACK (a navigation the browser cancelled, a page that comes back from the back / forward cache): the restore removes it at once;
+//     otherwise the next thing that reaches this file STALE_MS after the start does (a row pressed, a value changed, PLAY ONLINE left or entered), so it cannot start a battle page the player
+//     opens later by hand. Moving the cursor alone reaches nothing here: the token's own age (60 s, presence.js) is then the limit.
 //   * THE PREFERENCES (INAPP.md "Contract 2"): TEAM and SIZE through online_prefs.js, the NAME where the battle page reads it (localStorage 'arena.online.name': only a name the player typed).
 //     A value that could not be stored is taken back in the picture at once, with the reason: what the menu shows is what the battle page will read.
 //   * THE ROOM IN THE PAGE'S OWN ADDRESS (?np=ROOM&join=1 | &host=1: the battle page's CHANGE TEAM row, an old bookmark): the model shows its invite screen; a room that is not one, or both
 //     roles, is refused in words and the plain menu is shown. BACK puts the room away: it leaves the address, and a reload of this tab does not bring it back.
 //   * THE ROOM CODE A PLAYER TYPES OR PASTES is reduced by the battle page's own function (js/online.js roomFromInput; that file is the battle page's, so it is imported when JOIN A FRIEND is
-//     opened, not with this one) and checked against ROOM_RE.
+//     opened, not with this one) and checked against ROOM_RE. The answer goes back to the model WITH THE NUMBER OF THE REQUEST it answers (the join effect's req): the model drops one that is
+//     not the request it is waiting on (the player left, the menu gave up, another code was typed since), so a check that comes back late opens nothing.
 //
 // The pure parts (inviteFromSearch, boardOf, withoutInvite) are exported and run in Node; so does the ctl, on a real hub model with a fake page (tools/pokemonarena_hub_online_test.mjs).
 
@@ -39,7 +42,7 @@ export const NO_CODE = 'Type the room code your friend sent you.';
 export const NO_ROOM_HERE = 'That room could not be opened from here.';
 export const OPEN_FAILED = 'Open to battles could not be switched. Try again.';
 export const TOO_LONG = 'Longer than a room code: check it.';
-export const STALE_MS = 5000;                           // a start whose page is still here this long after it left for the battle page did not happen: its token is taken back at the player's next press
+export const STALE_MS = 5000;                           // a start whose page is still here this long after it left for the battle page did not happen: its token is taken back by the next thing that reaches this file (takeBack)
 
 /**
  * The room the HUB page's own address names. -> null (none) | { error } (the battle page's own words: js/online.js parseOnlineQuery, which a test compares this with) | { room, role: 'guest' | 'host' }.
@@ -97,7 +100,7 @@ export function createCtl(env) {
   function sync() { app.setPrefs(readOnlinePrefs(storage)); app.setName(readName()); app.setSeen(told()); }
 
   /* ---- OPEN TO BATTLES: the hub page's one presence service ---- */
-  function onPresence() { if (disposed || !svc) return; app.setPresence(svc.status()); redraw(); }
+  function onPresence() { if (disposed || !svc) return; app.setPresence(svc.status(), safe(() => svc.trainer(), null)); redraw(); }          // (trainer(): what the listing says while it is up, else null)
   function presence() {
     if (!svc) {
       svc = hubPresence(env);
@@ -165,14 +168,16 @@ export function createCtl(env) {
     if (!tools) tools = import('./online.js').then((m) => (typeof m.roomFromInput === 'function' ? m : null), (e) => { if (win.console) win.console.warn('[online] online.js did not load', e); tools = null; return null; });
     return tools;
   }
-  async function join(code) {
+  async function join(code, req) {
     const t = await loadTools();
-    if (disposed || app.state().busy !== 'join') return;          // the menu stopped waiting (it said so), or the player left the screen: nothing starts behind their back
+    if (disposed) return;
     const raw = String(code === undefined || code === null ? '' : code);
     const room = String((t ? t.roomFromInput(raw) : raw.replace(/[\s-]+/g, '').toUpperCase().slice(0, 8)) || '');
-    if (!ROOM_RE.test(room)) { app.roomRefused(room ? NOT_A_CODE : NO_CODE); redraw(); return; }
-    app.roomTaken();
-    start('join', room);
+    // (the MODEL decides whether this answer still counts: it answers request `req`, and only the request the menu is waiting on is heard. Nothing starts here: a room code brings the question
+    //  that says what joining connects to, and its YES comes back as a `start`)
+    if (!ROOM_RE.test(room)) app.roomRefused(req, room ? NOT_A_CODE : NO_CODE);
+    else app.roomTaken(req, room);
+    redraw();
   }
   async function paste(text) {
     const t = await loadTools();
@@ -186,7 +191,8 @@ export function createCtl(env) {
 
   return {
     enter() { takeBack(false); wake(); sync(); onPresence(); },
-    leave() { /* the model closes its own entry and questions (online_hub.js leave) */ },
+    // (the model closes its own entry and questions: online_hub.js leave. The storage question went with them, so the address it was holding is let go; and a start that never left is stale)
+    leave() { pending = null; takeBack(false); },
     effect(eff) {
       if (eff.type !== 'data' && eff.type !== 'dialog') takeBack(false);          // (anything the player does here; a data refresh or a dialog's own answer is not one)
       switch (eff.type) {
@@ -202,7 +208,7 @@ export function createCtl(env) {
         case 'open': wake(); return toggleOpen();
         case 'start': return start(eff.kind, eff.room, !!eff.seen);
         case 'join-open': loadTools(); return undefined;
-        case 'join': return join(eff.code);
+        case 'join': return join(eff.code, eff.req);
         case 'paste': return paste(eff.text);
         case 'invite-away': inviteAway(); return undefined;
         case 'leave': if (pending) go(pending); return undefined;

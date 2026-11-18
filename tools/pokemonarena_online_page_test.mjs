@@ -2472,11 +2472,12 @@ async function uiWords(c) {
     // the switch is the OPEN TO BATTLES row of PLAY ONLINE: what the picture says with the cursor on it (the two lines under the list), and what a screen reader is told
     const read = () => hub.eval('(() => { const H = window.__arenaHub; if (H.model.path() !== "online") H.goto("online"); H.model.apps.online.select("open"); const v = H.view(), r = v.menu.rows[v.menu.cursor]; return { label: r.label, value: r.value, help: v.msg.join(" "), said: H.model.speak(v) }; })()');
     const off = await read();
-    ok(/name and online record/.test(off.help) && /anyone can challenge you/.test(off.help), 'UW1 the OPEN TO BATTLES row says, under the list, that switching it on lists the name AND the online record, for anyone to challenge', J(off));
-    const says = await hub.eval('(async () => { await window.__arenaPresence.setOn(true); return { live: document.getElementById("live").textContent }; })()');
+    // (this browser has no trainer: the listing would say "Player", and the row says so. WHICH name is listed, and WHERE, is what the old tooltip said and the row must: "list your trainer name and online record on public servers")
+    ok(/Lists trainer name Player and online record on public servers/.test(off.help), 'UW1 the OPEN TO BATTLES row says, under the list, that switching it on lists the TRAINER name (by name) AND the online record ON PUBLIC SERVERS', J(off));
+    const says = await hub.eval('(async () => { await window.__arenaPresence.setOn(true); const t = window.__arenaPresence.trainer(); return { live: document.getElementById("live").textContent, listing: t ? t.name : null }; })()');
     await uiUntil(hub, 'window.__arenaHub.apps.state().online.open === "on"', 5000);
     const on = await read();
-    ok(/trainer name and online record/.test(says.live) && /You are listed/.test(on.help), 'UW2 switching on says, in the live region, that the trainer name AND the online record are listed, and the row says the player is listed', J({ says, on }));
+    ok(/trainer name and online record/.test(says.live) && says.listing === 'Player' && /You are listed as Player:/.test(on.help), 'UW2 switching on says, in the live region, that the trainer name AND the online record are listed, and the row says the player is listed, under the name the listing carries', J({ says, on }));
     ok(off.label === 'OPEN TO BATTLES' && on.label === 'OPEN TO BATTLES' && off.value === 'OFF' && on.value === 'ON' && /OPEN TO BATTLES OFF\./.test(off.said) && /OPEN TO BATTLES ON\./.test(on.said),
       'UN1 the row has ONE name ("OPEN TO BATTLES") whatever its state, and its value carries the state (OFF -> ON), in the picture and for a screen reader', J({ off, on }));
     // brokers that cannot be reached: the name stays, and the row says nobody can see the listing
@@ -2690,7 +2691,7 @@ const UI_MUTANTS = [
   { id: 'M20', what: 'the row\'s name changes with its state again (the state belongs in its value)', file: 'js/online_hub.js', from: "label: 'OPEN TO BATTLES', value: S.open === 'on' ||", to: "label: S.open === 'off' ? 'OPEN TO BATTLES' : 'OPEN', value: S.open === 'on' ||", run: 'words', fails: 'UN1' },
   { id: 'M21', what: 'the battle page\'s Open button changes its name with its state again (no constant aria-label)', file: 'js/presence_boot.js', from: "button.setAttribute('aria-label', OPEN_LABEL);", to: '', also: [{ file: 'battle.html', from: ' aria-label="Open to battles" hidden title=', to: ' hidden title=' }], run: 'battlebtn', fails: 'UN2' },
   { id: 'M22', what: 'the dialog layer takes the repeats of a held direction as steps (a key held since before the question drifts the highlight onto YES)', file: 'js/hub_dialog.js', from: "    if (info && info.repeat) return [];\n", to: '', run: 'drift', fails: 'UA5' },
-  { id: 'M23', what: 'the OPEN TO BATTLES row names only the name', file: 'js/online_hub.js', from: "openOff: ['Lists your name and online record',", to: "openOff: ['Lists your name',", run: 'words', fails: 'UW1' },
+  { id: 'M23', what: 'the OPEN TO BATTLES row says "your name" (which name?) and not where it is listed', file: 'js/online_hub.js', from: "openOff: (who) => ['Lists trainer name ' + who + ' and', 'online record on public servers. A: on.'],", to: "openOff: () => ['Lists your name and online record', 'so anyone can challenge you. A: on.'],", run: 'words', fails: 'UW1' },
   { id: 'M24', what: 'the live-region message names only the trainer name', file: 'js/presence_boot.js', from: "const ON_SAYS = 'Open to battles. Your trainer name and online record are listed for anyone using Play online.';", to: "const ON_SAYS = 'Open to battles. Your trainer name is listed for anyone using Play online.';", run: 'words', fails: 'UW2' },
   { id: 'M25', what: 'RESET RECORD in the hub does not tell the listing', file: 'js/boot.js', from: 'if (hook.presence) hook.presence.refresh().catch(', to: 'if (false) hook.presence.refresh().catch(', run: 'record', fails: 'UQ1' },
   { id: 'M26', what: 'a store that cannot be read lists the player as "Player" with no record', file: 'js/presence_boot.js', from: 'if (r.ok && trainerKey(r.trainer) !== trainerKey(trainer))', to: 'if (trainerKey(r.ok ? r.trainer : null) !== trainerKey(trainer))', run: 'record', fails: 'UQ2' },
@@ -3018,8 +3019,8 @@ async function uxText(c) {
     ok(!(await p.eval('document.querySelectorAll("#olPublic, #online").length')), 'OXT3b there is no switch that lists a room made for a friend: a room with a code is private', '');
     // the hub's switch is a row of its picture: the words of that row (js/online_hub.js) name the record as well as the name
     const words = await (await fetch(c.origin + '/pokemonarena/js/online_hub.js')).text();
-    const line = (words.match(/openOff: \[([^\]]*)\]/) || [])[1] || '';
-    ok(/name and online record/.test(line), 'OXT4 the hub\'s OPEN TO BATTLES row names the online record as well as the name', line);
+    const line = (words.match(/openOff: \(who\) => \[([^\]]*)\]/) || [])[1] || '';
+    ok(/trainer name ' \+ who \+ ' and/.test(line) && /online record on public servers/.test(line), 'OXT4 the hub\'s OPEN TO BATTLES row names the trainer name (by name) and the online record, on public servers', line);
     ok(p.errors.length === 0, 'OXT5 no page errors', J(p.errors).slice(0, 200));
   });
 }
@@ -3043,7 +3044,7 @@ const UX_MUTANTS = [
   { id: 'X18', what: 'a resume that is given up builds the setup form twice', file: 'js/online.js', from: "{ await resumeFlow(rec); return; }", to: '{ if (await resumeFlow(rec)) return; }', run: 'giveup', fails: 'OXG1' },
   { id: 'X19', what: 'online play says of itself that only choices travel, straight to the friend', file: 'js/online.js', from: 'Your teams stay in your browser until a battle starts; then the team you play and your choices go to the other player, directly when your browsers can reach each other and through a public relay when they cannot.', to: 'Your teams stay in your browser; only your choices travel, straight to your friend.', run: 'text', fails: 'OXT1' },
   { id: 'X21', what: 'the question FIND AN OPPONENT? names the trainer name but not the record', file: 'js/online_view.js', from: 'Other players see your trainer name and your online record.', to: 'Other players see your trainer name.', run: 'text', fails: 'OXT3' },
-  { id: 'X22', what: 'the hub\'s OPEN TO BATTLES row names only the name', file: 'js/online_hub.js', from: "openOff: ['Lists your name and online record',", to: "openOff: ['Lists your name',", run: 'text', fails: 'OXT4' },
+  { id: 'X22', what: 'the hub\'s OPEN TO BATTLES row names only the name', file: 'js/online_hub.js', from: "openOff: (who) => ['Lists trainer name ' + who + ' and', 'online record on public servers. A: on.'],", to: "openOff: (who) => ['Lists trainer name ' + who + ' on', 'public servers. A: on.'],", run: 'text', fails: 'OXT4' },
 ];
 const UX_SESSIONS = { join: uxJoin, quick: uxQuick, challenge: uxChallenge, cancel: uxCancel, relist: uxRelist, names: uxNames, rec: uxRec, resume: uxResume, giveup: uxGiveUp, text: uxText };
 
