@@ -13,10 +13,12 @@
 //                'ignored'    an Accept address without its token (a link from anywhere, Back, a restored tab): the words say so                    BACK
 //   wait       something is under way: who the player is in it, what is happening now, the numbered steps, one sentence, how long this step has taken; for the host the room code LARGE with
 //              COPY LINK / SHARE / COPY CODE; and the way out (CLOSE THE ROOM / STOP LOOKING / CANCEL) until the other player is connected. Nothing can be pressed once connected.
+//              While a token of the hub is starting something (view.kind 'starting': the teams are being read and checked) it is the same screen with no rows: who the player will be in it,
+//              GETTING READY..., and never the question the address would ask without the token.
 //   hidden     a battle (or the error screen) has the page.
 //
 // THE SNAPSHOT (online.js snapshot())
-//   { stage, role, room, codeShown, open, quick, invite, admitted, defecting, listedName, played (a battle of this page has been mounted), status: { text, bad }, since (ms this stage has
+//   { stage, role, room, codeShown, open, quick, invite, admitted, defecting, listedName, played (a battle of this page has been mounted), starting (a token of the hub is starting something), status: { text, bad }, since (ms this stage has
 //     lasted, or null), board (the address named no room and no role), ask ('host' | 'quick' | null: what a board page asks), ignored, ready (the team list is loaded), canGo, canQuick,
 //     cancel: { shown, label }, link, canShare, copied ('link' | 'code' | null), team: { key, label, size } | null, name, fmt, bar }
 // THE VIEW
@@ -41,6 +43,7 @@ export const WORDS = Object.freeze({
   quickLede: 'Get matched with whoever is looking now. Other players see your trainer name and your online record.',
   ROWS: Object.freeze({ go: 'JOIN THE BATTLE', open: 'OPEN THE ROOM', yes: 'YES', team: 'CHANGE TEAM', back: 'BACK', copyLink: 'COPY LINK', share: 'SHARE', copyCode: 'COPY CODE', copied: 'COPIED' }),
   codeFriend: 'ROOM CODE', codeAnyone: 'CODE FOR A FRIEND',
+  starting: 'Getting ready...',
 });
 
 /** Who the player is in what is under way (`role`), what is happening now (`title`), and the numbered steps with the one it is at. s: the snapshot (stage, role, room, open, quick, invite, admitted, defecting, listedName). */
@@ -66,14 +69,16 @@ export function stepsNow(s) {
 
 /** The view of a snapshot (the header says what each is). Never throws on a snapshot online.js makes; changes nothing. */
 export function onlineView(s) {
-  const st = s.stage, setup = st === 'setup', going = UNDER_WAY.includes(st) && !s.played, board = !!s.board;
+  const st = s.stage, going = UNDER_WAY.includes(st) && !s.played, board = !!s.board;
+  // a token of the hub is starting something: not a question (it would be the one the token answers), until a refusal says why it did not start
+  const starting = st === 'setup' && !!s.starting && !(s.status && s.status.bad), setup = st === 'setup' && !starting;
   const ms = going && s.since !== null && s.since !== undefined ? Math.max(0, s.since) : null;
   const role = s.role === 'host' ? 'host' : s.role === 'guest' ? 'guest' : 'either';
   // the invite (the link, the code large) is for a PRIVATE room a friend is coming to; a game waiting for anyone shows its code as a fallback, under a label that says so
   const friendRoom = s.role === 'host' && !s.open && !s.quick;
   const R = WORDS.ROWS;
   const v = {
-    screen: setup ? 'confirm' : going ? 'wait' : 'hidden', kind: null, stage: st, role,
+    screen: setup ? 'confirm' : going || starting ? 'wait' : 'hidden', kind: starting ? 'starting' : null, stage: st, role,
     heading: '', lede: '', ask: '', info: [], who: '', title: '', steps: [], at: 0,
     status: { text: (s.status && s.status.text) || '', bad: !!(s.status && s.status.bad) },
     hint: '', elapsed: ms === null ? '' : fmtClock(ms),
@@ -106,6 +111,9 @@ export function onlineView(s) {
       v.heading = WORDS.ignored;
       v.rows = [{ id: 'back', label: R.back }];
     }
+  } else if (starting) {
+    v.who = s.role === 'guest' ? 'You\'re joining' + (s.room ? ', room ' + s.room : '') : s.ask === 'quick' ? 'Battle anyone' : 'You\'re hosting';
+    v.title = WORDS.starting;
   } else if (going) {
     const n = stepsNow(s);
     v.who = n.role; v.title = n.title; v.steps = n.steps.slice(); v.at = n.at;
@@ -216,18 +224,20 @@ export function sentenceLayout(measure, v, L = layoutOf(v)) {
  * for the screen before.
  */
 export function createOnlinePanel() {
-  let cursor = 0, sig = '', onId = null;
+  let cursor = 0, sig = '', onId = null, moved = false;          // moved: the PLAYER put the cursor where it is (a button, the pointer), on this screen
   function sync(v) {
     const s = v.screen + '|' + (v.kind || '') + '|' + v.rows.map((r) => r.id).join(',');
-    if (s !== sig) {          // another screen, or other rows: the cursor stays on the row it was on when that row is still there, else it starts at the top
-      const keep = sig.split('|')[0] === v.screen ? v.rows.findIndex((r) => r.id === onId) : -1;
-      sig = s; cursor = keep >= 0 ? keep : 0;
+    // ANOTHER SCREEN, OR OTHER ROWS. The cursor stays on the row it was on only if the player put it there and that row is still there (SHARE appearing does not move it off COPY CODE). A cursor
+    // nobody moved starts at the top: when a room opens it stands on COPY LINK, not on the way out it stood on while CLOSE THE ROOM was the only row (an A meant for nothing would close the room).
+    if (s !== sig) {
+      const keep = moved && sig.split('|')[0] === v.screen ? v.rows.findIndex((r) => r.id === onId) : -1;
+      sig = s; cursor = keep >= 0 ? keep : 0; if (keep < 0) moved = false;
     }
     cursor = v.rows.length ? Math.max(0, Math.min(v.rows.length - 1, cursor)) : 0;
     onId = v.rows[cursor] ? v.rows[cursor].id : null;
     return cursor;
   }
-  const setCursor = (v, i) => { cursor = i; onId = v.rows[i] ? v.rows[i].id : null; return { kind: 'move', index: i }; };
+  const setCursor = (v, i) => { cursor = i; moved = true; onId = v.rows[i] ? v.rows[i].id : null; return { kind: 'move', index: i }; };
   const activate = (v) => { const r = v.rows[cursor]; return !r ? null : r.disabled ? { kind: 'refused', id: r.id } : { kind: 'act', id: r.id }; };
   function hit(x, y, v) {
     for (const r of rowRects(v)) if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) return { kind: 'row', index: r.index, id: r.id };
@@ -270,5 +280,5 @@ export function speakOnline(v, cursor = 0) {
   const row = v.rows[cursor] ? ' ' + v.rows[cursor].label + ', ' + (cursor + 1) + ' of ' + v.rows.length + '.' : '';
   const says = sentencesOf(v).map((p) => p.text).join(' ');
   if (v.screen === 'confirm') return [v.heading + '.', v.info.map((l) => [l.label, l.value, l.right].filter(Boolean).join(' ')).join('. ') + (v.info.length ? '.' : ''), says].filter(Boolean).join(' ') + row;
-  return [v.who + '.', v.title, 'Step ' + (v.at + 1) + ' of ' + v.steps.length + ': ' + (v.steps[v.at] || '') + '.', v.code ? v.codeLabel + ' ' + v.code.split('').join(' ') + '.' : '', says].filter(Boolean).join(' ') + row;
+  return [v.who + '.', v.title, v.steps.length ? 'Step ' + (v.at + 1) + ' of ' + v.steps.length + ': ' + (v.steps[v.at] || '') + '.' : '', v.code ? v.codeLabel + ' ' + v.code.split('').join(' ') + '.' : '', says].filter(Boolean).join(' ') + row;
 }

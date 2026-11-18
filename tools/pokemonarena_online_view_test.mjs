@@ -60,6 +60,7 @@ const SCREENS = {
   quick_open: { ...QUICK_OPEN, ...say('Nobody was waiting, so your game is open: anyone who picks BATTLE ANYONE can join it.') },
   guest_join: { ...GUEST_WAIT, ...say('Connecting to the room K7Q2P...') },
   guest_slow: { ...GUEST_WAIT, since: 15000, ...say('Connecting to the room K7Q2P...') },
+  starting: { ...ASK_HOST, starting: true, ready: false, team: null },
   asking: { stage: 'asking', role: 'guest', since: 4000, cancel: { shown: true, label: 'Cancel' }, ...say('Asked HUBHERO to battle. Waiting for an answer...') },
   resuming: { stage: 'resuming', role: 'host', since: 500, ...say('Picking your battle up again...') },
 };
@@ -138,6 +139,9 @@ async function suite(V, D, who) {
     ok(view({ ...HOST_OPEN, cancel: { shown: false, label: 'Close the room' } }).rows.every((r) => r.id !== 'cancel'), T('W9 the way out is a row only while the wait can still be given up'), '');
     ok(view({ ...HOST_OPEN, played: true, stage: 'handshake' }).screen === 'hidden' && view({ stage: 'playing' }).screen === 'hidden' && view({ stage: 'failed' }).screen === 'hidden' && view({ stage: 'left' }).screen === 'hidden', T('W10 a battle (also the handshake of a rematch), the error screen and a page that is leaving have no online screen'), '');
     ok(view({ ...HOST_WAIT, codeShown: false }).code === '' && view({ ...HOST_OPEN, codeShown: false }).rows.every((r) => !/copy/.test(r.id)), T('W11 a room\'s code is on the screen only once the room is open'), '');
+    const sg = view({ ...ASK_HOST, starting: true, ready: false, team: null }), sj = view({ starting: true, ...say('Checking your team...') });
+    ok(sg.screen === 'wait' && sg.kind === 'starting' && sg.rows.length === 0 && sg.title === 'Getting ready...' && sg.who === 'You\'re hosting' && sg.steps.length === 0 && sg.code === '' && sg.elapsed === '' && sj.screen === 'wait' && sj.who === 'You\'re joining, room K7Q2P' && sj.status.text === 'Checking your team...' && view({ ...ASK_QUICK, starting: true }).who === 'Battle anyone', T('W13 while a token of the hub is starting something the screen says what is starting (no rows), never the question the address would ask without the token'), J([sg.screen, sg.kind, sg.who, sj.who]));
+    ok(view({ ...ASK_HOST, starting: true, ...say('The team code could not be read.', true) }).kind === 'ask-host' && view({ ...ASK_HOST, starting: false }).kind === 'ask-host' && view({ ...HOST_OPEN, starting: true }).kind === null, T('W14 a refusal ends it (the question, with the reason), and a wait that is under way is the waiting screen'), '');
     const st = V.stepsNow;
     ok(st({ stage: 'asking' }).at === 1 && st({ stage: 'searching' }).title === 'Looking for an opponent...' && st({ stage: 'open', role: 'host', invite: true, room: 'X' }).steps[1] === 'They join' && st({ stage: 'handshake', role: 'guest', room: 'X' }).at === 1 && st({ stage: 'resuming' }).steps.length === 2, T('W12 the steps of each kind of wait'), '');
   }
@@ -159,6 +163,8 @@ async function suite(V, D, who) {
     ok(P6.cursor(withShare) === 2 && withShare.rows[2].id === 'copy-code' && P6.cursor(view({ ...HOST_OPEN, copied: 'code' })) === 1, T('P6 when a row appears (SHARE) or changes its words (COPIED) the cursor stays on the row it was on'), String(P6.cursor(withShare)));
     P6.press('down', ho);
     ok(P6.cursor(view({})) === 0, T('P7 another screen starts with the cursor on its first row'), '');
+    const P11 = V.createOnlinePanel(), opening = P11.cursor(view(SCREENS.host_opening)), opened = P11.cursor(view(SCREENS.host_open));
+    ok(opening === 0 && opened === 0 && view(SCREENS.host_open).rows[opened].id === 'copy-link', T('P11 a cursor nobody moved starts at the top when rows appear: when the room opens it stands on COPY LINK, not on CLOSE THE ROOM (the only row while the room was opening)'), String(opened));
     const P8 = V.createOnlinePanel(), rects = P8.rects(inv), r1 = rects[1];
     const mv = P8.pointer({ kind: 'move', x: r1.x + 5, y: r1.y + 5 }, inv), again = P8.pointer({ kind: 'move', x: r1.x + 6, y: r1.y + 6 }, inv), cl = P8.pointer({ kind: 'click', x: rects[0].x + 5, y: rects[0].y + 5 }, inv);
     ok(J(mv) === J({ kind: 'move', index: 1 }) && again === null && J(cl) === J({ kind: 'act', id: 'go' }) && P8.pointer({ kind: 'click', x: 230, y: 80 }, inv) === null && J(P8.hit(r1.x + 1, r1.y + 1, inv)) === J({ kind: 'row', index: 1, id: 'team' }) && P8.hit(1, 1, inv) === null, T('P8 the pointer highlights the row under it, a click presses it, and a click beside the rows does nothing'), J([mv, again, cl]));
@@ -246,7 +252,7 @@ async function suite(V, D, who) {
   {
     const a = V.speakOnline(view(SCREENS.host_open), 0), b = V.speakOnline(view({ ...SCREENS.host_open, since: 99000 }), 0), c = V.speakOnline(view(SCREENS.host_open), 2), d = V.speakOnline(view({}), 1);
     ok(a === b && !/\d:\d\d/.test(a), T('S1 the words leave out the running clock (a live region would read it out every second)'), a);
-    ok(/You're hosting, room K7Q2P/.test(a) && /Waiting for your friend to join/.test(a) && /Step 2 of 4: Friend joins/.test(a) && /ROOM CODE K 7 Q 2 P/.test(a) && /COPY LINK, 1 of 3/.test(a) && /CLOSE THE ROOM, 3 of 3/.test(c), T('S2 they say who, what, the step, the code letter by letter, the sentence and the highlighted row'), a);
+    ok(!/Step/.test(V.speakOnline(view({ ...ASK_HOST, starting: true }), 0)) && /You're hosting, room K7Q2P/.test(a) && /Waiting for your friend to join/.test(a) && /Step 2 of 4: Friend joins/.test(a) && /ROOM CODE K 7 Q 2 P/.test(a) && /COPY LINK, 1 of 3/.test(a) && /CLOSE THE ROOM, 3 of 3/.test(c), T('S2 they say who, what, the step, the code letter by letter, the sentence and the highlighted row'), a);
     ok(/YOU'RE INVITED TO A BATTLE/.test(d) && /ROOM K7Q2P/.test(d) && /TEAM RED - Sun team/.test(d) && /CHANGE TEAM, 2 of 3/.test(d) && V.speakOnline(view({ stage: 'playing' }), 0) === '', T('S3 a confirm screen says its heading, its lines, its words and the row; a hidden screen says nothing'), d);
   }
 }
@@ -276,13 +282,16 @@ const MUTANTS = [
   { id: 'hint-for-listed', file: 'online_view.js', from: "st === 'waiting' && s.role === 'guest' && !s.listedName) v.hint", to: "st === 'waiting' && s.role === 'guest') v.hint", fails: 'W7' },
   { id: 'rows-when-connected', file: 'online_view.js', from: "if (st !== 'handshake' && st !== 'resuming') {", to: 'if (true) {', fails: 'W8' },
   { id: 'cancel-always', file: 'online_view.js', from: "if (v.cancel.shown) v.rows.push({ id: 'cancel'", to: "if (true) v.rows.push({ id: 'cancel'", fails: 'W9' },
+  { id: 'starting-asks', file: 'online_view.js', from: "const starting = st === 'setup' && !!s.starting && !(s.status && s.status.bad), setup = st === 'setup' && !starting;", to: "const starting = false, setup = st === 'setup';", fails: 'W13' },
+  { id: 'refusal-hidden-by-starting', file: 'online_view.js', from: "const starting = st === 'setup' && !!s.starting && !(s.status && s.status.bad), setup = st === 'setup' && !starting;", to: "const starting = st === 'setup' && !!s.starting, setup = st === 'setup' && !starting;", fails: 'W14' },
   { id: 'rematch-shows-screen', file: 'online_view.js', from: 'going = UNDER_WAY.includes(st) && !s.played,', to: 'going = UNDER_WAY.includes(st),', fails: 'W10' },
   { id: 'code-before-open', file: 'online_view.js', from: "code: going && s.codeShown && s.room ? s.room : '',", to: "code: going && s.room ? s.room : '',", fails: 'W11' },
   { id: 'no-wrap', file: 'online_view.js', from: "if (action === 'down') return setCursor(v, (cursor + 1) % n);", to: "if (action === 'down') return setCursor(v, Math.min(n - 1, cursor + 1));", fails: 'P1' },
   { id: 'disabled-acts', file: 'online_view.js', from: "return !r ? null : r.disabled ? { kind: 'refused', id: r.id } : { kind: 'act', id: r.id }; };", to: "return !r ? null : { kind: 'act', id: r.id }; };", fails: 'P2' },
   { id: 'b-closes-wait', file: 'online_view.js', from: "        return i === cursor ? null : setCursor(v, i);\n", to: "        return { kind: 'act', id: 'cancel' };\n", fails: 'P4' },
-  { id: 'cursor-by-index', file: 'online_view.js', from: "const keep = sig.split('|')[0] === v.screen ? v.rows.findIndex((r) => r.id === onId) : -1;", to: "const keep = sig.split('|')[0] === v.screen ? cursor : -1;", fails: 'P6' },
-  { id: 'cursor-kept-across', file: 'online_view.js', from: "const keep = sig.split('|')[0] === v.screen ? v.rows.findIndex((r) => r.id === onId) : -1;", to: "const keep = v.rows.length ? Math.min(cursor, v.rows.length - 1) : -1;", fails: 'P7' },
+  { id: 'cursor-by-index', file: 'online_view.js', from: "const keep = moved && sig.split('|')[0] === v.screen ? v.rows.findIndex((r) => r.id === onId) : -1;", to: "const keep = moved && sig.split('|')[0] === v.screen ? cursor : -1;", fails: 'P6' },
+  { id: 'cursor-kept-across', file: 'online_view.js', from: "const keep = moved && sig.split('|')[0] === v.screen ? v.rows.findIndex((r) => r.id === onId) : -1;", to: "const keep = v.rows.length ? Math.min(cursor, v.rows.length - 1) : -1;", fails: 'P7' },
+  { id: 'unmoved-cursor-on-way-out', file: 'online_view.js', from: "const keep = moved && sig.split('|')[0] === v.screen ?", to: "const keep = sig.split('|')[0] === v.screen ?", fails: 'P11' },
   { id: 'hover-does-not-move', file: 'online_view.js', from: "      const moved = h.index !== cursor;\n      setCursor(v, h.index);\n", to: "      const moved = h.index !== cursor;\n      if (ev.kind === 'click') setCursor(v, h.index);\n", fails: 'P8' },
   { id: 'hidden-takes-press', file: 'online_view.js', from: "      if (!n || v.screen === 'hidden') return null;\n", to: "      if (!n) return null;\n", fails: 'P10', also: [{ file: 'online_view.js', from: "} else if (going) {\n    const n = stepsNow(s);", to: "} else {\n    const n = stepsNow(s); v.rows.push({ id: 'cancel', label: 'X' });" }] },
   { id: 'rows-over-sentence', file: 'online_view.js', from: "    if (n) { out.rows = { x: G.x, y, w: G.rows.w, h: n * G.rows.pitch, pitch: G.rows.pitch, n }; y += out.rows.h + G.gap; }\n  } else if (v.screen === 'wait') {", to: "    if (n) { out.rows = { x: G.x, y, w: G.rows.w, h: n * G.rows.pitch, pitch: G.rows.pitch, n }; y += out.rows.h; }\n  } else if (v.screen === 'wait') {", fails: 'L1' },

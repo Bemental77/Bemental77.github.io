@@ -1260,7 +1260,7 @@ and `js/online_prefs.js` are byte for byte what SEAM left; `PROTO`, `MSG`, `BEAC
 | `js/online.js` (rewritten presentation half) | no DOM but the status line of a battle (`#netbar`). `createOnline(cfg)` returns `view()`, `act(id)` and the named actions; `parseOnlineQuery` reads `ask=host \| quick`; `ONLINE_SHARES` (exported words) | page test, every battle-page group; `pokemonarena_online_view_test.mjs` X1-X4 |
 | `js/battle_boot.js` (hunks) | the canvas is up, fitted and listening before the first scene (`showOnline`), the loop draws the online screen while there is no scene, the buttons and the pointer go to it until a scene takes over; `hubUrl()` (Contract 6) | page test groups `easyjoin`, `screens`, `layout`, `openlayout` |
 | `battle.css` | the panel's 116 lines are gone; `body[data-state="online"] #menuBtn { visibility: hidden; }` (the pause menu's button before there is a battle) | `screens` SC8c; view test X2 |
-| `online_screens.golden.json` (new) | 19 frame hashes (FNV-1a of 240x160 RGBA). Hashes only | view test D8 (`--update`) |
+| `online_screens.golden.json` (new) | 20 frame hashes (FNV-1a of 240x160 RGBA). Hashes only | view test D8 (`--update`) |
 
 ### The battle page with NO valid token (Contract 1, as built)
 
@@ -1274,7 +1274,8 @@ and `js/online_prefs.js` are byte for byte what SEAM left; `PROTO`, `MSG`, `BEAC
 | `?online=1&auto=host&for=..&rq=..`, no accept token | `ignored`: the words say it was ignored. No board is dialled | BACK `back` |
 
 With the hub's token the page starts by itself exactly as SEAM built it (`startPlan`): START `{ host }` / `{ quick }` on the plain address, START `{ host, room }` on the room's host address, MEET on
-`&meet=1`, ACCEPT on `auto=host`. **A question the page falls back to after a token** (a room that could not open, a search that found nothing): the plain address shows `ask-host` or `ask-quick`
+`&meet=1`, ACCEPT on `auto=host`. **While a token is starting something** (the teams are read, the team is checked) the picture is the waiting screen with no rows, `view().kind === 'starting'`
+(who the player will be in it, *Getting ready...*, the sentence): the question the same address would ask WITHOUT the token is never shown on the way. **A question the page falls back to after a token** (a room that could not open, a search that found nothing): the plain address shows `ask-host` or `ask-quick`
 for what the token started, and the address gets `ask=<that>` so a reload is the same question.
 `CHANGE TEAM` = `hooks.toTeam(room, role)` = `/pokemonarena/?np=ROOM&join=1<test seams>#online` (or `&host=1`): **ONLINE reads `np` and `join` / `host` in the hub's own address.**
 The team used is the preference (`js/online_prefs.js preselect`) with the old fallback; the invite link the waiting screen hands out is unchanged (`/pokemonarena/battle.html?np=ROOM&join=1`).
@@ -1283,7 +1284,7 @@ The team used is the preference (`js/online_prefs.js preselect`) with the old fa
 
 ```js
 const online = createOnline({ win, doc, pack, bar, query, teamParam, formatParam, fingerprint, hooks });     // window.__arenaOnline
-online.view()                 // online_view.js onlineView(snapshot): { screen: 'confirm' | 'wait' | 'hidden', kind, stage, role, heading, lede, ask, info, who, title, steps, at, status: { text, bad },
+online.view()                 // online_view.js onlineView(snapshot): { screen: 'confirm' | 'wait' | 'hidden', kind ('invited' | 'room' | 'ask-host' | 'ask-quick' | 'ignored' | 'starting' | null), stage, role, heading, lede, ask, info, who, title, steps, at, status: { text, bad },
                               //   hint, elapsed, code, codeLabel, friendRoom, link, canShare, copied, cancel: { shown, label }, team, name, fmt, fmtShown, ready, canGo, canQuick, rows: [{ id, label, disabled? }], bar }
 online.act(id)                // a row was pressed: 'go' | 'host' | 'quick' | 'cancel' | 'copy-link' | 'copy-code' | 'share' | 'team' | 'back'. Call it INSIDE the key / pointer handler
 online.setForm({ teamKey, name, typed, fmt, room })      // the form model (what the hub stores as preferences; the tests' way in). -> a copy of the form
@@ -1298,7 +1299,7 @@ window.__arenaBattle.hubUrl()       // '/pokemonarena/#<arena.back>' or '/pokemo
 ```
 
 `createOnlinePanel()` (online_view.js): `press(action, view)` / `pointer(ev, view)` -> `null | { kind: 'move', index } | { kind: 'act', id } | { kind: 'refused', id }`; `hit(x, y, view)`, `rects(view)`,
-`cursor(view)`. **B on a confirm screen is its BACK row; B on a waiting screen never closes anything** (it puts the cursor on the way out). The cursor keeps its row (by id) when a row appears.
+`cursor(view)`. **B on a confirm screen is its BACK row; B on a waiting screen never closes anything** (it puts the cursor on the way out). A cursor the player moved keeps its row (by id) when a row appears; one nobody moved starts on the first row (COPY LINK when the room opens, not the way out).
 `createScreen(ui, h)` is drawn through the hub's shell renderer: `createHubScreen(ui, { appScreens: { online: createScreen } }).render({ app: 'online', screen: 'online', env, tick, online: view, cursor })`.
 **Stage 2** can draw a question over a battle the same way: that render call takes `dialog` (a hub_dialog.js view) and draws it over anything.
 
@@ -1315,8 +1316,8 @@ FAILED -> always this page's question, with the reason.
 Deleted: `buildPanel` and everything only it used (`ui`, `card`, the form nodes, `formControls`, `renderView`, `renderElapsed`, `renderSteps`, `renderOpenList`, `buildRow` / `fillRow` / `syncRows` and the
 list's focus-heir logic, the open-games note, the privacy foot on the page), `PASTE A TEAM CODE` (the `paste` choice and its words), the join-by-typed-code box, the panel's CSS. `battle.html` held
 no node of the panel (it was built in script): only its comment on `#live` changed.
-Kept, with no row in the picture: the board connection (`ensureLobbies`, dialled by BATTLE ANYONE, an accepted challenge and a challenge sent from this page: **a private room's page no longer dials the
-public brokers at all**), defecting to a listed game, `joinListed` / `challengeResident` / `pick` (the hub's tests and the page test's challenger drive them through the hook), `board()`.
+Kept, with no row in the picture: the board connection (`ensureLobbies`, dialled by BATTLE ANYONE, an accepted challenge and a challenge sent from this page: **a private room's page no longer opens the
+open-games board**; what `lib/netplay.js` dials to pair two browsers is as it was), defecting to a listed game, `joinListed` / `challengeResident` / `pick` (the hub's tests and the page test's challenger drive them through the hook), `board()`.
 `boardPrivacyText` and `ONLINE_SHARES` are exported words with nowhere on this page to stand: **ONLINE: show them in the hub's menu** (what going online shares; what BATTLE ANYONE dials).
 
 ### Sentences re-worded (they could not fit their window in a ROM font that reads well)
@@ -1363,9 +1364,9 @@ No new key. Read: `sessionStorage` `arena.go`, `arena.meet`, `arena.accept` (tak
 The counts are what each command prints as "passed". The battle-page sessions of the page test read and drive the picture; its hub sessions (ONLINE's) were not rewritten.
 
 ```bash
-node tools/pokemonarena_online_view_test.mjs --mutants                    # 60 passed, 34 mutants: the screens in Node with the real ROM renderer (see its header)
-node tools/pokemonarena_online_page_test.mjs                              # every group passes, 20 groups (profile hub lobby match leaving rejoin resume timeout easyjoin screens refusals teams lead layout open openlayout presence presenceui onlineux tokens)
-node tools/pokemonarena_online_page_test.mjs screens --mutants            # 21 mutants (new group: SC1-SC13, sessions bare ask copy back input battle; ARENA_SC=<session,...> picks some)
+node tools/pokemonarena_online_view_test.mjs --mutants                    # 63 passed, 37 mutants: the screens in Node with the real ROM renderer (see its header)
+node tools/pokemonarena_online_page_test.mjs                              # 528 passed, 20 groups (profile hub lobby match leaving rejoin resume timeout easyjoin screens refusals teams lead layout open openlayout presence presenceui onlineux tokens)
+node tools/pokemonarena_online_page_test.mjs screens --mutants            # 75 passed with them: 53 cases and 22 mutants (new group: SC1-SC13, sessions bare ask copy back input battle; ARENA_SC=<session,...> picks some)
 node tools/pokemonarena_online_page_test.mjs onlineux tokens --mutants    # 18 + 6 mutants (was 22 + 6: X06-X08 went with the list, X20 with the page's foot; X04, X05, X10-X13, X21, T04-T06 re-homed)
 node tools/pokemonarena_online_page_test.mjs open --mutants               # 10 mutants, unchanged strings
 node tools/pokemonarena_presence_test.mjs --mutants                       # 140 passed, 67 mutants (its 12 online.js mutants still apply)

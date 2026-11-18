@@ -176,6 +176,10 @@ export function createOnline(cfg) {
   // viaToken: what is under way was started by a token of the hub, with no press on this page. A way out the player takes then (CLOSE THE ROOM, STOP LOOKING, CANCEL) goes back to the hub, where they pressed;
   // a failure stays here, with the reason and the question (the player must be able to read why).
   let viaToken = false;
+  // starting: a token of the hub (START, MEET, ACCEPT) is about to start something on this page with no press here. Until it has (the teams are read, the team is checked) the screen says what
+  // is starting, never the question the same address would ask WITHOUT the token: a player who pressed INVITE A FRIEND in the hub must not be shown OPEN A ROOM FOR A FRIEND? on the way.
+  // A refusal ends it (the page is then at its question, with the reason), and so does anything the player starts from that question.
+  state.starting = !!(acceptTok || meetTok || startTok);
   // WHAT THE SCREEN SAYS, as state (view() reads it, and whatever presents the page reads view()): the one sentence, the way out of what is under way, whether the room's code may be shown, what can be pressed
   state.status = { text: '', bad: false }; state.cancel = { shown: false, label: 'Cancel' }; state.codeShown = false; state.goOff = true; state.quickOff = true; state.locked = false; state.copied = null; state.canShare = false; state.bar = null;
   const setCancel = (shown, label) => { state.cancel = { shown: !!shown, label: label || state.cancel.label }; };
@@ -228,7 +232,7 @@ export function createOnline(cfg) {
 
   /* ---------------------------------------------------------------------------------------------- what the page says (state; online_view.js makes the view of it, online_draw.js draws it) */
   /** The one sentence on the screen (a refusal when `bad`). It is state: view().status. */
-  const say = (t, bad) => { state.status = { text: t || '', bad: !!bad }; paint(); };
+  const say = (t, bad) => { state.status = { text: t || '', bad: !!bad }; if (bad) state.starting = false; paint(); };
   const inviteLink = () => win.location.origin + '/pokemonarena/battle.html?np=' + encodeURIComponent(state.room) + '&join=1' + (state.transport === 'local' ? '&net=local' : '');
   /** Copy, and say so WHERE THE PRESS WAS for two seconds (view().copied: 'link' | 'code'): the sentence says what is happening, and a "Copied." there used to replace "Waiting for your friend...".
    *  clipboard.writeText is called in the same task as the press that asked for it (nothing is awaited before it): a browser may refuse a copy that no user gesture stands behind. */
@@ -399,13 +403,13 @@ export function createOnline(cfg) {
     return lobbies;
   }
   function closeLobbies() { if (acceptor) { acceptor.stop(); acceptor = null; } if (lobbies) { const l = lobbies; lobbies = null; try { l.close(); } catch (_e) { /* ignore */ } } }
-  /** The board is watched while the page rests at the question that may go on it: the plain address asking FIND AN OPPONENT? (a private room has no business on the public brokers). */
+  /** The board is watched while the page rests at the question that may go on it: the plain address asking FIND AN OPPONENT? (a private room has no business on the board). */
   const boardWatched = () => state.stage === 'setup' && supportedHere() && boardPage() && state.ask === 'quick';
   /* ---------------------------------------------------------------------------------------------- the view: ONE pure function of a snapshot of the state (online_view.js) */
   function snapshot() {
     const c = choiceNow();
     return { stage: state.stage, role: state.role, room: state.room, codeShown: state.codeShown, open: state.open, quick: state.quick, invite: !!state.invite, admitted: state.admitted, defecting: state.defecting, listedName: state.listed ? state.listed.name : null,
-      played: state.matches > 0, status: state.status, since: stageAt && UNDER_WAY.includes(state.stage) ? Math.max(0, now() - stageAt) : null, board: boardPage(), ask: state.ask, ignored: !!autoNotice, ready: !!state.choices, canGo: !state.goOff && !state.locked, canQuick: !state.quickOff && !state.locked,
+      played: state.matches > 0, starting: state.starting, status: state.status, since: stageAt && UNDER_WAY.includes(state.stage) ? Math.max(0, now() - stageAt) : null, board: boardPage(), ask: state.ask, ignored: !!autoNotice, ready: !!state.choices, canGo: !state.goOff && !state.locked, canQuick: !state.quickOff && !state.locked,
       cancel: state.cancel, link: state.room ? inviteLink() : '', canShare: state.canShare, copied: state.copied, team: c ? { key: c.key, label: c.label, size: c.size || 6 } : null, name: form.name, fmt: form.fmt, bar: state.bar };
   }
   /** What the page shows now, as plain data (online_view.js says what each field is). Changes nothing. */
@@ -772,7 +776,7 @@ export function createOnline(cfg) {
     if (boardPage() && state.ask) { try { const u = new URL(win.location.href); if (u.searchParams.get('ask') !== state.ask) { u.searchParams.set('ask', state.ask); win.history.replaceState(null, '', u.pathname + u.search + u.hash); } } catch (_e) { /* the address stays as it was */ } }
     setCancel(false); state.locked = false; state.goOff = false; state.quickOff = false; state.codeShown = false;
     win.clearTimeout(copiedTimer); state.copied = null;          // (a COPIED that was said for the room that is gone is not said for the next one)
-    viaToken = false;          // (the page is at a question again: whatever is started from it now was started HERE)
+    viaToken = false; state.starting = false;          // (the page is at a question again: whatever is started from it now was started HERE)
     paint();
     if (boardWatched()) { ensureLobbies(); lobbies.startWatching(); }
   }
@@ -951,7 +955,7 @@ export function createOnline(cfg) {
 
   /** -> true when the battle is being resumed (the scene is mounted by the match's 'controller' event), false when the page should show the setup form after all. */
   async function resumeFlow(rec) {
-    startTok = null;          // (a start token is for the page load the hub's press led to, never for a battle that is picked up again: a resume that is given up shows the setup form and starts nothing)
+    startTok = null; state.starting = false;          // (a start token is for the page load the hub's press led to, never for a battle that is picked up again: a resume that is given up shows the setup form and starts nothing)
     state.stage = 'resuming'; state.role = rec.role; state.room = rec.room; state.name = rec.myName; state.fmt = rec.fmt;
     state.myTeamCode = rec.myTeam; state.oppTeamCode = rec.oppTeam;
     state.profileId = isId(rec.profileId) ? rec.profileId : null;
@@ -1006,9 +1010,9 @@ export function createOnline(cfg) {
   function act(id) {
     switch (id) {
       // (a press on THIS page: whatever it starts was started here, so its way out comes back to this page's question, not to the hub)
-      case 'go': viaToken = false; void go(); return true;
-      case 'host': viaToken = false; void startAs('host'); return true;
-      case 'quick': viaToken = false; void quick(); return true;
+      case 'go': viaToken = false; state.starting = false; void go(); return true;
+      case 'host': viaToken = false; state.starting = false; void startAs('host'); return true;
+      case 'quick': viaToken = false; state.starting = false; void quick(); return true;
       case 'cancel': cancelAsk(); return true;
       case 'copy-link': void copyLink(); return true;
       case 'copy-code': void copyCode(); return true;
