@@ -1,0 +1,14 @@
+{
+  "note": "tools/pokemonarena_center_test.mjs --update: FNV-1a hashes of pictures rendered from the ROM. Hashes only, never pixels.",
+  "hashes": {
+    "room.under": "82b2303c",
+    "room.over": "174638f7",
+    "frame.wait": "a350897c",
+    "frame.alone": "0792323d",
+    "frame.eight": "3c86bc87",
+    "frame.menu": "b2d94bca",
+    "frame.look": "784eef57",
+    "frame.emote": "47f3bcf4",
+    "frame.who": "e9f4d36f"
+  }
+}

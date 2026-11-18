@@ -769,3 +769,150 @@ In the page test the hub sessions that read `#challenge` / `#openInfo` now read 
 refresh (UR3), disclosure, touch. `stack` and `drift` changed meaning with the decision that a question WAITS behind a DOM panel: they used to prove the DOM dialog was on top of the panel. UR4 / UR5 mount
 presence_boot.js by hand with no dialogs handed in, so the DOM dialogs keep their two mutants (M12, M19); UK6 (M02) calls `mountDialog` itself. Moved deliberately: mutant `X13` of `onlineux` now breaks
 `ui.team.value = pre.teamKey;` (the line it broke was replaced by the preferences). ONLINE.md (BATTLE's file) still says the presence suite breaks things "50 ways": it is 67 now.
+
+## CENTER: as built
+
+The Trainer Center is the hub app `center` (2026-11-18): the ROM's own Pokemon Center in the 240x160 picture, the players as the ROM's overworld trainer sprites, the ROM's emote icons over their heads,
+every word in the ROM's windows and fonts. The page with the hand-drawn room and avatars is deleted. Every name below is the name in the code. Nothing in the protocol moved: `js/netmatch.js`,
+`js/online_match.js`, `js/openlobby.js`, `js/matchctl.js`, `js/engine*.js` and `lib/netplay.js` are untouched, and so are `PROTO`, `MSG`, `BEACON_V` / `TOPIC`, `SEAL_INFO`, `ACCEPT_KEY`, `MEET_KEY`, `resumeKey`, `GAME_KEY`.
+
+### What exists
+
+| File | What |
+|---|---|
+| `js/center_hub.js` | the app's pure model (`APP`, `createCenterHub`, `WALK`, `CGEOM`, `DLG`, `MENU_ROWS`, `WORDS`, `ANSWER_WORDS`, `DOING`, `stepOf`). One path, `center`, parent `online` |
+| `js/center_screen.js` | the pure renderer (`createScreen(ui, h)`, `TAG`, `BUBBLE_UP`): the map's lower layers, the nurse and her Pokemon and every trainer top to bottom, the map's top layer, the bubbles, the names (last: a name always reads), the mode's window |
+| `js/center_ctl.js` | the side effects (`createCtl(env)`, `ROOM_SOUNDS`, `ROOM_SOUNDTRACK`, `BEAT_MS`): the room read from the ROM, the presence service, the room's network, a challenge, the sounds |
+| `js/center_room.js` | THE ROOM as plain data (pure, no import): `roomFromWorld(world, { GFX, MB })`, `createGrid(room)`, `SPOTS`, `SPAWNS`, `STATUS_EMOTE`, `ahead`, `VEC`, `DIRS`, `OPPOSITE`, `CELL`, `ROOM_W`, `ROOM_H`, `TRAINER_ELEVATION`, `roomNpcs` |
+| `js/center_world.js` | `centerWorld(romBytes) -> { world, room }`: `world_rom.js loadWorld` and `roomFromWorld`, once per ROM image, shared by the renderer and the ctl |
+| `js/center_look.js` | THE LOOK CODE (Contract 4; replaces `js/avatar.js`) |
+| `js/center_net.js` | the room's messages and roster, VERSION 2, the room handed in as rules |
+| `center.html` | a redirect to `/pokemonarena/#center` that carries the test seams (`net anim arenaturn arenagrace openquick openchal openjoin openhold opendisc ctrname ctrav`) and nothing else of the address. No UI |
+| `center.golden.json` | hashes (FNV-1a) of nine pictures rendered from the ROM. Hashes only |
+| `tools/pokemonarena_center_test.mjs` | the suite, rebuilt (below) |
+
+`js/world_rom.js` was not changed. The three registries (`hub_apps.js`, `hub_app_screens.js`, `hub_app_ctls.js`) were not changed: they already named `center`.
+
+### What a player gets
+
+* **The room**: the ROM's map 2.0 with a fixed camera, 15 x 10 cells. `room.rows` is the ROM's collision at a trainer's elevation (`map.canEnter(x, y, 3)`), minus the two cells behind the counter nobody can reach.
+* **Walking** (`WALK`): one cell at a time, 16 frames a cell at a pixel a frame, the ROM's walk pictures 1 / 0 / 2 / 0 (a walk picture for the first half of a cell, the other foot on the next cell). A direction
+  pressed while standing turns at once and walks if it is still held 8 frames later; a new direction while walking is taken at the end of the cell. Held buttons come from `tick(path, held)`; of several held,
+  the one pressed last. Walls, the counter, the table and the plants stop a trainer exactly where the ROM's collision does. A tap or click on a floor cell walks there by the shortest way
+  (`grid.findPath`: never across the door mat unless the mat is where it goes). People do not block people.
+* **Who is in it**: every player with the Center open walks as their look. Players who are open elsewhere stand at `SPOTS` (ten cells; no two near each other, none under a plant) with a ROM icon saying what
+  they are doing (`STATUS_EMOTE`: `...` in the Arena's menu or a battle against the computer, `!!` looking for anyone, `!` hosting a listed game, the cross for another version). Players beyond the tenth
+  are in WHO'S HERE only. **Names**: a plate at each trainer's feet in the ROM's small narrow font, as tall as the letters: dark on white for the others, white on dark for the player.
+* **A** (facing it, or a tap on it): another player -> `<NAME>   W-L online` and **ASK TO BATTLE / CANCEL** (**JOIN THEIR BATTLE / CANCEL** when they host a listed game; a plain line when their listing has not
+  arrived or they are on another version); the nurse, from the cell across the counter, facing up -> a welcome and **PLAY ONLINE / STAY HERE** (`ctx.go('online')`); the PC, from the cell below it ->
+  `ctx.go('builder')`; the wall map -> WHO'S HERE; a sign -> what the Center shares, in pages (`DISCLOSURE_WORDS` of the seam plus `WORDS.also`). Standing on the door mat and stepping down leaves (`ctx.back()`);
+  a tap on the mat walks onto it and out.
+* **The menu** (B, START, a tap on `B: MENU` in the bottom right corner; B or START closes it): **LOOK** (the 138 ROM trainer sprites, sixteen to a page, the highlighted one walking in place; L / R, the
+  arrows in the title row or the wheel turn the page), **EMOTE** (the sixteen ROM icons), **TEAM** (`ctx.go('builder')`), **WHO'S HERE** (name, record, what they are doing; A on a row is A in front of that
+  player, which is how a player who is not in the picture is battled), **EXIT**. X is the emotes and Y the looks.
+* **Asking**: "Asked <NAME> to battle. Waiting for an answer..." with CANCEL (which listens after 0.6 s: the A that asked is not the A that cancels); then "<NAME> accepted! Opening the battle...",
+  "<NAME> said not now.", "<NAME> is answering another challenge. Try again in a moment.", "<NAME> did not answer.", "Challenge cancelled.", or why this browser cannot ask (`ANSWER_WORDS`).
+
+### What the Center calls of the other tracks, and what they can rely on
+
+* **SEAM** (`hubPresence(env)`): `ready`, `isOn()`, `mount.needsDisclosure()`, `turnOn({ persist: false, also: WORDS.also })`, `turnOff({ persist: false })`, `stored()`, `status()`, `onChange(fn)`,
+  `watchPlayers(bool)`, `players()`, `boardId()`, `trainer()`, `canChallenge()`, `challenge(player, { state, accepted, failed })`, `relist()`, `goBattle('join', room)` (the default `back`: the Center).
+  The Center asks nothing itself about being open: the disclosure and "<name> wants to battle you" are the service's questions.
+* **ONLINE**: the Center is opened with `ctx.go('center')`; `parent('center')` is `'online'`, so B, NO to the disclosure, the door mat and EXIT all come back to PLAY ONLINE when it was opened from there.
+  The nurse's PLAY ONLINE is `ctx.go('online')`. The HTML link `#trainerCenter` in `index.html` still points at `center.html`, which forwards to `#center`: remove it with the row.
+* **BUILDER**: the PC and TEAM are `ctx.go('builder')` (the builder opens on top of the Center). B on the builder's first screen must be `ctx.back()`: the Center then walks the player in again WHERE THEY STOOD
+  (`walkIn` keeps the cell when the player left through the PC or TEAM). While the builder is open the player is not in the room and, unless the stored switch is on, not open.
+* **BATTLE**: a battle that started in the Center has `sessionStorage['arena.back'] === 'center'` on both sides (the asker through `goBattle`, the one who accepted through the service). Coming back to
+  `/pokemonarena/#center` (with the test seams) walks the player in again. `tools/pokemonarena_center_test.mjs` CB7 reads the battle page through `window.__arenaOnline.state.stage`, `.state.role` and
+  `.nm().status().phase`, and its page mutant BM2 breaks the meet token's line in `js/online.js` (`else if (meetTok && state.role === 'guest' && state.room) { meetTok = false; startAs('guest'); }`): when
+  those move, CB7a / CB7c / CB7d and BM2 move with them.
+
+### The look (Contract 4) : `js/center_look.js`
+
+```js
+LOOK_KEY = 'arena.avatar'                  // localStorage, the key the first Trainer Center used
+LOOK_RE = /^w[0-9a-z]{6}$/    OLD_LOOK_RE = /^[0-5][0-9a-z]{6}$/    LOOK_ID_MAX
+lookCode(id) -> 'w00002h' | null           // 'w' + the ROM graphics id in base 36, six digits
+lookId(code) -> id | null                  // null: not a look code (an old code, junk). Says nothing about whether the ROM has such a sprite
+isLook(code, avatars) -> boolean           // a look code whose id is one of world.ow.avatars
+lookFor(code, avatars) -> id | null        // WHAT IS DRAWN: that id, else the FIRST avatar (an old code, junk, nothing, an id the list lacks)
+loadLook(storage) -> code | null           // an old code under the key reads as none      saveLook(storage, code) -> boolean      pickLook(avatars, n) -> code | null
+```
+
+`js/presence_boot.js` lists `av: loadLook(storage)` (it listed `loadAvatar(storage)`): a browser that still holds a code of the first Trainer Center lists NO look until the player has opened the Center once,
+where one of the ROM's is picked and kept. A player who lists no look is drawn as one of the ROM's trainers picked by their board id (the same one every time, the same on every screen).
+
+### The room's network : `js/center_net.js`, VERSION 2
+
+`CENTER_TOPIC = 'bemental/arena/center/2'`, `CENTER_CHANNEL = 'bemental-arena-center-2'`, `VERSION = 2`: a page of the first Trainer Center and this one never hear each other. The messages are what they
+were (`ask`, `here`, `mv`, `emo`, `bye`); so are `TIMING` (an emote now shows 2000 ms), `createRoster` and the caps. What changed:
+
+```js
+roomRules({ walkable(x, y), look(code), emotes }) -> rules     // from the ROM at run time; a rule that throws or does not answer `true` refuses
+NO_ROOM                                                         // refuses every position, look and emote
+checkCenterMsg(m, rules = NO_ROOM)                              // a position that is not a walkable cell, a look that is not one, an emote >= rules.emotes, a name that is not cleanName(name): refused
+createCenter({ bus, me, rules, now, timers, random, timing })   // + isIn(); the name goes out through cleanName
+```
+
+`EMOTES` and `EMOTE_NAMES` are gone (an emote is the number of a ROM icon), and the module imports neither a map nor a look table.
+
+### The model's own methods (what the ctl drives) and effects
+
+`setRoom(room)`, `room()`, `setMe({ name, rec, look })`, `setShares(text)`, `walkIn(n) -> boolean`, `isIn()`, `me() -> { name, rec, look, x, y, d }`, `setRoster({ walkers, players })`, `people()`,
+`setNet('off' | 'connecting' | 'up' | 'down')`, `myEmote(e)`, `askAccepted()`, `askFailed(why)`, `say(text)`, `kick('off' | 'noStart') -> effects`, `out() -> effects`.
+Effects `{ app: 'center', type }`: `moved`, `look { code }`, `emote { e }`, `ask { id, name }`, `join { id, room }`, `cancel-ask`, `sound { what: 'bump' | 'door' | 'pc' }`.
+Dialog ids: `center:talk`, `center:asking`, `center:note`, `center:nurse`, `center:sign` (closed in `leave`); the line that says why the player was walked out is `ctx.notify` and stays.
+Test hook: `window.__arenaHub.center = { state(), people(), me(), sid(), wire }`; the model's state is `window.__arenaHub.apps.state().center`.
+Test seams, honoured only with `?net=local`: `ctrname=<name>` (the name in the room) and `ctrav=<look code>`, so two tabs of one browser profile can be two trainers.
+
+### Storage, topics, addresses
+
+| Where | Key | Value |
+|---|---|---|
+| localStorage | `arena.avatar` | a look code, `w` + six base-36 digits (was: seven base-36 digits of the hand-drawn avatar; such a value reads as none) |
+| sessionStorage | `arena.center.in` | no longer written or read (the page that used it is gone) |
+| MQTT / BroadcastChannel | `bemental/arena/center/2` / `bemental-arena-center-2` | the room |
+| address | `/pokemonarena/#center` | the Center; `/pokemonarena/center.html` forwards to it |
+
+Nothing else is stored. `arena.open` is never written by the Center (it is on for the page only); `arena.meet` and `arena.back` are written by the seam's `goBattle`.
+
+### Sound
+
+* **Music**: the ctl calls `env.sound.music('pokecenter')` when the Center opens and `env.sound.music('hub')` when it closes. In the SoulGold soundtrack both keys are the same ROM song (song 400,
+  `MUS-POKE-CENTER`, `js/music_map.js`), so THE MENU MUSIC STAYS, and it is the ROM's Pokemon Center theme. The map's own header names song 835 (`world.center.music`), which `music_map.js` does not map
+  (`MUSIC_MAP.md`: "835 ... loop ... unmapped"); the music door a hub app has takes a `music_map.js` key only, so playing 835 needs a new key there (and in `MUSIC_MAP.md` and its test). Not done.
+* **Effects**: a step is silent (every press in the room returns `{ type: 'sfx', key: null }`); the menu opens with `se_menu_open` (the ROM's `SE-WIN-OPEN`); the pickers and questions keep the hub's
+  default cursor / select / back sounds. The wall bump, the door and the PC are three ROM effects the music map has no key for (`SE-WALL-HIT` 7, `SE-EXIT` 9, `SE-PC-ON` 4 in the SoulGold song table,
+  `ROOM_SOUNDS`): the ctl plays them through `env.sound.system().director.playEffectIndex` while the SoulGold soundtrack is in use, and plays `se_back` (door) / `se_select` (PC) / nothing (bump) with
+  another soundtrack, whose table has other numbers. The bump is heard once every 32 frames while a direction is held against a wall.
+
+### What was deleted
+
+`center.css`, `js/center_boot.js`, `js/center_draw.js`, `js/center_map.js`, `js/avatar.js`, `dev/avatar_sheet.html`, and the page in `center.html` (its canvas, buttons, dialog and status line).
+Still naming them, in files that are not CENTER's: a comment in `js/openlobby.js` (line 51: "avatar.js parseAvatar") and one in `js/presence.js` (line 66: "center_boot.js"); the stub fixture
+`tools/fixtures/pokemonarena/app-stubs/center_hub.js` (its header).
+
+### Known limits
+
+* A name plate laps over the trainer in the next row when two trainers stand in one column (the plates are drawn last, over the sprites and the bubbles, so the NAME always reads; a bubble can lose its top rows to the name of the trainer above). The spots are placed so that a plate never lies on a trainer
+  between players who stand still.
+* The picture's clock stops in a hidden tab: a walker in a hidden tab stands still for the others (they stay in the room: the heartbeat, the board id and the roster run on timers) and cannot be seen
+  walking until the tab is shown.
+* Leaving for the Team Builder leaves the room (the others see the player go and come back) and, for a player whose stored switch is off, takes the listing down for that time.
+* `ROOM_SOUNDS` are SoulGold song-table indexes: correct only for that soundtrack, which is why another soundtrack gets the mapped keys.
+* The roster is pushed to the model every 500 ms and on every room or board event; an emote on another trainer ends up to 500 ms late.
+
+### Tests (2026-11-18, this tree)
+
+```bash
+node tools/pokemonarena_center_test.mjs node             # the Node checks: L (looks), R (the room from the ROM), G (the grid), M1-M13 (the model), S (the renderer, the hashes), N (the room's messages),
+                                                         # T (the MEET token), K1-K6 (the ctl on two and three pages over Node's BroadcastChannel): 213 checks
+node tools/pokemonarena_center_test.mjs node --mutants   # ... and 66 defects, one at a time, each in a process of its own; each must fail the case it names (CENTER_MUT=<id> runs one)
+node tools/pokemonarena_center_test.mjs                  # the Node checks, then real Chrome: CB0 the redirect; CB1 the disclosure, NO, YES; CB2 two tabs; CB3 real keys and a click; CB4 a look and an emote;
+                                                         # CB5 a hub player at a spot; CB6 a challenge declined; CB7 one accepted: a battle on both screens, the MEET token; CB8 the door mat; CB9 the PC and back;
+                                                         # CB10 Open switched off elsewhere; CB11 a background tab; CB12 a phone (touch only) and a controller
+node tools/pokemonarena_center_test.mjs --mutants page-mutants   # five defects in the page, served over the real files; each must fail its session
+node tools/pokemonarena_center_test.mjs --update         # rewrite center.golden.json from what the ROM gives now (then LOOK at the pictures)
+```
+
+Ports: `ARENA_PORT` / `ARENA_CDP` (or `CENTER_PORT` / `CENTER_CDP`; defaults 8241 / 9441; the sessions use CDP+0..+2, the page mutants port+20.. and CDP+10..). Pictures: `CENTER_OUT`.

@@ -1,34 +1,39 @@
 // pokemonarena/js/center_net.js -- WHO IS IN THE TRAINER CENTER, and where they stand. The room's own messages, the roster built from them, and nothing else.
 //
 // The Center is one more topic on the public MQTT brokers lib/netplay.js and the open-games board (openlobby.js) already use (the same-browser transport is a BroadcastChannel, which is
-// what the tests use). It carries only what you can SEE in the room: a trainer's name, their look (avatar.js, seven characters), the tile they stand on and which way they face, a
-// short emote, and the id of their listing on the open-games board (`b`), so the page can tell which trainer in the room is which open game. Challenges and rooms are NOT here: a
-// battle is asked for through the board, exactly as from Players online (presence.js), so everything that protects a challenge (the sealed room, the accept token) is unchanged.
+// what the tests use). It carries only what you can SEE in the room: a trainer's name, their look (center_look.js: seven characters naming one of the ROM's overworld trainer sprites), the
+// cell they stand on and which way they face, an emote (the number of one of the ROM's emote icons), and the id of their listing on the open-games board (`b`), so the page can tell which
+// trainer in the room is which open game. Challenges and rooms are NOT here: a battle is asked for through the board (presence.js), so everything that protects a challenge (the sealed
+// room, the accept token) is unchanged.
+//
+// VERSION 2 (the room in the hub's picture, drawn from the ROM): the cells are the ROM Pokemon Center's and a look is a ROM sprite, so a page of the first Trainer Center (version 1: a
+// hand-drawn room and hand-drawn looks) must not mix with this one. The topic, the same-browser channel and the version in every message all changed; the messages themselves did not.
+//
+// THE ROOM IS HANDED IN, NOT WRITTEN HERE. Which cells can be stood on, which looks exist and how many emotes there are come from the ROM at run time (center_room.js roomFromWorld,
+// center_look.js): this module is given them as RULES (roomRules) and holds nothing ROM-derived. Without rules every position, look and emote is refused.
 //
 //   ask   { s }                                   who is here? (a page that just came in; the others answer with `here`, after a little random wait)
 //   here  { s, name, av, x, y, d, b?, rec? }      I am here, this is me (every TIMING.hereMs, and after an ask); a trainer drops out of the room TIMING.ttlMs after their last one
 //   mv    { s, x, y, d }                          I stepped onto (x, y) facing d (or turned on the spot)
-//   emo   { s, e }                                an emote (EMOTES[e]) over my head for a moment
+//   emo   { s, e }                                an emote (the ROM's emote icon number e) over my head for a moment
 //   bye   { s }                                   I left (the page closed, or went to a battle)
 //
-// LIKE THE BOARD, EVERYTHING HERE IS ADVICE FROM STRANGERS. Every message is shape-checked (checkCenterMsg): names reduced to safe text by the same cleanName the board uses, a look
-// that is not a valid avatar code is refused, a position that is not a floor tile of THIS room is refused, one sender cannot send more than TIMING.perSenderMax messages a second,
+// LIKE THE BOARD, EVERYTHING HERE IS ADVICE FROM STRANGERS. Every message is shape-checked (checkCenterMsg): a name that is not already safe text (what the board's cleanName leaves of it)
+// is refused, a look that is not a valid code of a sprite a player can be is refused, a position that is not a cell of THIS room a trainer can stand on is refused, an emote that is not
+// one of the ROM's is refused, one sender cannot send more than TIMING.perSenderMax messages a second,
 // the whole room is cut off above TIMING.totalMax, and the roster holds at most TIMING.maxWalkers trainers. Nobody can move anybody but themselves (a sender id is just a claim,
 // but the worst a copycat can do is draw a second trainer with the same name; talking to a trainer always goes through the board, where their own listing answers).
-// There is no free text: an emote is a number into a fixed list.
+// There is no free text: an emote is the number of an icon.
 //
 // Pure: no DOM, no network, timers injected. tools/pokemonarena_center_test.mjs runs it in Node.
 
 import { cleanName } from './netmatch.js';
-import { parseAvatar } from './avatar.js';
-import { walkable, isDir, MAP_W, MAP_H } from './center_map.js';
 
-export const CENTER_TOPIC = 'bemental/arena/center/1';
-export const CENTER_CHANNEL = 'bemental-arena-center-1';      // the same-browser transport
+export const CENTER_TOPIC = 'bemental/arena/center/2';
+export const CENTER_CHANNEL = 'bemental-arena-center-2';      // the same-browser transport
 export const KIND = 'arenactr';
-export const VERSION = 1;
-export const EMOTES = Object.freeze(['!', '?', '♥', '♪', 'Battle?', 'GG', '☺', 'Zzz']);
-export const EMOTE_NAMES = Object.freeze(['Surprised', 'Puzzled', 'Love', 'Music', 'Want to battle?', 'Good game', 'Happy', 'Sleepy']);
+export const VERSION = 2;
+export const DIRS = Object.freeze(['down', 'up', 'left', 'right']);
 export const TIMING = Object.freeze({
   hereMs: 3000,           // a trainer in the room says so this often
   ttlMs: 10000,           // ... and is gone this long after the last time
@@ -37,7 +42,7 @@ export const TIMING = Object.freeze({
   jitterMs: 400,          // ... after a random wait up to this
   moveGapMs: 60,          // our own steps are sent at most this often (a step takes longer than this, so in practice every step goes)
   emoteGapMs: 900,        // our own emotes at most this often
-  emoteShowMs: 2600,      // how long an emote stays over a head
+  emoteShowMs: 2000,      // how long an emote stays over a head
   maxWalkers: 30,         // the room holds at most this many other trainers
   perSenderMax: 14,       // messages per second from one sender above this are dropped unread
   totalMax: 260,          // messages per second from everybody above this are dropped unread
@@ -46,11 +51,27 @@ export const TIMING = Object.freeze({
 
 const HEX16 = /^[0-9a-f]{16}$/;
 const REC_MAX = 999999;
+const EMOTES_MAX = 64;
+const POS_MAX = 255;
 const bad = (why) => ({ ok: false, why });
-const isPos = (x, y) => Number.isInteger(x) && Number.isInteger(y) && x >= 0 && y >= 0 && x < MAP_W && y < MAP_H && walkable(x, y);
+const isDir = (d) => DIRS.includes(d);
 
-/** Strict shape check of ONE message. -> { ok: true, b } (only the fields the room defines, cleaned) | { ok: false, why } */
-export function checkCenterMsg(m) {
+/** The rules of no room at all: nothing can be stood on, nothing is a look, there is no emote. What checkCenterMsg uses when it is handed none. */
+export const NO_ROOM = Object.freeze({ walkable: () => false, look: () => false, emotes: 0 });
+/**
+ * THE RULES OF A ROOM, from what the ROM says at run time. o: { walkable(x, y) -> can a trainer stand there (center_room.js createGrid(room).walkable), look(code) -> is it a look a player can
+ * have (center_look.js isLook(code, room.looks)), emotes: how many emote icons there are (room.emotes) }. Anything left out refuses (NO_ROOM): rules never default to "anything goes".
+ */
+export function roomRules(o) {
+  const r = o && typeof o === 'object' ? o : {};
+  const n = Number.isInteger(r.emotes) && r.emotes > 0 ? Math.min(r.emotes, EMOTES_MAX) : 0;
+  const ask = (f) => (typeof f === 'function' ? (...a) => { try { return f(...a) === true; } catch (_e) { return false; } } : () => false);
+  return Object.freeze({ walkable: ask(r.walkable), look: ask(r.look), emotes: n });
+}
+const isPos = (rules, x, y) => Number.isInteger(x) && Number.isInteger(y) && x >= 0 && y >= 0 && x <= POS_MAX && y <= POS_MAX && rules.walkable(x, y);
+
+/** Strict shape check of ONE message against a room's rules (roomRules). -> { ok: true, b } (only the fields the room defines) | { ok: false, why } */
+export function checkCenterMsg(m, rules = NO_ROOM) {
   if (!m || typeof m !== 'object' || Array.isArray(m)) return bad('not an object');
   if (m.t !== KIND) return bad('wrong type');
   if (m.v !== VERSION) return bad('version');
@@ -58,22 +79,23 @@ export function checkCenterMsg(m) {
   const s = m.s;
   if (m.k === 'ask' || m.k === 'bye') return { ok: true, b: { k: m.k, s } };
   if (m.k === 'emo') {
-    if (!Number.isInteger(m.e) || m.e < 0 || m.e >= EMOTES.length) return bad('emote');
+    if (!Number.isInteger(m.e) || m.e < 0 || m.e >= rules.emotes) return bad('emote');
     return { ok: true, b: { k: 'emo', s, e: m.e } };
   }
   if (m.k !== 'here' && m.k !== 'mv') return bad('unknown kind');
-  if (!isPos(m.x, m.y)) return bad('position');
+  if (!isPos(rules, m.x, m.y)) return bad('position');
   if (!isDir(m.d)) return bad('direction');
   if (m.k === 'mv') return { ok: true, b: { k: 'mv', s, x: m.x, y: m.y, d: m.d } };
-  if (typeof m.name !== 'string' || m.name.length < 1 || m.name.length > 40) return bad('name');
-  if (!parseAvatar(m.av)) return bad('look');
+  // a name is what cleanName leaves of a name, nothing else: a page of this build never sends one it would have to change (hereMsg cleans it first)
+  if (typeof m.name !== 'string' || m.name.length < 1 || m.name.length > 40 || cleanName(m.name, '') !== m.name) return bad('name');
+  if (typeof m.av !== 'string' || !rules.look(m.av)) return bad('look');
   if (!(m.b === undefined || (typeof m.b === 'string' && HEX16.test(m.b)))) return bad('board id');
   let rec = null;
   if (m.rec !== undefined && m.rec !== null) {
     if (!Array.isArray(m.rec) || m.rec.length !== 2 || !m.rec.every((n) => Number.isInteger(n) && n >= 0 && n <= REC_MAX)) return bad('record');
     rec = [m.rec[0], m.rec[1]];
   }
-  return { ok: true, b: { k: 'here', s, name: cleanName(m.name, 'Trainer'), av: m.av, x: m.x, y: m.y, d: m.d, b: m.b || null, rec } };
+  return { ok: true, b: { k: 'here', s, name: m.name, av: m.av, x: m.x, y: m.y, d: m.d, b: m.b || null, rec } };
 }
 
 /**
@@ -130,9 +152,10 @@ const defaultRandom = (n) => { const a = new Uint8Array(n); globalThis.crypto.ge
  * This page in the room.
  *   bus     { send(obj), onMessage(fn), onStatus?(fn), status?(), close() }   openlobby.js createLocalBus / createMqttBus on CENTER_TOPIC / CENTER_CHANNEL
  *   me      () -> { name, av, x, y, d, b, rec }    read every time something is sent, so a new look, a new board id or a step is always what goes out
- * -> { sid, start(), moved(), emote(e), update(), list(), roster, watch(fn) -> off, status(), close() }
+ *   rules   roomRules({ walkable, look, emotes }): what a position, a look and an emote may be in THIS room (from the ROM, at run time). Left out, everything heard is refused
+ * -> { sid, start(), moved(), emote(e), update(), list(), roster, watch(fn) -> off, status(), isIn(), close() }
  */
-export function createCenter({ bus, me, now, timers, random = defaultRandom, timing = TIMING }) {
+export function createCenter({ bus, me, rules = NO_ROOM, now, timers, random = defaultRandom, timing = TIMING }) {
   const T = timers || { setInterval: globalThis.setInterval.bind(globalThis), clearInterval: globalThis.clearInterval.bind(globalThis), setTimeout: globalThis.setTimeout.bind(globalThis), clearTimeout: globalThis.clearTimeout.bind(globalThis) };
   const clock = now || (() => Date.now());
   const sid = randomHex(random, 8);
@@ -146,7 +169,7 @@ export function createCenter({ bus, me, now, timers, random = defaultRandom, tim
   const send = (o) => { if (closed) return; try { bus.send({ t: KIND, v: VERSION, s: sid, ...o }); } catch (_e) { /* the bus is down: the next heartbeat tries again */ } };
   const hereMsg = () => {
     const m = me();
-    const o = { k: 'here', name: String(m.name || 'Trainer').slice(0, 40), av: m.av, x: m.x, y: m.y, d: m.d };
+    const o = { k: 'here', name: cleanName(m.name, 'Trainer'), av: m.av, x: m.x, y: m.y, d: m.d };
     if (m.b) o.b = m.b;
     if (m.rec) o.rec = m.rec;
     return o;
@@ -158,7 +181,7 @@ export function createCenter({ bus, me, now, timers, random = defaultRandom, tim
     const t = clock();
     if (t - winStart > 1000) { winStart = t; winCount = 0; }
     if (++winCount > timing.totalMax) return;
-    const r = checkCenterMsg(raw);
+    const r = checkCenterMsg(raw, rules);
     if (!r.ok || r.b.s === sid) return;
     const b = r.b;
     let p = per.get(b.s);
@@ -200,7 +223,7 @@ export function createCenter({ bus, me, now, timers, random = defaultRandom, tim
     },
     /** An emote over our own head. -> false when it was too soon after the last one (nothing sent). */
     emote(e) {
-      if (!started || closed || !Number.isInteger(e) || e < 0 || e >= EMOTES.length) return false;
+      if (!started || closed || !Number.isInteger(e) || e < 0 || e >= rules.emotes) return false;
       const t = clock();
       if (t - lastEmote < timing.emoteGapMs) return false;
       lastEmote = t;

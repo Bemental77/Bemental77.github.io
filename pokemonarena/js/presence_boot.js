@@ -31,7 +31,7 @@ import { createOpenLobbies, createLocalBus, createMqttBus, brokersFor } from './
 import { createPresence, createChallenge, canSeal, isOpen, setOpen, acceptHref, TIMING } from './presence.js';
 import { PINNED } from './rom.js';
 import { DEFAULT_RULESET_ID } from './rules.js';
-import { loadAvatar } from './avatar.js';
+import { loadLook } from './center_look.js';
 
 export const SEEN_KEY = 'arena.open.seen';        // '1' once the player has read what the switch publishes and said OK
 export const FORMAT = '3v3';                      // every resident is listed, and every accepted challenge is played, as 3 v 3 (there is no format preference to read)
@@ -261,8 +261,8 @@ export function mountPresence(opts) {
     const fp = om.engineFingerprint(opts.pack);
     const bus = local ? createLocalBus(win) : createMqttBus(win, { brokers: brokersFor(win) });
     lobbies = createOpenLobbies({ bus, now: nowMs, mine: { rom: PINNED.sha256, fp } });
-    // av: the trainer's look in the Trainer Center (avatar.js), so a player who is open from the hub is drawn there as themselves; none stored = none sent (the Center draws a default)
-    identity = () => ({ name: (trainer && trainer.name) || 'Player', rec: trainer ? trainer.rec : null, fmt: FORMAT, rom: PINNED.sha256, fp, rs: DEFAULT_RULESET_ID, av: loadAvatar(storage) });
+    // av: the trainer's look in the Trainer Center (center_look.js: the code of a ROM trainer sprite), so a player who is open from the hub is drawn there as themselves; none stored = none sent (the Center draws a default)
+    identity = () => ({ name: (trainer && trainer.name) || 'Player', rec: trainer ? trainer.rec : null, fmt: FORMAT, rom: PINNED.sha256, fp, rs: DEFAULT_RULESET_ID, av: loadLook(storage) });
     lobbies.watch(paint);                  // a broker coming up, or none being reachable, changes what the switch says
     presence = createPresence({
       lobbies, identity, timing, now: nowMs, session,
