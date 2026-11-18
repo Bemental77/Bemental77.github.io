@@ -13,10 +13,12 @@
 //   const world = loadWorld(romBytes);                 // throws WorldRomError on a wrong / damaged ROM
 //   const room = world.center;                         // the Pokemon Center 1F (map 2.0), see CENTER below
 //   const pic = world.renderMap(room);                 // { width: 256, height: 160, under, over }  RGBA, 16 px per cell
-//   const view = world.renderView(room, 0, 0, 240, 160);          // the GBA screen: the room is exactly one screen
+//   const view = world.renderView(room, 0, 0, 240, 160);          // the whole room on one 240x160 screen (call ONCE and
+//                                                                 // keep it: see renderView; THE FRAMING below)
 //   const me = world.ow.walker(world.ow.avatars[0], 'down', 0);   // { width, height, rgba, flipX, frame }
 //   for (const s of world.mapSprites(room)) blit(s.sprite.rgba, s.px, s.py);   // the nurse and the other NPCs, as placed
 //   // one frame: view.under, then every sprite sorted by y (feet on the cell's bottom edge), then view.over
+//   const info = world.centerInfo(room);   // doors, counter (the solid cells), nurse, nurseTalk, pc, pcUse, regionMap, solid
 //
 // ------------------------------------------------------------------------------------------------------------
 // THE DATA MODEL AS FOUND IN THIS ROM (an Emerald engine with pokeemerald-expansion structs; the hack changed
@@ -63,6 +65,12 @@
 //                   the counter, the PC, the table and the mat are below. NOT confirmed against the running game.
 //   ATTRIBUTES       u16 per metatile; the low byte is the behaviour (Emerald's MB_* numbering: the Center's counter is
 //                   0x80, its PC 0x83, its wall map 0x85, its door mat 0x65, and the mat is where the warp event is).
+//                   Of the 1626 warp events 1199 sit on a door (0x60, 0x69), a ladder (0x61), an arrow warp
+//                   (0x62-0x65) or the one escalator cell (0x6a); see MB below for what confirms each value.
+//   ELEVATION        Emerald's meaning holds: 1 is surfable water (collision 0!), 3 the ground, 0 and 15 match anything.
+//                   map.walkable() is the collision bit alone, which is the whole rule in the Center (every open cell
+//                   is elevation 3); map.canEnter(x, y, elevation) adds the engine's elevation-mismatch rule, taken
+//                   from the Emerald source, NOT read from this ROM's code (the data supports it: test W2c / W2d).
 //   MapEvents (20 B) +0 u8 objectCount  +1 warpCount  +2 coordCount  +3 bgCount  +4 objects*  +8 warps*  +12 coords*  +16 bgs*
 //   ObjectEventTemplate (24 B, the expansion's packed one)  +0 u8 localId  +1 u16 graphicsId  +3 u8 kind  +4 s16 x
 //                   +6 s16 y  +8 u8 elevation  +9 u8 movementType  +10 u8 range (x low nibble, y high)  +12 u16 trainerType
@@ -95,6 +103,11 @@
 //   FRAME COUNTS     the info does not say how many frames a sprite has. It is the smaller of (the highest frame its
 //                   anim lists name + 1) and (what its pictures hold: all pictures lie back to back, so a sheet ends
 //                   where the next picture starts and an image table where the next table starts).
+//   NOT ITS OWN      an image table can be longer than the sprite's pictures: seven people (ids 243, 255, 256, 257,
+//                   293, 294, 295) have THREE pictures of their own under a nine-entry table whose entries 3..8 run
+//                   on into the next sprite's pictures or into empty space, and id 280's first two pictures are empty.
+//                   ow.info(id).cleanWalk is false for those eight, and walker() gives the standing picture for their
+//                   walk steps (every map places them standing). ow.frame() is the table as the ROM has it.
 //   sObjectEventSpritePalettes  0x4e9c84   { u16* data; u16 tag; u16 pad } records, ended by a null pointer; a sprite's
 //                   colours are the record whose tag equals its paletteTag (raw 16 x BGR555). Found by tag 0x1100.
 //                   0x1100 is the boy's palette, 0x1110 the girl's, 0x1103..0x1106 the four shared NPC palettes (their
@@ -103,11 +116,14 @@
 //                   0x7c7310, stride 0x118, see speciesgfx.js) embeds a graphics info at +0xc0 (female form +0xe4) and
 //                   palette pointers at +0x108 (shiny +0x10c). 956 species have one (897 are 32x32, 59 are 64x64).
 //   AVATARS          ow.avatars: the 16x32 sprites with the full walk (four directions, three different pictures each,
-//                   all drawn, every frame its own), each picture once: the two player characters (ids 0 and 89), then
-//                   135 people in table order. Kept out, each seen in the contact sheets: Pokemon drawn as walkers,
-//                   swimmers, the link / rival copies of the players (the same pictures again), four people whose image
-//                   table has three frames and runs on into the next sprite, four with empty walk frames, and eighteen
-//                   "standers" whose walk frames are copies of the standing ones (ow.standers: the nurse is one).
+//                   all drawn, every frame its own), each LOOK once (a look = the picture facing down in the sprite's
+//                   own colours): 138 ids. First the player characters: 0 the boy, 89 the girl, 216 the boy's pictures
+//                   in palette 0x1110 (the girl's; a pairing the ROM's own table makes, though no map places id 216
+//                   and whether the game ever shows it was not determined). Then 135 people in table order. Kept out,
+//                   each seen in the contact sheets: Pokemon drawn as walkers, swimmers, the ids that repeat a look
+//                   (100, 105, 217: the player characters again, pixel for pixel; 282-285, 292, 318), id 280, and the
+//                   25 "standers" with no walk to show (ow.standers): eighteen whose walk frames are copies of the
+//                   standing ones (the nurse is one) and the seven with three pictures only.
 //
 // EMOTES            three sprite templates share one callback (0x0826ba39): 0x13bcbf8 (palette tag 0x1110): the "!" "?"
 //                   "!!" "x" icons; 0x13bcc28 (tag 0x1103): the heart; 0x13bcc10 (tag 0x8003): the expansion's eleven
@@ -118,15 +134,24 @@
 // THE POKEMON CENTER (CENTER below, world.center): 23 maps are the standard Center (the nurse, a Chansey beside her,
 //   one PC cell, the counter, the wall map, one door-mat warp; tilesets 0x1138dc8 + 0x1138e28): thirteen are 16x10
 //   with a last column of solid black filler (twelve of them block for block identical) and ten are 15x10 with a
-//   second table. Map 2.0 is the first of the thirteen; its door leads to map 0.1. The room proper is 15 x 10 cells =
-//   240 x 160 px, exactly the GBA screen. There is no upstairs: the only warp is the door mat. Neither tileset has a
-//   tile-animation callback, so nothing in the room animates. Seats and cushions have no behaviour of their own: they
-//   are plain walkable floor; the table is four solid cells. world.centers also lists the five other maps that have a
-//   nurse, a PC and a counter (a big hall, the 35x18 one, a white 16x10 one, a 29x30 one and the 19x11 one with escalators).
+//   second table. Map 2.0 is the first of the thirteen; its door leads to map 0.1. There is no upstairs: the only warp
+//   is the door mat. Neither tileset has a tile-animation callback, so nothing in the room animates. Seats and
+//   cushions have no behaviour of their own: they are plain walkable floor; the table is four solid cells. The
+//   counter is the five SOLID MB.COUNTER cells (5..9,3); the ROM also gives that behaviour to the walkable wall-foot
+//   cell (0,2), which is no counter (centerInfo keeps it apart as counterFloor). world.centers also lists the five
+//   other maps that have a nurse, a PC and a counter (a big hall, the 35x18 one, a white 16x10 one, a 29x30 one and
+//   the 19x11 one with escalators).
+//   THE FRAMING: the room proper is 15 x 10 cells = 240 x 160 px, the SIZE of the GBA screen, so
+//   renderView(room, 0, 0, 240, 160) shows all of it at once. That is this site's framing, NOT a frame the game
+//   produces: the game keeps its camera on the player (in the Emerald source the player stands at screen cell (7, 5)
+//   and the map is drawn 8 px up; not checked in this ROM's code), so in play the room scrolls and its border block
+//   shows around it.
 //
 // NOT HERE (looked for or considered, not done): the field message box frame (uiassets.js has the battle one and the
 //   standard window frame), the overworld shadow sprite (field-effect templates 0-3 at 0x4f0fc4; its palette tag
-//   0x1200 is a run-time weather palette, not a table entry), map connections, map scripts, tile animations.
+//   0x1200 is a run-time weather palette, not a table entry), map connections, map scripts, tile animations,
+//   one-way cells (ledges), surfing. NOT CONFIRMED against the running game or the ROM's code: the layer rule, the
+//   black backdrop, the elevation rule, the camera.
 
 import { GfxError, decompressAny } from './gfxcodec.js';
 
@@ -169,9 +194,16 @@ export const TOP_LAYER = 2;                 // the layer drawn above the sprites
 export const CELL = 16;                     // pixels per map cell
 const RENDER_CACHE_BYTES = 32 * 1024 * 1024;   // map pictures kept (see renderMap)
 
-/** Metatile behaviours (attribute low byte). COUNTER, PC, REGION_MAP and SOUTH_ARROW_WARP were confirmed by where
- *  they are in the Pokemon Center; the second group is Emerald's numbering for the same family (values that do occur
- *  in this ROM's maps, NOT confirmed one by one by looking). */
+/** Metatile behaviours (attribute low byte), Emerald's MB_* numbering. How each was confirmed IN THIS ROM:
+ *    COUNTER, PC, REGION_MAP, SOUTH_ARROW_WARP   by where they are in the Pokemon Center (looked at);
+ *    the four ARROW_WARPs      by the map data (test W2e): the cell an arrow warp points at is one a trainer cannot
+ *                              enter for 106 of 106 east, 96 of 97 west, 421 of 430 south and 6 of 9 north warps, and
+ *                              the cell behind it is open for all but 2 of the 642;
+ *    NON_ANIMATED_DOOR, LADDER, ANIMATED_DOOR, TELEVISION   by the warp events (178, 183 and 195 warps sit on such
+ *                              cells) and by looking at a dozen cells of each: cave mouths and gate openings, ladders,
+ *                              building doors, a screen on a shelf;
+ *    UP_ESCALATOR, DOWN_ESCALATOR   NOT confirmed: the ROM has ONE cell of each (both in map 23.28; the 0x6a one
+ *                              carries a warp), so the names are Emerald's and nothing more. */
 export const MB = Object.freeze({
   NORMAL: 0x00,
   COUNTER: 0x80,            // you talk ACROSS it: the cell beyond it is the one you address
@@ -181,6 +213,13 @@ export const MB = Object.freeze({
   NON_ANIMATED_DOOR: 0x60, LADDER: 0x61, EAST_ARROW_WARP: 0x62, WEST_ARROW_WARP: 0x63, NORTH_ARROW_WARP: 0x64,
   ANIMATED_DOOR: 0x69, UP_ESCALATOR: 0x6a, DOWN_ESCALATOR: 0x6b, TELEVISION: 0x86,
 });
+
+/** Map elevations with a special meaning (see map.canEnter): a cell at 0 or 15 never refuses anyone, and an object
+ *  standing at 0 is refused nowhere. Elevation 1 is surfable water (45,615 of the 47,477 collision-free cells at
+ *  elevation 1 carry a water behaviour), 3 the ordinary ground, 4 the ground one level up. Emerald uses 15 for the
+ *  cells of a bridge; THIS ROM has no open cell at 15 (only 66 solid ones), so that half of the rule never fires. */
+export const ELEVATION_ANY = 0;
+export const ELEVATION_BRIDGE = 15;
 
 /** Graphics ids with a fixed meaning in this ROM (ids are table indices, not ROM data). */
 export const GFX = Object.freeze({
@@ -473,8 +512,42 @@ export function loadWorld(romBytes) {
       tilesets: { primary: L.primary, secondary: L.secondary, animated: !!(primary.callback || (secondary && secondary.callback)) },
       events: eventsOf(h.events),
       inside,
-      /** true when a trainer can stand on the cell: inside the map and collision 0 */
+      /** true when the cell is inside the map and its collision bit is clear. In a flat room (the Center: every
+       *  open cell is elevation 3) that is the whole rule. On other maps it is NOT: surfable water is collision 0
+       *  at elevation 1, and ground at two heights (elevations 3 and 4) is kept apart by elevation alone. Use
+       *  canEnter there. */
       walkable(x, y) { return inside(x, y) && collision[y * L.width + x] === 0; },
+      /**
+       * canEnter(x, y, elevation) -> true when an object standing at `elevation` may step onto the cell: walkable,
+       * and no elevation mismatch. The mismatch rule is the Emerald engine's (IsElevationMismatchAt, from the
+       * decompiled source, NOT read from this ROM's code): an object at elevation 0, or a cell at elevation 0 or
+       * 15, never mismatches; otherwise the two must be equal. Supported by the map data (test W2c / W2d): of the
+       * 353 placed objects that have an elevation of their own (3 or 4; most are placed at 0) and stand on a
+       * collision-free cell, 344 are on a cell this rule lets them enter (under 10% would be if the elevation sat
+       * in any other bits of the block), and it keeps a trainer at elevation 3 off 46,489 of the 48,325
+       * collision-free pond and ocean cells.
+       * NOT modelled: one-way cells (ledges, MB_IMPASSABLE_*), other objects, surfing.
+       */
+      canEnter(x, y, elev) {
+        if (!inside(x, y)) return false;
+        const i = y * L.width + x;
+        if (collision[i] !== 0) return false;
+        const ce = elevation[i];
+        return !elev || ce === ELEVATION_ANY || ce === ELEVATION_BRIDGE || ce === elev;
+      },
+      /**
+       * stepElevation(elevation, fromX, fromY, x, y) -> the elevation the object has after that step (Emerald's
+       * ObjectEventUpdateElevation, from the decompiled source like canEnter's rule): the new cell's, unless
+       * either cell is at 15, which leaves it as it was. A trainer entering a map takes the elevation of the cell
+       * it appears on. Stepping onto a cell at 0 gives elevation 0, from which any open cell can be entered.
+       */
+      stepElevation(elev, fromX, fromY, x, y) {
+        if (!inside(x, y)) return elev;
+        const ce = elevation[y * L.width + x];
+        if (ce === ELEVATION_BRIDGE) return elev;
+        if (inside(fromX, fromY) && elevation[fromY * L.width + fromX] === ELEVATION_BRIDGE) return elev;
+        return ce;
+      },
       behaviorAt(x, y) { return inside(x, y) ? behavior[y * L.width + x] : MB.NORMAL; },
     };
     mapCache.set(key, m);
@@ -584,28 +657,39 @@ export function loadWorld(romBytes) {
   }
 
   /**
-   * renderView(map, x0, y0, width, height) -> { width, height, under, over }: any pixel rectangle of the map's
-   * plane (x0 / y0 may be negative or reach past the map), with the border block wherever the map is not. This is
-   * what the game shows on its 240x160 screen. Not cached.
+   * renderView(map, x0, y0, width, height, into?) -> { width, height, under, over }: any pixel rectangle of the
+   * map's plane (x0 / y0 may be negative or reach past the map), with the border block wherever the map is not: the
+   * pixels a 240 x 160 screen whose top-left corner is at map pixel (x0, y0) shows.
+   *
+   * NOT CACHED, and the two arrays are the CALLER'S (unlike every other picture of this module): each call fills
+   * two new width * height * 4 arrays, which the caller may draw sprites on. A room with a fixed camera calls it
+   * ONCE and keeps the result; a scrolling one passes its previous result (or { under, over } of its own, e.g. two
+   * ImageData.data arrays) as `into`, and those arrays are overwritten in place: no allocation per frame.
    */
-  function renderView(m, x0, y0, width, height) {
+  function renderView(m, x0, y0, width, height, into) {
     if (![x0, y0, width, height].every(Number.isInteger) || width < 1 || height < 1 || width > 4096 || height > 4096) throw new WorldRomError('renderView: bad rectangle');
+    const n = width * height * 4;
+    const bytes = (a) => ArrayBuffer.isView(a) && a.BYTES_PER_ELEMENT === 1 && a.length === n;
+    if (into !== undefined && !(into && bytes(into.under) && bytes(into.over) && into.under !== into.over)) throw new WorldRomError('renderView: `into` needs two different byte arrays of ' + n + ' bytes (under, over)');
     const full = renderMap(m), bord = renderBorder(m);
-    const under = new Uint8Array(width * height * 4), over = new Uint8Array(width * height * 4);
+    const under = into ? into.under : new Uint8Array(n), over = into ? into.over : new Uint8Array(n);
+    const BW = bord.width;   // 32: the border block repeats every two cells, starting on an even cell
+    // columns [xa, xb) of the view lie on the map; the rest of a row (or a whole row above / below it) is border
+    const xa = Math.min(width, Math.max(0, -x0)), xb = Math.max(xa, Math.min(width, full.width - x0));
     for (let y = 0; y < height; y++) {
-      const my = y0 + y;
+      const my = y0 + y, row = y * width * 4;
+      const onMap = my >= 0 && my < full.height && xb > xa;
+      if (onMap) {
+        const s = (my * full.width + x0 + xa) * 4, e = s + (xb - xa) * 4;
+        under.set(full.under.subarray(s, e), row + xa * 4);
+        over.set(full.over.subarray(s, e), row + xa * 4);
+      }
+      const brow = (((my % BW) + BW) % BW) * BW;
       for (let x = 0; x < width; x++) {
-        const mx = x0 + x;
-        const d = (y * width + x) * 4;
-        let src, s;
-        if (mx >= 0 && my >= 0 && mx < full.width && my < full.height) { src = full; s = (my * full.width + mx) * 4; }
-        else {
-          const cx = Math.floor(mx / CELL), cy = Math.floor(my / CELL);
-          const bx = mod2(cx) * CELL + (mx - cx * CELL), by = mod2(cy) * CELL + (my - cy * CELL);
-          src = bord; s = (by * bord.width + bx) * 4;
-        }
-        under[d] = src.under[s]; under[d + 1] = src.under[s + 1]; under[d + 2] = src.under[s + 2]; under[d + 3] = src.under[s + 3];
-        over[d] = src.over[s]; over[d + 1] = src.over[s + 1]; over[d + 2] = src.over[s + 2]; over[d + 3] = src.over[s + 3];
+        if (onMap && x === xa) { x = xb - 1; continue; }
+        const mx = x0 + x, d = row + x * 4, s = (brow + (((mx % BW) + BW) % BW)) * 4;
+        under[d] = bord.under[s]; under[d + 1] = bord.under[s + 1]; under[d + 2] = bord.under[s + 2]; under[d + 3] = bord.under[s + 3];
+        over[d] = bord.over[s]; over[d + 1] = bord.over[s + 1]; over[d + 2] = bord.over[s + 2]; over[d + 3] = bord.over[s + 3];
       }
     }
     return { width, height, under, over };
@@ -849,25 +933,62 @@ export function loadWorld(romBytes) {
     return v;
   }
 
-  // every one of the twelve walker pictures shows a figure (a sheet with empty walk frames is not a walker to offer)
-  function walkerIsDrawn(inf) {
-    for (const p of inf.walk) {
-      for (const s of p) {
-        const d = frameData(inf, s.frame);
-        let ink = 0;
-        for (let i = 0, n = (inf.width * inf.height) >> 1; i < n; i++) { const b = d.buf[d.off + i]; if (b & 15) ink++; if (b >> 4) ink++; }
-        if (ink < 48) return false;
-      }
+  // inked (non-transparent) pixels of one frame
+  function inkOf(inf, f) {
+    const d = frameData(inf, f);
+    let ink = 0;
+    for (let i = 0, n = (inf.width * inf.height) >> 1; i < n; i++) { const b = d.buf[d.off + i]; if (b & 15) ink++; if (b >> 4) ink++; }
+    return ink;
+  }
+
+  // ROM offset of the FIRST picture of every sprite in the graphics table -> the lowest id that has it. A walk frame
+  // that IS another sprite's first picture is that sprite's art: seven people of this ROM (ids 255, 256, 293, 294,
+  // 295 with other people's pictures, 243 and 257 with empty ones) have three pictures of their own under a
+  // nine-entry image table, so entries 3..8 run on into whatever follows in the ROM.
+  let firstPics = null;
+  function firstPictures() {
+    if (firstPics) return firstPics;
+    firstPics = new Map();
+    for (let id = 0; id < O.owInfoCount; id++) {
+      const t = R.ptr(R.need(O.owInfoPointers + 4 * id, 'graphics info') + 28);
+      if (!t) continue;
+      const d = R.u32(t);
+      if (R.isPtr(d) && !firstPics.has(d - ROM_BASE)) firstPics.set(d - ROM_BASE, id);
     }
-    return true;
+    return firstPics;
+  }
+
+  // What walker() is really built from. inf.walk is what the anim lists SAY; this looks at the pictures they name:
+  //   cleanWalk   every one of the twelve is a drawn picture of the sprite's own
+  //   steps       the plan walker() uses: inf.walk itself, or, when a walk picture is empty or another sprite's, the
+  //               standing picture in its place (the sprite stands still; it never shows the next sprite's art)
+  function walkQuality(inf) {
+    if (inf.steps !== undefined) return inf;
+    if (!inf.walk) { inf.steps = null; inf.cleanWalk = false; return inf; }
+    const own = frameData(inf, 0), first = firstPictures();
+    const good = (s) => {
+      const d = frameData(inf, s.frame);
+      if (d.buf === rom && d.off !== own.off && first.has(d.off)) return false;   // another sprite's first picture
+      return inkOf(inf, s.frame) > 0;                                              // an empty picture
+    };
+    const stepsOwn = inf.walk.every((p) => good(p[1]) && good(p[2]));
+    inf.cleanWalk = stepsOwn && inf.walk.every((p) => good(p[0]));
+    inf.steps = stepsOwn ? inf.walk : inf.walk.map((p) => [p[0], p[0], p[0]]);
+    return inf;
+  }
+
+  // every one of the twelve walker pictures shows a whole figure (48 of a 16x32 picture's 512 pixels)
+  function walkerIsDrawn(inf) {
+    const least = (inf.width * inf.height * 3) >> 5;
+    return inf.steps.every((p) => p.every((s) => inkOf(inf, s.frame) >= least));
   }
 
   function publicInfo(id) {
-    const inf = rawInfo(id);
+    const inf = walkQuality(rawInfo(id));
     return {
       id, width: inf.width, height: inf.height, frameCount: inf.frameCount, paletteTag: inf.paletteTag,
       paletteSlot: inf.paletteSlot, shadowSize: inf.shadowSize, inanimate: inf.inanimate, compressed: inf.compressed,
-      tracks: inf.tracks, animCount: inf.anims.length, kind: inf.kind, walker: !!inf.walk,
+      tracks: inf.tracks, animCount: inf.anims.length, kind: inf.kind, walker: !!inf.walk, cleanWalk: inf.cleanWalk,
     };
   }
 
@@ -880,73 +1001,83 @@ export function loadWorld(romBytes) {
       for (let i = 0; i < n; i++) if (x.buf[x.off + i] !== y.buf[y.off + i]) return false;
       return true;
     };
-    return inf.walk.every((p) => !same(p[0], p[1]) && !same(p[0], p[2]));
+    return inf.steps.every((p) => !same(p[0], p[1]) && !same(p[0], p[2]));
   }
 
   let avatarList = null, standerList = null;
   function avatars() {
     if (avatarList) return avatarList;
-    const cands = [];
+    // The same LOOK listed again counts once: the look is the picture facing down in the sprite's own colours. (Ids
+    // 100, 105 and 217 are the player characters again; 216 is the boy's pictures in the palette the ROM's table
+    // gives that id, 0x1110: other colours, so another look.) Of two ids with one look the lower is kept. (Checked
+    // once on this ROM: keeping the one that walks instead gives the same two lists, so no walker is hidden behind
+    // a stander with its look.)
+    const byLook = new Map();
     for (let id = 0; id < O.owInfoCount; id++) {
-      let inf;
-      try { inf = rawInfo(id); } catch (e) { if (e instanceof WorldRomError) continue; throw e; }
-      if (inf.width !== 16 || inf.height !== 32 || (inf.kind !== 'player' && inf.kind !== 'walker')) continue;
-      cands.push(inf);
+      if (NOT_A_PERSON.has(id)) continue;
+      let inf, look, walks;
+      try {
+        inf = walkQuality(rawInfo(id));
+        if (inf.width !== 16 || inf.height !== 32 || (inf.kind !== 'player' && inf.kind !== 'walker')) continue;
+        if (!walkerIsDrawn(inf)) continue;      // an empty picture among the twelve (id 280's standing ones): nothing to show
+        look = String.fromCharCode.apply(null, frameRGBA(id, inf.steps[SOUTH][0].frame, false).rgba);
+        // four directions but no walk to show: the walk frames are copies of the standing ones, or it has none of its own
+        walks = inf.cleanWalk && walkIsAnimated(inf);
+      } catch (e) { if (e instanceof WorldRomError) continue; throw e; }
+      if (!byLook.has(look)) byLook.set(look, { id, walks, player: inf.kind === 'player' });
     }
-    // where each candidate's own first picture is: a walk frame that IS another sprite's first picture is borrowed
-    const firstPic = new Map();
-    for (const inf of cands) { const o = frameData(inf, 0).off; if (!firstPic.has(o)) firstPic.set(o, inf.id); }
-    const borrows = (inf) => {
-      const own = frameData(inf, 0).off;
-      for (const p of inf.walk) for (const st of p) { const o = frameData(inf, st.frame).off; if (o !== own && firstPic.has(o)) return true; }
-      return false;
-    };
-    const players = [], people = [], standers = [], seen = new Set();
-    for (const inf of cands) {
-      if (NOT_A_PERSON.has(inf.id)) continue;
-      if (!walkerIsDrawn(inf)) continue;          // a sheet with empty walk frames
-      if (borrows(inf)) continue;                 // a three-frame stander whose image table runs on into the next sprite
-      // the same pictures listed again (the rival / link copies of the player characters, in the other one's colours) count once
-      const key = frameData(inf, inf.walk[SOUTH][0].frame).off;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      if (!walkIsAnimated(inf)) { standers.push(inf.id); continue; }   // four directions, but it would glide
-      (inf.kind === 'player' ? players : people).push(inf.id);
-    }
+    const kept = [...byLook.values()].sort((a, b) => a.id - b.id);
+    const players = kept.filter((k) => k.walks && k.player).map((k) => k.id);
+    const people = kept.filter((k) => k.walks && !k.player).map((k) => k.id);
     avatarList = Object.freeze(players.concat(people));
-    standerList = Object.freeze(standers);
+    standerList = Object.freeze(kept.filter((k) => !k.walks).map((k) => k.id));
     return avatarList;
   }
 
   const ow = {
     /** number of graphics ids in the ROM's table (follower Pokemon are reached as GFX.MON | species) */
     count: O.owInfoCount,
-    /** info(id) -> { id, width, height, frameCount, paletteTag, paletteSlot, shadowSize, inanimate, compressed, tracks,
-     *  animCount, kind: 'player' | 'walker' | 'pokemon' | 'object', walker } */
+    /**
+     * info(id) -> { id, width, height, frameCount, paletteTag, paletteSlot, shadowSize, inanimate, compressed, tracks,
+     *   animCount, kind: 'player' | 'walker' | 'pokemon' | 'object', walker, cleanWalk }
+     *   walker     the sprite's anim lists give four directions with a standing and a walk anim (walker() works)
+     *   cleanWalk  ... and every one of those twelve pictures is a drawn picture of its own. FALSE for eight people
+     *              of this ROM (ids 243, 255, 256, 257, 293, 294, 295: three pictures of their own under a nine-entry
+     *              image table; 280: empty standing pictures). Only ow.avatars is a curated list of people:
+     *              `kind` and `walker` are read from the anim lists and say nothing about what is drawn.
+     *   frameCount what the ROM's image table holds, which for those eight is more than the sprite's own pictures.
+     */
     info: publicInfo,
-    /** frame(id, frameIndex, { paletteTag }?) -> { width, height, rgba } exactly as stored (not flipped) */
+    /** frame(id, frameIndex, { paletteTag }?) -> { width, height, rgba } exactly as the ROM's image table has it (not
+     *  flipped, not checked: frame 3 of a three-picture sprite is the next sprite's art) */
     frame(id, f, opts) { return frameRGBA(id, f, false, opts && opts.paletteTag); },
     /**
      * walker(id, dir, step, { paletteTag }?) -> { width, height, rgba, flipX, frame }
      *   dir   'down' | 'up' | 'left' | 'right'      step  0 standing, 1 and 2 the two walk frames
      * rgba is READY TO DRAW (already mirrored when the ROM's anim says so); flipX and frame say where it came from.
      * A walk cycle is step 1, 0, 2, 0 (8 game frames each in the ROM's walk anim).
+     * It never hands out another sprite's art: when a walk picture is empty or is another sprite's (info.cleanWalk
+     * false), steps 1 and 2 return the STANDING picture, which is all the ROM's maps show of those people (every
+     * map places them standing: movement types 0, 7, 8, 9).
      */
     walker(id, dir, step, opts) {
       const d = DIRS.indexOf(dir);
       if (d < 0) throw new WorldRomError('walker: no direction ' + dir);
       if (!(step === 0 || step === 1 || step === 2)) throw new WorldRomError('walker: no step ' + step);
-      const inf = rawInfo(id);
-      if (!inf.walk) throw new WorldRomError('overworld graphics ' + id + ' is not a walker');
-      const p = inf.walk[d][step];
+      const inf = walkQuality(rawInfo(id));
+      if (!inf.steps) throw new WorldRomError('overworld graphics ' + id + ' is not a walker');
+      const p = inf.steps[d][step];
       const v = frameRGBA(id, p.frame, p.flipX, opts && opts.paletteTag);
       return { width: v.width, height: v.height, rgba: v.rgba, flipX: p.flipX, frame: p.frame };
     },
-    /** the trainers / people a player can look like: the player characters first, then every NPC person, each once.
-     *  16x32, four directions, three DIFFERENT pictures per direction (standing and two walk frames), all drawn. */
+    /** the trainers / people a player can look like, each LOOK once (the picture facing down, in the sprite's own
+     *  colours): the player characters first (0 the boy, 89 the girl, 216 the boy in the girl's palette), then every
+     *  NPC person in table order. 16x32, four directions, three DIFFERENT pictures per direction (standing and two
+     *  walk frames), all drawn, all the sprite's own. */
     get avatars() { return avatars(); },
-    /** people with four directions whose walk frames are copies of the standing ones (the nurse, the cook, ...): fine
-     *  for someone who stands still, not for a look that walks. walker() works on them. */
+    /** people with four directions and no walk to show: the walk frames are copies of the standing ones (the nurse,
+     *  the cook, ...) or the sprite has three pictures only. Fine for someone who stands still, not for a look that
+     *  walks. walker() works on them (steps 1 and 2 are the standing picture). */
     get standers() { avatars(); return standerList; },
     /**
      * paletteTags(id) -> the sprite palette tags this sprite can be drawn in, its own first. A sprite drawn in one of
@@ -1022,7 +1153,9 @@ export function loadWorld(romBytes) {
   /**
    * centerInfo(map) -> the cells a room needs, read from the map itself:
    *   doors     [{ x, y, warpId, destGroup, destNum, behavior }]   the warp cells (the mat)
-   *   counter   [{ x, y }]                                         MB.COUNTER cells
+   *   counter   [{ x, y }]    the SOLID MB.COUNTER cells: the counter a trainer faces and talks across
+   *   counterFloor [{ x, y }] MB.COUNTER cells a trainer can stand on. Not a counter to talk across: the ROM gives the
+   *             behaviour to the wall-foot cell (0,2) of the standard Center (and to floor rows of two big halls)
    *   nurse     the object event with GFX.NURSE, or null
    *   nurseTalk { x, y, facing: 'up' } | null    the walkable cell from which the nurse is addressed across the counter
    *   pc        [{ x, y }]    MB.PC cells          pcUse  [{ x, y, facing: 'up' }]  the walkable cells below them
@@ -1032,7 +1165,8 @@ export function loadWorld(romBytes) {
   function centerInfo(m) {
     const cells = (b) => { const out = []; for (let y = 0; y < m.height; y++) for (let x = 0; x < m.width; x++) if (m.behavior[y * m.width + x] === b) out.push({ x, y }); return out; };
     const doors = m.events.warps.map((w) => ({ x: w.x, y: w.y, warpId: w.warpId, destGroup: w.destGroup, destNum: w.destNum, behavior: m.behaviorAt(w.x, w.y) }));
-    const counter = cells(MB.COUNTER), pc = cells(MB.PC);
+    const counterCells = cells(MB.COUNTER), pc = cells(MB.PC);
+    const counter = counterCells.filter((c) => !m.walkable(c.x, c.y)), counterFloor = counterCells.filter((c) => m.walkable(c.x, c.y));
     const nurse = m.events.objects.find((o) => o.gfx === GFX.NURSE) || null;
     let nurseTalk = null;
     if (nurse) {
@@ -1049,7 +1183,7 @@ export function loadWorld(romBytes) {
       }
     }
     return {
-      doors, counter, nurse, nurseTalk, pc,
+      doors, counter, counterFloor, nurse, nurseTalk, pc,
       pcUse: pc.filter((c) => m.walkable(c.x, c.y + 1)).map((c) => ({ x: c.x, y: c.y + 1, facing: 'up' })),
       regionMap: cells(MB.REGION_MAP), solid,
     };

@@ -95,6 +95,7 @@
   "195": "aef02f65b43cb8a49f4f5ab2a7fc5270efc96201",
   "196": "76115b6acc1602f56d03444c6be81fdfda13d3b6",
   "215": "6939faf31670dd86ab4c23d1422d0cf07f124f40",
+  "216": "a260348b7c8a481e6a6810592c1b6df60b3d14ab",
   "218": "e1395f779268a194b45ae50c5cdc591092e373b1",
   "219": "4f4be534ed74db0d913f0226b6f47ba9220953b1",
   "230": "4d45de846d0bf7cd165c7939d179bd5e5ba9a2b2",
@@ -202,6 +203,7 @@
   "object": 90,
   "pokemon": 4
  },
- "avatarsAll": "ec9ab99d135cb1fafcdab296235e5d24cad9130f",
+ "standers": "f36d98f18b1f2e9d9f08d9cc81718b6e7c168a94",
+ "avatarsAll": "0a41018beb928331996f7d785becaf12a730744d",
  "centerSprites": "7bdabe7efde7ff52c0c71f6cdb0861caa11d1135"
 }

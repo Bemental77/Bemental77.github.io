@@ -5,7 +5,8 @@
 //   node tools/pokemonarena_world_test.mjs --fast       # skip the source mutants and the all-maps render
 //   node tools/pokemonarena_world_test.mjs --update     # rewrite pokemonarena/world.golden.json (HASHES ONLY)
 //   node tools/pokemonarena_world_test.mjs --sheets     # also write the contact sheets (PNG) to WORLD_OUT
-//   ARENA_ROM=/path/to.gba  WORLD_OUT=/path/to/pngdir   (overrides; WORLD_OUT is never inside the repository)
+//   ARENA_ROM=/path/to.gba  WORLD_OUT=/path/to/pngdir   (overrides; WORLD_OUT defaults to <os tmp>/pokemonarena-world-sheets
+//                                                        and is REFUSED inside the repository: the sheets are ROM art)
 //
 // What it proves (and what would make it fail):
 //   W0  the ROM is the pinned image; loadWorld refuses a wrong length, a wrong header, a zero-filled ROM, and a ROM of
@@ -13,12 +14,16 @@
 //   W1  structure: 617 maps in 27 groups, every map decodes, every warp leads somewhere, every object event sits inside
 //       its map and resolves to a sprite, the facing table reads up / down / left / right;
 //   W2  the block split the hack uses (11-bit metatile id, 1 collision bit): trainers and warps stand on walkable cells;
-//   W3  THE POKEMON CENTER: map 2.0, its size, its one PC cell, its counter, its wall map, its door mat warp, the nurse
-//       and where she is addressed from, the 23 standard Centers;
+//       the elevation rule of canEnter against the map data (placed objects, water); the behaviour numbers of the
+//       doors, ladders and the four arrow warps against the warp events;
+//   W3  THE POKEMON CENTER: map 2.0, its size, its one PC cell, its counter (the SOLID counter cells only), its wall
+//       map, its door mat warp, the nurse and where she is addressed from, the 23 standard Centers;
 //   W4  pictures: sizes, an opaque under layer, a sparse over layer, no tile drawn from a blank palette slot, the border
-//       block and renderView agree with renderMap, two worlds built from the same bytes agree (determinism);
+//       block and renderView agree with renderMap on eight rectangles, renderView's arrays are the caller's (and can
+//       be reused), two worlds built from the same bytes agree (determinism);
 //   W5  sprites: 330 ids, the avatars (count, order, 4 directions x 3 steps, drawn, right = left mirrored, built from
-//       the sprite's own anim lists), follower Pokemon, the Center's NPCs resolved and placed;
+//       the sprite's own anim lists), the standers, cleanWalk (no walker() picture is another sprite's art), follower
+//       Pokemon, the Center's NPCs resolved and placed;
 //   W6  the golden hashes (pokemonarena/world.golden.json: SHA-1 of width, height and RGBA; no pixels are stored);
 //   W7  emotes: sixteen 16x16 pictures, all different, in the documented order;
 //   W8  world_rom.js is browser-portable and holds no ROM-derived data;
@@ -41,7 +46,9 @@ const UPDATE = args.includes('--update') || process.env.ARENA_UPDATE_GOLDEN === 
 const SHEETS = args.includes('--sheets');
 const FAST = args.includes('--fast');
 const ROM_PATH = process.env.ARENA_ROM || path.join(root, 'gba', 'gbaWasm', 'roms', 'Pokemon SoulGold (v1.1.1).gba');
-const OUT = process.env.WORLD_OUT || 'C:/Users/Admin/AppData/Local/Temp/claude/00bb488e02117e04/2fbb0172-3991-4171-8c09-77559e11ae9e/scratchpad/inapp/world';
+const OUT = path.resolve(process.env.WORLD_OUT || path.join(os.tmpdir(), 'pokemonarena-world-sheets'));
+// the sheets are ROM art: they may never land in the repository (INAPP.md rule 1)
+if (SHEETS && !path.relative(root, OUT).startsWith('..') && !path.isAbsolute(path.relative(root, OUT))) { console.log('WORLD_OUT ' + OUT + ' is inside the repository: refused'); process.exit(1); }
 const GOLDEN = path.join(root, 'pokemonarena', 'world.golden.json');
 const JS_DIR = path.join(root, 'pokemonarena', 'js');
 
@@ -121,12 +128,54 @@ async function runChecks(dir, { full, quiet }) {
   /* ---- W2 the block split ------------------------------------------------------------------------------ */
   ok(objsOnFloor / objs > 0.75 && objsOnFloor / objs < 0.95, 'W2a between 75% and 95% of the object events stand on a walkable cell (the rest are behind counters, signs, item balls in walls): the collision bit is bit 11', objsOnFloor + '/' + objs);
   ok(warpsOnFloor / warps > 0.35, 'W2b warps sit on cells a trainer can enter or are doors in a wall (more than 35% on walkable cells)', warpsOnFloor + '/' + warps);
+  { // canEnter: the engine's elevation rule, against what the maps themselves say
+    const MB = W.MB; let el = 0, elOk = 0, sea = 0, seaKept = 0, seaSurf = 0, same = 0, cellsSeen = 0;
+    for (const m of allMaps) {
+      for (const o of m.events.objects) { if (!o.elevation || !m.walkable(o.x, o.y)) continue; el++; if (m.canEnter(o.x, o.y, o.elevation)) elOk++; }
+      for (let y = 0; y < m.height; y++) for (let x = 0; x < m.width; x++) {
+        cellsSeen++; if (m.canEnter(x, y, W.ELEVATION_ANY) === m.walkable(x, y) && (m.walkable(x, y) || !m.canEnter(x, y, 3))) same++;
+        const b = m.behaviorAt(x, y); if ((b !== 0x10 && b !== 0x15) || !m.walkable(x, y)) continue;      // pond, ocean (Emerald's numbers)
+        sea++; if (!m.canEnter(x, y, 3)) seaKept++; if (m.canEnter(x, y, 1)) seaSurf++;
+      }
+    }
+    ok(el > 300 && elOk / el > 0.95, 'W2c more than 95% of the 300+ placed objects with an elevation of their own stand on a cell canEnter lets them enter (elevation = bits 12-15; under 10% from any other bits)', elOk + '/' + el);
+    ok(sea > 40000 && seaKept / sea > 0.9 && seaSurf / sea > 0.9, 'W2d canEnter keeps a trainer at elevation 3 off more than 90% of the collision-free pond / ocean cells, and lets elevation 1 on them', seaKept + ' kept, ' + seaSurf + ' surfable of ' + sea);
+    ok(same === cellsSeen, 'W2d canEnter(x, y, 0) is walkable(x, y), and canEnter never opens a solid cell', same + '/' + cellsSeen);
+    const c0 = world.center;
+    ok(c0.canEnter(7, 4, 3) && !c0.canEnter(7, 3, 3) && !c0.canEnter(-1, 4, 3) && !c0.canEnter(7, 4, 4) && c0.stepElevation(0, 7, 8, 7, 7) === 3 && c0.stepElevation(4, 7, 7, 99, 99) === 4,
+      'W2d in the Center: the floor is entered at elevation 3 and not at 4, the counter and the outside never; a step onto the floor gives elevation 3');
+    { // this ROM has no open cell at elevation 15, so that half of the rule is tried on a COPY of the ROM whose Center
+      // floor cell (7,4) is put at 15 (two bytes changed in memory; nothing is written anywhere)
+      const dv2 = new DataView(rom.buffer, rom.byteOffset, rom.length), P = (o) => dv2.getUint32(o, true) - 0x08000000, O = W.WORLD_OFFSETS;
+      const data = P(P(P(P(O.mapGroups + 4 * W.CENTER.group) + 4 * W.CENTER.num)) + 12), at = data + 2 * (4 * 16 + 7);
+      const copy = rom.slice(); copy[at + 1] = (copy[at + 1] & 0x0f) | 0xf0;
+      let c15 = null; try { c15 = W.loadWorld(copy).center; } catch (e) { /* reported below */ }
+      ok(!!c15 && c15.elevation[4 * 16 + 7] === W.ELEVATION_BRIDGE && c15.metatiles[4 * 16 + 7] === c0.metatiles[4 * 16 + 7] && c15.canEnter(7, 4, 3) && c15.canEnter(7, 4, 4) && c15.canEnter(7, 4, 0)
+        && c15.stepElevation(4, 7, 5, 7, 4) === 4 && c15.stepElevation(4, 7, 4, 7, 5) === 4 && c15.stepElevation(4, 6, 5, 7, 5) === 3 && !c0.canEnter(7, 4, 4),
+        'W2g a cell at elevation 15 lets every elevation in, and a step onto or off it keeps the object\'s elevation (on a copy of the ROM with one Center cell put at 15)'); }
+    // the warp events sit on the cells whose behaviour says "warp", and an arrow warp points at a cell nobody can enter
+    const arrows = [['east', MB.EAST_ARROW_WARP, 1, 0], ['west', MB.WEST_ARROW_WARP, -1, 0], ['north', MB.NORTH_ARROW_WARP, 0, -1], ['south', MB.SOUTH_ARROW_WARP, 0, 1]];
+    const st = {}; for (const a of arrows) st[a[0]] = { n: 0, ahead: 0, behind: 0 };
+    const on = new Map();
+    for (const m of allMaps) for (const w of m.events.warps) {
+      if (!m.inside(w.x, w.y)) continue;
+      const b = m.behaviorAt(w.x, w.y); on.set(b, (on.get(b) || 0) + 1);
+      for (const [name, beh, dx, dy] of arrows) if (b === beh) { st[name].n++; if (!m.walkable(w.x + dx, w.y + dy)) st[name].ahead++; if (!m.walkable(w.x - dx, w.y - dy)) st[name].behind++; }
+    }
+    const strong = (q) => q.n >= 90 && q.ahead / q.n >= 0.95 && q.behind / q.n <= 0.05;
+    ok(strong(st.east) && strong(st.west) && strong(st.south) && st.north.n >= 5 && st.north.ahead > st.north.behind && st.north.behind === 0,
+      'W2e an arrow warp points at a cell a trainer cannot enter and has open floor behind it (east, west, south: 95% of 90+ warps each; north: the few there are)', J(st));
+    const family = [MB.NON_ANIMATED_DOOR, MB.LADDER, MB.ANIMATED_DOOR, MB.EAST_ARROW_WARP, MB.WEST_ARROW_WARP, MB.NORTH_ARROW_WARP, MB.SOUTH_ARROW_WARP, MB.UP_ESCALATOR];
+    const inFamily = family.reduce((a, b) => a + (on.get(b) || 0), 0);
+    ok(inFamily / warps > 0.7 && [MB.NON_ANIMATED_DOOR, MB.LADDER, MB.ANIMATED_DOOR].every((b) => (on.get(b) || 0) >= 150), 'W2f more than 70% of the warp events sit on a door, ladder, arrow-warp or escalator cell (150+ on each of the two doors and the ladder)', inFamily + '/' + warps);
+  }
 
   /* ---- W3 the Pokemon Center --------------------------------------------------------------------------- */
   const c = world.center, ci = world.centerInfo(c);
   ok(c.group === 2 && c.num === 0 && c.width === 16 && c.height === 10, 'W3a the Center is map 2.0, 16 x 10 cells', c.group + '.' + c.num + ' ' + c.width + 'x' + c.height);
   ok(ci.pc.length === 1 && ci.pc[0].x === 11 && ci.pc[0].y === 1 && J(ci.pcUse) === J([{ x: 11, y: 2, facing: 'up' }]), 'W3b one PC cell at (11,1), used from (11,2) facing up', J(ci.pc) + ' ' + J(ci.pcUse));
-  ok(J(ci.counter) === J([{ x: 0, y: 2 }, { x: 5, y: 3 }, { x: 6, y: 3 }, { x: 7, y: 3 }, { x: 8, y: 3 }, { x: 9, y: 3 }]), 'W3c the counter cells are (5..9,3) (and the wall piece (0,2))', J(ci.counter));
+  ok(J(ci.counter) === J([{ x: 5, y: 3 }, { x: 6, y: 3 }, { x: 7, y: 3 }, { x: 8, y: 3 }, { x: 9, y: 3 }]) && ci.counter.every((q) => !c.walkable(q.x, q.y)), 'W3c the counter is the five SOLID counter cells (5..9,3)', J(ci.counter));
+  ok(J(ci.counterFloor) === J([{ x: 0, y: 2 }]) && c.walkable(0, 2) && c.behaviorAt(0, 2) === W.MB.COUNTER, 'W3c the walkable wall-foot cell (0,2) carries the counter behaviour and is kept out of counter (counterFloor)', J(ci.counterFloor));
   ok(J(ci.regionMap) === J([{ x: 12, y: 1 }, { x: 13, y: 1 }]), 'W3c the wall map is (12,1) and (13,1)', J(ci.regionMap));
   ok(ci.doors.length === 1 && ci.doors[0].x === 7 && ci.doors[0].y === 8 && ci.doors[0].behavior === W.MB.SOUTH_ARROW_WARP && ci.doors[0].destGroup === 0 && ci.doors[0].destNum === 1 && c.walkable(7, 8),
     'W3d one warp, on the door mat (7,8) (a south arrow warp, walkable), leading to map 0.1', J(ci.doors));
@@ -139,6 +188,14 @@ async function runChecks(dir, { full, quiet }) {
   ok(std.length === 23 && std.filter((x) => x.width === 16).length === 13 && std.filter((x) => x.width === 15).length === 10, 'W3h 23 standard Centers: thirteen 16 x 10 and ten 15 x 10', std.length + ' / ' + cs.length);
   ok(cs.length >= 23 && cs.every((x) => x.group !== undefined) && cs.some((x) => x.group === 2 && x.num === 0 && x.sameAsCenter), 'W3h the Center is in world.centers', String(cs.length));
   ok(c.tilesets.animated === false, 'W3i neither tileset of the Center has a tile-animation callback');
+  { let bad = 0, across = 0;
+    for (const e of cs) {
+      const m = world.map(e.group, e.num), i = world.centerInfo(m);
+      if (i.counter.length < 5 || i.counter.some((q) => m.walkable(q.x, q.y)) || i.counterFloor.some((q) => !m.walkable(q.x, q.y) || m.behaviorAt(q.x, q.y) !== W.MB.COUNTER)) bad++;
+      if (e.standard && i.nurse && i.nurseTalk && i.nurseTalk.y === i.nurse.y + 2 && i.nurseTalk.x === i.nurse.x && i.counter.some((q) => q.x === i.nurse.x && q.y === i.nurse.y + 1)) across++;
+    }
+    ok(bad === 0, 'W3j in every Center the counter cells are solid and the counterFloor cells walkable', bad + ' of ' + cs.length);
+    ok(across === 23, 'W3j in all 23 standard Centers the nurse is addressed across exactly one counter cell', String(across)); }
   made.center = { centers: cs.map((x) => x.group + '.' + x.num + (x.standard ? '' : '*')).join(' '), sameAsCenter: cs.filter((x) => x.sameAsCenter).length };
 
   /* ---- W4 pictures ------------------------------------------------------------------------------------- */
@@ -200,6 +257,25 @@ async function runChecks(dir, { full, quiet }) {
     const quad = [0, 1, 2, 3].map((i) => { const h = crypto.createHash('sha1'); for (let py = 0; py < 16; py++) { const o = (((i >> 1) * 16 + py) * 32 + (i & 1) * 16) * 4; h.update(tb.under.subarray(o, o + 64)); h.update(tb.over.subarray(o, o + 64)); } return h.digest('hex'); });
     ok(new Set(t.border).size === 4 && new Set(quad).size === 4, 'W4g map 0.0 has a border of four different blocks (four different pictures)', Array.from(t.border).join(','));
     ok(q === 0, 'W4g outside a map the game shows the border block tiled by cell parity: quadrant (x & 1, y & 1)', q + ' px differ');
+    { // every way a rectangle can lie on a map: inside, around, off each side, across each edge, one pixel
+      const expect = (m, x0, y0, w, h) => { const P = world.renderMap(m), B = world.renderBorder(m), u = new Uint8Array(w * h * 4), o = new Uint8Array(w * h * 4);
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) { const mx = x0 + x, my = y0 + y, d = (y * w + x) * 4; let src = B, s2 = ((((my % 32) + 32) % 32) * 32 + ((mx % 32) + 32) % 32) * 4; if (mx >= 0 && my >= 0 && mx < P.width && my < P.height) { src = P; s2 = (my * P.width + mx) * 4; } for (let k = 0; k < 4; k++) { u[d + k] = src.under[s2 + k]; o[d + k] = src.over[s2 + k]; } }
+        return sha1(u, o); };
+      const rects = [[16, 16, 64, 48], [-40, -24, 400, 300], [-400, 8, 64, 64], [700, 8, 50, 50], [8, -300, 64, 64], [8, 900, 64, 64], [200, 120, 120, 100], [-7, -9, 30, 30], [255, 159, 1, 1], [256, 160, 1, 1]];
+      let wrong = 0; for (const m of [c, t]) for (const [x0, y0, w, h] of rects) { const v2 = world.renderView(m, x0, y0, w, h); if (v2.width !== w || v2.height !== h || sha1(v2.under, v2.over) !== expect(m, x0, y0, w, h)) wrong++; }
+      ok(wrong === 0, 'W4f renderView equals the map picture and the border block, pixel for pixel, on ten rectangles of two maps (inside, around, off every side, across the edges, one pixel)', wrong + ' rectangles differ'); }
+    { // the arrays are the caller's: new every call, never the cached map picture; `into` reuses them
+      const before = layersHash(pic), a = world.renderView(c, -24, -40, 320, 240), a2 = world.renderView(c, -24, -40, 320, 240);
+      ok(a.under !== a2.under && a.over !== a2.over && a.under !== pic.under && layersHash(a) === layersHash(v), 'W4j renderView returns new arrays on every call (the caller may draw on them), with the same pixels');
+      a.under.fill(7); a.over.fill(9);
+      const again = world.renderView(c, -24, -40, 320, 240, a);
+      ok(again.under === a.under && again.over === a.over && layersHash(again) === layersHash(v) && layersHash(world.renderMap(c)) === before && layersHash(world.renderView(c, -24, -40, 320, 240)) === layersHash(v),
+        'W4j renderView(..., into) overwrites the given arrays in place (no allocation), and drawing on a view never reaches the cached map picture');
+      const cl = world.renderView(c, 0, 0, 240, 160, { under: new Uint8ClampedArray(240 * 160 * 4), over: new Uint8ClampedArray(240 * 160 * 4) }), plain = world.renderView(c, 0, 0, 240, 160);
+      ok(cl.under instanceof Uint8ClampedArray && sha1(cl.under, cl.over) === sha1(plain.under, plain.over), 'W4j `into` may be two Uint8ClampedArrays (ImageData.data)');
+      let threw = 0; const one = new Uint8Array(240 * 160 * 4);
+      for (const bad of [{ under: one, over: one }, { under: one, over: new Uint8Array(8) }, { under: one }, null, { under: new Uint16Array(240 * 160 * 4), over: new Uint8Array(240 * 160 * 4) }]) { try { world.renderView(c, 0, 0, 240, 160, bad); } catch (e) { if (e instanceof W.WorldRomError) threw++; } }
+      ok(threw === 5, 'W4j a wrong `into` (one array twice, a wrong size, a missing array, null, 16-bit) is refused with a WorldRomError', threw + '/5'); }
     ok(world.borderQuadrant(-1, -1) === 3 && world.borderQuadrant(16, 0) === 0 && world.borderQuadrant(17, 3) === 3, 'W4g borderQuadrant');
     made.border = layersHash(b); made.view = layersHash(v); }
   for (const k of SAMPLE_MAPS) { const [g, n] = k.split('.').map(Number); made.maps[k] = layersHash(world.renderMap(world.map(g, n))); }
@@ -221,10 +297,15 @@ async function runChecks(dir, { full, quiet }) {
     ok(ow.count === 330 && bad === 0, 'W5a 330 graphics ids; every one decodes or is refused with a WorldRomError', J(kinds));
     made.kinds = kinds; }
   const av = ow.avatars;
-  ok(av.length === 137 && new Set(av).size === av.length, 'W5b 137 avatars, each once', String(av.length));
-  ok(ow.standers.length === 18 && ow.standers.includes(W.GFX.NURSE) && ow.standers.every((id) => !av.includes(id) && ow.info(id).walker), 'W5b 18 standers (four directions, walk frames that are copies of the standing ones); the nurse is one', ow.standers.join(','));
-  ok(av[0] === 0 && av[1] === 89 && ow.info(av[0]).kind === 'player' && ow.info(av[1]).kind === 'player' && av.slice(2).every((id) => ow.info(id).kind === 'walker') && av.slice(2).every((id, i, a) => i === 0 || id > a[i - 1]),
-    'W5c the two player characters come first (ids 0 and 89), then the people in table order', av.slice(0, 6).join(','));
+  ok(av.length === 138 && new Set(av).size === av.length, 'W5b 138 avatars, each once', String(av.length));
+  { const st = ow.standers; const glides = (id) => W.DIRS.some((d) => { const s0 = picHash(ow.walker(id, d, 0)); return picHash(ow.walker(id, d, 1)) === s0 || picHash(ow.walker(id, d, 2)) === s0; });
+    ok(st.length === 25 && new Set(st).size === 25 && st.includes(W.GFX.NURSE) && st.every((id, i) => !av.includes(id) && ow.info(id).walker && (i === 0 || id > st[i - 1])), 'W5b 25 standers in table order, none an avatar; the nurse is one', st.join(','));
+    ok(st.every(glides) && !av.some(glides), 'W5b every stander has a direction whose walk picture is its standing picture (it would glide), and no avatar has');
+    made.standers = sha1(...st.flatMap((id) => W.DIRS.map((d) => ow.walker(id, d, 0).rgba))); }
+  ok(J(av.slice(0, 3)) === J([0, 89, 216]) && av.every((id, i) => (ow.info(id).kind === 'player') === (i < 3)) && av.slice(3).every((id) => ow.info(id).kind === 'walker') && av.slice(3).every((id, i, a) => i === 0 || id > a[i - 1]),
+    'W5c the player characters come first (ids 0, 89 and 216), then the people in table order', av.slice(0, 6).join(','));
+  ok(picHash(ow.frame(216, 0, { paletteTag: W.PAL_TAG_PLAYER })) === picHash(ow.frame(0, 0)) && picHash(ow.frame(216, 0)) !== picHash(ow.frame(0, 0)) && ow.info(216).paletteTag !== ow.info(0).paletteTag && !av.includes(100) && picHash(ow.frame(100, 0)) === picHash(ow.frame(0, 0)),
+    'W5c id 216 is the boy\'s pictures in another palette of the ROM (a look of its own); id 100 is the boy again, pixel for pixel, and is listed once');
   { let sizeBad = 0, blank = 0, mirrorBad = 0, sameDir = 0, sameStep = 0, borrowed = 0;
     const firstPic = new Map(); for (const id of av) firstPic.set(picHash(ow.frame(id, 0)), id);
     for (const id of av) {
@@ -244,6 +325,32 @@ async function runChecks(dir, { full, quiet }) {
     ok(sameStep === 0, 'W5g standing and the two walk frames are three different pictures in every direction', sameStep + ' cases');
     ok(borrowed === 0, 'W5h no avatar walks in another avatar\'s pictures', borrowed + ' frames');
     made.avatarsAll = sha1(...av.map((id) => Buffer.from(made.avatars[id], 'hex'))); }
+  { // cleanWalk: what walker() hands out is the sprite's own drawn art. Drawn in ONE palette, two pictures are equal
+    // exactly when their pixel data is, so "another sprite's first picture" can be told from the pictures alone.
+    const TAG = { paletteTag: W.NPC_PAL_TAGS[0] }, key = (p) => p.width + 'x' + p.height + ':' + sha1(p.rgba);
+    const inkOf = (p) => { let n = 0; for (let i = 3; i < p.rgba.length; i += 4) if (p.rgba[i]) n++; return n; };
+    const firstOf = new Map(), walkers = [];
+    for (let id = 0; id < ow.count; id++) { if (!ow.has(id)) continue; const inf = ow.info(id); if (!inf.frameCount) continue; const k = key(ow.frame(id, 0, TAG)); if (!firstOf.has(k)) firstOf.set(k, id); if (inf.walker) walkers.push(id); }
+    const unclean = [], borrowed = [], blank = [];
+    for (const id of walkers) {
+      if (!ow.info(id).cleanWalk) unclean.push(id);
+      const own = key(ow.frame(id, 0, TAG));
+      for (const d of ['down', 'up', 'left']) for (const s of [0, 1, 2]) {
+        const p = ow.walker(id, d, s, TAG), k = key(p);
+        if (k !== own && firstOf.has(k) && !borrowed.includes(id)) borrowed.push(id);
+        if (inkOf(p) === 0 && !blank.includes(id)) blank.push(id);
+      }
+    }
+    ok(walkers.length === 248 && J(unclean) === J([243, 255, 256, 257, 280, 293, 294, 295]), 'W5n cleanWalk is false for exactly eight of the 248 walkers of the table (ids 243, 255, 256, 257, 280, 293, 294, 295)', walkers.length + ' ' + J(unclean));
+    ok(borrowed.length === 0, 'W5o no walker() picture of any graphics id is another sprite\'s first picture (a three-picture sprite stands still)', J(borrowed));
+    ok(J(blank) === J([280]), 'W5o no walker() picture is empty, except id 280 whose own standing pictures are', J(blank));
+    ok(av.every((id) => ow.info(id).cleanWalk) && ow.standers.filter((id) => !ow.info(id).cleanWalk).join() === '243,255,256,257,293,294,295', 'W5n every avatar has a clean walk; seven standers have three pictures only', ow.standers.filter((id) => !ow.info(id).cleanWalk).join());
+    const still = new Set([0, 7, 8, 9, 10]), three = new Set([243, 255, 256, 257, 293, 294, 295]); let placed = 0, moving = 0;
+    for (const m of allMaps) for (const o of m.events.objects) if (three.has(o.gfx)) { placed++; if (!still.has(o.movementType)) moving++; }
+    ok(placed >= 30 && moving === 0, 'W5p every map places the seven three-picture people standing (movement types 0, 7, 8, 9, 10)', moving + ' of ' + placed + ' move');
+    const steps = (id, d) => [0, 1, 2].map((s) => ow.walker(id, d, s).frame).join();
+    ok(steps(255, 'down') === '0,0,0' && steps(255, 'left') === '2,2,2' && ow.info(255).frameCount === 9 && ow.info(255).kind === 'walker', 'W5n id 255 (nine table entries, three pictures of its own) walks on its standing frames');
+  }
   { // the walk comes from the sprite's own anim lists: on the standard table that is 0 / 1 / 2 standing, 3,4 / 5,6 / 7,8 walking
     const fr = (id, d) => [0, 1, 2].map((s) => { const w = ow.walker(id, d, s); return w.frame + (w.flipX ? 'h' : ''); }).join();
     ok(fr(58, 'down') === '0,3,4' && fr(58, 'up') === '1,5,6' && fr(58, 'left') === '2,7,8' && fr(58, 'right') === '2h,7h,8h', 'W5i the nurse walks on frames 0,3,4 / 1,5,6 / 2,7,8 / the same mirrored (read from her anim lists)', [fr(58, 'down'), fr(58, 'up'), fr(58, 'left'), fr(58, 'right')].join(' | '));
@@ -288,7 +395,7 @@ async function runChecks(dir, { full, quiet }) {
     const diff = (a, b) => Object.keys({ ...a, ...b }).filter((k) => a[k] !== b[k]);
     ok(diff(made.maps, g.maps).length === 0, 'W6a the pinned map pictures equal the golden (the Center, the other Center shape, a town, a route, houses, ...)', diff(made.maps, g.maps).join(' '));
     ok(made.border === g.border && made.view === g.view, 'W6b the border block and the 320 x 240 view equal the golden');
-    ok(diff(made.avatars, g.avatars).length === 0 && made.avatarsAll === g.avatarsAll, 'W6c every avatar\'s twelve pictures equal the golden', diff(made.avatars, g.avatars).slice(0, 8).join(' '));
+    ok(diff(made.avatars, g.avatars).length === 0 && made.avatarsAll === g.avatarsAll && made.standers === g.standers, 'W6c every avatar\'s twelve pictures and the standers equal the golden', diff(made.avatars, g.avatars).slice(0, 8).join(' '));
     ok(diff(made.emotes, g.emotes).length === 0, 'W6d every emote equals the golden', diff(made.emotes, g.emotes).join(' '));
     ok(diff(made.followers, g.followers).length === 0 && made.centerSprites === g.centerSprites, 'W6e the follower samples and the Center\'s NPCs equal the golden');
     ok(J(made.kinds) === J(g.kinds) && J(made.counts) === J(g.counts) && J(made.center) === J(g.center), 'W6f the counts equal the golden (sprite kinds, maps, cells, warps, objects, the list of Centers)', J(made.kinds) + ' ' + J(made.center));
@@ -357,14 +464,26 @@ const MUTANTS = [
   { id: 'M12 the walk frames assumed, not read (the standing frame counts as a step)', from: '        if (f.frame === stand.frame) continue;\n', to: '', fails: 'W5i' },
   { id: 'M13 a follower drawn in the palette its tag names', from: '    if (inf.palOff) return readPal(inf.palOff);\n', to: '', fails: 'W5j' },
   { id: 'M14 the heart read from the icon table', from: "add('heart', [image(heart, 0)]);", to: "add('heart', [image(icons, 0)]);", fails: 'W7d' },
-  { id: 'M15 three-frame standers offered as walkers', from: '      if (borrows(inf)) continue;', to: '', fails: 'W5b' },
+  { id: 'M15 a three-picture sprite walks in the next sprite\'s pictures', from: 'inf.steps = stepsOwn ? inf.walk : inf.walk.map((p) => [p[0], p[0], p[0]]);', to: 'inf.steps = inf.walk;', fails: 'W5o' },
   { id: 'M16 a sheet read as one frame', from: 'R.need(inf.imagesOff, \'sprite sheet\') + f * R.u16(inf.imagesOff + 4) };', to: 'R.need(inf.imagesOff, \'sprite sheet\') };', fails: 'W5b' },
-  { id: 'M17 the border block not tiled by cell parity', from: 'const bx = mod2(cx) * CELL + (mx - cx * CELL), by = mod2(cy) * CELL + (my - cy * CELL);', to: 'const bx = (mx - cx * CELL), by = (my - cy * CELL);', fails: 'W4g' },
+  { id: 'M17 the border block tiled from the wrong cell parity', from: 's = (brow + (((mx % BW) + BW) % BW)) * 4;', to: 's = (brow + ((((mx + CELL) % BW) + BW) % BW)) * 4;', fails: 'W4g' },
   { id: 'M18 left and right swapped in the facing codes', from: "const FACING_BY_CODE = ['down', 'down', 'up', 'left', 'right'];", to: "const FACING_BY_CODE = ['down', 'down', 'up', 'right', 'left'];", fails: 'W1h' },
   { id: 'M19 the object template read at the Emerald stride', from: 'objectTemplateSize: 24, warpSize: 8,', to: 'objectTemplateSize: 20, warpSize: 8,', fails: 'W1e' },
   { id: 'M20 the palette slot taken from the low tile bits', from: 'const tile = e & 0x3ff, hf = e & 0x400, vf = e & 0x800, bank = e >> 12;', to: 'const tile = e & 0x3ff, hf = e & 0x400, vf = e & 0x800, bank = (e >> 12) & 7;', fails: 'W6a' },
   { id: 'M21 the nurse addressed from the counter cell itself', from: "      if (crossed && m.walkable(nurse.x, y)) nurseTalk = { x: nurse.x, y, facing: 'up' };", to: "      if (crossed) nurseTalk = { x: nurse.x, y: y - 1, facing: 'up' };", fails: 'W3e' },
-  { id: 'M22 gliding standers offered as walkers', from: "      if (!walkIsAnimated(inf)) { standers.push(inf.id); continue; }   // four directions, but it would glide\n", to: '', fails: 'W5g' },
+  { id: 'M22 gliding standers offered as walkers', from: 'walks = inf.cleanWalk && walkIsAnimated(inf);', to: 'walks = inf.cleanWalk;', fails: 'W5g' },
+  { id: 'M23 a walkable cell with the counter behaviour counted as counter', from: 'const counter = counterCells.filter((c) => !m.walkable(c.x, c.y)), counterFloor', to: 'const counter = counterCells, counterFloor', fails: 'W3c' },
+  { id: 'M24 the elevation rule dropped from canEnter', from: 'return !elev || ce === ELEVATION_ANY || ce === ELEVATION_BRIDGE || ce === elev;', to: 'return true;', fails: 'W2d' },
+  { id: 'M25 the east and west arrow warps swapped', from: 'EAST_ARROW_WARP: 0x62, WEST_ARROW_WARP: 0x63,', to: 'EAST_ARROW_WARP: 0x63, WEST_ARROW_WARP: 0x62,', fails: 'W2e' },
+  { id: 'M26 the view copies the map row without its x offset', from: 'const s = (my * full.width + x0 + xa) * 4, e = s + (xb - xa) * 4;', to: 'const s = (my * full.width + xa) * 4, e = s + (xb - xa) * 4;', fails: 'W4f' },
+  { id: 'M27 a look told by its pixels alone (the boy in the other palette dropped)', from: 'look = String.fromCharCode.apply(null, frameRGBA(id, inf.steps[SOUTH][0].frame, false).rgba);', to: 'look = String(frameData(inf, inf.steps[SOUTH][0].frame).off);', fails: 'W5c' },
+  { id: 'M28 renderView ignores the arrays it is given', from: 'const under = into ? into.under : new Uint8Array(n), over = into ? into.over : new Uint8Array(n);', to: 'const under = new Uint8Array(n), over = new Uint8Array(n);', fails: 'W4j' },
+  { id: 'M29 a sprite with empty standing pictures offered as a stander', from: '        if (!walkerIsDrawn(inf)) continue; ', to: '        ', fails: 'W5b' },
+  { id: 'M30 an empty walk picture passes for a walk', from: 'return inkOf(inf, s.frame) > 0;', to: 'return true;', fails: 'W5n' },
+  { id: 'M31 the elevation read from the wrong bits', from: 'export const BLOCK_ELEVATION_SHIFT = 12;', to: 'export const BLOCK_ELEVATION_SHIFT = 13;', fails: 'W2c' },
+  { id: 'M32 a cell at elevation 15 refuses like any other', from: 'ce === ELEVATION_ANY || ce === ELEVATION_BRIDGE || ce === elev', to: 'ce === ELEVATION_ANY || ce === elev', fails: 'W2g' },
+  { id: 'M33 a step off a cell at elevation 15 takes the new cell\'s elevation', from: '        if (inside(fromX, fromY) && elevation[fromY * L.width + fromX] === ELEVATION_BRIDGE) return elev;\n', to: '', fails: 'W2g' },
+  { id: 'M34 stepElevation never changes the elevation', from: '        return ce;\n      },\n      behaviorAt', to: '        return elev;\n      },\n      behaviorAt', fails: 'W2d' },
 ];
 async function runMutants() {
   let killed = 0;
@@ -415,6 +534,7 @@ if (SHEETS && real.world) {
     const mark = (cell, col, label) => { tint(c, x0 + cell.x * 16 * k, y0 + cell.y * 16 * k, 16 * k, 16 * k, col, 0.6); text(c, x0 + cell.x * 16 * k + 2, y0 + cell.y * 16 * k + 14, label); };
     for (const d of ci.doors) mark(d, [0, 200, 0], 'DOOR');
     for (const d of ci.counter) mark(d, [240, 160, 0], 'CTR');
+    for (const d of ci.counterFloor) mark(d, [160, 160, 160], 'flr');
     for (const d of ci.pc) mark(d, [0, 120, 255], 'PC');
     for (const d of ci.pcUse) mark(d, [0, 200, 255], 'use');
     for (const d of ci.regionMap) mark(d, [160, 0, 200], 'MAP');
@@ -427,13 +547,14 @@ if (SHEETS && real.world) {
     text(c, gap, 2 * H1 + 3 * gap + 38, 'BG events: ' + m.events.bgs.map((b) => '(' + b.x + ',' + b.y + ')').join(' ') + '   door -> map ' + ci.doors.map((d) => d.destGroup + '.' + d.destNum).join(' '));
     save('center.png', c);
   }
-  { // 2. the 240x160 view of the Center (the room is exactly one screen) and a view that shows the border block
+  { // 2. the 240x160 view of the Center (this site's framing: the whole room on one screen; the game itself keeps its
+    //    camera on the player) and a view that shows the border block
     const m = world.center, c = newCanvas(240 * 2 + 320 + 36, 480 + 24, [40, 40, 56, 255]);
     const v = world.renderView(m, 0, 0, 240, 160); const s1 = { width: 240, height: 160, rgba: v.under.slice() };
     for (const s of world.mapSprites(m)) if (s.sprite) blit(s1, s.px, s.py, s.sprite.width, s.sprite.height, s.sprite.rgba);
     blit(s1, 0, 0, 240, 160, v.over); put(c, 12, 12, s1, 2);
     const v2 = world.renderView(m, -32, -40, 320, 240); const s2 = { width: 320, height: 240, rgba: v2.under.slice() }; blit(s2, 0, 0, 320, 240, v2.over); put(c, 240 * 2 + 24, 12, s2, 1);
-    text(c, 12, 340, 'left: renderView(center, 0, 0, 240, 160) at 2x = the GBA screen.   right: renderView(center, -32, -40, 320, 240): border block outside');
+    text(c, 12, 340, 'left: renderView(center, 0, 0, 240, 160) at 2x: the whole room on one 240x160 screen (the lobby framing).   right: renderView(center, -32, -40, 320, 240): border block outside');
     save('center_view.png', c);
   }
   { // 3. every Pokemon Center (as the game shows it), labelled; the standard ones first
@@ -457,6 +578,13 @@ if (SHEETS && real.world) {
       });
       save('avatars_' + s + '.png', c);
     }
+  }
+  { // 4b. the standers: four directions standing at 2x; "3 PIC" = three pictures only (cleanWalk false: its steps are the standing picture)
+    const st = world.ow.standers, cols = 6, k = 2, cw = 44 + 4 * 16 * k + 8, ch = 32 * k + 4;
+    const c = newCanvas(cols * cw, Math.ceil(st.length / cols) * ch + 18, [72, 104, 72, 255]);
+    text(c, 4, 0, 'STANDERS (' + st.length + '): id | down up left right, standing.   3 PIC = three pictures of its own (no walk in the ROM)');
+    st.forEach((id, i) => { const x0 = (i % cols) * cw, y0 = 18 + Math.floor(i / cols) * ch; text(c, x0 + 2, y0 + 12, id); if (!world.ow.info(id).cleanWalk) text(c, x0 + 2, y0 + 30, '3 PIC', [255, 255, 0]); W.DIRS.forEach((d, n) => put(c, x0 + 44 + n * 16 * k, y0 + 2, world.ow.walker(id, d, 0), k)); });
+    save('standers.png', c);
   }
   { // 5. the NPC palette axis: a sample of people in their own palette (top) and the four shared NPC palettes
     const ids = [6, 7, 8, 13, 16, 21, 28, 35, 45, 58, 64, 83, 116, 129, 230, 265], k = 3;
