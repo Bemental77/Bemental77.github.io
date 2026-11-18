@@ -23,6 +23,17 @@ const pack = T.loadPack(L.readRom(), { verify: 'header', dexText: false });
 const F = await L.towerFixtures(pack);
 const BU = await L.mod('battle_ui.js');
 const rom = L.readRom();
+// THE RETRIES (2026-11-17: a lost floor is tried again, three times a floor): the same real runs as F, with tries lost through the game's own reducers (never a hand-made summary)
+const SS = await L.mod('tower_session.js'), TWR = await L.mod('tower.js');
+const lossOf = (tw) => SS.reduceFinishFloor(tw, { floor: tw.current.floor, seed: tw.current.seed, result: { floor: tw.current.floor, result: 'l', turns: 6, faints: 3 }, pack, now: 1700000000000, tries: TWR.tryNumber(tw.current) }).tower;
+const markOf = (tw) => SS.reduceMarkFight(tw, { floor: tw.current.floor, seed: tw.current.seed, attempt: 7, tries: TWR.tryNumber(tw.current) }).tower;
+const rawRetry = lossOf(F.raw.fight), rawLastTry = lossOf(lossOf(rawRetry));
+const rawRecord = { ...clone(F.raw.none), runs: F.raw.none.runs + 1, wins: 1, winsByFormat: { '3v3': 1, '6v6': 0 }, best: { ...F.raw.none.best, '3v3': 30 }, floors: F.raw.none.floors + 30, retries: 14, fewestRetries: { '3v3': 2, '6v6': null }, last: { ...clone(F.raw.none.last), retries: 5 } };
+const FR = {
+  retry: SS.summarizeTower(rawRetry, pack), lastTry: SS.summarizeTower(rawLastTry, pack), unsaved: SS.summarizeTower(rawRetry, pack, { saved: false }),          // the last try of the floor was lost once / three times; the same in a browser that keeps nothing
+  left: SS.summarizeTower(markOf(rawRetry), pack), leftLast: SS.summarizeTower(markOf(rawLastTry), pack),                                                       // a fight that was begun and left, with two retries in hand / with none
+  record: SS.summarizeTower(rawRecord, pack),                                                                                                                  // no run: a record with retries (14 in all, a 3v3 climb won with 2, a last run with 5)
+};
 
 const mkData = (towers, o = {}) => ({ state: 'ready', activeId: 'p1', profiles: towers.map((tw, i) => ({ id: 'p' + (i + 1), name: ['RED', 'BLUE', 'GREEN'][i], readOnly: !!(o.readOnly && o.readOnly[i]), tower: tw,
   teams: [{ id: 't' + (i + 1) + 'a', name: 'Kanto Squad', size: 3, legal: true, problems: 0, names: ['A', 'B', 'C'], lead: { species: 25 }, ruleset: 'arena-gen3-standard' }, { id: 't' + (i + 1) + 'b', name: 'Big Six', size: 6, legal: true, problems: 0, names: ['A', 'B', 'C', 'D', 'E', 'F'], lead: { species: 6 }, ruleset: 'arena-gen3-standard' },
@@ -80,6 +91,44 @@ function checkModelBody(HM, f, TH) {
   const broken = clone(F.fight); broken.run = { broken: true, why: 'x' };
   m = mk(D(broken)); tower(m);
   t('home: a run that cannot be read is offered to be dropped, never fought', () => (labels(m)[0] === 'DROP THIS RUN' && !labels(m).includes('MY BUFFS')), () => (J(labels(m))));
+  // ---- THE RETRIES: the RETRY FLOOR row, the message that says the climb is saved, the status window, a fight that was left, the record
+  {
+    const fl = FR.retry.run.floor;
+    m = mk(D(FR.retry)); tower(m);
+    t('retry: the first row reads RETRY FLOOR n when the last try of the floor was lost (the same row with the same effect: A asks the page to fight that floor)', () => (J(labels(m)) === J(['RETRY FLOOR ' + fl, 'MY BUFFS', 'NEW RUN', 'LAST RUN', 'ACHIEVEMENTS', 'BACK']) && FR.retry.run.lostTry === 'retry' && fl === F.fight.run.floor && (e = m.press('a'), e.length === 1 && e[0].type === 'tower-fight' && e[0].seed === FR.retry.run.seed && e[0].floor === fl)), () => (J(labels(m)) + J(e)));
+    m = mk(D(FR.retry)); tower(m);
+    t('retry: the message of RETRY FLOOR says the climb is saved, how many retries this floor has left and how many the climb has used', () => (J(m.view().msg) === J(['The climb is saved on floor ' + fl + '.', '2 of 3 retries left here, 1 used.'])), () => (J(m.view().msg)));
+    t('retry: the status panel shows the retries left on this floor and the retries used on the climb (RETRIES LEFT 2/3, RETRIES USED 1), after the floor, the best floor and the buffs', () => { const ln = m.view().tower.panel.lines; return ln.length === 6 && ln[1] === 'FLOOR ' + fl + '/30' && /^3v3 BEST \d+$/.test(ln[2]) && ln[3] === 'BUFFS ' + FR.retry.run.held.length && ln[4] === 'RETRIES LEFT 2/3' && ln[5] === 'RETRIES USED 1'; }, () => (J(m.view().tower.panel.lines)));
+    m = mk(D(F.fight)); tower(m);
+    t('retry: a floor that has not been lost keeps FIGHT and "Next: ...", and its panel says RETRIES LEFT 3/3, RETRIES USED 0', () => (labels(m)[0] === 'FIGHT: FLOOR ' + fl && /^Next: /.test(m.view().msg[0]) && m.view().tower.panel.lines[4] === 'RETRIES LEFT 3/3' && m.view().tower.panel.lines[5] === 'RETRIES USED 0'), () => (J(m.view().tower.panel.lines)));
+    m = mk(D(FR.lastTry)); tower(m);
+    t('retry: on the last try of a floor the message says no retry is left, and the panel says 0/3', () => (labels(m)[0] === 'RETRY FLOOR ' + fl && J(m.view().msg) === J(['The climb is saved on floor ' + fl + '.', 'Last try: no retry left, 3 used.']) && m.view().tower.panel.lines[4] === 'RETRIES LEFT 0/3' && m.view().tower.panel.lines[5] === 'RETRIES USED 3'), () => (J(m.view().msg) + J(m.view().tower.panel.lines)));
+    m = mk(D(FR.unsaved)); tower(m);
+    t('retry: in a browser that keeps no profiles the message does NOT say the climb is saved: it says it is not', () => (J(m.view().msg) === J(['This climb is NOT being saved:', 'this browser keeps no profiles.']) && m.view().tower.status.saved === false), () => (J(m.view().msg)));
+    m = mk(D(FR.left)); tower(m);
+    t('retry: a fight that was left says what coming back costs (one of the retries left; the climb, when none is left)', () => (J(m.view().msg) === J(['You left a fight unfinished.', 'That costs 1 of the 2 retries left.']) && (m = mk(D(FR.leftLast)), tower(m), J(m.view().msg) === J(['You left a fight unfinished.', 'No retry is left: the climb ends.']))), () => (J(m.view().msg)));
+    m = mk(D(FR.record)); tower(m);
+    t('retry: with no run the panel shows the retries of every finished climb once there are some (a record that has none keeps its five lines)', () => (m.view().tower.panel.lines.length === 6 && m.view().tower.panel.lines[5] === 'RETRIES 14' && (m = mk(D(F.none)), tower(m), m.view().tower.panel.lines.length === 5)), () => (J(m.view().tower.panel.lines)));
+    m = mk(D(FR.record)); tower(m); toRow(m, 'new');
+    t('retry: the record line of NEW RUN names the fewest retries of a won climb in each format (a Tower never won keeps the words that explain the climb)', () => (J(m.view().msg) === J(['Fewest retries to win:', '3v3 2, 6v6 not won yet.']) && (m = mk(D(F.none)), tower(m), toRow(m, 'new'), /^Climb 30 floors/.test(m.view().msg[0]))), () => (J(m.view().msg)));
+    m = mk(D(FR.record)); tower(m); toRow(m, 'last'); m.press('a');
+    t('retry: LAST RUN shows the retries of the finished run', () => (m.path() === 'tower-last' && m.view().tower.last.retries === 5), () => (J(m.view().tower.last)));
+    t('retry: the words follow the config (one place makes them): a cap for the whole climb, no cap at all, no retries at all, a cap of two digits; and a count the window cannot hold beside its words (past 999: no stored run has one) is shown as RETRIES 999+', () => (
+      J(TH.retryLines({ scope: 'run', cap: 3, left: 2, used: 1 })) === J(['RETRIES LEFT 2/3', 'RETRIES USED 1']) && TH.retryWords({ scope: 'run', cap: 3, left: 2, used: 1 }) === '2 of 3 retries left, 1 used.'
+      && J(TH.retryLines({ scope: 'none', cap: null, left: 296, used: 4 })) === J(['RETRIES NO LIMIT', 'RETRIES USED 4']) && TH.retryWords({ scope: 'none', cap: null, left: 296, used: 4 }) === 'Retries used on this climb: 4.'
+      && J(TH.retryLines({ scope: 'floor', cap: 0, left: 0, used: 0 })) === J(['NO RETRIES']) && TH.retryWords({ scope: 'floor', cap: 0, left: 0, used: 0 }) === 'No retries: a loss ends the climb.'
+      && J(TH.retryLines({ scope: 'floor', cap: 30, left: 12, used: 18 })) === J(['RETRIES 12/30', 'RETRIES USED 18']) && J(TH.retryLines(null)) === '[]' && TH.retryWords(null) === ''
+      && J(TH.retryLines({ scope: 'floor', cap: 3, left: 0, used: 999 })) === J(['RETRIES LEFT 0/3', 'RETRIES USED 999']) && TH.retryLines({ scope: 'floor', cap: 3, left: 0, used: 1000 })[1] === 'RETRIES 999+' && TH.retryLines({ scope: 'none', cap: null, left: 0, used: 1000000 })[1] === 'RETRIES 999+'), () => (J(TH.retryLines({ scope: 'none', cap: null, left: 296, used: 4 }))));
+    const say = (mm) => TH.speakTower(mm.view());
+    // (THE EXPECTATION CHANGED with the review of 2026-11-17: on the RETRY FLOOR row the retry sentence used to be spoken TWICE, once by the status and once by the row's message. It is said once now: by the
+    //  message on that row, by the status on every other row.)
+    m = mk(D(FR.retry)); tower(m); const sp1 = say(m); toRow(m, 'buffs'); const sp1b = say(m);
+    const times = (s, x) => s.split(x).length - 1, RS = '2 of 3 retries left here, 1 used.';
+    t('retry: the screen reader is told the floor, the retries left and used, and the RETRY FLOOR row, each ONCE (on the RETRY FLOOR row the message carries the retry sentence, so the status does not say it a second time; on any other row the status says it)', () => (sp1.includes('Floor ' + fl + ' of 30. The climb is saved on floor ' + fl + '. ' + RS) && times(sp1, RS) === 1 && sp1.includes('selected RETRY FLOOR ' + fl) && sp1b.includes('Floor ' + fl + ' of 30. ' + RS) && times(sp1b, RS) === 1 && sp1b.includes('selected MY BUFFS') && !/ {2}/.test(sp1 + sp1b)), () => (sp1 + ' || ' + sp1b));
+    m = mk(D(FR.record)); tower(m); toRow(m, 'last'); m.press('a'); const sp2 = say(m);
+    m = mk(D(F.none)); tower(m); toRow(m, 'last'); m.press('a'); const sp3 = say(m);
+    t('retry: the screen reader is told the retries of the last run (and "no retry" for a run that used none)', () => (/, 5 retries/.test(sp2) && /, no retry/.test(sp3)), () => (sp2 + ' || ' + sp3));
+  }
   // ---- NEW RUN: giving up the run under way, then the team and format
   m = mk(D(F.fight)); tower(m); toRow(m, 'new'); e = m.press('a');
   t('new: with a run under way A asks first (YES / NO, NO is chosen), and nothing is given up yet', () => (e.length === 0 && m.view().tower.confirm && m.view().tower.confirm.cursor === 1 && /Give up/.test(m.view().msg[0])), () => (J(m.view())));
@@ -375,6 +424,31 @@ const MUTANTS = [
   { file: 'tower_hub.js', name: 'the last run is not spoken', find: "if (t.kind === 'tower-last') {", replace: "if (t.kind === 'tower-last' && false) {", expect: 'speak: the last-run screen says how the climb ended' },
   { file: 'tower_hub.js', name: 'the selected buff is not named', find: "parts.push((t.tab === 0 ? 'Buff ' : 'Synergy ') + (t.abs + 1) + ' of ' + t.total + ': ' + r.name +", replace: "parts.push((t.tab === 0 ? 'Buff ' : 'Synergy ') + (t.abs + 1) + ' of ' + t.total + ': ' +", expect: 'speak: MY BUFFS says the selected buff' },
   { file: 'tower_hub.js', name: 'the selected achievement is not named', find: "if (r) parts.push('Achievement ' + (t.abs + 1) + ' of ' + t.total + ': ' + r.name + ', '", replace: "if (r) parts.push('Achievement ' + (t.abs + 1) + ' of ' + t.total + ': ' + ', '", expect: 'speak: ACHIEVEMENTS says the selected one' },
+  // ---- the retries: the row, the messages, the status window, the speech
+  { file: 'tower_hub.js', name: 'the first row always reads FIGHT', find: "label: (r.lostTry ? 'RETRY FLOOR ' : 'FIGHT: FLOOR ') + r.floor });", replace: "label: 'FIGHT: FLOOR ' + r.floor });", expect: 'retry: the first row reads RETRY FLOOR n' },
+  { file: 'tower_hub.js', name: 'the first row always reads RETRY FLOOR', find: "label: (r.lostTry ? 'RETRY FLOOR ' : 'FIGHT: FLOOR ') + r.floor });", replace: "label: 'RETRY FLOOR ' + r.floor });", expect: 'a floor that has not been lost keeps FIGHT' },
+  { file: 'tower_hub.js', name: 'the retry message does not say the climb is saved', find: "['The climb is saved on floor ' + r.floor + '.', retryWords(r.retry)];", replace: "['Floor ' + r.floor + ' is waiting.', retryWords(r.retry)];", expect: 'retry: the message of RETRY FLOOR says the climb is saved' },
+  { file: 'tower_hub.js', name: 'the retry message forgets the retries', find: "['The climb is saved on floor ' + r.floor + '.', retryWords(r.retry)];", replace: "['The climb is saved on floor ' + r.floor + '.', 'A to fight.'];", expect: 'retry: the message of RETRY FLOOR says the climb is saved' },
+  { file: 'tower_hub.js', name: 'the message counts the retries used as the retries left', find: "return rt.left + ' of ' + rt.cap + ' retries left' + (rt.scope === 'floor' ? ' here' : '') + ', ' + rt.used + ' used.';", replace: "return rt.used + ' of ' + rt.cap + ' retries left' + (rt.scope === 'floor' ? ' here' : '') + ', ' + rt.left + ' used.';", expect: 'retry: the message of RETRY FLOOR says the climb is saved' },
+  { file: 'tower_hub.js', name: 'the last try is not announced', find: "  if (rt.left === 0) return 'Last try: no retry left, ' + rt.used + ' used.';\n", replace: "", expect: 'retry: on the last try of a floor' },
+  { file: 'tower_hub.js', name: 'the message says saved when nothing is kept', find: "if (r.lostTry) return t.saved === false ? [", replace: "if (r.lostTry) return false ? [", expect: 'keeps no profiles the message does NOT say' },
+  { file: 'tower_hub.js', name: 'the status panel hides the retries', find: ".concat(retryLines(r.retry));", replace: ";", expect: 'retry: the status panel shows the retries left' },
+  { file: 'tower_hub.js', name: 'the status panel shows the retries used as left', find: "'RETRIES LEFT ' + rt.left + '/' + rt.cap;", replace: "'RETRIES LEFT ' + rt.used + '/' + rt.cap;", expect: 'retry: the status panel shows the retries left' },
+  { file: 'tower_hub.js', name: 'the status panel forgets the retries used', find: "return [first, usedLine(rt.used)];", replace: "return [first];", expect: 'retry: the status panel shows the retries left' },
+  { file: 'tower_hub.js', name: 'a huge count of retries used is drawn past the window', find: "const usedLine = (n) => (n > 999 ? 'RETRIES 999+' : 'RETRIES USED ' + n);", replace: "const usedLine = (n) => 'RETRIES USED ' + n;", expect: 'retry: the words follow the config' },
+  { file: 'tower_hub.js', name: 'the retry sentence is spoken twice on the RETRY FLOOR row', find: "(said && !msg.includes(said) ? said : '')", replace: "said", expect: 'retry: the screen reader is told the floor' },
+  { file: 'tower_hub.js', name: 'the status never speaks the retries', find: "(said && !msg.includes(said) ? said : '')", replace: "''", expect: 'retry: the screen reader is told the floor' },
+  { file: 'tower_hub.js', name: 'a left fight says nothing of what it costs', find: "(r.retry.scope === 'none' ? 'That costs a retry.' : 'That costs 1 of the ' + r.retry.left + (r.retry.left === 1 ? ' retry' : ' retries') + ' left.')", replace: "'Fighting again counts it as a loss.'", expect: 'retry: a fight that was left says what coming back costs' },
+  { file: 'tower_hub.js', name: 'a left fight with no retry left says it costs a retry', find: ": 'No retry is left: the climb ends.'];", replace: ": 'That costs a retry.'];", expect: 'retry: a fight that was left says what coming back costs' },
+  { file: 'tower_hub.js', name: 'the record panel hides the retries of finished climbs', find: ".concat(t.record.retries > 0 ? ['RETRIES ' + short(t.record.retries)] : []);", replace: ";", expect: 'retry: with no run the panel shows the retries' },
+  { file: 'tower_hub.js', name: 'the record panel always has a retries line', find: ".concat(t.record.retries > 0 ? ['RETRIES ' + short(t.record.retries)] : []);", replace: ".concat(['RETRIES ' + short(t.record.retries)]);", expect: 'retry: with no run the panel shows the retries' },
+  { file: 'tower_hub.js', name: 'NEW RUN never names the fewest retries', find: "if (won.length) return ['Fewest retries to win:',", replace: "if (false) return ['Fewest retries to win:',", expect: 'retry: the record line of NEW RUN names the fewest retries' },
+  { file: 'tower_hub.js', name: 'NEW RUN names a fewest for a Tower never won', find: "if (won.length) return ['Fewest retries to win:',", replace: "if (fw) return ['Fewest retries to win:',", expect: 'retry: the record line of NEW RUN names the fewest retries' },
+  { file: 'tower_hub.js', name: 'the words ignore a cap for the whole climb', find: "(rt.scope === 'floor' ? ' here' : '')", replace: "' here'", expect: 'retry: the words follow the config' },
+  { file: 'tower_hub.js', name: 'no retries reads as no limit', find: "  if (!hasRetries(rt)) return ['NO RETRIES'];\n", replace: "", expect: 'retry: the words follow the config' },
+  { file: 'tower_hub.js', name: 'the home does not speak the floor and the retries', find: "if (t.kind === 'tower' && t.status) parts.push(", replace: "if (false) parts.push(", expect: 'retry: the screen reader is told the floor' },
+  { file: 'tower_hub.js', name: 'the last run is spoken without its retries', find: "', ' + (l.retries ? l.retries + (l.retries === 1 ? ' retry' : ' retries') : 'no retry') + ", replace: "", expect: 'retry: the screen reader is told the retries of the last run' },
+  { file: 'tower_hub.js', name: 'the view carries no status', find: "status: path === 'tower' && lr ? {", replace: "status: false ? {", expect: 'retry: the screen reader is told the floor' },
   { file: 'tower_hub.js', name: 'the rows are spoken without their values', find: "r.label + (r.value !== undefined ? ' ' + r.value : '')).join(', ') + '.');\n  return parts.join(' ');", replace: "r.label).join(', ') + '.');\n  return parts.join(' ');", expect: 'speak: NEW RUN says its rows with their values' },
 ];
 let modCache = new Map();
@@ -426,15 +500,35 @@ const GO = ['down', 'down', 'down', 'a'];                 // TOWER (the fourth r
   add('buffs', D(F.offer5), [...GO, 'down', 'a']); add('buffs 2', D(F.offer5), [...GO, 'down', 'a', 'down', 'down']); add('buff detail', D(F.offer5), [...GO, 'down', 'a', 'down', 'a']); add('synergies', D(F.offer5), [...GO, 'down', 'a', 'right']);
   for (const k of [0, 5, 20, 50]) add('ach ' + k, D(F.fight), [...GO, 'down', 'down', 'down', 'down', 'a', ...Array(k).fill('down')]);
   add('last', D(F.none), [...GO, 'down', 'a']);
+  // the retries: the home with RETRY FLOOR (one retry used, the last try), a fight that was left, the browser that keeps nothing, the record with retries, the last run with retries
+  add('home retry', D(FR.retry), GO); add('home last try', D(FR.lastTry), GO); add('home left', D(FR.left), GO); add('home left last', D(FR.leftLast), GO); add('home unsaved', D(FR.unsaved), GO);
+  add('home record retries', D(FR.record), GO); add('home record new', D(FR.record), [...GO, 'down']); add('last retries', D(FR.record), [...GO, 'down', 'a']);
   const bad = [], w = [];
   for (const [label, v] of views) {
     const f = screen.render(v);
     if (f.width !== 240 || f.height !== 160 || f.rgba.length !== 240 * 160 * 4) bad.push(label + ': size');
     for (let i = 3; i < f.rgba.length; i += 4) if (f.rgba[i] !== 255) { bad.push(label + ': transparent pixel'); break; }
     for (const x of screen.widths(v)) if (x.px > x.max) w.push(label + ': ' + x.what + ' ' + x.px + ' > ' + x.max);
+    // the status window (home, new run): every line inside its width and above its bottom edge; the LAST RUN window's two lines inside its width
+    if (v.tower && v.tower.panel) for (const x of screen.tower.panelWidths(v.tower.panel.lines)) { if (x.px > x.max) w.push(label + ': ' + x.what + ' ' + x.px + ' > ' + x.max); if (x.bottom > x.floor) w.push(label + ': ' + x.what + ' ends at ' + x.bottom + ', below ' + x.floor); }
+    if (v.tower && v.tower.kind === 'tower-last' && v.tower.last) for (const x of screen.tower.lastWidths(v.tower.last)) if (x.px > x.max) w.push(label + ': ' + x.what + ' ' + x.px + ' > ' + x.max);
   }
-  ok(views.length >= 36 && bad.length === 0, 'R. all ' + views.length + ' Tower views draw a full opaque 240x160 frame', bad.slice(0, 3).join('; '));
-  ok(w.length === 0, 'R. every help line and message of every Tower view fits its window', w.slice(0, 4).join('; '));
+  // ... and the same for the extremes no fixture reaches: every cap a config could set, a run at the most retries a run can count, lives, a record's total at its largest, the longest LAST RUN lines
+  {
+    const ext = [];
+    for (const rt of [{ scope: 'floor', cap: 3, left: 3, used: 0 }, { scope: 'floor', cap: 9, left: 9, used: 300 }, { scope: 'floor', cap: 30, left: 30, used: 300 }, { scope: 'floor', cap: 300, left: 300, used: 300 }, { scope: 'run', cap: 300, left: 299, used: 1 }, { scope: 'none', cap: null, left: 0, used: 300 }, { scope: 'floor', cap: 0, left: 0, used: 0 }, { scope: 'floor', cap: 3, left: 0, used: 1000000 }]) {
+      const d = clone(FR.retry); d.run.retry = { ...d.run.retry, ...rt }; d.run.floor = 30; d.run.lives = 3; d.run.livesUsed = 1; d.run.held = d.run.held.concat(Array.from({ length: 29 }, () => d.run.held[0])).slice(0, 29); d.record.best = { '3v3': 30, '6v6': 30 };
+      const v = at(D(d), GO).view(); screen.render(v);
+      for (const x of screen.tower.panelWidths(v.tower.panel.lines)) { if (x.px > x.max) ext.push(J(rt) + ': ' + x.what + ' ' + x.px + ' > ' + x.max); if (x.bottom > x.floor) ext.push(J(rt) + ': ' + x.what + ' below the window'); }
+      for (const x of screen.widths(v)) if (x.px > x.max) ext.push(J(rt) + ': msg ' + x.px);
+      const dl = clone(d); dl.run.fighting = true; const vl = at(D(dl), GO).view(); for (const x of screen.widths(vl)) if (x.px > x.max) ext.push(J(rt) + ': left-fight msg ' + x.px);
+    }
+    for (const total of [1, 99999, 100000, 999000000]) { const d = clone(FR.record); d.record.retries = total; d.record.runs = 999; d.record.wins = 999; d.record.fewestRetries = { '3v3': 300, '6v6': 300 }; const m2 = at(D(d), GO), v = m2.view(); for (const x of screen.tower.panelWidths(v.tower.panel.lines)) if (x.px > x.max || x.bottom > x.floor) ext.push('record ' + total + ': ' + x.what + ' ' + x.px); m2.press('down'); for (const x of screen.widths(m2.view())) if (x.px > x.max) ext.push('record fewest msg ' + x.px); }
+    for (const l of [{ cleared: 30, format: '6v6', retries: 300, livesUsed: 3, skips: 29, held: Array.from({ length: 29 }, () => ({})) }, { cleared: 30, format: '6v6', retries: 0, livesUsed: 1, skips: 0, held: [] }]) for (const x of screen.tower.lastWidths(l)) if (x.px > x.max) ext.push('last: ' + x.what + ' ' + x.px + ' > ' + x.max);
+    ok(ext.length === 0, 'R. the status window, the messages and the LAST RUN lines still fit at the extremes (a cap of 3, 9, 30 or 300, for the floor or the climb, no cap, no retries; 300 retries used, and a count of 1,000,000 that no stored run can reach, shown as RETRIES 999+; 3 lives beside 29 buffs, the most a run can hold; a record of 999,000,000 retries)', ext.slice(0, 4).join('; '));
+  }
+  ok(views.length >= 44 && bad.length === 0, 'R. all ' + views.length + ' Tower views draw a full opaque 240x160 frame', bad.slice(0, 3).join('; '));
+  ok(w.length === 0, 'R. every help line and message of every Tower view fits its window, every line of the status window fits its width and its height, and the LAST RUN lines fit theirs', w.slice(0, 4).join('; '));
   // every buff, synergy and achievement text is word-wrapped by the REAL font to the message window, paged two lines at a time, and no word is ever cut or lost (the old box cut 844 of 1929 buff texts mid-word)
   {
     const BF = await L.mod('tower_buffs.js'), AC = await L.mod('achievements.js');

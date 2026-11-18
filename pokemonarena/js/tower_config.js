@@ -37,7 +37,14 @@ export const CONFIG = deepFreeze({
   bossEvery: 10,                             // floors 10, 20, 30 are bosses
   powerCap: 16,
   capBonusPm: 1250,                          // the anchor at the power cap = gold * 1.25
-  lives: 0,                                  // lives a run starts with (the Extra Life family adds more); 0 = a loss ends the run
+  lives: 0,                                  // lives a run starts with (the Extra Life family adds more): a lost floor spends a life before it counts a retry
+  // RETRIES (the owner, 2026-11-17: "need to be able to save progress in the tower too, and retry and have counted # of retries"; asked for a cap: "three", read as three per floor).
+  // A lost floor is tried again while a retry is left; a loss with none left (and no Extra Life) ends the run. Each cap is a whole number from 0, or null for no cap of that kind:
+  //   retriesPerFloor: 3, retriesPerRun: null   three retries on EVERY floor (four tries of a floor in all)          <- the rule in force
+  //   retriesPerFloor: null, retriesPerRun: 3   three retries for the WHOLE climb (the other reading of "three": change these two values and every rule, screen text and test follows)
+  //   retriesPerFloor: 0                        no retry at all: a loss ends the run, exactly the rule before 2026-11-17
+  retriesPerFloor: 3,
+  retriesPerRun: null,
   offer: {
     size: 3, bossSize: 5, minSize: 2, maxSize: 7,
     allowSkip: true,                         // the player may take nothing (a skipped offer is a choice, and some achievements are about it)

@@ -3,7 +3,7 @@
 //
 //   const run = newRun({ pack, seed, format: '3v3', team: { name, recs, meta } });          // floor 1, phase 'battle'
 //   const setup = battleSetup(pack, run);                                                   // { player, foe, cpu, pick, seed, validate:false, ... } for createMatchController
-//   const { run: r2, events } = recordFloorResult(run, { floor: 1, result: 'w', turns, faints });   // a win -> phase 'offer' (balls), a loss -> 'over' (or a life is spent)
+//   const { run: r2, events } = recordFloorResult(run, { floor: 1, result: 'w', turns, faints });   // a win -> phase 'offer' (balls); a loss -> the same floor again (an Extra Life is spent, else a RETRY is counted), or 'over' when none is left
 //   const view = offerView(r2, { pack });                                                   // { balls:[{ id, name, rarity, effectText, synergyProgress, stacksInto }], cursorStart }
 //   const { run: r3 } = takeBuff(r2, view.balls[0].id);                                     // or takeBuff(r2, null) to skip; nothing is ever granted automatically
 //
@@ -14,11 +14,11 @@ import { createRng } from './ai.js';
 import { randomTeam, FORMATS } from './matchctl.js';
 import { validateTeam } from './rules.js';
 import { CONFIG, TIERS } from './tower_config.js';
-import { emptyTower, TOWER_VERSION, checkTowerShape, RUN_KEYS, RUN_KEYS_OPTIONAL, sanitiseStamp } from './tower_record.js';
+import { emptyTower, TOWER_VERSION, TOWER_LIMITS, checkTowerShape, RUN_KEYS, RUN_KEYS_OPTIONAL, sanitiseStamp, retriesOf, floorRetriesOf, tryNumber, fewestRetriesOf } from './tower_record.js';
 import { FAMILIES, FAMILY_BY_ID, SYNERGIES, capOf, applyTeam, applyFoe, foeMods, runEffects, synergyState, describeOps, tierOfPower, mulPm } from './tower_buffs.js';
 
 export const RUN_VERSION = 1;
-export { emptyTower, TOWER_VERSION };               // the stored record's layout lives in tower_record.js (light: profile.js imports it); re-exported so the Tower's callers need one import
+export { emptyTower, TOWER_VERSION, retriesOf, floorRetriesOf, tryNumber, fewestRetriesOf };               // the stored record's layout lives in tower_record.js (light: profile.js imports it); re-exported so the Tower's callers need one import
 const clone = (x) => JSON.parse(JSON.stringify(x));
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const isInt = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi;
@@ -89,6 +89,23 @@ export function newRun({ pack, seed, format, team, cfg = CONFIG }) {
 }
 
 export const livesLeft = (run, cfg = CONFIG) => Math.max(0, cfg.lives + runEffects(run.held, { cfg }).lives - run.livesUsed);
+
+/** A retry cap of the config: a whole number from 0, or null (no cap of that kind). Anything else reads as 0, so a typo in the config can never hand out retries without end. */
+const capOfRetries = (v) => (v === null ? null : Number.isInteger(v) && v >= 0 ? v : 0);
+/**
+ * THE RETRIES OF A RUN, as every rule and every screen reads them (the two caps are cfg.retriesPerFloor and cfg.retriesPerRun; tower_config.js):
+ *   used      retries counted over the whole climb          onFloor   retries counted on the floor the run is on (0 again on every new floor)
+ *   left      how many more lost tries the run can take before a loss ends it (never more than TOWER_LIMITS.retriesMax in all)
+ *   cap, scope  the cap that `left` is counted against and what it covers: 'floor' (N per floor), 'run' (N for the whole climb), or 'none' (no cap: cap is null)
+ * Everything is read from the run's own history (a lost try that cost a retry is a row marked `retry`): no number is stored beside the rows, so none can disagree with them. The rows themselves are the
+ * player's own data: parseRun refuses a malformed edit of them, and cannot tell a self-consistent one (a retry row deleted) from a genuine run (TOWER.md section 9, "The known limit").
+ */
+export function retryInfo(run, cfg = CONFIG) {
+  const used = retriesOf(run), onFloor = floorRetriesOf(run), perFloor = capOfRetries(cfg.retriesPerFloor), perRun = capOfRetries(cfg.retriesPerRun);
+  const leftFloor = perFloor === null ? Infinity : Math.max(0, perFloor - onFloor), leftRun = perRun === null ? Infinity : Math.max(0, perRun - used), hard = Math.max(0, TOWER_LIMITS.retriesMax - used);
+  const scope = perFloor !== null && leftFloor <= leftRun ? 'floor' : perRun !== null ? 'run' : 'none';
+  return { used, onFloor, perFloor, perRun, left: Math.min(leftFloor, leftRun, hard), cap: scope === 'floor' ? perFloor : scope === 'run' ? perRun : null, scope };
+}
 const heldPower = (held, id) => { const h = held.find((x) => x.id === id); return h ? h.p : 0; };
 
 /** Everything a battle of the CURRENT floor needs, buffs applied: feed `player.recs` / `foe.recs` to createMatchController with `validate: false` (the Tower's records may exceed the ruleset's 510 EV total on purpose). */
@@ -99,7 +116,7 @@ export function battleSetup(pack, run, cfg = CONFIG) {
   const player = applyTeam(pack, run.team.recs, run.held, { cfg, salt });
   const foeRecs = applyFoe(pack, trainer.recs, run.held, { cfg, salt });
   return {
-    floor: run.floor, boss: trainer.boss, ruleset: cfg.ruleset, format: run.format, pick: FORMATS[run.format].pick, lead: !!FORMATS[run.format].lead, validate: false, seed: run.livesUsed ? mix(run.seed, run.floor, 0xb477, run.livesUsed) : mix(run.seed, run.floor, 0xb477),
+    floor: run.floor, boss: trainer.boss, ruleset: cfg.ruleset, format: run.format, pick: FORMATS[run.format].pick, lead: !!FORMATS[run.format].lead, validate: false, seed: tryNumber(run) ? mix(run.seed, run.floor, 0xb477, tryNumber(run)) : mix(run.seed, run.floor, 0xb477),          // (the dice are re-rolled for every try of a floor: a retry is not a replay of the lost battle; the trainer and both teams are the floor's own)
     names: [run.team.name, trainer.name], cpu: trainer.cpu,
     player: { recs: player, meta: clone(run.team.meta) }, foe: { recs: foeRecs, meta: trainer.meta },
     trainer: { name: trainer.name, boss: trainer.boss, spec: trainer.spec }, effects: runEffects(run.held, { cfg }),
@@ -198,12 +215,16 @@ const RESULTS = ['w', 'l', 'd', 'f'];
 
 /**
  * Record the result of the floor being fought. -> { run, applied, events, why? }. Idempotent: a result for a floor that is not the current one, or in any phase but 'battle', changes nothing (a double fire,
- * a reload that replays the result screen). A win opens the offer (or wins the run on the last floor); a loss spends a life if there is one, else ends the run.
+ * a reload that replays the result screen), and neither does a result that names another TRY of the floor than the one the run is waiting for (`tries`: tower_record.js tryNumber; a lost try leaves the run
+ * on the same floor, so the floor alone no longer tells two tries apart).
+ * A win opens the offer (or wins the run on the last floor). A loss leaves the run ON THE SAME FLOOR, holding everything it holds: an Extra Life is spent if one is held (the row is marked `life`), else a
+ * RETRY is counted while one is left (the row is marked `retry`); a loss with neither ENDS the run (phase 'over': the row carries no mark).
  */
-export function recordFloorResult(run, resultIn, { pack = null, cfg = CONFIG } = {}) {
+export function recordFloorResult(run, resultIn, { pack = null, cfg = CONFIG, tries } = {}) {
   const res = floorResultFrom(resultIn, run.floor);
   if (!RESULTS.includes(res.result) || !isInt(res.turns, 0, 100000) || !isInt(res.faints, 0, 36)) return { run, applied: false, events: [], why: 'bad result' };
   if (run.phase !== 'battle' || res.floor !== run.floor) return { run, applied: false, events: [], why: run.phase !== 'battle' ? 'not in battle' : 'not the current floor' };
+  if (tries !== undefined && tries !== tryNumber(run)) return { run, applied: false, events: [], why: 'not the current try' };
   const r = clone(run), boss = isBoss(run.floor, cfg), won = res.result === 'w';
   r.fighting = false; r.attempt = 0;
   r.history.push({ floor: run.floor, result: won ? 'w' : 'l', turns: res.turns, faints: res.faints, flawless: won && res.faints === 0, boss, comeback: won && res.comeback, sweep: won && res.sweep, closest: res.closest });
@@ -213,6 +234,7 @@ export function recordFloorResult(run, resultIn, { pack = null, cfg = CONFIG } =
     if (run.floor >= cfg.floors) { r.phase = 'won'; events.push({ type: 'run-won' }); }
     else { r.phase = 'offer'; r.floor = run.floor + 1; r.offer = offerFor(r, { pack, cfg }); if (!r.offer.length) { r.phase = 'battle'; r.offer = null; r.history[r.history.length - 1].pick = null; r.skips += 1; } }
   } else if (livesLeft(run, cfg) > 0) { r.livesUsed += 1; r.history[r.history.length - 1].life = true; events.push({ type: 'life-used', floor: run.floor }); }
+  else if (retryInfo(run, cfg).left > 0) { r.history[r.history.length - 1].retry = true; events.push({ type: 'retry-used', floor: run.floor, retries: retriesOf(r), left: retryInfo(r, cfg).left }); }
   else { r.phase = 'over'; events.push({ type: 'run-over', floor: run.floor }); }
   return { run: r, applied: true, events };
 }
@@ -248,7 +270,7 @@ export function markFighting(run, attempt = 0) {
 
 /* ---------------------------------------------------------------------------------------------- serialised form (strict) */
 
-const HIST_KEYS = ['floor', 'result', 'turns', 'faints', 'flawless', 'boss', 'comeback', 'sweep', 'closest', 'life', 'pick'];
+const HIST_KEYS = ['floor', 'result', 'turns', 'faints', 'flawless', 'boss', 'comeback', 'sweep', 'closest', 'life', 'retry', 'pick'];
 
 function checkRec(r) {
   if (!isObj(r) || !isInt(r.species, 1, 100000) || !isInt(r.level, 1, 100) || !isInt(r.nature, 0, 24) || !isInt(r.abilitySlot, 0, 2) || !isInt(r.item === undefined ? 0 : r.item, 0, 100000)) return false;
@@ -286,15 +308,25 @@ export function parseRun(input, { pack = null, cfg = CONFIG } = {}) {
   if (!Array.isArray(r.types) || r.types.length !== r.team.recs.length || !r.types.every((t) => Array.isArray(t) && t.length === 2 && t.every((x) => isInt(x, 0, 30)))) return bad('types');
   if (!Array.isArray(r.held) || r.held.length > FAMILIES.length || !r.held.every((h) => isObj(h) && Object.keys(h).length === 2 && FAMILY_BY_ID[h.id] && isInt(h.p, 1, capOf(FAMILY_BY_ID[h.id], cfg))) || new Set(r.held.map((h) => h.id)).size !== r.held.length) return bad('held');
   if (!Array.isArray(r.history) || r.history.length > 400) return bad('history');
-  let wins = 0, prev = 0, lives = 0;
-  for (const h of r.history) {
+  // THE HISTORY IS THE RECORD OF EVERY TRY. A won floor is one row. A lost try is one row ON THE FLOOR IT WAS FOUGHT ON, and it says what the loss cost: `life: true` (an Extra Life was spent),
+  // `retry: true` (a retry was counted), or neither, which is the loss that ENDED the run (so it is the last row of a run that is over). Lives and retries are counted from these rows, never believed.
+  let wins = 0, prev = 0, lives = 0, retries = 0;
+  for (const [i, h] of r.history.entries()) {
     if (!isObj(h)) return bad('history entry');
     for (const k of Object.keys(h)) if (!HIST_KEYS.includes(k)) return bad('history field ' + k);
     if (!isInt(h.floor, 1, cfg.floors) || h.floor < prev || (h.result !== 'w' && h.result !== 'l') || !isInt(h.turns, 0, 100000) || !isInt(h.faints, 0, 36)) return bad('history values');
     if (typeof h.flawless !== 'boolean' || typeof h.boss !== 'boolean' || typeof h.comeback !== 'boolean' || typeof h.sweep !== 'boolean' || !(h.closest === null || isInt(h.closest, 0, 100))) return bad('history flags');
     if (h.boss !== isBoss(h.floor, cfg) || h.flawless !== (h.result === 'w' && h.faints === 0)) return bad('history is inconsistent');
     if (h.pick !== undefined && h.pick !== null && !(isObj(h.pick) && FAMILY_BY_ID[h.pick.id] && isInt(h.pick.tier, 0, 3) && FAMILY_BY_ID[h.pick.id].tiers[0] <= h.pick.tier && h.pick.tier <= FAMILY_BY_ID[h.pick.id].tiers[1])) return bad('history pick');
-    if (h.result === 'w') { wins++; if (h.floor !== wins) return bad('wins are not floors in order'); } else if (h.life) lives++;
+    if ((h.life !== undefined && h.life !== true) || (h.retry !== undefined && h.retry !== true)) return bad('a life or retry mark that is not true');
+    if (h.result === 'w') { if (h.life || h.retry) return bad('a won floor cost a life or a retry'); wins++; if (h.floor !== wins) return bad('wins are not floors in order'); }
+    else {
+      if (h.floor !== wins + 1) return bad('a loss is not on the floor that was being fought');
+      if (h.pick !== undefined) return bad('a pick on a lost floor');
+      if (h.life && h.retry) return bad('one loss cost both a life and a retry');
+      if (h.life) lives++; else if (h.retry) retries++;
+      else if (i !== r.history.length - 1 || r.phase !== 'over') return bad('a loss that cost nothing did not end the run');
+    }
     prev = h.floor;
   }
   // the floor and the pending offer follow from the history: wins are floors 1..n; a battle or an offer is on floor n + 1; a won run has cleared every floor; an over run is on the floor it lost or left
@@ -307,6 +339,7 @@ export function parseRun(input, { pack = null, cfg = CONFIG } = {}) {
   if (JSON.stringify(rebuilt) !== JSON.stringify(r.held)) return bad('held buffs do not match the picks');
   if (!isInt(r.skips, 0, 400) || r.skips !== r.history.filter((h) => h.result === 'w' && h.pick === null).length) return bad('skips');
   if (!isInt(r.livesUsed, 0, 50) || r.livesUsed !== lives || r.livesUsed > cfg.lives + runEffects(r.held, { cfg }).lives) return bad('lives');
+  if (retries > TOWER_LIMITS.retriesMax) return bad('retries');          // (how many retries a FLOOR may take is the config's to say and the reducer's to enforce: a stored run is not refused for having been made under another cap)
   if (r.phase === 'offer') {
     if (!Array.isArray(r.offer) || r.offer.length < 1 || r.offer.length > cfg.offer.maxSize || !r.offer.every((o) => isObj(o) && FAMILY_BY_ID[o.id] && isInt(o.tier, 0, 3) && FAMILY_BY_ID[o.id].tiers[0] <= o.tier && o.tier <= FAMILY_BY_ID[o.id].tiers[1]) || new Set(r.offer.map((o) => o.id)).size !== r.offer.length) return bad('offer');
     if (pack && JSON.stringify(offerFor(r, { pack, cfg })) !== JSON.stringify(r.offer)) return bad('the offer is not the one this seed gives');
@@ -330,16 +363,26 @@ export function checkTower(t, { cfg = CONFIG, pack = null } = {}) {
 
 /** The summary of a finished run the result screen shows (tower.last). */
 export function lastOf(run, at) {
-  return { format: run.format, seed: run.seed, won: run.phase === 'won', cleared: run.history.filter((h) => h.result === 'w').length, livesUsed: run.livesUsed, skips: run.skips, held: run.held.map((h) => ({ id: h.id, p: h.p })), earned: run.earned.slice(), at: sanitiseStamp(at) };
+  const retries = retriesOf(run);          // (written only when there are some: the summary of a run with no retry is exactly what the build before retries wrote)
+  return { format: run.format, seed: run.seed, won: run.phase === 'won', cleared: run.history.filter((h) => h.result === 'w').length, livesUsed: run.livesUsed, skips: run.skips, held: run.held.map((h) => ({ id: h.id, p: h.p })), earned: run.earned.slice(), at: sanitiseStamp(at), ...(retries > 0 ? { retries } : {}) };
 }
 
 /**
  * Fold a FINISHED run into the Tower record, once. -> { tower, run } (run.folded = true). A run that is not over, or was folded already, changes nothing.
- * The record's counters move, "current" is emptied and "last" becomes this run's summary; "at" is the caller's clock (this module has none).
+ * The record's counters move (the retries among them), "current" is emptied and "last" becomes this run's summary; "at" is the caller's clock (this module has none).
  */
 export function foldRunInto(tower, run, { cfg = CONFIG, at = 0 } = {}) {
   if ((run.phase !== 'over' && run.phase !== 'won') || run.folded) return { tower, run };
   const t = clone(tower), wins = run.history.filter((h) => h.result === 'w');
+  // the retries: the total over every finished run, and the fewest a WON climb needed, per format (optional keys of the record: each is written once it has something to say)
+  const retries = retriesOf(run);
+  if (retries > 0 || Number.isInteger(t.retries)) t.retries = (Number.isInteger(t.retries) ? t.retries : 0) + retries;
+  if (run.phase === 'won') {
+    const before = fewestRetriesOf(tower, run.format), fewest = {};
+    for (const f of cfg.formats) fewest[f] = t.fewestRetries && Number.isInteger(t.fewestRetries[f]) ? t.fewestRetries[f] : null;
+    fewest[run.format] = before === null ? retries : Math.min(before, retries);
+    t.fewestRetries = fewest;
+  }
   t.runs += 1; if (run.phase === 'won') { t.wins += 1; t.winsByFormat[run.format] += 1; }
   t.floors += wins.length; t.bosses += wins.filter((h) => h.boss).length;
   t.best[run.format] = Math.max(t.best[run.format], wins.length);

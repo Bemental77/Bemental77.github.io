@@ -431,6 +431,8 @@ export function applyFoe(pack, recs, held, o = {}) {
   return out;
 }
 
+/** Does this config hand out retries at all? (The words of Extra Life say what a life is spent INSTEAD of: a retry where there are retries, the end of the run where there are none.) */
+const retriesExist = (cfg) => (cfg.retriesPerFloor === null || cfg.retriesPerFloor > 0) && (cfg.retriesPerRun === null || cfg.retriesPerRun > 0);
 /** What the held buffs do to the run: { offer, fortune, bossOffer, lives, reveal }. */
 export function runEffects(held, o = {}) {
   const cfg = o.cfg || CONFIG, e = { offer: 0, fortune: 0, bossOffer: 0, lives: 0, reveal: false };
@@ -490,7 +492,7 @@ export function describeOps(ops, power, o = {}) {
       case 'foe-defang': out.push('Each trainer Pokemon loses its ' + (N(op.n) > 1 ? N(op.n) + ' strongest attacks' : 'strongest attack')); return;
       case 'foe-ability0': out.push('Trainers use their ordinary ability'); return;
       case 'foe-neutral': out.push('Trainers have neutral natures'); return;
-      case 'run': { const p = []; if (op.offer !== undefined) p.push('offers show ' + sgn(N(op.offer)) + ' ball(s)'); if (op.fortune !== undefined) p.push('rarer balls (Fortune ' + N(op.fortune) + ')'); if (op.bossOffer !== undefined) p.push('boss offers show ' + sgn(N(op.bossOffer)) + ' ball(s)'); if (op.lives !== undefined && N(op.lives) > 0) p.push(N(op.lives) + ' extra ' + (N(op.lives) > 1 ? 'lives' : 'life')); if (op.reveal) p.push('the next trainer is revealed'); if (p.length) out.push(p.join(', ')); return; }
+      case 'run': { const p = []; if (op.offer !== undefined) p.push('offers show ' + sgn(N(op.offer)) + ' ball(s)'); if (op.fortune !== undefined) p.push('rarer balls (Fortune ' + N(op.fortune) + ')'); if (op.bossOffer !== undefined) p.push('boss offers show ' + sgn(N(op.bossOffer)) + ' ball(s)'); if (op.lives !== undefined && N(op.lives) > 0) p.push(N(op.lives) + ' extra ' + (N(op.lives) > 1 ? 'lives' : 'life') + ': a lost floor spends ' + (N(op.lives) > 1 ? 'one' : 'it') + (retriesExist(cfg) ? ' instead of a retry' : ' instead of ending the run')); if (op.reveal) p.push('the next trainer is revealed'); if (p.length) out.push(p.join(', ')); return; }
       default: return;
     }
   };

@@ -6,7 +6,15 @@
 //
 //   launchFloorBattle(run, { navigate, profileId })   -> the address it went to (today); the page to mount the fight in (tomorrow)
 //   returnToTower({ navigate })                        -> back to the hub's Tower screens
-//   towerBattleHref(run, { profileId }) / parseTowerParams(URLSearchParams)   the address contract: battle.html?tower=1&floor=N&run=<run seed>&life=<lives spent>[&p=<profile id>]
+//   towerBattleHref(run, { profileId }) / parseTowerParams(URLSearchParams)   the address contract: battle.html?tower=1&floor=N&run=<run seed>[&try=<try number>][&p=<profile id>]
+// THE TRY NUMBER (tower_record.js tryNumber: the Extra Lives spent + the retries counted) is in the address so that every try of a floor has its OWN address: RETRY FLOOR is then a real navigation to another
+// page (not the same address again). (The tab's saved battle is not kept under the address: a Tower fight's is kept under the fight's own tag, battle_resume.js resumeKeyOfTag.) The build before retries wrote the lives spent as `life=K`, which for a run with no
+// retry is the same number: `life` is still read (and still checked) when there is no `try`. The fight's logic never takes the try it FIGHTS from the address: that comes from the run itself (tower_session.js
+// startTowerFloor). What the address's try does say is WHICH PAGE THIS IS (`openedTry`): a page reached again through the tab's history (Back, Forward, a reload) while a fight is under way is that fight's own
+// page only if its address names the fight's try; the page of an earlier try, which is what lies behind a retry in the history, is not, and neither resumes that fight nor counts it as left. For that to hold
+// the address must always name the try the page hosts, so:
+//   * a page that opens another try than its address names (a reload at a lost result opens the NEXT try) puts that try into its address (searchForTry; the page's history.replaceState);
+//   * RETRY FLOOR on the result screen REPLACES the lost try's page in the history (the page hands launchFloorBattle a navigate that replaces), so Back from a retry is the hub, as from a first try.
 
 import { BATTLE_PAGE } from './editor_links.js';
 import { CONFIG } from './tower_config.js';
@@ -15,22 +23,26 @@ export const HUB_PAGE_URL = '/pokemonarena/';
 export const TOWER_HUB_URL = HUB_PAGE_URL + '#tower';
 const ID = /^[A-Za-z0-9_-]{1,40}$/;
 const isU32 = (n) => Number.isInteger(n) && n >= 0 && n <= 0xffffffff;
+/** The try number of the fight a run is waiting for: the Extra Lives spent + the retries counted (the lost tries its history marks `retry`). The same number as tower_record.js tryNumber, spelled out here
+ *  because this module imports nothing of the Tower but its config (a test pins that the two agree for every run). */
+export const tryOfRun = (run) => (Number.isInteger(run.livesUsed) && run.livesUsed > 0 ? run.livesUsed : 0) + (Array.isArray(run.history) ? run.history.filter((h) => !!h && typeof h === 'object' && h.result === 'l' && h.retry === true).length : 0);
 
 /** The address of the fight a run is waiting for. Throws RangeError for anything outside the contract. */
 export function towerBattleHref(run, { profileId = null, cfg = CONFIG } = {}) {
   if (!run || !isU32(run.seed) || !Number.isInteger(run.floor) || run.floor < 1 || run.floor > cfg.floors) throw new RangeError('a Tower run with a seed and a floor is needed');
   const q = ['tower=1', 'floor=' + run.floor, 'run=' + run.seed];
-  const life = Number.isInteger(run.livesUsed) && run.livesUsed > 0 ? Math.min(run.livesUsed, 1000) : 0;
-  if (life) q.push('life=' + life);
+  const tries = Math.min(tryOfRun(run), 1000);
+  if (tries) q.push('try=' + tries);
   if (profileId !== null && profileId !== undefined) { if (!ID.test(profileId)) throw new RangeError('profileId must be a profile id'); q.push('p=' + encodeURIComponent(profileId)); }
   return BATTLE_PAGE + '?' + q.join('&');
 }
 
 /**
- * Read the Tower part of an address. -> { ok: true, tower: null } (no `tower` parameter: a regular battle) | { ok: true, tower: { floor, run, life, profileId } } | { ok: false, error: { param, title, message } }
- * Only `tower=1` turns the Tower on. An address without a `tower` parameter is a regular one and `floor`, `run`, `life` and `p` on it mean nothing: they are ignored, exactly as the build before the Tower
+ * Read the Tower part of an address. -> { ok: true, tower: null } (no `tower` parameter: a regular battle) | { ok: true, tower: { floor, run, tries, profileId } } | { ok: false, error: { param, title, message } }
+ * (`tries`: the `try` parameter, else the older `life` one, else 0.)
+ * Only `tower=1` turns the Tower on. An address without a `tower` parameter is a regular one and `floor`, `run`, `try`, `life` and `p` on it mean nothing: they are ignored, exactly as the build before the Tower
  * ignored every parameter it did not know (a link with a tracker's `p=1` on it must still open a Quick Battle).
- * Strict once `tower` is there: it must be exactly "1"; floor, run and life are plain decimal numbers in range; the profile id has the profile id alphabet. Nothing is echoed back.
+ * Strict once `tower` is there: it must be exactly "1"; floor, run, try and life are plain decimal numbers in range; the profile id has the profile id alphabet. Nothing is echoed back.
  */
 export function parseTowerParams(q, cfg = CONFIG) {
   const has = (k) => q.has(k);
@@ -44,12 +56,28 @@ export function parseTowerParams(q, cfg = CONFIG) {
   if (run === null) return bad('run', 'The run must be a whole number from 0 to 4294967295.');
   const life = num('life', 0, 1000, false);
   if (life === null) return bad('life', 'The life count must be a whole number from 0 to 1000.');
+  const tries = num('try', 0, 1000, false);
+  if (tries === null) return bad('try', 'The try number must be a whole number from 0 to 1000.');
   let profileId = null;
   if (has('p')) { const p = q.get('p'); if (!ID.test(p)) return bad('p', 'The profile in the address is not a profile id.'); profileId = p; }
-  return { ok: true, tower: { floor, run, life, profileId } };
+  return { ok: true, tower: { floor, run, tries: has('try') ? tries : life, profileId } };
 }
 
-/** Go and fight the floor the run is waiting for. `navigate(url)` is the page's navigation. Returns the address. */
+/**
+ * The query string of a Tower fight's address with its try set to `tries` (the try the page really hosts): -> '?tower=1&...' to put in the address bar, or null when the address already names that try (or is not
+ * a Tower fight's address at all). Everything else in the address is kept as it is; the older `life` goes, because `try` is what is written now.
+ */
+export function searchForTry(search, tries, cfg = CONFIG) {
+  let q;
+  try { q = new URLSearchParams(search || ''); } catch (_e) { return null; }
+  const p = parseTowerParams(q, cfg);
+  if (!p.ok || !p.tower || !Number.isInteger(tries) || tries < 0 || tries > 1000 || p.tower.tries === tries) return null;
+  q.delete('life');
+  if (tries > 0) q.set('try', String(tries)); else q.delete('try');
+  return '?' + q.toString();
+}
+
+/** Go and fight the floor the run is waiting for. `navigate(url)` is the page's navigation (RETRY FLOOR on a result screen hands in one that REPLACES the history entry: see the head of this file). Returns the address. */
 export function launchFloorBattle(run, { navigate, profileId = null, cfg = CONFIG } = {}) {
   const url = towerBattleHref(run, { profileId, cfg });
   if (typeof navigate !== 'function') throw new TypeError('launchFloorBattle needs navigate(url)');
