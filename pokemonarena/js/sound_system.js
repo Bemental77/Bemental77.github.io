@@ -238,8 +238,8 @@ export function createSoundSystem(opts = {}) {
     const p = S.prompt;
     if (!p || p.hidden || !win || !doc) return;
     const vw = doc.documentElement.clientWidth, vh = win.innerHeight, G = 8, PAD = 2;
-    const obs = [], wts = []; let canvasPage = false;          // wts: what covering each costs. The picture costs 30, the header's controls 20, a touch pad cluster 10, a dim footer line 1: on a page too full for a free spot the pill goes over the cheapest thing, and never over the picture while anything else will do
-    for (const sel of PROMPT_OBSTACLES) { const el = doc.querySelector(sel); const r = el ? rectOf(el) : null; if (r) { obs.push(r); wts.push(sel === 'canvas' ? 30 : sel === '.ab-float' ? 20 : PROMPT_FOOTERS.includes(sel) ? 1 : 10); if (sel === 'canvas') canvasPage = true; } }
+    const obs = [], wts = []; let canvasPage = false;          // wts: what covering each costs. The picture costs 30, the header's controls 20, a touch pad cluster 10, the footer hint (#keys) 5, the dim ROM-status / note lines 1: on a page too full for a free spot the pill goes over the cheapest thing, and never over the picture while anything else will do
+    for (const sel of PROMPT_OBSTACLES) { const el = doc.querySelector(sel); const r = el ? rectOf(el) : null; if (r) { obs.push(r); wts.push(sel === 'canvas' ? 30 : sel === '.ab-float' ? 20 : sel === '#keys' ? 5 : PROMPT_FOOTERS.includes(sel) ? 1 : 10); if (sel === 'canvas') canvasPage = true; } }
     const head = doc.getElementById('top'); const headBox = head ? rectOf(head) : null; const kids = [];
     if (head) for (const k of Array.from(head.children)) { const r = ownRect(k); if (r) { obs.push(r); wts.push(20); kids.push(r); } }
     const lowest = obs.reduce((m, o) => Math.max(m, o.bottom), 0);
@@ -251,8 +251,8 @@ export function createSoundSystem(opts = {}) {
     }
     p.style.transform = 'none'; p.style.right = 'auto'; p.style.bottom = 'auto';
     let best = null;
-    // (text, width) choices from the roomiest to the most cramped; a short text at 146 px reads better than the long one at 146 px, so it is tried first
-    const CHOICES = [['long', 520], ['long', 340], ['short', 340], ['long', 230], ['short', 230], ['short', 146], ['long', 146]];
+    // (text, width) choices from the roomiest to the most cramped (the short text on one wide line fits the one dim line under the picture of a small desktop window, now that no HTML row sits there); a short text at 146 px reads better than the long one at 146 px, so it is tried first
+    const CHOICES = [['long', 520], ['short', 520], ['long', 340], ['short', 340], ['long', 230], ['short', 230], ['short', 146], ['long', 146]];
     const search = (withHeader) => {
       for (const [kind, w] of CHOICES) {
         if (p.dataset.sndText !== kind) { p.textContent = PROMPT_TEXT[kind]; p.dataset.sndText = kind; }

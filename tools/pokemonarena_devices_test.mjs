@@ -541,7 +541,7 @@ async function journeyA(dev, page) {
   await gamepadWake(page, dev);
   await noDemoWords(dev, 'the hub');
   let h = await dev.hubState();
-  ok(h.allRows.join() === 'quick,team,tower,record,builder,import,controls,sound,about' && h.rows.length === 8, dev.tag('A: the hub has nine rows (IMPORT SAVE, RECORD and TOWER among them), eight shown at a time'), J(h.allRows));
+  ok(h.allRows.join() === 'quick,team,online,tower,builder,record,import,controls,sound,about' && h.rows.length === 8, dev.tag('A: the hub has ten rows (PLAY ONLINE, TOWER, IMPORT SAVE and RECORD among them), eight shown at a time'), J(h.allRows));
   await dev.shot('hub');
   await dev.hubChoose('quick');
   h = await dev.hubState();

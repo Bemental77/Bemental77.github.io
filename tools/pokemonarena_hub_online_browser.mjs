@@ -459,7 +459,10 @@ async function sDevices(ok) {
     const got = {};
     got.menu = (await where(p)) === 'online';
     await shot(p, 'devices-1-phone-menu');
-    got.center = (await tapRow('center')) && (await where(p)) === 'center'; await tapSel(p, '#bB'); await sleep(250);
+    got.center = (await tapRow('center')) && (await where(p)) === 'center';
+    // (in the Trainer Center's room B opens the room's menu, the Center's own rule; its last row, EXIT, leaves: a tap on it)
+    await tapSel(p, '#bB'); await sleep(250);
+    { const r = await p.eval(`(() => { const a = ${H}.model.rects(); const e = a[a.length - 1]; return e ? { x: e.x + e.w / 2, y: e.y + e.h / 2 } : null; })()`); got.centerExit = !!r && (await tapLogical(p, `${H}.canvas`, r.x, r.y), await until(p, `${H}.model.path() === 'online'`, 5000)); }
     got.anyone = (await tapRow('anyone')) && !!(await q(p)) && (await q(p)).id === 'online:quick'; await tapSel(p, '#bB'); await sleep(250);
     got.invite = (await tapRow('invite')) && /battle\.html\?online=1&net=local$/.test((await p.eval('window.__nav')) || '');
     got.join = (await tapRow('join')) && ((await entry(p)) || {}).id === 'room';
