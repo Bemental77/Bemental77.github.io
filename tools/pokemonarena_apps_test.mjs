@@ -762,9 +762,10 @@ function checkScreens(K) {
 function checkInterface(K) {
   const { f, t } = tester(), { HM, HA } = K;
   const md = fs.readFileSync(K.dir === SRC ? path.join(root, 'pokemonarena', 'INAPP.md') : path.join(K.dir, 'INAPP.md'), 'utf8');          // (a mutant tree carries a copy of the document)
-  const at = md.indexOf('## The app interface'), doc = at < 0 ? '' : md.slice(at);
+  // (the SECTION only, up to the next "## ": what the sections after it say about the work built on the contract is not the contract)
+  const at = md.indexOf('## The app interface'), rest = at < 0 ? '' : md.slice(at), next = rest.indexOf('\n## ', 4), doc = next < 0 ? rest : rest.slice(0, next);
   const named = (name) => doc.includes('`' + name + '`') || doc.includes('`' + name + '(');
-  t('the document has the section "The app interface", and it is the last one', () => at > 0 && !/\n## /.test(doc.slice(4)));
+  t('the document has the section "The app interface" (the sections after it are the work built on it)', () => at > 0 && doc.length > 4000 && !/\n## /.test(doc.slice(4)));
   const A = fakeApp('alpha', ['alpha']); let ctxKeys = [], dlgKeys = [];
   try { HM.createHubModel({ mascot: 25, apps: [A.desc] }); ctxKeys = Object.keys(A.ctx()); dlgKeys = Object.keys(A.ctx().dialog); } catch (_e) { /* a contract this suite's fake app does not meet: the checks below say so */ }
   t('every method of the app contract is in the document (and the optional onDialog), and this suite\'s fake app meets the contract', () => HA.APP_METHODS.every(named) && named('onDialog') && ctxKeys.length > 0, () => HA.APP_METHODS.filter((m) => !named(m)).join() + ' ctx ' + ctxKeys.length);
