@@ -123,6 +123,9 @@ async function suite(V, D, who) {
     ok(view({ role: 'host', room: null, board: false }).kind === 'ask-host', T('V9 an accepted challenge whose room could not be opened comes back to OPEN A ROOM FOR A FRIEND?'), '');
     const stale = view({ ...say('x'), cancel: { shown: true, label: 'Cancel' }, codeShown: true });
     ok(inv.cancel.shown === false && inv.code === '' && inv.link === '' && inv.elapsed === '' && stale.cancel.shown === false && stale.code === '' && stale.rows.every((r) => r.id !== 'cancel' && r.id !== 'copy-code'), T('V10 a confirm screen has no way out of a wait, no code and no clock, whatever the last wait left behind'), '');
+    const rv = view({ ...SCREENS.room, name: 'Red' }), iv = view({ name: 'Red' });
+    ok(rv.info[0].rightLabel === 'AS' && rv.info[0].right === 'Red' && iv.info[0].rightLabel === 'AS' && iv.info[0].right === 'Red' && view({ name: '' }).info[0].rightLabel === '' && /ROOM K7Q2P AS Red\./.test(V.speakOnline(iv, 0)), T('V11 AS is a LABEL of the line (drawn in the labels\' grey, like ROOM and TEAM), the name its value: never "AS Host" set as one mixed-case word'), J([rv.info[0], iv.info[0]]));
+    ok(/public servers/.test(view(ASK_QUICK).lede) && /trainer name/.test(view(ASK_QUICK).lede) && /online record/.test(view(ASK_QUICK).lede), T('V12 FIND AN OPPONENT? says, before YES, that it goes through public servers and what other players see'), view(ASK_QUICK).lede);
   }
 
   /* W. the waiting screens */
@@ -142,6 +145,9 @@ async function suite(V, D, who) {
     const sg = view({ ...ASK_HOST, starting: true, ready: false, team: null }), sj = view({ starting: true, ...say('Checking your team...') });
     ok(sg.screen === 'wait' && sg.kind === 'starting' && sg.rows.length === 0 && sg.title === 'Getting ready...' && sg.who === 'You\'re hosting' && sg.steps.length === 0 && sg.code === '' && sg.elapsed === '' && sj.screen === 'wait' && sj.who === 'You\'re joining, room K7Q2P' && sj.status.text === 'Checking your team...' && view({ ...ASK_QUICK, starting: true }).who === 'Battle anyone', T('W13 while a token of the hub is starting something the screen says what is starting (no rows), never the question the address would ask without the token'), J([sg.screen, sg.kind, sg.who, sj.who]));
     ok(view({ ...ASK_HOST, starting: true, ...say('The team code could not be read.', true) }).kind === 'ask-host' && view({ ...ASK_HOST, starting: false }).kind === 'ask-host' && view({ ...HOST_OPEN, starting: true }).kind === null, T('W14 a refusal ends it (the question, with the reason), and a wait that is under way is the waiting screen'), '');
+    const says = (p) => V.sentencesOf(view(p)).map((x) => x.text).join(' ');
+    ok(/^Your room opens in a moment\.$/.test(says({ ...ASK_HOST, starting: true })) && /^The search for an opponent starts in a moment\.$/.test(says({ ...ASK_QUICK, starting: true })) && /room in a moment\.$/.test(says({ starting: true })) && says({ starting: true, ...say('Checking your team...') }) === 'Checking your team...', T('W15 the starting screen says in its message window what is starting (the window was empty); a status said meanwhile takes its place'), J([says({ ...ASK_HOST, starting: true }), says({ starting: true })]));
+    ok(!/["\u201c\u201d]/.test(view(SCREENS.guest_slow).hint) && /WAITING FOR YOUR FRIEND/.test(view(SCREENS.guest_slow).hint), T('W16 the slow-join hint quotes nothing (the ROM font draws a closing quote as an opening one): it names the friend\'s screen in capitals, as the rows are named'), view(SCREENS.guest_slow).hint);
     const st = V.stepsNow;
     ok(st({ stage: 'asking' }).at === 1 && st({ stage: 'searching' }).title === 'Looking for an opponent...' && st({ stage: 'open', role: 'host', invite: true, room: 'X' }).steps[1] === 'They join' && st({ stage: 'handshake', role: 'guest', room: 'X' }).at === 1 && st({ stage: 'resuming' }).steps.length === 2, T('W12 the steps of each kind of wait'), '');
   }
@@ -165,6 +171,17 @@ async function suite(V, D, who) {
     ok(P6.cursor(view({})) === 0, T('P7 another screen starts with the cursor on its first row'), '');
     const P11 = V.createOnlinePanel(), opening = P11.cursor(view(SCREENS.host_opening)), opened = P11.cursor(view(SCREENS.host_open));
     ok(opening === 0 && opened === 0 && view(SCREENS.host_open).rows[opened].id === 'copy-link', T('P11 a cursor nobody moved starts at the top when rows appear: when the room opens it stands on COPY LINK, not on CLOSE THE ROOM (the only row while the room was opening)'), String(opened));
+    // THE SECOND A OF A DOUBLE PRESS: a screen that took the place of another answers no A and no click for PANEL_ARM_MS (the cursor can still move); the first screen, and new rows, are not held
+    let clock = 1000; const PA = V.createOnlinePanel({ now: () => clock, armMs: V.PANEL_ARM_MS });
+    const first = PA.press('a', view({}));
+    const gw = view(SCREENS.guest_join), cr = PA.rects(gw)[0];
+    const a1 = PA.press('a', gw); clock += V.PANEL_ARM_MS - 1; const c1 = PA.pointer({ kind: 'click', x: cr.x + 4, y: cr.y + 4 }, gw); const listens = PA.armed(gw); clock += 1; const a2 = PA.press('a', gw);
+    const back = view({ ...say('Cancelled.') }); const a3 = PA.press('a', back); clock += V.PANEL_ARM_MS; const a4 = PA.press('a', back);
+    ok(J(first) === J({ kind: 'act', id: 'go' }) && a1 === null && c1 === null && listens === false && J(a2) === J({ kind: 'act', id: 'cancel' }) && a3 === null && J(a4) === J({ kind: 'act', id: 'go' }) && V.PANEL_ARM_MS >= 500 && V.PANEL_ARM_MS <= 800,
+      T('P12 a screen that REPLACED another (JOIN THE BATTLE -> the wait whose only row is CANCEL, and back) answers no A and no click for ' + V.PANEL_ARM_MS + ' ms: the second A of a double press does not undo what the first started'), J([first, a1, c1, listens, a2, a3, a4]));
+    let clock2 = 0; const PB = V.createOnlinePanel({ now: () => clock2, armMs: V.PANEL_ARM_MS });
+    PB.cursor(view(SCREENS.host_opening)); clock2 += 10; const pb0 = PB.press('a', view(SCREENS.host_open)); const pb1 = PB.press('down', view(SCREENS.guest_join));
+    ok(J(pb0) === J({ kind: 'act', id: 'copy-link' }) && pb1 && pb1.kind === 'move' && J(V.createOnlinePanel().press('a', gw)) === J({ kind: 'act', id: 'cancel' }), T('P13 rows that come or go on the SAME screen (the room opens: COPY LINK appears) are not held, the d-pad is never held, and a panel made without a clock answers at once'), J([pb0, pb1]));
     const P8 = V.createOnlinePanel(), rects = P8.rects(inv), r1 = rects[1];
     const mv = P8.pointer({ kind: 'move', x: r1.x + 5, y: r1.y + 5 }, inv), again = P8.pointer({ kind: 'move', x: r1.x + 6, y: r1.y + 6 }, inv), cl = P8.pointer({ kind: 'click', x: rects[0].x + 5, y: rects[0].y + 5 }, inv);
     ok(J(mv) === J({ kind: 'move', index: 1 }) && again === null && J(cl) === J({ kind: 'act', id: 'go' }) && P8.pointer({ kind: 'click', x: 230, y: 80 }, inv) === null && J(P8.hit(r1.x + 1, r1.y + 1, inv)) === J({ kind: 'row', index: 1, id: 'team' }) && P8.hit(1, 1, inv) === null, T('P8 the pointer highlights the row under it, a click presses it, and a click beside the rows does nothing'), J([mv, again, cl]));
@@ -228,7 +245,7 @@ async function suite(V, D, who) {
     const hashes = Object.fromEntries(Object.entries(frames).map(([k, f]) => [k, fnv(f.rgba)]));
     ok(new Set(Object.values(hashes)).size === Object.keys(hashes).length, T('D2 no two screens are the same picture'), '');
     const teal = ui.partyArt().bg, px = (f, x, y) => [f.rgba[(y * 240 + x) * 4], f.rgba[(y * 240 + x) * 4 + 1], f.rgba[(y * 240 + x) * 4 + 2]];
-    ok(J(px(frames.invited, 236, 80)) === J(teal) && J(px(frames.host_open, 118, 80)) === J(teal), T('D3 the party-menu teal is behind the windows'), J(px(frames.invited, 236, 80)));
+    ok(J(px(frames.invited, 236, 80)) === J(teal) && J(px(frames.host_open, 239, 80)) === J(teal), T('D3 the party-menu teal is behind the windows'), J(px(frames.invited, 236, 80)));
     const dark = (f, r) => { let n = 0; for (let y = r.y; y < r.y + r.h; y++) for (let x = r.x; x < r.x + r.w; x++) { const p = px(f, x, y); if (p[0] < 60 && p[1] < 60 && p[2] < 60) n++; } return n; };
     const Lo = V.layoutOf(view(SCREENS.host_open)), small = measure('normal', 'K7Q2P');
     ok(dark(frames.host_open, Lo.code) > 4 * 30 * 5 * 0.5 && dark(frames.host_open, Lo.code) > 2.5 * dark(render(view(SCREENS.host_open)), { x: Lo.head.x, y: Lo.head.y, w: small + 60, h: 15 }) * 0.5, T('D4 the room code is drawn LARGE (the normal ROM font at twice its size: four times the ink)'), String(dark(frames.host_open, Lo.code)));
@@ -307,6 +324,13 @@ const MUTANTS = [
   { id: 'cursor-on-first', file: 'online_draw.js', from: "      if (i === cursor) h.text(f, 'normal', '{CURSOR}', r.x + 2, y, TEXT.dark);\n", to: "      if (i === 0) h.text(f, 'normal', '{CURSOR}', r.x + 2, y, TEXT.dark);\n", fails: 'D5' },
   { id: 'refusal-not-red', file: 'online_draw.js', from: "ln.bad ? TEXT.red : TEXT.dark", to: 'TEXT.dark', fails: 'D6' },
   { id: 'no-clock-drawn', file: 'online_draw.js', from: "    if (v.elapsed) { const x = L.top.x + L.top.w - measure('normal', v.elapsed); white(f, 'normal', v.elapsed, x, L.top.y); }\n", to: '', fails: 'D7' },
+  { id: 'double-a-takes-wait', file: 'online_view.js', from: "      if (action === 'a') return armed() ? activate(v) : null;", to: "      if (action === 'a') return activate(v);", fails: 'P12' },
+  { id: 'double-click-takes-wait', file: 'online_view.js', from: "      if (ev.kind === 'click') return armed() ? activate(v) : null;", to: "      if (ev.kind === 'click') return activate(v);", fails: 'P12' },
+  { id: 'rows-rearm', file: 'online_view.js', from: "if (s !== sig && sig && sig.split('|')[0] !== v.screen) armAt = now() + armMs;", to: "if (s !== sig && sig) armAt = now() + armMs;", fails: 'P13' },
+  { id: 'starting-says-nothing', file: 'online_view.js', from: "    v.lede = s.role === 'guest' ? WORDS.startingSays.guest : s.ask === 'quick' ? WORDS.startingSays.quick : WORDS.startingSays.host;\n", to: '', fails: 'W15' },
+  { id: 'hint-quoted', file: 'online_view.js', from: "their screen still says WAITING FOR YOUR FRIEND.';", to: "their screen still says \"Waiting for your friend\".';", fails: 'W16' },
+  { id: 'as-in-value', file: 'online_view.js', from: "      v.info = [{ label: 'ROOM', value: room, rightLabel: v.name ? 'AS' : '', right: v.name }, team];", to: "      v.info = [{ label: 'ROOM', value: room, right: v.name ? 'AS ' + v.name : '' }, team];", fails: 'V11' },
+  { id: 'quick-no-servers', file: 'online_view.js', from: "whoever is looking now, through public servers. Other", to: "whoever is looking now. Other", fails: 'V12' },
   { id: 'terrain-behind', file: 'online_draw.js', from: "      f.rect(0, 0, OGEOM.W, OGEOM.H, bg);\n", to: '', fails: 'D3' },
 ];
 

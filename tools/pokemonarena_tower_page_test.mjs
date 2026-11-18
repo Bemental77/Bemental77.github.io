@@ -565,7 +565,7 @@ try {
     ok((await toBattle(page)) === 'ready', tag + 'START opens floor 1');
     const ps1 = await ev(page, PROFILES);
     ok(ps1.length === 1 && ps1[0].tower.current && ps1[0].tower.current.floor === 1 && ps1[0].tower.runs === 0 && ps1[0].tower.last === null, tag + 'a double START made exactly ONE profile and ONE run (no run was made and abandoned, none is counted)', J(ps1.map((p) => [p.id, p.tower.runs, !!p.tower.current])));
-    ok((await ev(page, `window.__arenaPresence === undefined && ${B}.presence === undefined && document.getElementById('openBtn').hidden === true`)) === true, tag + 'OPEN TO BATTLES is not mounted in a Tower fight (no challenge dialog can take the player away mid-fight; the header button stays hidden)');
+    ok((await ev(page, `window.__arenaPresence === undefined && ${B}.presence === undefined && ${B}.ask === undefined && document.getElementById('openBtn') === null`)) === true, tag + 'OPEN TO BATTLES is not mounted in a Tower fight (no challenge can take the player away mid-fight; its pause menu has no OPEN TO BATTLES row)');
     // ---- THE ENGINE END: the Tower hears the match the moment the engine ends it, before the result screen is up
     ok((await ev(page, DRIVE("a.mode === 'action' && a.ctl.turn >= 1"))) === 'action', tag + 'floor 1 is played by hand to turn 1');
     const pid1 = ps1[0].id;

@@ -1177,8 +1177,8 @@ async function suite(S, tag, opt = {}) {
       const bb = fs.readFileSync(path.join(opt.dir || SRC, 'battle_boot.js'), 'utf8'), idx = (s) => bb.indexOf(s);
       ok(idx('towerFight.watchEngine(ctl, summarizeMatch)') > idx('ctl = rs.ctl;') && idx('towerFight.watchEngine(ctl, summarizeMatch)') < idx('resumeStore.attach(ctl)') && /import \{ summarizeMatch \} from '\.\/match_stats\.js'/.test(bb), t('Q32 the battle page hands the Tower the match at the ENGINE\'S end (watchEngine on the final controller, before the resume record is cleared) with the same summariser the scene uses'), '');
       ok(/towerFight\.status === 'resume' && !rs\.info\.restored/.test(bb) && /await towerFight\.leaveUnrestorable\(\)/.test(bb), t('Q33 the battle page counts a marked fight that cannot be restored as LEFT (leaveUnrestorable), never restarts it free'), '');
-      const iPres = idx("import('./presence_boot.js')"), iGuard = idx('if (towerFight) return;');
-      ok(iGuard > 0 && iPres > iGuard && bb.slice(iGuard, iPres).indexOf('openBtn.hidden = false') > 0, t('Q34 OPEN TO BATTLES is not mounted in a Tower fight: the guard comes before the presence module is loaded and before the button is shown (an Accepted challenge would leave the fight)'), '');
+      const iPres = idx("import('./battle_ask.js')"), iGuard = idx('if (towerFight) return;');
+      ok(iGuard > 0 && iPres > iGuard && bb.includes('open: towerFight ? undefined : openSwitch'), t('Q34 OPEN TO BATTLES is not mounted in a Tower fight: the guard comes before the presence module is loaded, and the pause menu of a Tower fight is given no OPEN TO BATTLES row (an Accepted challenge would leave the fight)'), '');
       ok(/nonce: freshSeed/.test(bb) && /onDuplicate:/.test(bb), t('Q35 the battle page gives each fight a fresh attempt number (from crypto) and shows the duplicate-tab notice'), '');
     }
 

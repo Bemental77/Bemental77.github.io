@@ -1456,6 +1456,7 @@ export function createScene(opts) {
     if (ac) rows.push('ANIMATION: ' + (ac.on ? 'ON' : 'OFF'), 'BATTLE SPEED: ' + ac.speed + 'X');                       // AN1
     const bs = styleSetting();
     if (bs) rows.push(styleLabel(bs));                                                                                  // the hack's own Options row: "Battle Style", Shift or Set (a battle against a person has no such row)
+    const ol = openLabel(); if (ol) rows.push(ol);                                                                      // OPEN TO BATTLES: ON / OFF, when the page gave the switch (battle_ask.js: a battle against the CPU)
     if (!S.ended && ctl.winner === null && (S.mode === 'action' || S.mode === 'moves' || S.mode === 'party' || S.mode === 'wait' || S.mode === 'preview')) rows.push('FORFEIT');
     rows.push(quitLabel);
     const at = cursorLabel ? Math.max(0, rows.findIndex((r) => r.startsWith(cursorLabel))) : 0;
@@ -1463,6 +1464,8 @@ export function createScene(opts) {
     S.overlay = bs ? { rows, cursor: at, w: 116, x: 120, y: 4 } : ac ? { rows, cursor: at, w: 104, x: 132, y: 8 } : menuWide ? { rows, cursor: at, w: 88, x: 148, y: 20 } : { rows, cursor: at, w: 76, x: 160, y: 20 };
     S.mode = 'menu';
   }
+  // OPEN TO BATTLES (battle_ask.js): opts.open = { label() -> 'OPEN TO BATTLES: ON' | '...: OFF' | null (no row), toggle(done) }. Like CONTROLS the menu closes, and comes back on the row when done() is called
+  const openLabel = () => { if (!opts.open || typeof opts.open.label !== 'function') return null; let t = null; try { t = opts.open.label(); } catch (_e) { t = null; } return typeof t === 'string' && /^OPEN TO BATTLES: (ON|OFF)$/.test(t) ? t : null; };
   // AN1: the settings object, when the page gave one the menu can change ({ get, set })
   const animSettings = () => (opts.anim && typeof opts.anim.get === 'function' && typeof opts.anim.set === 'function' ? opts.anim.get() : null);
   // BATTLE STYLE (style_settings.js): the page's setting object, when it gave one the menu can change ({ get, set }). The words are the ROM's: the Options row "Battle Style" and its values "Shift" and "Set".
@@ -1484,6 +1487,7 @@ export function createScene(opts) {
     else if (label.startsWith('ANIMATION')) { const c = animSettings(); if (c) opts.anim.set({ on: !c.on }); close(); openMenu('ANIMATION'); S.menu.back = back; }
     else if (label.startsWith((msg('opt.style') || 'Battle Style').toUpperCase())) { const c = styleSetting(); if (c) opts.style.set({ style: c.style === 'set' ? 'switch' : 'set' }); close(); openMenu('BATTLE STYLE'); S.menu.back = back; }
     else if (label.startsWith('BATTLE SPEED')) { const c = animSettings(); if (c) opts.anim.set({ speed: c.speed === 1 ? 2 : c.speed === 2 ? 4 : 1 }); close(); openMenu('BATTLE SPEED'); S.menu.back = back; }
+    else if (label.startsWith('OPEN TO BATTLES') && opts.open && typeof opts.open.toggle === 'function') { close(); opts.open.toggle(() => { if (S.mode === back) openMenu('OPEN TO BATTLES'); }); }
     else if (label === 'FORFEIT') { S.menu = null; S.overlay = null; S.mode = back; openConfirm('forfeit', back); }   // always asks (YES / NO), from the action menu, the team preview and the waiting screen alike
     else if (label === quitLabel) { S.menu = null; S.overlay = null; S.mode = back; if (S.ended || ctl.winner !== null) { if (hooks.onQuit) hooks.onQuit(); } else openQuitConfirm(back); }
   }

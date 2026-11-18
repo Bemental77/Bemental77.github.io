@@ -51,6 +51,7 @@ export function createScreen(ui, h) {
         const y = L.info.y + i * L.info.line, x0 = L.info.x + 2, right = L.info.x + L.info.w - 2;
         let rw = 0;
         if (ln.right) { rw = measure('normal', ln.right) + 8; h.textRight(f, 'normal', ln.right, right, y); }
+        if (ln.right && ln.rightLabel) { const lw = measure('normal', ln.rightLabel) + 4; h.textRight(f, 'normal', ln.rightLabel, right - rw + 4, y, COL.line); rw += lw; }          // (AS, in the labels' grey: ROOM ... AS Red)
         let x = x0;
         if (ln.label) { h.text(f, 'normal', ln.label, x, y, COL.line); x += measure('normal', ln.label) + 6; }
         const val = fit(ln.value, right - rw - x);
