@@ -748,17 +748,21 @@ mounts presence by itself on `center.html` (CENTER deletes that page).
   Measured in real Chrome (page test UA2): 580 ms from the frame the question is first drawn to the frame it listens.
 * The disclosure is six pages (the DOM dialog was one glance). B is NO from any of them.
 * The question has no sound of its own, and the live region reads it only when the hub next draws (it does not draw while the tab is hidden).
+* `roomFromInput` lives in `js/online.js`, whose imports are the battle page's (the profile store, `hub_data.js`, the engine through `online_match.js`, `netmatch.js`). A hub ctl that needs it should
+  `import('./online.js')` when JOIN A FRIEND is opened, not at the top of its file.
 
 ### Tests (2026-11-18, this tree)
 
+The counts are what each command prints as "passed" when it is run alone; the page test's include its own case-id check (ID1), so `tokens` is 29 checks, `presence` 48 and `presenceui` 103.
+
 ```bash
-node tools/pokemonarena_presence_test.mjs --mutants        # 140 cases, 67 mutants: + group P (the START token and startPlan) and O12-O15 (roomFromInput)
-node tools/pokemonarena_online_prefs_test.mjs --mutants    # 35 cases, 21 mutants: the online preferences
-node tools/pokemonarena_hub_presence_test.mjs --mutants    # 117 cases, 63 mutants (about 20 minutes with them; ARENA_HP_MUTANT=<id> runs one): the service on a real hub model, the real renderer,
+node tools/pokemonarena_presence_test.mjs --mutants        # 140 passed, 67 mutants: + group P (the START token and startPlan) and O12-O15 (roomFromInput)
+node tools/pokemonarena_online_prefs_test.mjs --mutants    # 35 passed, 21 mutants: the online preferences
+node tools/pokemonarena_hub_presence_test.mjs --mutants    # 117 passed, 63 mutants (about 20 minutes with them; ARENA_HP_MUTANT=<id> runs one): the service on a real hub model, the real renderer,
                                                            # presence_boot.js, presence.js and the board over Node's BroadcastChannel. A mutant counts only when the case it NAMES fails
-node tools/pokemonarena_online_page_test.mjs tokens --mutants       # 30 cases, 6 mutants, real Chrome: the three starts with and without their token; the preferences; an accepted challenge plays the preferred team
-node tools/pokemonarena_online_page_test.mjs presence               # 49 cases: the hub sessions read and drive the PICTURE (window.__arenaHub); the CPU-battle session (PF) still reads the DOM
-node tools/pokemonarena_online_page_test.mjs presenceui --mutants   # 104 cases, 36 mutants (the count ONLINE.md states is unchanged): M01, M03-M07 and M22 are re-homed onto the code above
+node tools/pokemonarena_online_page_test.mjs tokens --mutants       # 30 passed + 6 mutants, real Chrome: the three starts with and without their token; the preferences; an accepted challenge plays the preferred team
+node tools/pokemonarena_online_page_test.mjs presence               # 49 passed: the hub sessions read and drive the PICTURE (window.__arenaHub); the CPU-battle session (PF) still reads the DOM
+node tools/pokemonarena_online_page_test.mjs presenceui --mutants   # 104 passed + 36 mutants (the count ONLINE.md states is unchanged): M01, M03-M07 and M22 are re-homed onto the code above
 ```
 
 In the page test the hub sessions that read `#challenge` / `#openInfo` now read the picture: `presence` A, PB, C, D, G (PF, the battle against the CPU, is as it was) and `presenceui` keys, accept, drift, stack,
