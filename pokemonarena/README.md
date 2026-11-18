@@ -165,6 +165,7 @@ tests run in a row. Servers start themselves (`PORT=8097 node tools/devserver.mj
 
 ```bash
 node tools/pokemonarena_ui_assets_test.mjs     # ROM art decoders
+node tools/pokemonarena_world_test.mjs         # THE ROM'S OVERWORLD (`js/world_rom.js`): all 617 maps decode and render, the Pokemon Center (its PC, counter, wall map, door mat, nurse), 137 avatars (4 directions x 3 steps, read from each sprite's own anim lists), follower Pokemon, 16 emotes; hashes-only golden, a wrong or damaged ROM refused, 22 source mutants; Node only (below)
 node tools/pokemonarena_battle_ui_test.mjs     # the battle screen compositor
 node tools/pokemonarena_pack_test.mjs          # the ROM data tables
 node tools/pokemonarena_rules_test.mjs         # rulesets, legality, stats
@@ -218,6 +219,18 @@ node tools/multiplayer_page_test.mjs           # the lobby's catalogue and hand-
 
 `pokemonarena_hub_test.mjs --unit` skips the browser; `--update` rewrites `hub.golden.json` (frame hashes only, no pixels or ROM text) after an intended
 change of look. `pokemonarena_journey_test.mjs` takes `ARENA_VP=phone,land,desk` to run a subset; `pokemonarena_devices_test.mjs` takes `ARENA_FAMILIES=keyboard,mouse,gamepad,touch` and `ARENA_JOURNEYS=A,B,C,D,S`. Screenshots go to `ARENA_OUT` (default: a temp folder) and are meant to be opened.
+
+**The overworld test** (`pokemonarena_world_test.mjs`, Node only, no browser, about 12 s; `--fast` skips the source mutants and the all-maps render, about 2 s).
+`js/world_rom.js` reads the ROM's maps, tilesets, overworld sprites and emote icons; its header comment is the data model as found in THIS ROM (an 11-bit metatile id and one
+collision bit in a map block, 640 + 384 tiles, 7 + 6 palettes, triple-layer metatiles: none of them Emerald's numbers) with every pinned offset and how it was found. The test
+checks the structure (617 maps in 27 groups, every warp and object event, the Center's cells by coordinate), the pictures (an opaque layer below the sprites, a sparse one above,
+no tile drawn from a blank palette slot, the border block, a second world built from the same bytes drawing the same pixels), the sprites (137 avatars: the two player characters,
+then 135 people; right is left mirrored; three different pictures per direction; no avatar walking in another sprite's pictures) and the emotes, against `world.golden.json`
+(SHA-1 of sizes and RGBA; no pixels). `--update` rewrites the golden; **look at the pictures first**: `--sheets` writes the contact sheets (the Center below / above / as the
+game shows it / with its solid and special cells marked, every Pokemon Center, every avatar, the emotes, follower Pokemon, a sample of other maps, every other graphics id) to
+`WORLD_OUT`, a folder outside the repository. A golden only proves the decoder still draws what it drew: the sheets are what showed it draws the right thing. The 22 source
+mutants each put one wrong number or rule into a copy of the module (Emerald's block split, tile split, palette split, a two-layer metatile, the wrong layer above the sprites,
+swapped flip bits, an 8-bit graphics id, assumed walk frames, ...) and must fail the check they name.
 
 ## What is approximate
 
@@ -275,5 +288,6 @@ True as of this build; each item is also visible in the code it names.
 
 `index.html`, `arena.css`, `js/boot.js` (the hub page), `js/hub_model.js` (menu state machine, pure), `js/hub_screen.js` (ROM renderer), `js/hub_data.js` (reads profiles and teams from the store, builds battle / editor links),
 `battle.html`, `battle.css`, `js/battle_boot.js`, `js/scene.js`, `js/matchctl.js`, `js/ai.js`, `js/engine*.js`, `editor.html`, `editor.css`, `js/editor_*.js`, `js/cries.js`, `js/input*.js`, `js/uinav.js`, `input.css`,
+`js/world_rom.js` (the ROM's overworld: maps, map pictures, the Pokemon Center, overworld sprites, emotes; `world.golden.json`),
 `js/anim_settings.js` + `js/anim_mon.js` (the animation settings; the ROM's sprite-animation data and ball art) with `js/move_anim.js` + `js/anim_*.js` (the ROM animation engine, `ANIM.md`), `js/saveimport.js` (the .sav reader), `js/battle_resume.js` (reload-resume), `js/match_stats.js` (the match statistics collector), `js/recap_model.js` + `js/record_model.js` (the recap's and the RECORD screen's pages, as data), `js/page_draw.js` (how a page is set in a ROM window), `js/career_stats.js` (the battle record on a profile: schema, limits, repair, the fold of one match), `js/rom_error.js` (the one ROM error screen), `js/editor_import.js` + `js/editor_import_model.js` (the Import from a save screen and its pure half), `js/controls_dialog.js` (the one Controls dialog), `js/osk.js` (the controller's on-screen keyboard), `js/hints.js` (the device-aware hint line), `js/audio_mixer.js` (the one AudioContext, the three buses, the settings), `js/music_director.js` (which song when), `js/sound_panel.js` (the SOUND panel), `js/sound_system.js` (the one object a page creates), `js/audiobar.js` + `audiobar.css` (the volume bar in every header) with `js/menu_music.js` (what the menus play: the music changer), `js/music.js` + `js/mp2k*.js` (the m4a engine, `MUSIC.md`), `js/music_map.js` (`MUSIC_MAP.md`), and the shared ROM codecs and tables (`rom.js`, `romfetch.js`, `tables.js`, `gfxcodec.js`, `uiassets.js`, `speciesgfx.js`, `battle_ui.js`, `textfx.js`, `charset.js`).
 No file holds ROM pixels, text or tables: the JSON files here are offsets, counts and hashes.
