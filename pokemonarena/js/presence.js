@@ -32,6 +32,8 @@ export const ACCEPT_KEY = 'arena.accept';             // sessionStorage: the one
 export const ACCEPT_MAX_AGE_MS = 120000;              // a token older than this was not written for the page that is reading it
 export const MEET_KEY = 'arena.meet';                 // sessionStorage: the Trainer Center's hand-off to the battle page that JOINS a room it was let into (this tab only)
 export const MEET_MAX_AGE_MS = 60000;
+export const START_KEY = 'arena.go';                  // sessionStorage: the HUB's hand-off to the battle page it opens for INVITE A FRIEND, BATTLE ANYONE and OPEN THE ROOM (this tab only)
+export const START_MAX_AGE_MS = 60000;
 export const SEAL_INFO = 'bemental/pokemonarena/acc/1';           // the fixed HKDF label of the sealed room
 export const TIMING = Object.freeze({
   answerMs: 25000,        // a dialog nobody answers is declined after this long (and a challenger gives up on an owner who never answers after about this long)
@@ -81,6 +83,57 @@ export function takeMeetToken(storage, room, nowMs, maxAgeMs = MEET_MAX_AGE_MS) 
     const age = nowMs - t.at;
     return t.room === room.toUpperCase() && age <= maxAgeMs && age >= -5000;
   } catch (_e) { return false; }
+}
+/**
+ * THE START TOKEN (the hub: INAPP.md "Contract 1"). All choosing happens in the hub's picture, so the hub's press must carry over to the battle page it opens: INVITE A FRIEND and BATTLE ANYONE
+ * open the plain ?online=1 address, OPEN THE ROOM opens ?np=ROOM&host=1, and that page starts by itself only if THIS TAB holds a fresh token the hub wrote just before it navigated:
+ *   { what: 'host', room: null, at }      open a friend's private room (as pressing "Get an invite link" does)
+ *   { what: 'host', room: 'K7Q2P', at }   open THAT room (the site lobby's hand-off; as pressing "Open the room" does)
+ *   { what: 'quick', room: null, at }     find an opponent (as pressing "Find an opponent" does)
+ * The same address from anywhere else has no token and starts nothing. `at` is WALL-CLOCK ms (the token crosses a page load). -> true when stored.
+ */
+const START_WHATS = Object.freeze(['host', 'quick']);
+export function writeStartToken(storage, tok, nowMs) {
+  try {
+    const { what, room } = tok || {};
+    if (!storage || !START_WHATS.includes(what) || !Number.isFinite(nowMs)) return false;
+    const named = room !== undefined && room !== null;
+    if (named && (what !== 'host' || typeof room !== 'string' || !ROOM_RE.test(room))) return false;          // only a host names a room, and only a real room code
+    storage.setItem(START_KEY, JSON.stringify({ what, room: named ? room.toUpperCase() : null, at: nowMs }));
+    return true;
+  } catch (_e) { return false; }
+}
+/** -> { what: 'host' | 'quick', room: 'K7Q2P' | null } and the token is gone, or null (none, stale, from the future, malformed, or storage that will not let it be removed). Whatever is found is removed: one use or no use. */
+export function takeStartToken(storage, nowMs, maxAgeMs = START_MAX_AGE_MS) {
+  try {
+    if (!storage) return null;
+    const raw = storage.getItem(START_KEY);
+    if (raw === null || raw === undefined) return null;
+    storage.removeItem(START_KEY);
+    if (storage.getItem(START_KEY) !== null) return null;          // (it would not go: a token that stays could start a second game)
+    let t = null; try { t = JSON.parse(raw); } catch (_e) { t = null; }
+    if (!t || typeof t !== 'object' || !START_WHATS.includes(t.what) || !Number.isFinite(t.at)) return null;
+    const named = t.room !== undefined && t.room !== null;
+    if (named && (t.what !== 'host' || typeof t.room !== 'string' || !ROOM_RE.test(t.room))) return null;
+    const startAge = nowMs - t.at;
+    if (!(startAge <= maxAgeMs && startAge >= -5000)) return null;
+    return { what: t.what, room: named ? t.room.toUpperCase() : null };
+  } catch (_e) { return null; }
+}
+/**
+ * WHAT A START TOKEN STARTS ON THIS ADDRESS. tok = what takeStartToken gave (or null); q = the page's address as online.js parseOnlineQuery read it ({ role, room, auto, error }).
+ *   'host'    open a friend's private room: only on the PLAIN ?online=1 address (no room, no role, no accepted challenge)
+ *   'room'    open the room the address names: only on ?np=<the token's room>&host=1
+ *   'quick'   find an opponent: only on the plain address
+ *   null      nothing starts: no token, a token for another room or for another kind of address. AN ADDRESS ALONE STARTS NOTHING.
+ */
+export function startPlan(tok, q) {
+  if (!tok || !q || q.error || q.auto) return null;
+  const plain = q.role === null && !q.room;
+  if (tok.what === 'quick') return plain && !tok.room ? 'quick' : null;
+  if (tok.what !== 'host') return null;
+  if (tok.room) return q.role === 'host' && q.room === tok.room ? 'room' : null;
+  return plain ? 'host' : null;
 }
 
 /**

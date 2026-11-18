@@ -10,7 +10,10 @@
 // nothing is left running. And the SECRECY of the hand-off, with the real WebCrypto of Node: the room reaches the challenger SEALED to a one-time key that only it holds (the board never carries the room; an
 // observer, a forger and a wrong request cannot open it; a browser without WebCrypto fails closed instead of sending it in the clear), the Accept token that lets the next page host exactly one accepted
 // challenge (written by Accept, matched, fresh, used once), who an open game may let in without Allow (admission(): the first, the returning player after a rebuilt Session, nobody else), and the address
-// a reload of an accepted-challenge page comes back to (online.js canonicalAddress / parseOnlineQuery), and the plain Play online address a board page goes back to when a join ends without a match (boardAddress). The page half (the switch, the real dialog, a real battle) is tools/pokemonarena_online_page_test.mjs, group `presence`.
+// a reload of an accepted-challenge page comes back to (online.js canonicalAddress / parseOnlineQuery), and the plain Play online address a board page goes back to when a join ends without a match (boardAddress).
+// And the START token (group P): the hub's hand-off that lets the battle page open a friend's room, a named room, or a search by itself (written, matched to its address, fresh, used once, never from the
+// future, never malformed, not from a storage that will not remove it; an address alone starts nothing). The page half (the switch, the real dialog, a real battle) is tools/pokemonarena_online_page_test.mjs,
+// groups `presence` and `tokens`.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -526,6 +529,63 @@ async function suite(L, P, O, tag) {
     ok(plain === '/pokemonarena/battle.html?online=1&net=local' && O.boardAddress('http://x' + plain) === plain, T('O10 the plain board address is its own board address (idempotent)'), plain);
     const hold = (qs) => (O.parseOnlineQuery(qs).limits || {}).holdMs;
     ok(hold('?online=1&net=local&openhold=1500') === 1500 && hold('?online=1&openhold=1500') === undefined && hold('?online=1&net=local&openhold=299') === undefined && hold('?online=1&net=local&openhold=120001') === undefined && hold('?online=1&net=local&openhold=x') === undefined, T('O11 the seat-holding clock can be shortened for the same-browser transport only, within 300 ms to 2 min'), J([hold('?online=1&net=local&openhold=1500'), hold('?online=1&openhold=1500')]));
+    // roomFromInput: the one function that reads a room code out of what a player typed or pasted (the battle page's code box, and the hub's JOIN A FRIEND entry)
+    const rf = O.roomFromInput;
+    ok(typeof rf === 'function' && rf(' k7-q2 p ') === 'K7Q2P' && rf('abcd') === 'ABCD' && rf('') === '' && rf(null) === '' && rf('ABCDEFGHIJ') === 'ABCDEFGH', T('O12 roomFromInput is a pure export: a code in any case, with spaces and dashes dropped, at most 8 characters'), J([rf(' k7-q2 p '), rf('ABCDEFGHIJ')]));
+    ok(rf('https://caseybement.com/pokemonarena/battle.html?np=k7q2p&join=1') === 'K7Q2P' && rf('  http://x/pokemonarena/battle.html?net=local&np=AB12#top ') === 'AB12' && rf('/pokemonarena/battle.html?join=1&np=zz9zz') === 'ZZ9ZZ', T('O13 ... or the room of a whole invite link pasted in (its np=)'), J(rf('https://caseybement.com/pokemonarena/battle.html?np=k7q2p&join=1')));
+    ok(rf('https://caseybement.com/pokemonarena/') === null && rf('/pokemonarena/battle.html?online=1') === null && rf('http://x/?np=ab') === null, T('O14 ... and null (leave the text alone) for an address that names no room'), J([rf('https://caseybement.com/pokemonarena/'), rf('http://x/?np=ab')]));
+    ok([' k7-q2 p ', 'abcd', 'ABCDEFGHIJ', 'https://x/pokemonarena/battle.html?np=k7q2p&join=1'].every((x) => O.ROOM_RE.test(rf(x))) && !O.ROOM_RE.test(rf('ab')) && !O.ROOM_RE.test(rf('a b!')), T('O15 what it gives is then judged by ROOM_RE (a code is 4 to 8 letters and digits)'), '');
+  }
+
+  /* P. the start token: the only thing that lets a press in the HUB start a room or a search on the battle page (INAPP.md "Contract 1") */
+  {
+    const NOW = WALL0, mem = memStorage();
+    ok(P.START_KEY === 'arena.go' && P.START_MAX_AGE_MS === 60000 && P.writeStartToken(mem, { what: 'host' }, NOW) === true && J(JSON.parse(mem.store[P.START_KEY])) === J({ what: 'host', room: null, at: NOW }), T('P1 a start token is stored under arena.go with what it starts, the room (none) and the time'), J(mem.store));
+    const got = P.takeStartToken(mem, NOW + 1000);
+    ok(J(got) === J({ what: 'host', room: null }) && !(P.START_KEY in mem.store), T('P2 taking it says what to start and removes it in the same step'), J([got, mem.store]));
+    ok(P.takeStartToken(mem, NOW + 2000) === null, T('P3 a token is good ONCE: the address that used it is a plain address from then on'), '');
+    ok(P.takeStartToken(memStorage(), NOW) === null && P.takeStartToken(null, NOW) === null, T('P3b no token, or no storage: nothing'), '');
+    ok(P.writeStartToken(mem, { what: 'quick' }, NOW) && J(P.takeStartToken(mem, NOW)) === J({ what: 'quick', room: null }), T('P4 "find an opponent" is a token of its own'), J(mem.store));
+    ok(P.writeStartToken(mem, { what: 'host', room: 'k7q2p' }, NOW) && J(P.takeStartToken(mem, NOW)) === J({ what: 'host', room: 'K7Q2P' }), T('P4b a host token can name the room to open (kept in capitals)'), J(mem.store));
+    P.writeStartToken(mem, { what: 'host' }, NOW);
+    ok(P.takeStartToken(mem, NOW + P.START_MAX_AGE_MS + 1) === null && !(P.START_KEY in mem.store), T('P5 a token older than a minute starts nothing (and is removed): it was not written for this page load'), J(mem.store));
+    P.writeStartToken(mem, { what: 'host' }, NOW);
+    ok(P.takeStartToken(mem, NOW + P.START_MAX_AGE_MS) !== null, T('P5b ... exactly a minute old is still fresh'), '');
+    P.writeStartToken(mem, { what: 'quick' }, NOW + 60000);
+    ok(P.takeStartToken(mem, NOW) === null && !(P.START_KEY in mem.store), T('P6 a token dated in the future (a clock that moved, or a made-up one) starts nothing'), J(mem.store));
+    P.writeStartToken(mem, { what: 'quick' }, NOW + 4000);
+    ok(P.takeStartToken(mem, NOW) !== null, T('P6b ... a few seconds of clock skew are not the future'), '');
+    const junk = ['', 'x', '[]', 'null', '7', '"host"', '{"what":"host"}', J({ what: 'host', at: 'now' }), J({ what: 'join', at: NOW }), J({ what: 'quick', room: 'K7Q2P', at: NOW }), J({ what: 'host', room: 'no spaces!', at: NOW }), J({ what: 'host', room: 7, at: NOW }), J({ what: ['host'], at: NOW })];
+    const taken = junk.filter((j) => { mem.store[P.START_KEY] = j; const r = P.takeStartToken(mem, NOW); return r !== null || P.START_KEY in mem.store; });
+    ok(taken.length === 0, T('P7 junk in the slot starts nothing and is cleared (' + junk.length + ' kinds: no time, a start that is not one, a search that names a room, a room that is not a room code ...)'), J(taken));
+    const m2 = memStorage();
+    const badWrites = [{ what: 'join' }, { what: 'HOST' }, {}, null, undefined, { what: 'quick', room: 'K7Q2P' }, { what: 'host', room: 'no spaces!' }, { what: 'host', room: 'abc' }, { what: 'host', room: 77777 }];
+    ok(badWrites.every((b) => P.writeStartToken(m2, b, NOW) === false) && P.writeStartToken(m2, { what: 'host' }, NaN) === false && Object.keys(m2.store).length === 0 && P.writeStartToken(null, { what: 'host' }, NOW) === false, T('P8 a token that names no known start, a search with a room, or a room that is not a room code is never written'), J(m2.store));
+    const blocked = { getItem() { throw new Error('blocked'); }, setItem() { throw new Error('blocked'); }, removeItem() { throw new Error('blocked'); } };
+    ok(P.writeStartToken(blocked, { what: 'host' }, NOW) === false && P.takeStartToken(blocked, NOW) === null, T('P9 a storage that throws neither writes nor yields a token'), '');
+    const stuck = memStorage(); stuck.removeItem = () => {};            // a storage that will not forget
+    P.writeStartToken(stuck, { what: 'host' }, NOW);
+    ok(P.takeStartToken(stuck, NOW) === null, T('P10 a token that cannot be removed is not used (one use, or none)'), '');
+    const unrem = memStorage(); const real = unrem.removeItem; let boom = false; unrem.removeItem = (k) => { if (boom) throw new Error('blocked'); return real(k); };
+    P.writeStartToken(unrem, { what: 'quick' }, NOW); boom = true;
+    ok(P.takeStartToken(unrem, NOW) === null, T('P11 ... nor one whose removal throws'), '');
+    // WHAT A TOKEN STARTS ON AN ADDRESS (startPlan, on the addresses as online.js parseOnlineQuery reads them): each token only on its own kind of address, and an address alone starts nothing
+    const F = 'a'.repeat(16), R = 'b'.repeat(16);
+    const addr = {
+      plain: O.parseOnlineQuery('?online=1'), plainLocal: O.parseOnlineQuery('?online=1&net=local&anim=0&format=6v6'), hostRoom: O.parseOnlineQuery('?np=K7Q2P&host=1'), joinRoom: O.parseOnlineQuery('?np=K7Q2P&join=1'),
+      bareRoom: O.parseOnlineQuery('?np=K7Q2P'), otherRoom: O.parseOnlineQuery('?np=ZZZZ9&host=1'), auto: O.parseOnlineQuery('?online=1&auto=host&for=' + F + '&rq=' + R), bad: O.parseOnlineQuery('?np=!!&host=1'), cpu: O.parseOnlineQuery('?cpu=hard'),
+    };
+    const tok = { host: { what: 'host', room: null }, room: { what: 'host', room: 'K7Q2P' }, quick: { what: 'quick', room: null } };
+    const plans = (t, keys) => keys.map((k) => P.startPlan(t, addr[k]));
+    const all = Object.keys(addr), none = (list) => list.every((x) => x === null);
+    ok(none(plans(null, all)) && none(plans(undefined, all)), T('P12 AN ADDRESS ALONE STARTS NOTHING: with no token, none of ' + all.length + ' addresses starts anything'), J(plans(null, all)));
+    ok(J(plans(tok.host, ['plain', 'plainLocal'])) === J(['host', 'host']), T('P13 { host } on the plain ?online=1 address opens a friend\'s room'), J(plans(tok.host, all)));
+    ok(none(plans(tok.host, ['hostRoom', 'joinRoom', 'bareRoom', 'otherRoom', 'auto', 'bad', 'cpu'])), T('P13b ... and on no other address (a room\'s host or join address, an accepted-challenge address, a bad one, a battle against the CPU)'), J(plans(tok.host, all)));
+    ok(P.startPlan(tok.host, { role: null, room: null, auto: { for: F, rq: R } }) === null && P.startPlan(tok.quick, { role: null, room: null, auto: { for: F, rq: R } }) === null, T('P13c an address that carries an accepted challenge is never the plain address, whatever its role reads as'), '');
+    ok(J(plans(tok.quick, ['plain', 'plainLocal'])) === J(['quick', 'quick']) && none(plans(tok.quick, ['hostRoom', 'joinRoom', 'bareRoom', 'otherRoom', 'auto', 'bad', 'cpu'])), T('P14 { quick } finds an opponent on the plain address, and nowhere else'), J(plans(tok.quick, all)));
+    ok(J(plans(tok.room, ['hostRoom'])) === J(['room']), T('P15 { host, room } opens that room on ?np=<that room>&host=1'), J(plans(tok.room, all)));
+    ok(none(plans(tok.room, ['otherRoom', 'joinRoom', 'bareRoom', 'plain', 'plainLocal', 'auto', 'bad', 'cpu'])), T('P15b ... not another room, not that room\'s JOIN address, not the plain page'), J(plans(tok.room, all)));
+    ok(none([{ what: 'quick', room: 'K7Q2P' }, { what: 'join', room: null }, {}].map((t) => P.startPlan(t, addr.plain))), T('P16 a token that is not one of the three starts nothing'), '');
   }
 }
 
@@ -583,6 +643,24 @@ const MUTANTS = [
   { id: 'board-address-keeps-auto', why: 'the board address keeps the challenge that started a game', file: 'online.js', from: "['np', 'host', 'join', 'rq', 'for', 'ck', 'auto', 'meet']", to: "['np', 'host', 'join', 'rq', 'for', 'ck', 'meet']" },
   { id: 'board-address-no-online', why: 'the board address does not say online=1, so a reload is not the Play online page at all', file: 'online.js', from: "u.searchParams.set('online', '1');", to: '' },
   { id: 'hold-limit-unbounded', why: 'the seat-holding clock can be set to anything, a 0 ms hold included', file: 'online.js', from: 'Number.isInteger(hm) && hm >= 300 && hm <= 120000', to: 'Number.isInteger(hm)' },
+  { id: 'room-link-not-read', why: 'a pasted invite link is not read for its room', file: 'online.js', from: '  if (m) return m[1].toUpperCase();\n', to: '' },
+  { id: 'room-keeps-dashes', why: 'the spaces and dashes of a typed code are kept', file: 'online.js', from: "return s.replace(/[\\s-]+/g, '').toUpperCase().slice(0, 8);", to: 'return s.toUpperCase().slice(0, 8);' },
+  { id: 'room-any-length', why: 'a typed code is not cut to the length of a room code', file: 'online.js', from: "return s.replace(/[\\s-]+/g, '').toUpperCase().slice(0, 8);", to: "return s.replace(/[\\s-]+/g, '').toUpperCase();" },
+  { id: 'room-address-as-code', why: 'an address that names no room is read as a code', file: 'online.js', from: '  if (/^https?:|\\//i.test(s)) return null;\n', to: '' },
+  // ---- the start token (the hub's hand-off): one use, fresh, well-formed, and only on its own kind of address
+  { id: 'start-reusable', why: 'a start token is not removed when it is used', from: "    storage.removeItem(START_KEY);\n    if (storage.getItem(START_KEY) !== null) return null;          // (it would not go: a token that stays could start a second game)\n", to: '' },
+  { id: 'start-unremovable-used', why: 'a start token that cannot be removed is used anyway', from: "    if (storage.getItem(START_KEY) !== null) return null;          // (it would not go: a token that stays could start a second game)\n", to: '' },
+  { id: 'start-never-expires', why: 'an old start token is as good as a new one', from: 'if (!(startAge <= maxAgeMs && startAge >= -5000)) return null;', to: 'if (!(startAge >= -5000)) return null;' },
+  { id: 'start-future', why: 'a start token dated in the future is accepted', from: 'if (!(startAge <= maxAgeMs && startAge >= -5000)) return null;', to: 'if (!(startAge <= maxAgeMs)) return null;' },
+  { id: 'start-write-any', why: 'a token that names no known start is written', from: 'if (!storage || !START_WHATS.includes(what) || !Number.isFinite(nowMs)) return false;', to: 'if (!storage || !Number.isFinite(nowMs)) return false;' },
+  { id: 'start-take-any', why: 'a stored token that names no known start is honoured', from: "if (!t || typeof t !== 'object' || !START_WHATS.includes(t.what) || !Number.isFinite(t.at)) return null;", to: "if (!t || typeof t !== 'object' || !Number.isFinite(t.at)) return null;" },
+  { id: 'start-write-room-unchecked', why: 'any room, for any start, goes into a token', from: "    if (named && (what !== 'host' || typeof room !== 'string' || !ROOM_RE.test(room))) return false;          // only a host names a room, and only a real room code\n", to: '' },
+  { id: 'start-take-room-unchecked', why: 'a stored token with a room that is not one (or a search with a room) is honoured', from: "    if (named && (t.what !== 'host' || typeof t.room !== 'string' || !ROOM_RE.test(t.room))) return null;\n", to: '' },
+  { id: 'plan-host-anywhere', why: 'a { host } token opens a room on any online address', from: "  return plain ? 'host' : null;\n}", to: "  return 'host';\n}" },
+  { id: 'plan-quick-anywhere', why: 'a { quick } token starts a search on any online address', from: "if (tok.what === 'quick') return plain && !tok.room ? 'quick' : null;", to: "if (tok.what === 'quick') return 'quick';" },
+  { id: 'plan-any-room', why: 'a token for one room opens another', from: "if (tok.room) return q.role === 'host' && q.room === tok.room ? 'room' : null;", to: "if (tok.room) return q.role === 'host' ? 'room' : null;" },
+  { id: 'plan-room-on-join', why: 'a host token opens a room on its JOIN address', from: "if (tok.room) return q.role === 'host' && q.room === tok.room ? 'room' : null;", to: "if (tok.room) return q.room === tok.room ? 'room' : null;" },
+  { id: 'plan-auto-is-plain', why: 'an address that carries an accepted challenge can be started on like the plain one', from: 'if (!tok || !q || q.error || q.auto) return null;', to: 'if (!tok || !q || q.error) return null;' },
 ];
 
 async function loadFrom(dir, file) { return import(pathToFileURL(path.join(dir, file)).href + '?x=' + Math.random().toString(36).slice(2)); }

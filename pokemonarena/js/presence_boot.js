@@ -19,9 +19,16 @@
 // focus on Accept, a fresh press clears it), never from who moved the focus first: with the challenge stacked over the Controls dialog or the Sound panel, THEIR navigation moves the focus
 // before this module hears the press. The page keeps its OWN pause state per owner
 // (a Set of who holds it: the Controls dialog, the Sound panel, this module's dialogs), so closing one dialog never un-pauses the page behind another that is still open.
+//
+// A HOST THAT DRAWS ITS OWN QUESTIONS (the hub: js/hub_presence.js asks both in the 240x160 picture) INJECTS them: opts.dialogs = { challenge, disclosure }, each { show, hide(), isOpen(), destroy() }.
+//   challenge.show({ name, rec, s, r, fmtText })   a challenge that passed every check is to be asked; the host answers with p.accept() or p.decline(). hide() = it is over (answered, cancelled, timed out)
+//   disclosure.show(onYes)                          the first switch-on: say what is published and ask; YES = call onYes() (it remembers the answer and switches on); NO = do nothing (not remembered)
+// Whichever of the two is left out is the DOM dialog of this file, built as before (a CPU battle injects nothing). An injected dialog pauses and un-pauses its own page: opts.onDialog is only called
+// for the DOM ones. A host with no DOM button drives the switch through the returned object: toggle() / setOn() / needsDisclosure() / confirmDisclosure(), reads it with isOn() / status(), and hears
+// every change (the switch, the board connection, the board's list) through onChange(fn).
 
 import { createOpenLobbies, createLocalBus, createMqttBus, brokersFor } from './openlobby.js';
-import { createPresence, isOpen, setOpen, acceptHref, TIMING } from './presence.js';
+import { createPresence, createChallenge, canSeal, isOpen, setOpen, acceptHref, TIMING } from './presence.js';
 import { PINNED } from './rom.js';
 import { DEFAULT_RULESET_ID } from './rules.js';
 import { loadAvatar } from './avatar.js';
@@ -183,8 +190,10 @@ const trainerKey = (t) => JSON.stringify(t ? [t.name, t.rec] : null);
 /**
  * opts: { win, doc, pack, input, enableDomNav, navigate, button (the switch, or null), buttonText (false: the button draws its own face, an icon -- only its state, name and tooltip are kept current),
  *         focusHome() (where the focus goes after a mouse click on the switch),
- *         onDialog: { open(which), close(which) } (a page pauses what it is doing while one of our dialogs is up; `which` names it, so a page can tell its dialogs apart) }
- * -> { setOn(on), isOn(), refresh(), dispose() }
+ *         onDialog: { open(which), close(which) } (a page pauses what it is doing while one of our dialogs is up; `which` names it, so a page can tell its dialogs apart),
+ *         dialogs: { challenge?, disclosure? } (a host that asks the questions itself: see the top of this file; default = the DOM dialogs) }
+ * -> { setOn(on, { persist }), isOn(), status(), toggle(), needsDisclosure(), confirmDisclosure({ persist }), onChange(fn), accept(), decline(), pending(), challenge(target, on), canChallenge(), trainer(),
+ *      refresh(), dispose(), presence, lobbies, timing }
  */
 export function mountPresence(opts) {
   const { win, doc } = opts;
@@ -202,6 +211,9 @@ export function mountPresence(opts) {
   const nowMs = () => (win.performance && win.performance.now ? win.performance.now() : Date.now());
   let lobbies = null, presence = null, on = false, starting = null, disposed = false, trainer = null, gen = 0, refreshing = null, again = false;
   const offs = [];
+  // WHO IS TOLD WHEN SOMETHING CHANGES (onChange): the switch, a start under way, the board connection, the board's own list. A host with no DOM button draws its switch from these.
+  const watchers = new Set();
+  const notify = () => { for (const f of [...watchers]) { try { f(); } catch (_e) { /* a listener must not break the switch */ } } };
   const listen = (t, type, fn) => { t.addEventListener(type, fn); offs.push(() => t.removeEventListener(type, fn)); };
 
   const seen = () => { try { return !!storage && storage.getItem(SEEN_KEY) === '1'; } catch (_e) { return false; } };
@@ -210,6 +222,7 @@ export function mountPresence(opts) {
   const pageDialog = (which, v) => { const f = opts.onDialog && opts.onDialog[v ? 'open' : 'close']; if (typeof f === 'function') f(which); };
 
   function paint() {
+    notify();
     if (!button) return;
     button.setAttribute('aria-pressed', String(on));
     button.setAttribute('aria-label', OPEN_LABEL);
@@ -220,17 +233,26 @@ export function mountPresence(opts) {
   }
   function say(t) { const live = doc.getElementById('live'); if (live) live.textContent = t; }
 
-  // ONE challenge dialog and ONE disclosure per page, however often the switch goes on and off (each used to be built again at every switch-on, leaving duplicate ids)
-  const dialog = mountChallengeDialog({
+  // ONE challenge dialog and ONE disclosure per page, however often the switch goes on and off (each used to be built again at every switch-on, leaving duplicate ids).
+  // A host that asks the questions itself hands them in (opts.dialogs: the hub draws both in its picture); whichever it leaves out is the DOM dialog of this file.
+  const given = opts.dialogs || {};
+  const dialog = given.challenge || mountChallengeDialog({
     doc, win, input: opts.input, enableDomNav: opts.enableDomNav,
     onOpen: () => pageDialog('challenge', true), onClose: () => pageDialog('challenge', false),
     onAccept: () => { if (presence) presence.accept(); }, onDecline: () => { if (presence) presence.decline(); },
   });
-  const disclosure = mountDialog({
-    doc, win, input: opts.input, enableDomNav: opts.enableDomNav, ids: DISCLOSURE_IDS, heading: 'Open to battles', okLabel: 'OK', cancelLabel: 'Cancel', inertMs: 0,
-    onOpen: () => pageDialog('disclosure', true), onClose: () => pageDialog('disclosure', false),
-    onOk: () => { markSeen(); setOn(true); },
-  });
+  // YES to the disclosure: the player has been told, so it is remembered, and the switch goes on
+  const confirmDisclosure = (o) => { markSeen(); return setOn(true, o); };
+  const disclosure = given.disclosure || (() => {
+    let yes = null;
+    const d = mountDialog({
+      doc, win, input: opts.input, enableDomNav: opts.enableDomNav, ids: DISCLOSURE_IDS, heading: 'Open to battles', okLabel: 'OK', cancelLabel: 'Cancel', inertMs: 0,
+      onOpen: () => pageDialog('disclosure', true), onClose: () => pageDialog('disclosure', false),
+      onOk: () => { const f = yes; yes = null; if (f) f(); },
+    });
+    return { show: (onYes) => { yes = onYes; return d.show({ text: DISCLOSURE_TEXT, sub: DISCLOSURE_SUB }); }, hide: d.hide, isOpen: d.isOpen, destroy: d.destroy };
+  })();
+  let identity = null;                              // () -> what the listing says about this player; exists while the switch is on
 
   async function begin(mine) {
     const [t, om] = await Promise.all([readTrainer(), import('./online_match.js')]);
@@ -240,7 +262,7 @@ export function mountPresence(opts) {
     const bus = local ? createLocalBus(win) : createMqttBus(win, { brokers: brokersFor(win) });
     lobbies = createOpenLobbies({ bus, now: nowMs, mine: { rom: PINNED.sha256, fp } });
     // av: the trainer's look in the Trainer Center (avatar.js), so a player who is open from the hub is drawn there as themselves; none stored = none sent (the Center draws a default)
-    const identity = () => ({ name: (trainer && trainer.name) || 'Player', rec: trainer ? trainer.rec : null, fmt: FORMAT, rom: PINNED.sha256, fp, rs: DEFAULT_RULESET_ID, av: loadAvatar(storage) });
+    identity = () => ({ name: (trainer && trainer.name) || 'Player', rec: trainer ? trainer.rec : null, fmt: FORMAT, rom: PINNED.sha256, fp, rs: DEFAULT_RULESET_ID, av: loadAvatar(storage) });
     lobbies.watch(paint);                  // a broker coming up, or none being reachable, changes what the switch says
     presence = createPresence({
       lobbies, identity, timing, now: nowMs, session,
@@ -266,6 +288,7 @@ export function mountPresence(opts) {
       if (mine !== gen) return on;                                    // a later switch took over while this was starting; it says what happened
       if (!started && !disposed) { teardown(); on = false; paint(); say('Open to battles could not start.'); return false; }
       if (disposed) return false;
+      notify();                                                       // (the start is over: 'starting' has become 'on')
       say(ON_SAYS);
       return true;
     }
@@ -275,7 +298,7 @@ export function mountPresence(opts) {
   }
   function teardown() {
     const p = presence, l = lobbies;
-    presence = null; lobbies = null;
+    presence = null; lobbies = null; identity = null;
     try { if (p) p.stop(); } catch (_e) { /* ignore */ }
     try { if (l) l.close(); } catch (_e) { /* ignore */ }
   }
@@ -301,8 +324,41 @@ export function mountPresence(opts) {
     refreshing = p;
     return p;
   }
+  // THE PLAYER ASKED FOR THE SWITCH TO CHANGE (the button below, or a host that has none: toggle()). The first switch-on asks first: nothing is published before YES, and a NO is not remembered.
+  // -> a promise of the switch's state afterwards (false at once when the question was put: the answer switches it on)
+  function toggle() {
+    if (!on && disclosureWanted()) { disclosure.show(confirmDisclosure); return Promise.resolve(false); }
+    return setOn(!on);
+  }
   const api = {
-    setOn, isOn: () => on, refresh,
+    setOn, isOn: () => on, refresh, toggle,
+    /** 'off' | 'starting' (switched on, the trainer and the board are still loading) | 'on' | 'offline' (on, but no public server can be reached: nobody can see the listing). */
+    status: () => (!on ? 'off' : !presence ? 'starting' : lobbies && lobbies.status() === 'down' ? 'offline' : 'on'),
+    /** Must switching on ask first? (The player has not been told what is published; the same-browser test transport publishes nothing and asks only with ?opendisc=1.) */
+    needsDisclosure: () => disclosureWanted(),
+    /** The player said YES to the disclosure: remembered, and the switch goes on. o: { persist } as for setOn. -> setOn's promise. */
+    confirmDisclosure,
+    /** Call fn() whenever what a switch would show may have changed: on / off, a start that finished, the board connection, the board's list. -> unsubscribe. */
+    onChange(fn) { watchers.add(fn); return () => watchers.delete(fn); },
+    /** The answer to the challenge an injected dialog was shown (challenge.show): YES leaves the page for the battle (false: no challenge is waiting, or the token could not be written and the challenger was told busy). */
+    accept: () => (presence ? presence.accept() : false),
+    decline: () => (presence ? presence.decline() : false),
+    /** The challenge that is waiting for an answer: { s, r, name, rec, pk } or null. */
+    pending: () => (presence ? presence.pending() : null),
+    /** Can this browser challenge at all? (It needs WebCrypto: the room comes back sealed to a one-time key.) */
+    canChallenge: () => canSeal(win.crypto),
+    /**
+     * ASK AN OPEN PLAYER TO BATTLE (the Trainer Center): `target` is their entry on the board (lobbies.list()); handlers = { state(name), accepted(room), failed(why) } (presence.js createChallenge).
+     * It goes out on this page's own board connection, under the trainer name and the online record of the listing. -> { r, ready, cancel(), done() }, or null while the switch is not on.
+     */
+    challenge(target, handlers) {
+      if (!lobbies || !presence || !identity || !target) return null;
+      const me = identity();
+      return createChallenge({ lobbies, target, name: me.name, rec: me.rec || null, now: nowMs, timing, crypto: win.crypto, on: handlers });
+    },
+    /** What the listing says about this player: { name, rec: [wins, losses] | null }, or null while the switch is not on. */
+    trainer() { if (!identity || !presence) return null; const me = identity(); return { name: me.name, rec: me.rec || null }; },
+    timing,
     get presence() { return presence; }, get lobbies() { return lobbies; },
     dispose() {
       if (disposed) return;
@@ -312,14 +368,14 @@ export function mountPresence(opts) {
       dialog.destroy(); disclosure.destroy();
       if (button) delete button.dataset.presence;
       if (win.__arenaPresence === api) delete win.__arenaPresence;
+      notify(); watchers.clear();
     },
   };
 
   function onClick(e) {
     // a mouse or a finger leaves nothing focused: a button left focused would be toggled again by the next Enter or Space (the other header buttons hand the focus back the same way)
     if (e && e.detail > 0) { try { button.blur(); } catch (_e) { /* ignore */ } if (typeof opts.focusHome === 'function') { try { opts.focusHome(); } catch (_e) { /* ignore */ } } }
-    if (!on && disclosureWanted()) { disclosure.show({ text: DISCLOSURE_TEXT, sub: DISCLOSURE_SUB }); return; }
-    setOn(!on);
+    toggle();
   }
   // the switch is one setting of this BROWSER: another tab turning it off (or on) is followed here, so a CPU battle opened earlier stops listing and stops showing dialogs when it goes off
   function onStorage(e) {
@@ -332,7 +388,7 @@ export function mountPresence(opts) {
   if (button) listen(button, 'click', onClick);
   listen(win, 'storage', onStorage);
   // leaving the page takes the listing down at once and lets go of the brokers; coming back from the back/forward cache lists again (a new load starts from the stored switch)
-  listen(win, 'pagehide', () => { ++gen; if (on || presence) { on = false; teardown(); } });
+  listen(win, 'pagehide', () => { ++gen; if (on || presence) { on = false; teardown(); notify(); } });
   listen(win, 'pageshow', (e) => {
     if (!e.persisted) return;
     if (isOpen(storage) && !disclosureWanted() && !on) setOn(true, { persist: false });          // begin() reads the trainer again

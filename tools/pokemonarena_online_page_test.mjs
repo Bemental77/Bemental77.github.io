@@ -3,8 +3,10 @@
 //
 //   node tools/pokemonarena_online_page_test.mjs            starts its own dev server (ARENA_PORT, default 8097) and one muted headless Chrome (ARENA_CDP, default 9283)
 //   ARENA_OUT=<dir> for screenshots (judged by eye); ARENA_SKIP_SHOTS=1 to skip them
-//   groups (name some to run a subset): profile hub lobby match leaving rejoin resume timeout refusals teams lead layout open openlayout presence presenceui onlineux; `profile --mutants`, `open --mutants`, `presenceui --mutants`
-//   and `onlineux --mutants` also run a copy of the game with ONE defect at a time, each of which must fail the case it names.
+//   groups (name some to run a subset): profile hub lobby match leaving rejoin resume timeout easyjoin refusals teams lead layout open openlayout presence presenceui onlineux tokens; `profile --mutants`, `open --mutants`,
+//   `presenceui --mutants`, `onlineux --mutants` and `tokens --mutants` also run a copy of the game with ONE defect at a time, each of which must fail the case it names.
+//   ON THE HUB PAGE the "wants to battle you" question and the first-time disclosure are IN THE PICTURE (js/hub_presence.js, the hub's dialog layer): the hub sessions of `presence` and `presenceui` read
+//   and drive them through window.__arenaHub. In a battle against the CPU they are still the DOM dialogs of presence_boot.js, and those sessions read the DOM.
 //   EVERY CASE ID BELONGS TO ONE GROUP (checkCaseIds, ID1, reads this file): a failure is named by its id, and two groups sharing one made "B3 failed" mean either of two things.
 //
 // Browsers: tools/headless_cdp.mjs only (bare CDP, throwaway profile, --mute-audio). Nothing here touches the user's browser, and nothing makes a sound.
@@ -1345,7 +1347,26 @@ async function openHub(page, extra = '') {
 }
 const seedProfile = (page, trainerName) => page.eval('(async () => { const { openStore } = await import("/pokemonarena/js/store.js"); const st = await openStore(); const c = await st.createProfile({ trainerName: ' + JSON.stringify(trainerName) + ' }); await st.setActiveId(c.id); await st.close(); return c.id; })()');
 const toggleState = (p) => p.eval('({ pressed: document.getElementById("openToggle").getAttribute("aria-pressed"), text: document.getElementById("openToggle").textContent, stored: localStorage.getItem("arena.open") })');
-const dialogOn = (p) => p.eval('(() => { const d = document.getElementById("challenge"); return !!d && !d.hidden; })()');
+// THE HUB ASKS IN THE PICTURE (js/hub_presence.js: "<name> wants to battle you" and the first-time disclosure are the hub's dialog layer, drawn from the ROM; there is no DOM dialog on the hub page).
+// These read and drive the question through window.__arenaHub, the way a pad does: A turns the page, the d-pad moves the highlight, B is NO. (The same questions on the BATTLE page are still the
+// DOM dialogs #challenge / #openInfo, and its sessions read those.) THE HUB'S CLOCK ONLY RUNS IN THE TAB THAT IS IN FRONT (a question listens 36 frames after it appears), so a session brings the
+// hub to the front before it waits for a question to listen.
+const HQ_CHAL = 'presence:challenge', HQ_DISC = 'presence:disclosure';
+const HUB_Q = (id = HQ_CHAL) => `(() => { const H = window.__arenaHub, d = H && H.dialog ? H.dialog.current() : null; return !!d && d.id === ${J(id)}; })()`;
+const HUB_Q_ARMED = (id = HQ_CHAL) => `(() => { const H = window.__arenaHub, d = H && H.dialog ? H.dialog.current() : null; return !!d && d.id === ${J(id)} && d.armed === true; })()`;
+const HUB_Q_GONE = (id = HQ_CHAL) => `(() => { const H = window.__arenaHub, d = H && H.dialog ? H.dialog.current() : null; return !d || d.id !== ${J(id)}; })()`;
+// what the question says and where its highlight is: { id, page, pages, armed, text (this page's lines), options, on (the option highlighted), dom (DOM dialogs of presence_boot.js in the page: must be 0) }
+const hubQ = (p) => p.eval('(() => { const H = window.__arenaHub, d = H.dialog.current(), v = H.view().dialog; return d ? { id: d.id, page: d.page, pages: d.pages, armed: d.armed, text: v.lines.filter(Boolean).join(" "), options: d.choice ? d.choice.options : null, on: d.choice ? d.choice.options[d.choice.cursor] : null, last: d.choice ? d.choice.cursor === d.choice.options.length - 1 : null, dom: document.querySelectorAll("#challenge, #openInfo, .arena-chal").length } : null; })()');
+const hubAsked = (p, id = HQ_CHAL) => p.eval(HUB_Q(id));
+const hubFront = (p) => p.send('Page.bringToFront');
+// every page of the question, read by turning them with A (it ends on the last page, where the options are)
+const hubQPages = (p) => p.eval('(() => { const H = window.__arenaHub, out = []; const d = H.dialog.current(); if (!d) return out; for (let i = d.page; i < d.pages; i++) { out.push(H.view().dialog.lines.filter(Boolean).join(" ")); if (i < d.pages - 1) H.press("a"); } return out; })()');
+// B: NO. And YES the long way: A to the last page, the d-pad up onto YES, A.
+const hubNo = (p) => p.eval('(window.__arenaHub.press("b"), true)');
+const hubYes = (p) => p.eval('(() => { const H = window.__arenaHub, d = H.dialog.current(); if (!d) return false; for (let i = d.page; i < d.pages - 1; i++) H.press("a"); H.press("up"); H.press("a"); return true; })()');
+// the client point of a logical point of the picture (240 x 160), and of the middle of option k of the question that is up
+const hubPoint = (p, lx, ly) => p.eval(`(() => { const r = window.__arenaHub.canvas.getBoundingClientRect(); return { x: r.left + ${lx} * r.width / 240, y: r.top + ${ly} * r.height / 160, k: r.width / 240 }; })()`);
+const hubOption = (p, k) => p.eval(`(() => { const H = window.__arenaHub, rs = H.model.rects(), r = H.canvas.getBoundingClientRect(), o = rs[${k}]; return o ? { x: r.left + (o.x + o.w / 2) * r.width / 240, y: r.top + (o.y + o.h / 2) * r.height / 160, h: o.h * r.height / 160, w: o.w * r.width / 240, n: rs.length } : null; })()`);
 const residentRow = (p) => p.eval('(() => { const li = [...document.querySelectorAll("#olOpenList li")].find((x) => /^H/.test(x.dataset.room)); return li ? { room: li.dataset.room, who: li.querySelector(".who").textContent, button: li.querySelector("button").textContent, label: li.querySelector("button").getAttribute("aria-label") } : null; })()');
 
 async function groupPresence(S) {
@@ -1369,14 +1390,19 @@ async function groupPresence(S) {
     await shot(ch, 'P_board_resident');
     await setForm(ch, { name: 'Chad' });
     await ch.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
-    await hub.waitFor('(() => { const d = document.getElementById("challenge"); return !!d && !d.hidden; })()', { timeoutMs: 15000 });
-    const dlg = await hub.eval('({ text: document.getElementById("chText").textContent, focus: document.activeElement && document.activeElement.id, modal: document.getElementById("challenge").getAttribute("aria-modal"), role: document.getElementById("challenge").getAttribute("role"), open: window.__arenaHub.dialogOpen() })');
-    ok(/^Chad.* wants to battle you\.$/.test(dlg.text) && dlg.focus === 'chDecline' && dlg.modal === 'true' && dlg.role === 'alertdialog' && dlg.open === true, 'A4 the owner gets a modal dialog naming the challenger, with NOT NOW focused (a stray press must not carry them off) and the hub paused behind it', J(dlg));
+    await hubFront(hub);
+    await hub.waitFor(HUB_Q_ARMED(), { timeoutMs: 15000 });
+    const dlg = await hubQ(hub);
+    // (the menu behind the question hears nothing: a press goes to the question, and on its first page the d-pad has nothing to move)
+    const behind = await hub.eval('(() => { const H = window.__arenaHub, c0 = H.model.state().cursor; H.press("down"); H.press("down"); return { same: JSON.stringify(H.model.state().cursor) === JSON.stringify(c0), asked: H.dialog.isOpen(), panel: H.dialogOpen() }; })()');
+    const dlg2 = await hub.eval('(() => { const H = window.__arenaHub; H.press("a"); const d = H.dialog.current(); return { page: d.page, on: d.choice.options[d.choice.cursor], options: d.choice.options, shown: !!H.view().dialog.choice }; })()');
+    ok(/^Chad.* wants to battle you\.$/.test(dlg.text) && dlg.dom === 0 && dlg.pages === 2 && dlg2.page === 1 && dlg2.shown && J(dlg2.options) === J(['YES', 'NO']) && dlg2.on === 'NO' && behind.same && behind.asked === true && behind.panel === false,
+      'A4 the owner is asked IN THE PICTURE (no DOM dialog), naming the challenger, with YES / NO and NO highlighted (a stray press must not carry them off), and the menu behind the question hears nothing', J({ dlg, dlg2, behind }));
     ok(/Asked HUBHERO/.test(await statusText(ch)) && (await stageOf(ch)) === 'asking' && !(await ch.eval('document.getElementById("olCancelAsk").hidden')), 'A5 the challenger is told it asked, and can cancel', await statusText(ch));
     await shot(hub, 'P_dialog_hub');
-    await hub.eval('document.getElementById("chDecline").click()');
+    await hubNo(hub);
     await ch.waitFor('window.__arenaOnline.state.stage === "setup"', { timeoutMs: 10000 });
-    ok(/not available/.test(await statusText(ch)) && !(await dialogOn(hub)) && (await hub.eval('window.__arenaHub.dialogOpen()')) === false, 'A6 Not now: the challenger is told in words, the dialog closes and the hub is live again', await statusText(ch));
+    ok(/not available/.test(await statusText(ch)) && !(await hubAsked(hub)) && (await hub.eval('window.__arenaHub.dialog.isOpen()')) === false, 'A6 NO (the B button): the challenger is told in words, the question closes and the hub is live again', await statusText(ch));
     await ch.waitFor('document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 15000 });
     // The second ask must really go out and really be answered. This case used to wait for "setup + not available" with a `.catch(() => {})` and then sleep: a challenge that never left (the old
     // wait was already true from the first No, and a timeout was swallowed) passed as "no dialog". Now the challenge is COUNTED as it goes out (the challenger's own board connection), and the case
@@ -1384,7 +1410,7 @@ async function groupPresence(S) {
     await ch.eval('(() => { const L = window.__arenaOnline.lobbies(), sig = L.signal; window.__chals = 0; L.signal = function (k, ...a) { if (k === "chal") window.__chals++; return sig.call(this, k, ...a); }; return true; })()');
     await ch.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
     const asked2 = await ch.waitFor('window.__chals >= 1 && window.__arenaOnline.state.stage === "setup" && /not available/.test(document.getElementById("olStatus").textContent)', { timeoutMs: 15000 }).then(() => true, () => false);
-    ok(asked2 && (await ch.eval('window.__chals')) === 1 && !(await dialogOn(hub)), 'A7 asking again straight after Not now: the second ask goes out (once), gets a quiet no in words, and shows the owner no dialog', 'asked+answered=' + asked2 + ' chals=' + (await ch.eval('window.__chals')) + ' ' + (await statusText(ch)));
+    ok(asked2 && (await ch.eval('window.__chals')) === 1 && !(await hubAsked(hub)), 'A7 asking again straight after NO: the second ask goes out (once), gets a quiet no in words, and the owner is not asked again', 'asked+answered=' + asked2 + ' chals=' + (await ch.eval('window.__chals')) + ' ' + (await statusText(ch)));
     ok(hub.errors.length === 0 && ch.errors.length === 0, 'A8 no page errors', J(hub.errors.concat(ch.errors)).slice(0, 200));
   });
 
@@ -1401,13 +1427,18 @@ async function groupPresence(S) {
     await openPanel(ch, '&openchal=20000');
     await ch.waitFor('document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 20000 });
     await setForm(ch, { name: 'Chad' });          // typed in a tab of the SAME browser, so it is also what this browser remembers as "the name"
+    // (the hub's clock is held while the challenge arrives, so the question is certainly still in its first moments when the presses below land: it has not started to listen)
+    await hubFront(hub);
+    await hub.eval('(window.__arenaHub.pause(true), true)');
     await ch.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
-    await hub.waitFor('(() => { const d = document.getElementById("challenge"); return !!d && !d.hidden; })()', { timeoutMs: 15000 });
-    await hub.eval('document.getElementById("chAccept").click()');
+    await hub.waitFor(HUB_Q(), { timeoutMs: 15000 });
+    await hubYes(hub);
     await sleep(200);
-    ok(await dialogOn(hub), 'PB1 Accept ignores a press in the first moments (an unannounced dialog must not be accepted by a stray A)', '');
-    await sleep(700);
-    await hub.eval('document.getElementById("chAccept").click()');
+    const early = await hubQ(hub);
+    ok(!!early && early.id === HQ_CHAL && early.page === 0 && early.armed === false && (await hub.eval('location.pathname')) === '/pokemonarena/', 'PB1 YES ignores presses in the first moments (a question nobody asked for must not be accepted by a stray A): A, up, A turned no page and answered nothing', J(early));
+    await hub.eval('(window.__arenaHub.pause(false), true)');
+    await hub.waitFor(HUB_Q_ARMED(), { timeoutMs: 10000 });
+    await hubYes(hub);
     await hub.waitFor('location.pathname === "/pokemonarena/battle.html"', { timeoutMs: 30000 });
     const u = new URL(await hub.eval('location.href'));
     ok(u.searchParams.get('auto') === 'host' && /^[0-9a-f]{16}$/.test(u.searchParams.get('for')) && /^[0-9a-f]{16}$/.test(u.searchParams.get('rq')) && u.searchParams.get('format') === '3v3' && u.searchParams.get('net') === 'local', 'PB2 Accept takes the hub player to the battle page as the host of an accepted challenge', u.search);
@@ -1482,22 +1513,23 @@ async function groupPresence(S) {
     await c2.waitFor('document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 20000 });
     await setForm(c1, { name: 'One' }); await setForm(c2, { name: 'Two' });
     await c1.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
-    await hub.waitFor('(() => { const d = document.getElementById("challenge"); return !!d && !d.hidden; })()', { timeoutMs: 15000 });
+    await hub.waitFor(HUB_Q(), { timeoutMs: 15000 });
     await c2.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
     await c2.waitFor('window.__arenaOnline.state.stage === "setup" && /another challenge/.test(document.getElementById("olStatus").textContent)', { timeoutMs: 15000 });
-    ok(/^One/.test(await hub.eval('document.getElementById("chText").textContent')), 'C1 a second challenger is told the owner is busy, and the dialog on screen is still the first one', await statusText(c2));
+    const first = await hubQ(hub);
+    ok(/^One/.test(first.text) && (await hub.eval('window.__arenaHub.model.state().dialog.queued.length')) === 0, 'C1 a second challenger is told the owner is busy, and the question in the picture is still the first one (nothing queued behind it)', J([first, await statusText(c2)]));
     await c1.eval('document.getElementById("olCancelAsk").click()');
-    await hub.waitFor('(() => { const d = document.getElementById("challenge"); return !d || d.hidden; })()', { timeoutMs: 10000 });
-    ok((await stageOf(c1)) === 'setup' && /Cancelled/.test(await statusText(c1)), 'C2 cancelling closes the owner\'s dialog and puts the challenger back at the board', await statusText(c1));
+    await hub.waitFor(HUB_Q_GONE(), { timeoutMs: 10000 });
+    ok((await stageOf(c1)) === 'setup' && /Cancelled/.test(await statusText(c1)), 'C2 cancelling closes the owner\'s question and puts the challenger back at the board', await statusText(c1));
     await c2.waitFor('document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 15000 });
     await c2.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
-    await hub.waitFor('(() => { const d = document.getElementById("challenge"); return !!d && !d.hidden; })()', { timeoutMs: 15000 });
-    ok(/^Two/.test(await hub.eval('document.getElementById("chText").textContent')), 'C3 and the owner can be asked again once the dialog is free', '');
-    // the challenger closes the tab while it is waiting: the challenge is withdrawn at once (the dialog does not stay up for a player who has gone, for the rest of its 20 s)
+    await hub.waitFor(HUB_Q(), { timeoutMs: 15000 });
+    ok(/^Two/.test((await hubQ(hub)).text), 'C3 and the owner can be asked again once the question is gone', '');
+    // the challenger closes the tab while it is waiting: the challenge is withdrawn at once (the question does not stay up for a player who has gone, for the rest of its 20 s)
     const t0 = Date.now();
     await c2.navigate('about:blank');
-    const closed = await hub.waitFor('(() => { const d = document.getElementById("challenge"); return !d || d.hidden; })()', { timeoutMs: 8000 }).then(() => true, () => false);
-    ok(closed && Date.now() - t0 < 8000, 'C4 a challenger who leaves the page withdraws its challenge: the owner\'s dialog closes within seconds, not after the full wait', String(Date.now() - t0));
+    const closed = await hub.waitFor(HUB_Q_GONE(), { timeoutMs: 8000 }).then(() => true, () => false);
+    ok(closed && Date.now() - t0 < 8000, 'C4 a challenger who leaves the page withdraws its challenge: the owner\'s question closes within seconds, not after the full wait', String(Date.now() - t0));
   });
 
   // D: nobody answers -> the dialog closes by itself and the challenger is told
@@ -1508,11 +1540,14 @@ async function groupPresence(S) {
     await hub.waitFor('window.__arenaPresence.isOn() && window.__arenaPresence.presence', { timeoutMs: 30000 });
     await openPanel(ch, '&openchal=1500');
     await ch.waitFor('document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 20000 });
+    // (watched from inside the page: with only 1.5 s to live, a poll from here could miss the question altogether)
+    await hub.eval('(() => { window.__sawQ = false; const tick = () => { const d = window.__arenaHub.dialog.current(); if (d && d.id === "presence:challenge") window.__sawQ = true; if (!window.__qStop) setTimeout(tick, 20); }; tick(); return true; })()');
     await ch.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
-    await hub.waitFor('(() => { const d = document.getElementById("challenge"); return !!d && !d.hidden; })()', { timeoutMs: 15000 });
-    await hub.waitFor('(() => { const d = document.getElementById("challenge"); return !d || d.hidden; })()', { timeoutMs: 10000 });
+    await hub.waitFor('window.__sawQ === true', { timeoutMs: 15000 });
+    await hub.waitFor(HUB_Q_GONE(), { timeoutMs: 10000 });
     await ch.waitFor('window.__arenaOnline.state.stage === "setup"', { timeoutMs: 10000 });
-    ok(/not available/.test(await statusText(ch)) && (await hub.eval('window.__arenaHub.dialogOpen()')) === false, 'D1 a dialog nobody answers closes by itself and counts as a no, told to the challenger', await statusText(ch));
+    await hub.eval('(window.__qStop = true)');
+    ok(/not available/.test(await statusText(ch)) && (await hub.eval('window.__arenaHub.dialog.isOpen()')) === false, 'D1 a question nobody answers closes by itself and counts as a no, told to the challenger', await statusText(ch));
   });
 
   // E: the switch is remembered, listed again after a reload, and off means gone
@@ -1577,16 +1612,23 @@ async function groupPresence(S) {
     const sid = await hub.eval('window.__arenaPresence.lobbies.sid');
     await raw.navigate(BASE + '?online=1&net=local' + ANIM);
     await inject(raw, { t: 'arenaopen', v: 1, k: 'chal', s: '00000000000000b1', to: sid, r: '00000000000000b2', name: '<img src=x onerror=window.__pwn=1>Zed', pk: PK_SHAPE });
-    await hub.waitFor('(() => { const d = document.getElementById("challenge"); return !!d && !d.hidden; })()', { timeoutMs: 10000 });
-    const d = await hub.eval('({ text: document.getElementById("chText").textContent, imgs: document.querySelectorAll("#challenge img").length, pwn: !!window.__pwn })');
-    ok(/^[A-Za-z0-9 .'_!?-]{1,10} wants to battle you\.$/.test(d.text) && d.imgs === 0 && !d.pwn, 'G1 a hostile name in a challenge is plain safe text in the dialog and nothing in it runs', J(d));
-    await hub.eval('document.getElementById("chDecline").click()');
+    await hubFront(hub);
+    await hub.waitFor(HUB_Q_ARMED(), { timeoutMs: 10000 });
+    const d = await hub.eval('(() => { const H = window.__arenaHub; return { text: H.view().dialog.lines.filter(Boolean).join(" "), dom: document.querySelectorAll("#challenge, #openInfo, .arena-chal, #challenge img").length, imgs: document.querySelectorAll("img").length, pwn: !!window.__pwn, fault: H.renderError || null }; })()');
+    ok(/^[A-Za-z0-9 .'_!?-]{1,10} wants to battle you\.$/.test(d.text) && d.dom === 0 && d.imgs === 0 && !d.pwn && !d.fault, 'G1 a hostile name in a challenge is plain safe text in the picture and nothing in it runs', J(d));
+    await hubNo(hub);
+    // a name FULL OF BRACES (the ROM font's own token syntax): no token of the font is drawn for it, and the picture is drawn without a fault
+    await inject(raw, { t: 'arenaopen', v: 1, k: 'chal', s: '00000000000000c1', to: sid, r: '00000000000000c2', name: '{CURSOR}{NOPE}}{{UP}', pk: PK_SHAPE });
+    await hub.waitFor(HUB_Q_ARMED(), { timeoutMs: 10000 });
+    const b = await hub.eval('(() => { const H = window.__arenaHub; return { text: H.view().dialog.lines.filter(Boolean).join(" "), fault: H.renderError || null, loop: H.loopError || null }; })()');
+    ok(/^[A-Za-z0-9 .'_!?-]{1,10} wants to battle you\.$/.test(b.text) && !/[{}]/.test(b.text) && !b.fault && !b.loop, 'G1b a name full of braces is letters only in the picture (no ROM token is drawn for it) and the picture is drawn without a fault', J(b));
+    await hubNo(hub);
     for (const bad of [{ k: 'chal' }, { k: 'chal', to: 'nobody', name: 'x' }, { k: 'dec', why: 'rude' }, { k: 'chal', name: 'N', rec: [1, 2, 3] }]) await inject(raw, { t: 'arenaopen', v: 1, s: '00000000000000b3', to: sid, r: '00000000000000b4', ...bad });
     await sleep(500);
-    ok(!(await dialogOn(hub)) && hub.errors.length === 0, 'G2 malformed challenges open nothing and raise no error', J(hub.errors).slice(0, 200));
+    ok(!(await hubAsked(hub)) && hub.errors.length === 0, 'G2 malformed challenges ask nothing and raise no error', J(hub.errors).slice(0, 200));
     await inject(raw, { t: 'arenaopen', v: 1, k: 'chal', s: '00000000000000b5', to: sid, r: '00000000000000b6', name: 'NoKey' });
     await sleep(500);
-    ok(!(await dialogOn(hub)) && hub.errors.length === 0, 'G3 a challenge with no one-time key (an old client, or a forger) opens no dialog: there would be no private way to answer it', J(hub.errors).slice(0, 200));
+    ok(!(await hubAsked(hub)) && hub.errors.length === 0, 'G3 a challenge with no one-time key (an old client, or a forger) asks nothing: there would be no private way to answer it', J(hub.errors).slice(0, 200));
   });
 
   // H: the switch on a phone
@@ -1872,7 +1914,7 @@ async function uiAx(p, sel) {
   return { name: n.name ? n.name.value : null, role: n.role ? n.role.value : null, pressed: prop('pressed') };
 }
 const UI_PADI = { a: 0, b: 1, up: 12, down: 13, left: 14, right: 15 };
-const UI_KEYS = { x: ['x', 'KeyX', 88], backspace: ['Backspace', 'Backspace', 8], escape: ['Escape', 'Escape', 27], z: ['z', 'KeyZ', 90], enter: ['Enter', 'Enter', 13], right: ['ArrowRight', 'ArrowRight', 39] };
+const UI_KEYS = { x: ['x', 'KeyX', 88], backspace: ['Backspace', 'Backspace', 8], escape: ['Escape', 'Escape', 27], z: ['z', 'KeyZ', 90], enter: ['Enter', 'Enter', 13], right: ['ArrowRight', 'ArrowRight', 39], up: ['ArrowUp', 'ArrowUp', 38], down: ['ArrowDown', 'ArrowDown', 40] };
 const uiPad = (p, n, ms = 120) => p.eval(`window.__padTap(${UI_PADI[n]}, ${ms})`);
 const uiKey = (p, n, hold = 70) => p.press(UI_KEYS[n][0], UI_KEYS[n][1], UI_KEYS[n][2], hold);
 // Enter WITH its character: without `text` Chrome does not activate a focused button from a synthetic key event
@@ -1921,29 +1963,35 @@ async function uiKeys(c) {
     await uiFront(hub); await hub.eval('window.__padConnect()'); await sleep(250);
     await hub.eval('(() => { window.__bPress = 0; window.__arenaHub.input.on("action", (e) => { if (e.action === "b" && e.pressed) window.__bPress++; }); })()');
     const sid = await uiSid(hub);
+    // (the page stays where it is whatever is answered: a build in which B ACCEPTS must fail these cases by what the challenger is told, not by the page leaving under the rig)
+    await hub.eval('(() => { window.__navTo = []; window.__arenaNavigate = (u) => { window.__navTo.push(u); }; return true; })()');
     const routes = [['UK1', 'gamepad B', () => uiPad(hub, 'b')], ['UK2', 'the X key', () => uiKey(hub, 'x')], ['UK3', 'Backspace', () => uiKey(hub, 'backspace')], ['UK4', 'Escape', () => uiKey(hub, 'escape')]];
     for (const [id, label, press] of routes) {
       const q = await uiChal(raw, sid);
-      const shown = await uiUntil(hub, UI_DLG());
-      const before = shown ? await hub.eval('({ focus: document.activeElement && document.activeElement.id, close: document.getElementById("chDecline").hasAttribute("data-nav-close"), paused: window.__arenaHub.dialogOpen() })') : null;
+      const shown = await uiUntil(hub, HUB_Q_ARMED());
+      const before = shown ? await hub.eval('(() => { const H = window.__arenaHub; H.press("a"); const d = H.dialog.current(); return { page: d.page, on: d.choice.options[d.choice.cursor], last: d.choice.cursor === d.choice.options.length - 1, asked: H.dialog.isOpen(), panel: H.dialogOpen(), dom: document.querySelectorAll("#challenge").length }; })()') : null;
       await press();
-      const closed = await uiUntil(hub, uiDlgGone(), 3000);
+      const closed = await uiUntil(hub, HUB_Q_GONE(), 3000);
       await sleep(150);
-      const after = await hub.eval('({ paused: window.__arenaHub.dialogOpen(), held: window.__arenaHub.input.isDown("b"), n: window.__bPress, canvasFocus: document.activeElement === window.__arenaHub.canvas })');
-      await uiKey(hub, 'x'); await sleep(120);            // B is alive: a fresh press must still be heard (a B held for good by a stray synthetic Escape swallows every later one)
+      const after = await hub.eval('({ asked: window.__arenaHub.dialog.isOpen(), held: window.__arenaHub.input.isDown("b"), n: window.__bPress, canvasFocus: document.activeElement === window.__arenaHub.canvas, went: window.__navTo.length })');
+      await uiKey(hub, 'x'); await sleep(120);            // B is alive: a fresh press must still be heard (a B left held swallows every later one)
       const alive = await hub.eval('({ n: window.__bPress, held: window.__arenaHub.input.isDown("b") })');
       const told = await uiTold(raw, q);
-      ok(shown && before.focus === 'chDecline' && before.close && before.paused === true && closed && after.paused === false && after.held === false && alive.n === after.n + 1 && alive.held === false && told.includes('declined'),
-        id + ' ' + label + ' declines the challenge: the dialog closes, the hub is live again, the challenger is told Not now, and B is not left held', J({ before, closed, after, alive, told }));
+      ok(shown && before.on === 'NO' && before.last && before.asked === true && before.panel === false && before.dom === 0 && closed && after.asked === false && after.went === 0 && after.held === false && alive.n === after.n + 1 && alive.held === false && told.includes('declined'),
+        id + ' ' + label + ' answers NO to the challenge: the question closes, the hub is live again, the challenger is told no, nobody goes anywhere, and B is not left held', J({ before, closed, after, alive, told }));
       if (id === 'UK1') await shot(hub, 'U_keys_after_decline');
     }
-    // a click on Not now (the mouse), and the module's own Escape fallback for an input layer that did not start
+    // a click on NO (the mouse): a click on the text turns the page, a click on the NO row answers. Then the DOM dialog's own Escape fallback for an input layer that did not start (the battle page's dialog)
     const q5 = await uiChal(raw, sid);
-    await uiUntil(hub, UI_DLG());
+    await uiUntil(hub, HUB_Q_ARMED());
     await shot(hub, 'U_dialog_desktop');
-    const p5 = await uiCenter(hub, '#chDecline');
-    await hub.click(p5.x, p5.y);
-    ok(await uiUntil(hub, uiDlgGone(), 3000) && (await uiTold(raw, q5)).includes('declined'), 'UK5 a mouse click on Not now declines it', J(await uiTold(raw, q5)));
+    const txt = await hubPoint(hub, 100, 132);
+    await hub.click(txt.x, txt.y);
+    await sleep(150);
+    const p5 = await hubOption(hub, 1);
+    await shot(hub, 'U_dialog_desktop_options');
+    if (p5) await hub.click(p5.x, p5.y);
+    ok(!!p5 && p5.n === 2 && await uiUntil(hub, HUB_Q_GONE(), 3000) && (await uiTold(raw, q5)).includes('declined') && (await hub.eval('window.__navTo.length')) === 0, 'UK5 a mouse click on the text turns the page and a click on NO answers no', J([p5, await uiTold(raw, q5)]));
     const fb = await hub.eval(`(async () => {
       const m = await import('/pokemonarena/js/presence_boot.js'); let declined = 0, closed = 0;
       const d = m.mountDialog({ doc: document, win: window, input: null, enableDomNav: null, ids: { root: 'tstDlg', title: 'tstT', text: 'tstX', sub: 'tstS', ok: 'tstOk', cancel: 'tstNo', flag: 'tstdlg' }, heading: 'T', okLabel: 'OK', cancelLabel: 'No', inertMs: 0, onCancel: () => { declined++; }, onClose: () => { closed++; } });
@@ -1966,118 +2014,177 @@ async function uiAccept(c) {
     await uiWatcher(raw, c.origin);
     await uiFront(hub); await hub.eval('window.__padConnect()'); await sleep(250);
     const sid = await uiSid(hub);
-    const t0 = await hub.eval('performance.now()');
+    // (the page stays where it is while the first cases run: a build in which a stray press ACCEPTS must fail them by name, not by the page leaving under the rig)
+    await hub.eval('(() => { window.__navTo = []; window.__arenaNavigate = (u) => { window.__navTo.push(u); }; return true; })()');
+    // inside the first 600 ms: the question does not listen. The pad's A, Up and A again (the whole way to YES) land in its first moments and do nothing; the clock is read from inside the page,
+    // from the frame the question is first seen to the frame it starts to listen
+    await hub.eval(`(() => { window.__q = { seen: 0, armed: 0, log: [] }; const tick = () => { const d = window.__arenaHub.dialog.current(), q = window.__q; if (d && d.id === 'presence:challenge') { if (!q.seen) q.seen = performance.now(); if (d.armed && !q.armed) q.armed = performance.now(); } if (!q.stop) requestAnimationFrame(tick); }; requestAnimationFrame(tick); return true; })()`);
     const q1 = await uiChal(raw, sid);
-    await uiUntil(hub, UI_DLG());
-    // inside the first 600 ms: Accept is disabled, the pad's Right cannot reach it, and a press of "click" does nothing
-    const w = await hub.eval(`(async () => { const a = document.getElementById('chAccept'); const r = { disabled: a.disabled, focus0: document.activeElement.id }; await window.__padTap(15, 60); r.focus1 = document.activeElement.id; a.click(); r.open = !document.getElementById('challenge').hidden; r.elapsed = performance.now() - ${t0}; return r; })()`);
-    ok(w.disabled === true && w.focus0 === 'chDecline' && w.focus1 === 'chDecline' && w.open === true && w.elapsed < 600, 'UA1 Accept is inert (disabled) for its first 600 ms: the pad cannot focus it and a click on it does nothing', J(w));
-    await sleep(750);
-    const woke = await hub.eval('document.getElementById("chAccept").disabled');
-    ok(woke === false, 'UA2 and it wakes up after that', String(woke));
-    await hub.eval('document.getElementById("chDecline").click()');
-    await uiUntil(hub, uiDlgGone(), 3000);
-    // a key held since BEFORE the dialog appeared keeps repeating towards Accept once it is awake: the focus drifts onto it, and neither Z nor Enter may take it
-    await uiKeyEdge(hub, 'right', 'keyDown'); await sleep(250);
+    const w = await hub.eval(`(async () => { const H = window.__arenaHub, q = window.__q; const t0 = performance.now(); while (!q.seen && performance.now() - t0 < 8000) await new Promise((r) => setTimeout(r, 5));
+      const r = { seen: !!q.seen, armed0: H.dialog.current().armed, cursorShown: null }; await window.__padTap(0, 40); await window.__padTap(12, 40); await window.__padTap(0, 40);
+      const d = H.dialog.current(); r.open = !!d && d.id === 'presence:challenge'; r.page = d ? d.page : null; r.elapsed = performance.now() - q.seen; r.armedAfter = d ? d.armed : null; r.went = window.__navTo.length; return r; })()`);
+    ok(w.seen && w.armed0 === false && w.open === true && w.page === 0 && w.went === 0 && w.elapsed < 600, 'UA1 YES is inert for the first 600 ms: A, Up and A again in the question\'s first moments turn no page and answer nothing', J(w));
+    const woke = await uiUntil(hub, 'window.__q.armed > 0', 5000);
+    const took = await hub.eval('Math.round(window.__q.armed - window.__q.seen)');
+    ok(woke && took >= 450 && took <= 1500, 'UA2 and it starts to listen after that (measured: ' + took + ' ms after it was first drawn; 36 frames is 603 ms)', String(took));
+    await hub.eval('(window.__q.stop = true)');
+    await uiKey(hub, 'x');
+    await uiUntil(hub, HUB_Q_GONE(), 3000);
+    // a key held since BEFORE the question appeared keeps repeating once the question listens: the highlight must not drift onto YES, and Z must then answer NO
+    await hub.eval('(() => { window.__reps = 0; window.__arenaHub.input.on("action", (e) => { if (e.pressed && e.repeat && e.action === "up") window.__reps++; }); return true; })()');
+    await uiKeyEdge(hub, 'up', 'keyDown'); await sleep(250);
     const q2 = await uiChal(raw, sid);
-    await uiUntil(hub, UI_DLG());
-    const drifted = await uiUntil(hub, 'document.activeElement && document.activeElement.id === "chAccept"', 6000);
-    await uiKey(hub, 'z'); await sleep(300); await uiEnter(hub); await sleep(400);
-    const still = await hub.eval('(() => { const d = document.getElementById("challenge"); return { open: !!d && !d.hidden, path: location.pathname }; })()');
-    ok(drifted && still.open && still.path === '/pokemonarena/', 'UA3 the focus drifted onto Accept by a held key repeating: Z and Enter do not accept (the rig reached the state: ' + drifted + ')', J(still));
-    // let go, press Right afresh (a decision), then A: it goes
-    await uiKeyEdge(hub, 'right', 'keyUp'); await sleep(200);
-    await uiKey(hub, 'right'); await sleep(200);
+    await uiUntil(hub, HUB_Q_ARMED());
+    await uiKey(hub, 'z'); await sleep(120);                     // (a fresh A: the page with the options; Up is still held and repeating)
+    const reps0 = await hub.eval('window.__reps');
+    const drift = await hub.eval(`(async () => { const H = window.__arenaHub, seen = new Set(); const t0 = performance.now(); let page = null; while (performance.now() - t0 < 900) { const d = H.dialog.current(); if (d && d.choice) { seen.add(d.choice.options[d.choice.cursor]); page = d.page; } await new Promise((r) => setTimeout(r, 15)); } return { seen: [...seen], page, reps: window.__reps }; })()`);
+    await uiKey(hub, 'z');
+    const gone3 = await uiUntil(hub, HUB_Q_GONE(), 3000);
+    await sleep(200);
+    const told3 = await uiTold(raw, q2), went3 = await hub.eval('window.__navTo.length');
+    ok(drift.page === 1 && drift.reps - reps0 >= 4 && J(drift.seen) === J(['NO']) && gone3 && told3.includes('declined') && went3 === 0,
+      'UA3 a direction held since before the question appeared keeps repeating (' + (drift.reps - reps0) + ' repeats while the options were up): the highlight never leaves NO, and Z then answers NO, not YES', J({ drift, told3, went3 }));
+    await uiKeyEdge(hub, 'up', 'keyUp'); await sleep(200);
+    // a FRESH press on the d-pad (a decision), then A: it goes, so the guard that holds above is not simply "never"
+    await hub.eval('(delete window.__arenaNavigate, true)');
+    const q4 = await uiChal(raw, sid);
+    await uiUntil(hub, HUB_Q_ARMED());
+    await uiKey(hub, 'z'); await sleep(150);
+    await uiKey(hub, 'up'); await sleep(150);
+    const onYes = (await hubQ(hub)) || {};
     await uiKey(hub, 'z');
     const went = await uiUntil(hub, 'location.pathname === "/pokemonarena/battle.html"', 20000);
     const u = went ? new URL(await hub.eval('location.href')) : null;
-    ok(went && u.searchParams.get('auto') === 'host' && u.searchParams.get('for') === q2.s && u.searchParams.get('rq') === q2.r, 'UA4 a fresh press on Accept and then A does accept, and takes the player to the challenger\'s battle', u ? u.search : 'no navigation');
+    ok(onYes.on === 'YES' && went && u.searchParams.get('auto') === 'host' && u.searchParams.get('for') === q4.s && u.searchParams.get('rq') === q4.r, 'UA4 a fresh press onto YES and then A does accept, and takes the player to the challenger\'s battle', u ? u.search : 'no navigation ' + J(onYes));
   });
 }
 
-// ---- UA5 / UA6: the same drift guard with the challenge STACKED over another dialog. The Controls dialog and the Sound panel subscribed to the input layer before the challenge existed, so THEIR navigation
-// moves the focus first, and a guard that looked at where the focus was when the press reached it saw "already on Accept" and never armed (hold Right, a challenge arrives over Controls, Z carried the player off).
+// ---- UA5 / UA6: the same guard when the challenge arrives while ANOTHER DIALOG IS OPEN with a direction held. The Controls dialog and the Sound panel are DOM: a question in the picture would be under
+// them, so it WAITS (hub_presence.js) and appears when the panel closes, with the key still held and repeating. Its repeats must not drift the highlight onto YES, and A must then answer NO.
 async function uiDrift(c) {
   const { ok } = c;
   await withBrowser({ port: c.cdp(1), width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (hub) => {
     const raw = await hub.openTab({ width: 900, height: 760 });
     await uiWatcher(raw, c.origin);
     const stacks = [
-      ['UA5', 'the Controls dialog', 'window.__arenaHub.openControls()', '!document.getElementById("controlsDialog").hidden && window.__arenaHub.dialogOpen()', 'true'],
-      // the Sound panel opens with its Master SLIDER focused, and the input layer leaves arrow keys to a slider (they are its own), so Right would never be "held" there: the key goes down on a button
-      ['UA6', 'the Sound panel', 'document.getElementById("soundBtn").click()', '(() => { const e = document.querySelector(".arena-snd"); return !!e && !e.hidden && window.__arenaHub.dialogOpen(); })()', 'document.querySelector(".arena-snd [data-snd=mute]").focus()'],
+      ['UA5', 'the Controls dialog', 'window.__arenaHub.openControls()', '!document.getElementById("controlsDialog").hidden && window.__arenaHub.dialogOpen()', 'true', 'window.__arenaHub.closeControls()'],
+      // the Sound panel opens with its Master SLIDER focused, and the input layer leaves arrow keys to a slider (they are its own), so a direction would never be "held" there: the key goes down on a button
+      ['UA6', 'the Sound panel', 'document.getElementById("soundBtn").click()', '(() => { const e = document.querySelector(".arena-snd"); return !!e && !e.hidden && window.__arenaHub.dialogOpen(); })()', 'document.querySelector(".arena-snd [data-snd=mute]").focus()', 'window.__arenaSound.closePanel()'],
     ];
-    for (const [id, label, open, isOpen, prep] of stacks) {
-      await uiHubOn(hub, c.origin);                          // a fresh hub each time: the Accept at the end of a round leaves the page
+    for (const [id, label, open, isOpen, prep, close] of stacks) {
+      await uiHubOn(hub, c.origin);                          // a fresh hub each time: the YES at the end of a round leaves the page
       await uiFront(hub);
       const sid = await uiSid(hub);
+      await hub.eval('(() => { window.__navTo = []; window.__arenaNavigate = (u) => { window.__navTo.push(u); }; window.__reps = 0; window.__arenaHub.input.on("action", (e) => { if (e.pressed && e.repeat && e.action === "up") window.__reps++; }); return true; })()');
       await hub.eval(open);
       const up = await uiUntil(hub, isOpen);
       await hub.eval(prep);
-      await uiKeyEdge(hub, 'right', 'keyDown'); await sleep(300);          // Right is held BEFORE the challenge exists; the dialog under it is navigating with it
-      const held = await hub.eval('window.__arenaHub.input.isDown("right")');
+      await uiKeyEdge(hub, 'up', 'keyDown'); await sleep(300);          // Up is held BEFORE the challenge exists; the dialog that is open is navigating with it
+      const held = await hub.eval('window.__arenaHub.input.isDown("up")');
       const q = await uiChal(raw, sid, 'Stacked');
-      await uiUntil(hub, UI_DLG());
-      const drifted = await uiUntil(hub, 'document.activeElement && document.activeElement.id === "chAccept"', 6000);
-      await uiKey(hub, 'z'); await sleep(300); await uiEnter(hub); await sleep(400);
-      const still = await hub.eval('(() => { const d = document.getElementById("challenge"); return { open: !!d && !d.hidden, path: location.pathname }; })()');
-      ok(up && held && drifted && still.open && still.path === '/pokemonarena/', id + ' a challenge over ' + label + ': the focus drifted onto Accept by a held key repeating, and Z and Enter do not accept (the rig reached the state: ' + J({ up, held, drifted }) + ')', J(still));
-      // let go, press Right afresh (a decision), then A: it goes, so the guard that holds here is not simply "never"
-      await uiKeyEdge(hub, 'right', 'keyUp'); await sleep(200);
-      await uiKey(hub, 'right'); await sleep(200);
+      const waited = await uiUntil(hub, 'window.__arenaHub.presence.state().challenge === "waiting"', 6000) && !(await hubAsked(hub));
+      await hub.eval(close);
+      const shown = await uiUntil(hub, HUB_Q_ARMED(), 6000);
+      await uiKey(hub, 'z'); await sleep(120);                 // a fresh A: the page with the options; Up is still held and repeating
+      const reps0 = await hub.eval('window.__reps');
+      const drift = await hub.eval(`(async () => { const H = window.__arenaHub, seen = new Set(); const t0 = performance.now(); let page = null; while (performance.now() - t0 < 900) { const d = H.dialog.current(); if (d && d.choice) { seen.add(d.choice.options[d.choice.cursor]); page = d.page; } await new Promise((r) => setTimeout(r, 15)); } return { seen: [...seen], page, reps: window.__reps }; })()`);
+      await uiKey(hub, 'z');
+      const gone = await uiUntil(hub, HUB_Q_GONE(), 3000);
+      await sleep(200);
+      const told = await uiTold(raw, q), went0 = await hub.eval('window.__navTo.length');
+      ok(up && held && waited && shown && drift.page === 1 && drift.reps - reps0 >= 4 && J(drift.seen) === J(['NO']) && gone && told.includes('declined') && went0 === 0,
+        id + ' a challenge that arrived over ' + label + ' with a direction held: it waited, appeared when the panel closed, the held key\'s repeats (' + (drift.reps - reps0) + ') never moved the highlight off NO, and Z answered NO (the rig reached the state: ' + J({ up, held, waited, shown }) + ')', J({ drift, told, went0 }));
+      // let go, press Up afresh (a decision), then A: it goes, so the guard that holds here is not simply "never"
+      await uiKeyEdge(hub, 'up', 'keyUp'); await sleep(200);
+      await hub.eval('(delete window.__arenaNavigate, true)');
+      const q2 = await uiChal(raw, sid, 'Again');
+      await uiUntil(hub, HUB_Q_ARMED(), 6000);
+      await uiKey(hub, 'z'); await sleep(150);
+      await uiKey(hub, 'up'); await sleep(150);
       await uiKey(hub, 'z');
       const went = await uiUntil(hub, 'location.pathname === "/pokemonarena/battle.html"', 20000);
       const u = went ? new URL(await hub.eval('location.href')) : null;
-      ok(went && u.searchParams.get('rq') === q.r, id + 'b and over ' + label + ' a fresh press on Accept and then A does accept', u ? u.search : 'no navigation');
+      ok(went && u.searchParams.get('rq') === q2.r, id + 'b and after ' + label + ' a fresh press onto YES and then A does accept', u ? u.search : 'no navigation');
     }
   });
 }
 
-// ---- US: the challenge over the Controls dialog and over the Sound panel (the page's pause state is a SET of owners, and the challenge is the top of the stack)
+// ---- US: a challenge that arrives while the Controls dialog or the Sound panel is open. Those are DOM panels and the question is in the picture, UNDER them, where it could be neither read nor
+// answered: so it WAITS, and appears when the last panel has closed (the page's "a panel is up" state is a SET of owners: closing one of two does not let the question out)
 async function uiStack(c) {
   const { ok } = c;
   await withBrowser({ port: c.cdp(2), width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (hub) => {
     await hub.send('Page.addScriptToEvaluateOnNewDocument', { source: UI_PAD_INIT });
     const raw = await hub.openTab({ width: 900, height: 760 });
-    await uiHubOn(hub, c.origin);
+    await uiHubOn(hub, c.origin, '&openchal=60000');
     await uiWatcher(raw, c.origin);
     await uiFront(hub); await hub.eval('window.__padConnect()'); await sleep(250);
     const sid = await uiSid(hub);
     const cursor = () => hub.eval('window.__arenaHub.view().menu.cursor');
+    const CTL_UP = '!document.getElementById("controlsDialog").hidden && window.__arenaHub.dialogOpen()';
+    const SND_UP = '(() => { const e = document.querySelector(".arena-snd"); return !!e && !e.hidden && window.__arenaHub.dialogOpen(); })()';
+    const waiting = () => hub.eval('(() => { const H = window.__arenaHub; return { state: H.presence.state().challenge, drawn: !!H.view().dialog, asked: H.dialog.isOpen(), dom: document.querySelectorAll("#challenge").length, panel: H.dialogOpen() }; })()');
     // Controls first
     await hub.eval('window.__arenaHub.openControls()');
-    await uiUntil(hub, '!document.getElementById("controlsDialog").hidden && window.__arenaHub.dialogOpen()');
-    await uiChal(raw, sid);
-    const shown = await uiUntil(hub, UI_DLG());
-    const top1 = await hub.eval(`({ top: ${UI_TOP_AT('#chDecline')}, focus: document.activeElement && document.activeElement.id, zc: Number(getComputedStyle(document.getElementById('challenge')).zIndex), zk: Number(getComputedStyle(document.getElementById('controlsDialog')).zIndex) })`);
-    ok(shown && top1.top === 'chDecline' && top1.focus === 'chDecline' && top1.zc > top1.zk, 'US1 a challenge over the open Controls dialog is on top of it and has the focus', J(top1));
-    await shot(hub, 'U_challenge_over_controls');
+    await uiUntil(hub, CTL_UP);
+    const q1 = await uiChal(raw, sid, 'Under');
+    const held = await uiUntil(hub, 'window.__arenaHub.presence.state().challenge === "waiting"', 6000);
+    await sleep(900);                                    // (longer than the arm delay: a question that had been drawn under the dialog would be listening by now)
+    const w1 = await waiting();
+    const top1 = await hub.eval('({ ctl: !document.getElementById("controlsDialog").hidden, focusIn: document.getElementById("controlsDialog").contains(document.activeElement) })');
+    ok(held && w1.state === 'waiting' && w1.drawn === false && w1.asked === false && w1.dom === 0 && w1.panel === true && top1.ctl && (await uiTold(raw, q1)).length === 0,
+      'US1 a challenge that arrives while the Controls dialog is open WAITS: nothing is drawn under the dialog (in the picture or in the page), nothing is answered, and Controls is still up', J({ w1, top1 }));
+    await shot(hub, 'U_challenge_waits_behind_controls');
+    // a second panel over the first, and it closes again: the question must still wait (Controls is still up)
     const c0 = await cursor();
-    await uiPad(hub, 'b');
-    const closed = await uiUntil(hub, uiDlgGone(), 3000); await sleep(200);
-    const aft = await hub.eval('({ ctlHidden: document.getElementById("controlsDialog").hidden, paused: window.__arenaHub.dialogOpen(), canvas: document.activeElement === window.__arenaHub.canvas })');
-    ok(closed && aft.ctlHidden === false && aft.paused === true && aft.canvas === false, 'US2 Not now over Controls closes only the challenge: Controls is still up, the page is still paused, the canvas did not take the focus', J(aft));
+    await hub.eval('document.getElementById("soundBtn").click()');
+    const both = await uiUntil(hub, SND_UP + ' && ' + CTL_UP, 4000);
+    await hub.eval('window.__arenaSound.closePanel()');
+    await uiUntil(hub, 'document.querySelector(".arena-snd").hidden', 3000); await sleep(300);
+    const w2 = await waiting();
+    ok(both && w2.panel === true && w2.state === 'waiting' && w2.drawn === false && w2.asked === false, 'US2 closing ONE of two open panels (the Sound panel over Controls) leaves the page paused and the question waiting: Controls is still up', J(w2));
     await uiPad(hub, 'down'); await uiPad(hub, 'down');
     ok((await cursor()) === c0, 'US3 and the hub menu behind the Controls dialog did not move when the pad pressed Down', J([c0, await cursor()]));
     await uiPad(hub, 'b');
-    const ctlClosed = await uiUntil(hub, 'document.getElementById("controlsDialog").hidden && !window.__arenaHub.dialogOpen()', 3000); await sleep(200);
-    await uiPad(hub, 'down');
-    ok(ctlClosed && (await cursor()) !== c0, 'US4 closing Controls gives the hub back (Down moves its menu again)', J([c0, await cursor()]));
-    // the Sound panel, built AFTER the challenge dialog exists (the old z-index tie: the later one in the document painted on top)
-    await hub.eval('document.getElementById("soundBtn").click()');
-    await uiUntil(hub, '(() => { const e = document.querySelector(".arena-snd"); return !!e && !e.hidden && window.__arenaHub.dialogOpen(); })()');
-    await uiChal(raw, sid);
-    const shown2 = await uiUntil(hub, UI_DLG());
-    const top2 = await hub.eval(`({ top: ${UI_TOP_AT('#chDecline')}, focus: document.activeElement && document.activeElement.id, zc: Number(getComputedStyle(document.getElementById('challenge')).zIndex), zs: Number(getComputedStyle(document.querySelector('.arena-snd')).zIndex), last: document.body.lastElementChild.id || document.body.lastElementChild.className })`);
-    ok(shown2 && top2.top === 'chDecline' && top2.focus === 'chDecline' && top2.zc > top2.zs, 'US5 a challenge over the Sound panel (built after the dialog) is on top of it, has the focus, and the nav belongs to it', J(top2));
+    const ctlClosed = await uiUntil(hub, 'document.getElementById("controlsDialog").hidden && !window.__arenaHub.dialogOpen()', 3000);
+    const appeared = await uiUntil(hub, HUB_Q(), 3000);
+    const fresh = appeared ? await hubQ(hub) : null;
+    const listens = await uiUntil(hub, HUB_Q_ARMED(), 4000);
+    ok(ctlClosed && appeared && /^Under wants to battle you\.$/.test(fresh.text) && fresh.page === 0 && listens, 'US4 when Controls closes the question APPEARS in the picture (from its first page), and then listens', J(fresh));
+    await shot(hub, 'U_challenge_after_controls');
     await uiPad(hub, 'b');
-    const closed2 = await uiUntil(hub, uiDlgGone(), 3000); await sleep(200);
-    const aft2 = await hub.eval('({ snd: !document.querySelector(".arena-snd").hidden, paused: window.__arenaHub.dialogOpen() })');
-    ok(closed2 && aft2.snd === true && aft2.paused === true, 'US6 Not now over the Sound panel closes only the challenge: the panel is still up and the page still paused', J(aft2));
+    const closed = await uiUntil(hub, HUB_Q_GONE(), 3000); await sleep(200);
+    await uiPad(hub, 'down');
+    ok(closed && (await uiTold(raw, q1)).includes('declined') && (await cursor()) !== c0, 'US4b B answers it NO, and the hub is back (Down moves its menu again)', J([await uiTold(raw, q1), c0, await cursor()]));
+    // the Sound panel
+    await hub.eval('document.getElementById("soundBtn").click()');
+    await uiUntil(hub, SND_UP);
+    const q2 = await uiChal(raw, sid, 'Sound');
+    const held2 = await uiUntil(hub, 'window.__arenaHub.presence.state().challenge === "waiting"', 6000);
+    await sleep(900);
+    const w5 = await waiting();
+    ok(held2 && w5.state === 'waiting' && w5.drawn === false && w5.asked === false && w5.dom === 0 && !(await hub.eval('document.querySelector(".arena-snd").hidden')), 'US5 a challenge that arrives while the Sound panel is open waits as well', J(w5));
     await uiPad(hub, 'b');
     const sndClosed = await uiUntil(hub, 'document.querySelector(".arena-snd").hidden && !window.__arenaHub.dialogOpen()', 3000);
-    ok(sndClosed, 'US7 and B then closes the Sound panel and the page is live again', J(await hub.eval('({ snd: !document.querySelector(".arena-snd").hidden, paused: window.__arenaHub.dialogOpen() })')));
-    ok(uiErrs(hub, raw).length === 0, 'US8 no page errors', J(uiErrs(hub, raw)).slice(0, 300));
+    const appeared2 = await uiUntil(hub, HUB_Q_ARMED(), 4000);
+    ok(sndClosed && appeared2 && /^Sound wants to battle you\.$/.test((await hubQ(hub)).text), 'US6 B closes the Sound panel (only the panel: the question was not there to hear it), and then the question appears and listens', J(await hubQ(hub)));
+    await uiPad(hub, 'b');
+    const closed2 = await uiUntil(hub, HUB_Q_GONE(), 3000);
+    ok(closed2 && (await uiTold(raw, q2)).includes('declined') && (await hub.eval('window.__arenaHub.dialog.isOpen() || window.__arenaHub.dialogOpen()')) === false, 'US7 and B then answers it NO: the page is live again', J(await uiTold(raw, q2)));
+    // a panel that opens OVER a question that is up: the question comes out of the picture, and is back when the panel closes
+    const q3 = await uiChal(raw, sid, 'Over');
+    await uiUntil(hub, HUB_Q_ARMED(), 6000);
+    await hub.eval('window.__arenaHub.openControls()');
+    await uiUntil(hub, CTL_UP);
+    const w8 = await waiting();
+    await hub.eval('window.__arenaHub.closeControls()');
+    const back = await uiUntil(hub, HUB_Q(), 3000);
+    const b8 = back ? await hubQ(hub) : null;
+    ok(w8.state === 'waiting' && w8.drawn === false && back && b8.armed === false && b8.page === 0 && /^Over /.test(b8.text), 'US9 a panel opened over a question that is up takes it out of the picture, and it is back (not yet listening) when the panel closes', J({ w8, b8 }));
+    await uiUntil(hub, HUB_Q_ARMED(), 4000);
+    await uiPad(hub, 'b');
+    await uiUntil(hub, HUB_Q_GONE(), 3000);
+    ok((await uiTold(raw, q3)).includes('declined') && uiErrs(hub, raw).length === 0, 'US8 it is answered as usual, and there were no page errors', J(uiErrs(hub, raw)).slice(0, 300));
   });
 }
 
@@ -2158,30 +2265,40 @@ async function uiRefresh(c) {
     await hub.eval('(() => { const e = new Event("pageshow"); e.persisted = true; window.dispatchEvent(e); return true; })()');
     const sid2 = await uiUntil(hub, 'window.__arenaPresence.isOn() && window.__arenaPresence.presence', 8000) ? await uiSid(hub) : null;
     ok(down && sid2 && await uiUntil(w, `window.__live[${J(sid2)}] && window.__live[${J(sid2)}].name === 'NEWER'`, 8000), 'UR2 a restore from the back/forward cache lists again under the current name', J({ down, live: await uiLive(w) }));
-    // challenges across an off/on cycle and a re-mount: exactly one dialog in the document, and its aria references point at it
+    // challenges across an off/on cycle: exactly ONE question in the picture (nothing queued behind it, no DOM dialog), and it names the current challenger
+    await uiFront(hub);
     const q1 = await uiChal(w, sid2, 'First');
-    await uiUntil(hub, UI_DLG());
-    await hub.eval('document.getElementById("chDecline").click()');
-    await uiUntil(hub, uiDlgGone(), 3000);
+    await uiUntil(hub, HUB_Q_ARMED());
+    await hubNo(hub);
+    await uiUntil(hub, HUB_Q_GONE(), 3000);
     await hub.eval('window.__arenaPresence.setOn(false)'); await hub.eval('window.__arenaPresence.setOn(true)');
     await uiUntil(hub, 'window.__arenaPresence.presence', 8000);
     const sid3 = await uiSid(hub);
     await uiChal(w, sid3, 'Second');
+    await uiUntil(hub, HUB_Q_ARMED());
+    const one = await hub.eval('(() => { const H = window.__arenaHub; return { queued: H.model.state().dialog.queued.length, open: H.model.state().dialog.open, says: H.view().dialog.lines.filter(Boolean).join(" "), dom: document.querySelectorAll("#challenge, #chText, #openInfo").length, state: H.presence.state().challenge }; })()');
+    ok(one.queued === 0 && one.open === 'presence:challenge' && one.dom === 0 && one.state === 'shown' && /^Second wants to battle you\.$/.test(one.says), 'UR3 after the switch went off and on there is ONE question in the picture (nothing queued behind it, no DOM dialog in the page), and it names the current challenger', J(one));
+    await hubNo(hub);
+    await uiUntil(hub, HUB_Q_GONE(), 3000);
+    // THE DOM DIALOGS OF presence_boot.js (what a page that injects nothing gets: a battle against the CPU). Mounting the module by hand on this page, with no dialogs handed in, disposes the hub's own
+    // mount and asks in a DOM dialog; mounting it AGAIN disposes the first of those: still ONE dialog in the document, not two
+    await hub.eval(`(async () => {
+      const m = await import('/pokemonarena/js/presence_boot.js'), n = await import('/pokemonarena/js/uinav.js'), H = window.__arenaHub;
+      window.__mountDom = () => m.mountPresence({ win: window, doc: document, pack: H.pack, input: H.input, enableDomNav: n.enableDomNav, navigate: () => {}, button: document.getElementById('openToggle') });
+      window.__mountDom();
+      return true; })()`);
+    await uiUntil(hub, 'window.__arenaPresence.isOn() && window.__arenaPresence.presence', 8000);
+    await uiChal(w, await uiSid(hub), 'Pre');
     await uiUntil(hub, UI_DLG());
-    const one = await hub.eval('({ roots: document.querySelectorAll("#challenge").length, texts: document.querySelectorAll("#chText").length, titles: document.querySelectorAll("#chTitle").length, says: document.getElementById(document.getElementById("challenge").getAttribute("aria-describedby")).textContent })');
-    ok(one.roots === 1 && one.texts === 1 && one.titles === 1 && /^Second/.test(one.says), 'UR3 after the switch went off and on there is ONE challenge dialog, and aria-describedby reads the current challenger', J(one));
+    const pre = await hub.eval('({ roots: document.querySelectorAll("#challenge").length, says: (document.getElementById("chText") || {}).textContent, picture: window.__arenaHub.dialog.isOpen() })');
     await hub.eval('document.getElementById("chDecline").click()');
     await uiUntil(hub, uiDlgGone(), 3000);
-    // mounting the module AGAIN on the same page (a second mount) disposes the first: still one dialog, not two
-    const re = await hub.eval(`(async () => {
-      const m = await import('/pokemonarena/js/presence_boot.js'), n = await import('/pokemonarena/js/uinav.js'), H = window.__arenaHub;
-      m.mountPresence({ win: window, doc: document, pack: H.pack, input: H.input, enableDomNav: n.enableDomNav, navigate: () => {}, button: document.getElementById('openToggle') });
-      return { roots: document.querySelectorAll('#challenge').length }; })()`);
+    const re = await hub.eval('(() => { window.__mountDom(); return { roots: document.querySelectorAll("#challenge").length }; })()');
     await uiUntil(hub, 'window.__arenaPresence.isOn() && window.__arenaPresence.presence', 8000);
     await uiChal(w, await uiSid(hub), 'Third');
     await uiUntil(hub, UI_DLG());
     const two = await hub.eval('({ roots: document.querySelectorAll("#challenge").length, says: document.getElementById("chText").textContent })');
-    ok(re.roots <= 1 && two.roots === 1 && /^Third/.test(two.says), 'UR4 a second mount on the same page leaves ONE challenge dialog (the first mount\'s is removed with it)', J({ re, two }));
+    ok(pre.roots === 1 && /^Pre/.test(pre.says) && pre.picture === false && re.roots <= 1 && two.roots === 1 && /^Third/.test(two.says), 'UR4 a mount with no dialogs handed in asks in the DOM dialog (not in the picture), and a second such mount on the same page leaves ONE challenge dialog (the first mount\'s is removed with it)', J({ pre, re, two }));
     await hub.eval('document.getElementById("chDecline").click()');
     await uiUntil(hub, uiDlgGone(), 3000);
     // dispose: no dialog, no listing, and the switch is inert again
@@ -2285,23 +2402,26 @@ async function uiDisclosure(c) {
     await uiHubReady(hub);
     await uiWatcher(w, c.origin);
     await uiFront(hub); await hub.eval('window.__padConnect()'); await sleep(250);
-    const state = () => hub.eval('({ on: window.__arenaPresence.isOn(), stored: localStorage.getItem("arena.open"), seen: localStorage.getItem("arena.open.seen"), paused: window.__arenaHub.dialogOpen(), shown: !!document.getElementById("openInfo") && !document.getElementById("openInfo").hidden })');
+    const state = () => hub.eval('({ on: window.__arenaPresence.isOn(), stored: localStorage.getItem("arena.open"), seen: localStorage.getItem("arena.open.seen"), paused: window.__arenaHub.dialog.isOpen() || window.__arenaHub.dialogOpen(), shown: (() => { const d = window.__arenaHub.dialog.current(); return !!d && d.id === "presence:disclosure"; })(), board: !!window.__arenaPresence.lobbies })');
     const pt = await uiCenter(hub, '#openToggle');
     await hub.click(pt.x, pt.y);
-    const shown = await uiUntil(hub, UI_DLG('openInfo'), 3000);
-    const d = shown ? await hub.eval('({ text: document.getElementById("oiText").textContent + " " + document.getElementById("oiSub").textContent, focus: document.activeElement && document.activeElement.id, ok: document.getElementById("oiOk").textContent, cancel: document.getElementById("oiCancel").textContent, role: document.getElementById("openInfo").getAttribute("role"), close: document.getElementById("oiCancel").hasAttribute("data-nav-close") })') : null;
+    const shown = await uiUntil(hub, HUB_Q(HQ_DISC), 3000);
     const s1 = await state();
-    ok(shown && /trainer name/.test(d.text) && /online record/.test(d.text) && /public servers/.test(d.text) && d.focus === 'oiCancel' && d.ok === 'OK' && d.cancel === 'Cancel' && d.role === 'alertdialog' && d.close && s1.on === false && s1.stored === null && s1.paused === true,
-      'UD1 the first press on the switch shows what is published (trainer name, online record, public servers) with Cancel focused, and nothing is published yet', J({ d, s1 }));
     await shot(hub, 'U_disclosure');
+    const d0 = shown ? await hubQ(hub) : null;
+    const pages = shown ? await hubQPages(hub) : [];
+    const d = shown ? await hubQ(hub) : null, text = pages.join(' ');
+    ok(shown && d0.page === 0 && d0.armed === true && /trainer name/.test(text) && /online record/.test(text) && /public servers/.test(text) && pages.length >= 3 && /\?$/.test(pages[pages.length - 1]) && J(d.options) === J(['YES', 'NO']) && d.on === 'NO' && d.last && d.dom === 0 && s1.on === false && s1.stored === null && s1.board === false && s1.paused === true && (await uiLive(w)).length === 0,
+      'UD1 the first press on the switch asks IN THE PICTURE: message pages that say what is published (trainer name, online record, public servers), ending in a question with YES / NO and NO highlighted; nothing is published yet', J({ d, s1, pages }).slice(0, 900));
+    await shot(hub, 'U_disclosure_question');
     await uiPad(hub, 'b');
-    ok(await uiUntil(hub, uiDlgGone('openInfo'), 3000) && (await state()).on === false && (await state()).seen === null && (await state()).paused === false, 'UD2 Cancel (the pad\'s B) leaves the switch off, remembers nothing, and gives the page back', J(await state()));
+    ok(await uiUntil(hub, HUB_Q_GONE(HQ_DISC), 3000) && (await state()).on === false && (await state()).seen === null && (await state()).paused === false && (await state()).board === false, 'UD2 NO (the pad\'s B) leaves the switch off, remembers nothing, publishes nothing, and gives the page back', J(await state()));
     const pt2 = await uiCenter(hub, '#openToggle');
     await hub.click(pt2.x, pt2.y);
-    ok(await uiUntil(hub, UI_DLG('openInfo'), 3000), 'UD3 it asks again next time (Cancel is not remembered)', '');
-    const okp = await uiCenter(hub, '#oiOk');
-    await hub.click(okp.x, okp.y);
-    ok(await uiUntil(hub, 'window.__arenaPresence.isOn() && window.__arenaPresence.presence', 15000), 'UD4 OK switches it on', J(await state()));
+    const asked2 = await uiUntil(hub, HUB_Q(HQ_DISC), 3000);
+    ok(asked2 && (await hubQ(hub)).page === 0, 'UD3 it asks again next time, from its first page (NO is not remembered)', '');
+    await hubYes(hub);
+    ok(await uiUntil(hub, 'window.__arenaPresence.isOn() && window.__arenaPresence.presence', 15000), 'UD4 YES switches it on', J(await state()));
     const s4 = await state();
     ok(s4.stored === '1' && s4.seen === '1' && s4.shown === false && s4.paused === false && (await uiUntil(w, 'Object.keys(window.__live).length === 1', 6000)), 'UD5 and remembers that the player was told, and the listing is on the board', J({ s4, live: await uiLive(w) }));
     // off, on: not asked again
@@ -2372,24 +2492,32 @@ async function uiTouch(c) {
     await uiWatcher(w, c.origin);
     await uiFront(hub);
     const sid = await uiSid(hub);
+    // (the hub's clock is held while the challenge arrives, so the taps of UT2 certainly land in the question's first moments)
+    await hub.eval('(window.__arenaHub.pause(true), true)');
     const q1 = await uiChal(w, sid);
-    await uiUntil(hub, UI_DLG());
-    const lay = await hub.eval(`(() => { const r = (id) => document.getElementById(id).getBoundingClientRect(); const d = document.querySelector('#challenge .dlg').getBoundingClientRect(); return { l: d.left, r: d.right, t: d.top, b: d.bottom, vw: innerWidth, vh: innerHeight, nowH: r('chDecline').height, nowW: r('chDecline').width, accH: r('chAccept').height, accW: r('chAccept').width, over: document.documentElement.scrollWidth - document.documentElement.clientWidth }; })()`);
-    ok(lay.l >= 0 && lay.r <= lay.vw && lay.t >= 0 && lay.b <= lay.vh && lay.nowH >= 44 && lay.nowW >= 44 && lay.accH >= 44 && lay.accW >= 44 && lay.over <= 0, 'UT1 on a 390 px phone the dialog fits and both buttons are at least 44 css px', J(lay));
+    await uiUntil(hub, HUB_Q());
+    const tapText = async () => { const t = await hubPoint(hub, 110, 134); await hub.tap(t.x, t.y); };          // (the point is read at each tap: the first touch lays the on-screen pad out, which moves the picture)
+    await tapText(); await sleep(600);
+    await tapText(); await sleep(150);
+    const inert = await hub.eval('(() => { const d = window.__arenaHub.dialog.current(); return { open: !!d && d.id === "presence:challenge", page: d ? d.page : null, armed: d ? d.armed : null, path: location.pathname }; })()');
+    ok(inert.open && inert.page === 0 && inert.armed === false && inert.path === '/pokemonarena/' && (await uiTold(w, q1)).length === 0, 'UT2 taps on the question in its first moments do nothing (no page is turned, nothing is answered)', J(inert));
+    await hub.eval('(window.__arenaHub.pause(false), true)');
+    await uiUntil(hub, HUB_Q_ARMED(), 5000);
+    await tapText(); await sleep(200);                // a tap on the text turns the page: the options are up
+    const yes = await hubOption(hub, 0), no = await hubOption(hub, 1);
+    const lay = await hub.eval(`(() => { const c = window.__arenaHub.canvas.getBoundingClientRect(), d = window.__arenaHub.dialog.current(); return { l: c.left, r: c.right, t: c.top, b: c.bottom, vw: innerWidth, vh: innerHeight, page: d ? d.page : null, dom: document.querySelectorAll('#challenge, .arena-chal').length, over: document.documentElement.scrollWidth - document.documentElement.clientWidth, padB: (() => { const e = document.getElementById('bB'); if (!e) return null; const q = e.getBoundingClientRect(); return { w: q.width, h: q.height, shown: q.width > 0 && getComputedStyle(e).visibility !== 'hidden' }; })() }; })()`);
+    ok(lay.page === 1 && lay.dom === 0 && lay.l >= 0 && lay.r <= lay.vw + 0.5 && lay.t >= 0 && lay.b <= lay.vh + 0.5 && lay.over <= 0 && !!yes && !!no && yes.n === 2 && no.y > yes.y && no.x >= lay.l && no.x <= lay.r && no.y >= lay.t && no.y <= lay.b && no.h >= 20 && no.w >= 44 && !!lay.padB && lay.padB.shown && lay.padB.h >= 44 && lay.padB.w >= 44,
+      'UT1 on a 390 px phone the question is in the picture, the picture fits the screen, YES and NO are separate rows that can be tapped (' + (no ? Math.round(no.w) + ' x ' + Math.round(no.h) : '?') + ' css px each), and the on-screen B button (NO) is at least 44 css px', J({ lay, yes, no }));
     await shot(hub, 'U_dialog_phone');
-    const acc = await uiCenter(hub, '#chAccept');
-    await hub.tap(acc.x, acc.y); await sleep(150);
-    const inert = await hub.eval('({ open: !document.getElementById("challenge").hidden, path: location.pathname })');
-    ok(inert.open && inert.path === '/pokemonarena/', 'UT2 a tap on Accept in the first moments does nothing', J(inert));
-    const no = await uiCenter(hub, '#chDecline');
-    await hub.tap(no.x, no.y);
-    ok(await uiUntil(hub, uiDlgGone(), 3000) && (await uiTold(w, q1)).includes('declined'), 'UT3 a tap on Not now declines it', J(await uiTold(w, q1)));
+    if (no) await hub.tap(no.x, no.y);
+    ok(await uiUntil(hub, HUB_Q_GONE(), 3000) && (await uiTold(w, q1)).includes('declined'), 'UT3 a tap on NO answers no', J(await uiTold(w, q1)));
     const q2 = await uiChal(w, sid);
-    await uiUntil(hub, UI_DLG()); await sleep(750);
-    const acc2 = await uiCenter(hub, '#chAccept');
-    await hub.tap(acc2.x, acc2.y);
+    await uiUntil(hub, HUB_Q_ARMED(), 5000);
+    await tapText(); await sleep(200);
+    const yes2 = await hubOption(hub, 0);
+    if (yes2) await hub.tap(yes2.x, yes2.y);
     const went = await uiUntil(hub, 'location.pathname === "/pokemonarena/battle.html"', 20000);
-    ok(went && new URL(await hub.eval('location.href')).searchParams.get('rq') === q2.r, 'UT4 a tap on Accept once it is awake accepts', went ? '' : 'no navigation');
+    ok(went && new URL(await hub.eval('location.href')).searchParams.get('rq') === q2.r, 'UT4 a tap on YES once the question listens accepts', went ? '' : 'no navigation');
   });
 }
 
@@ -2534,13 +2662,13 @@ async function uiHidden(c) {
 
 // every defect below must fail the NAMED case; the session that holds it is run against a copy of the game with only that defect in it
 const UI_MUTANTS = [
-  { id: 'M01', what: 'Not now loses data-nav-close (B / Esc / X / Backspace no longer decline)', file: 'js/presence_boot.js', from: 'data-nav-default data-nav-close>', to: 'data-nav-default>', run: 'keys', fails: 'UK1' },
+  { id: 'M01', what: 'the answer to a question in the picture never reaches the presence service (B closes the question, and nobody is told no)', file: 'js/boot.js', from: "      else if (eff.type === 'dialog' && hook.presence) hook.presence.answer(eff);", to: "      else if (eff.type === 'dialog' && false) hook.presence.answer(eff);", run: 'keys', fails: 'UK1' },
   { id: 'M02', what: 'the Escape fallback of a dialog with no input layer is gone', file: 'js/presence_boot.js', from: "if (open && e.key === 'Escape' && !nav)", to: "if (open && e.key === 'Escape' && false)", run: 'keys', fails: 'UK6' },
-  { id: 'M03', what: 'Accept is not disabled for its first 600 ms', file: 'js/presence_boot.js', from: 'inert = inertMs > 0; ok.disabled = inert;', to: 'inert = inertMs > 0; ok.disabled = false;', run: 'accept', fails: 'UA1' },
-  { id: 'M04', what: 'a button the focus only drifted onto accepts', file: 'js/presence_boot.js', from: 'if (viaRepeat && e.detail === 0) return;', to: '', run: 'accept', fails: 'UA3' },
-  { id: 'M05', what: 'the challenge z-index drops under the other dialogs', file: 'js/presence_boot.js', from: 'inset: 0; z-index: 3100;', to: 'inset: 0; z-index: 1;', run: 'stack', fails: 'US1' },
-  { id: 'M06', what: 'the challenge is not moved to the end of the document when it is shown', file: 'js/presence_boot.js', from: 'if (el.parentNode !== body || el.nextElementSibling) body.appendChild(el);', to: '', run: 'stack', fails: 'US5' },
-  { id: 'M07', what: 'the hub\'s pause state is one boolean again', file: 'js/boot.js', from: 'dialogOpen = dlgOwners.size > 0;', to: 'dialogOpen = !!v;', run: 'stack', fails: 'US2' },
+  { id: 'M03', what: 'the question listens at once (no arm delay): the A on its way to the menu underneath answers it', file: 'js/hub_presence.js', from: 'armTicks: a.arm || a.waited ? DIALOG_ARM_TICKS : 0 });', to: 'armTicks: 0 });', run: 'accept', fails: 'UA1' },
+  { id: 'M04', what: 'the page tells the picture that the repeat of a held direction is a fresh press (the highlight drifts onto YES)', file: 'js/boot.js', from: 'const info = { repeat: !!e.repeat };', to: 'const info = { repeat: false };', run: 'accept', fails: 'UA3' },
+  { id: 'M05', what: 'a question is put into the picture while a DOM panel covers it', file: 'js/hub_presence.js', from: "    if (panelOpen()) { a.waited = true; emit(); return; }\n", to: '', run: 'stack', fails: 'US1' },
+  { id: 'M06', what: 'the presence service is not told when a DOM panel opens or closes (a question that waited never appears)', file: 'js/boot.js', from: ' if (hook.presence) hook.presence.panels(); };', to: ' };', run: 'stack', fails: 'US4' },
+  { id: 'M07', what: 'the hub\'s "a panel is up" state is one boolean again (closing one of two panels lets the question out under the other)', file: 'js/boot.js', from: 'dialogOpen = dlgOwners.size > 0;', to: 'dialogOpen = !!v;', run: 'stack', fails: 'US2' },
   { id: 'M08', what: 'the battle page\'s pause state is one boolean again', file: 'js/battle_boot.js', from: 'controlsOpen = pauseOwners.size > 0;', to: 'controlsOpen = !!v;', run: 'cross', fails: 'UB2' },
   { id: 'M09', what: 'no storage listener (another tab\'s switch is not followed)', file: 'js/presence_boot.js', from: "listen(win, 'storage', onStorage);", to: '', run: 'cross', fails: 'UX1' },
   { id: 'M10', what: 'the listing is not refreshed when the tab becomes visible', file: 'js/presence_boot.js', from: "listen(doc, 'visibilitychange', () => { if (!doc.hidden) refresh(); });", to: '', run: 'refresh', fails: 'UR1' },
@@ -2555,7 +2683,7 @@ const UI_MUTANTS = [
   { id: 'M18', what: 'the switch is visible before the module has mounted', file: 'arena.css', from: '#openToggle:not([data-presence="ready"]) { visibility: hidden; }', to: '', run: 'hidden', fails: 'UH1' },
   { id: 'M20', what: 'the hub switch\'s name changes with its state again (no constant aria-label)', file: 'js/presence_boot.js', from: "button.setAttribute('aria-label', OPEN_LABEL);", to: '', also: [{ file: 'index.html', from: ' aria-label="Open to battles" title=', to: ' title=' }], run: 'words', fails: 'UN1' },
   { id: 'M21', what: 'the battle page\'s Open button changes its name with its state again (no constant aria-label)', file: 'js/presence_boot.js', from: "button.setAttribute('aria-label', OPEN_LABEL);", to: '', also: [{ file: 'battle.html', from: ' aria-label="Open to battles" hidden title=', to: ' hidden title=' }], run: 'battlebtn', fails: 'UN2' },
-  { id: 'M22', what: 'the drift guard reads the focus at the moment of the press (the old way): a dialog under the challenge has already moved it', file: 'js/presence_boot.js', from: 'function watchFocus(ev) {', to: 'function watchFocus(ev) { const had = doc.activeElement === ok;', also: [{ file: 'js/presence_boot.js', from: 'arrived = there && !wasOnOk;', to: 'arrived = there && !had;' }], run: 'drift', fails: 'UA5' },
+  { id: 'M22', what: 'the dialog layer takes the repeats of a held direction as steps (a key held since before the question drifts the highlight onto YES)', file: 'js/hub_dialog.js', from: "    if (info && info.repeat) return [];\n", to: '', run: 'drift', fails: 'UA5' },
   { id: 'M23', what: 'the off-state tooltip names only the trainer name', file: 'js/presence_boot.js', from: 'list your trainer name and online record on public servers so anyone using Play online can challenge you', to: 'list your trainer name on public servers so anyone using Play online can challenge you', run: 'words', fails: 'UW1' },
   { id: 'M24', what: 'the live-region message names only the trainer name', file: 'js/presence_boot.js', from: "const ON_SAYS = 'Open to battles. Your trainer name and online record are listed for anyone using Play online.';", to: "const ON_SAYS = 'Open to battles. Your trainer name is listed for anyone using Play online.';", run: 'words', fails: 'UW2' },
   { id: 'M25', what: 'RESET RECORD in the hub does not tell the listing', file: 'js/boot.js', from: 'if (hook.presence) hook.presence.refresh().catch(', to: 'if (false) hook.presence.refresh().catch(', run: 'record', fails: 'UQ1' },
@@ -2937,7 +3065,7 @@ const UX_MUTANTS = [
   { id: 'X10', what: 'a name the panel filled in is remembered as the player\'s', file: 'js/online.js', from: 'if (nameTouched) { try { win.localStorage.setItem(LS_NAME, name); }', to: 'if (true) { try { win.localStorage.setItem(LS_NAME, name); }', run: 'names', fails: 'OXN1' },
   { id: 'X11', what: 'a name the player typed is not remembered', file: 'js/online.js', from: 'if (nameTouched) { try { win.localStorage.setItem(LS_NAME, name); }', to: 'if (false) { try { win.localStorage.setItem(LS_NAME, name); }', run: 'names', fails: 'OXN3' },
   { id: 'X12', what: 'a remembered name is replaced when the team changes', file: 'js/online.js', from: 'nameTouched = !!saved;', to: 'nameTouched = false;', run: 'names', fails: 'OXN3b' },
-  { id: 'X13', what: 'the pre-selected team\'s owner does not name the player', file: 'js/online.js', from: 'ui.team.value = choices[0].key;\n    nameFollowsTeam();', to: 'ui.team.value = choices[0].key;', run: 'names', fails: 'OXN4' },
+  { id: 'X13', what: 'the pre-selected team\'s owner does not name the player', file: 'js/online.js', from: 'ui.team.value = pre.teamKey;\n    nameFollowsTeam();', to: 'ui.team.value = pre.teamKey;', run: 'names', fails: 'OXN4' },
   { id: 'X14', what: 'a challenge from the panel carries the previous attempt\'s record (state.rec), not this one\'s', file: 'js/online.js', from: 'rec: p.rec || null, now, timing', to: 'rec: state.rec || null, now, timing', run: 'rec', fails: 'OXP1' },
   { id: 'X15', what: 'a random team reads the active profile\'s record (and opens the store for it)', file: 'js/online.js', from: 'profileId: choice.profileId || null, rec: tc.rec || null };', to: 'profileId: choice.profileId || null, rec: tc.rec || (await (async () => { const s = await openStore(); try { return await onlineRecOf(s, await s.getActiveId()); } finally { await s.close(); } })()) };', run: 'rec', fails: 'OXI1' },
   { id: 'X16', what: 'the match record keeps no profile', file: 'js/online.js', from: 'myName: state.name, profileId: state.profileId || null, admittedId:', to: 'myName: state.name, admittedId:', run: 'resume', fails: 'OXM1' },
@@ -2988,6 +3116,195 @@ async function groupOnlineUx(S) {
   console.log(`onlineux mutants: ${killed}/${ran} killed`);
 }
 
+/* ---------------------------------------------------------------------------------------------- tokens: what the HUB hands to the battle page (pokemonarena/INAPP.md "Contract 1" and "Contract 2")
+ * All choosing happens in the hub's picture, and the battle is another page. Two things cross: a one-time START TOKEN in this tab's sessionStorage (js/presence.js writeStartToken: INVITE A FRIEND,
+ * BATTLE ANYONE, OPEN THE ROOM), which makes the battle page start BY ITSELF what the player pressed in the hub; and the ONLINE PREFERENCES in localStorage (js/online_prefs.js: the team and the size),
+ * which the battle page pre-selects. An address alone still starts nothing.
+ *   node tools/pokemonarena_online_page_test.mjs tokens             the cases (TK: the three starts, each with its token and not without; TP: the preferences)
+ *   node tools/pokemonarena_online_page_test.mjs tokens --mutants   ... and a copy of the game with ONE defect at a time, each of which must fail the case it names (ARENA_TK=start,prefs picks sessions) */
+async function groupTokens(S) {
+  ANIM = '&anim=0';
+  const mk = (origin, okFn) => ({ origin, ok: okFn, cdp: (k) => CDP0 + 30 + (k % 2) });
+  const run = async (name, c) => { try { await TK_SESSIONS[name](c); } catch (e) { c.ok(false, 'TK ' + name + ' session crashed', e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : String(e)); } };
+  const wanted = (process.env.ARENA_TK || '').split(',').filter(Boolean);
+  for (const name of Object.keys(TK_SESSIONS)) if (!wanted.length || wanted.includes(name)) await run(name, mk(ORIGIN, ok));
+  if (!process.argv.includes('--mutants')) return;
+  if (REMOTE) { ok(true, 'TKMUT (skipped against a deployed site)'); return; }
+  const { copyTree, mutateFile, startOverlay } = await import('./pokemonarena_overlay.mjs');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'arena-tokens-mut-'));
+  let killed = 0, ran = 0;
+  try {
+    for (const mu of TOKEN_MUTANTS) {
+      if (wanted.length && !wanted.includes(mu.run)) continue;
+      const failed = [];
+      const rec = (cond, name, detail) => { if (!cond) failed.push(name + (detail ? ' :: ' + String(detail).slice(0, 160) : '')); };
+      ran++;
+      const dir = copyTree(path.join(root, 'pokemonarena'), path.join(tmp, mu.id));
+      let ov = null;
+      try {
+        try { mutateFile(dir, mu.file, mu.from, mu.to); } catch (e) { ok(false, 'TKMUT ' + mu.id + ' could not be applied', e.message); continue; }
+        ov = await startOverlay({ dir, port: PORT + 12, upstream: ORIGIN });
+        await run(mu.run, mk(ov.url, rec));
+      } finally { if (ov) ov.stop(); }
+      const hit = failed.find((f) => f.startsWith(mu.fails + ' '));
+      ok(!!hit, 'TKMUT ' + mu.id + ' (' + mu.what + ') fails ' + mu.fails, hit ? '' : 'it did NOT: failed cases = ' + J(failed.map((f) => f.slice(0, 60))));
+      if (hit) killed++;
+    }
+  } finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_e) { /* ignore */ } }
+  console.log(`tokens mutants: ${killed}/${ran} killed`);
+}
+const TK_SETTLED = 'window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "online" && (() => { const g = document.getElementById("olGo"); return !!g && (!g.disabled || window.__arenaOnline.state.stage !== "setup"); })()';
+const TK_VIEW = '(() => { const O = window.__arenaOnline, st = O.state, code = document.getElementById("olCode"); return { stage: st.stage, role: st.role, room: st.room, open: !!st.open, quick: !!st.quick, tok: sessionStorage.getItem("arena.go"), search: location.search, go: document.getElementById("olGo").textContent, code: code.hidden ? null : code.textContent.trim(), status: document.getElementById("olStatus").textContent, prompt: !!document.getElementById("npApprove"), hosting: O.lobbies() ? !!O.lobbies().hosting() : false }; })()';
+
+// ---- TK: the START token. Each of the three starts happens by itself WITH its token on its own address, and does not without it, with a stale one, or on another kind of address
+async function tkStart(c) {
+  const { ok } = c;
+  const PAGE = c.origin + '/pokemonarena/battle.html', BLANK = c.origin + '/pokemonarena/input.css';
+  await withBrowser({ port: c.cdp(0), width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (a) => {
+    const guest = await a.openTab({ width: 900, height: 760 });
+    const spy = await a.openTab({ width: 900, height: 760 });
+    await spy.navigate(BLANK);
+    await spy.eval('(() => { window.__spy = []; const ch = new BroadcastChannel("bemental-arena-open-1"); ch.onmessage = (e) => window.__spy.push(e.data); window.__spyCh = ch; return true; })()');
+    const listed = async (room) => (await spied(spy)).filter((m) => m && m.k === 'open' && (room ? m.room === room : !/^H/.test(m.room)));
+    // the tab's sessionStorage is written from a same-origin page that is not the battle page, the way the hub writes it just before it navigates. tok: an object (stamped `ageMs` ago), a raw string, or null
+    const arrive = async (tok, query, ageMs = 0) => {
+      await a.navigate(BLANK);
+      await a.eval('(() => { sessionStorage.clear(); ' + (tok === null ? '' : typeof tok === 'string' ? 'sessionStorage.setItem("arena.go", ' + J(tok) + ');' : 'sessionStorage.setItem("arena.go", JSON.stringify(Object.assign(' + J(tok) + ', { at: Date.now() - (' + ageMs + ') })));') + ' return true; })()');
+      await a.navigate(PAGE + '?' + query + '&net=local&anim=0');
+      await a.waitFor(TK_SETTLED, { timeoutMs: 90000 });
+    };
+    const view = () => a.eval(TK_VIEW);
+    const nothing = async (ms = 2500) => { await sleep(ms); const v = await view(); return { v, none: v.stage === 'setup' && !v.code && !v.hosting && v.tok === null }; };
+    let prompted = false;
+
+    // { host } on the plain page: a friend's private room, by itself
+    await arrive({ what: 'host' }, 'online=1');
+    const opened = await a.waitFor('window.__arenaOnline.state.stage === "open" && !document.getElementById("olCode").hidden', { timeoutMs: 30000 }).then(() => true, () => false);
+    const v1 = await view(), u1 = new URLSearchParams(v1.search);
+    ok(opened && v1.role === 'host' && /^[A-Z0-9]{4,8}$/.test(v1.room || '') && v1.code === v1.room && v1.open === false && v1.quick === false && u1.get('np') === v1.room && u1.get('host') === '1' && u1.get('online') === null && (await listed(v1.room)).length === 0,
+      'TK1 with the hub\'s START token { host } the plain ?online=1 page OPENS A FRIEND\'S PRIVATE ROOM BY ITSELF, as pressing Get an invite link does: the room is open, its code is on the screen, the address names it, and it is not listed', J(v1));
+    ok(v1.tok === null, 'TK2 the token was used up by the page that took it', J(v1.tok));
+    if (opened) {
+      await guest.navigate(PAGE + '?np=' + v1.room + '&join=1&net=local&anim=0');
+      await guest.waitFor(TK_SETTLED, { timeoutMs: 90000 });
+      await fillAndGo(guest, { name: 'Bob', team: 'random' });
+      const r = await bothPlaying(a, guest, 60000, a);
+      prompted = prompted || r.prompted;
+      ok(r.phases[0] === 'playing' && r.phases[1] === 'playing' && !r.prompted, 'TK1b and a friend who opens its invite link joins it: the battle starts, and nobody presses Allow', J(r));
+      await guest.navigate('about:blank');
+    }
+    // a RELOAD of a page a token started: an ordinary room page, nothing starts again
+    await arrive({ what: 'host' }, 'online=1');
+    await a.waitFor('window.__arenaOnline.state.stage === "open"', { timeoutMs: 30000 }).catch(() => {});
+    const before = await view();
+    await a.send('Page.reload', { ignoreCache: false });
+    await a.waitFor(TK_SETTLED, { timeoutMs: 90000 });
+    const re = await nothing();
+    ok(before.stage === 'open' && re.none && re.v.role === 'host' && re.v.room === before.room && /Open the room/.test(re.v.go), 'TK4 a RELOAD of the page a token started is the ordinary page of that room (Open the room): nothing starts again, the token was good once', J(re.v));
+    // no token: the page it always was
+    const heard0 = (await listed()).length;
+    await arrive(null, 'online=1');
+    const n3 = await nothing();
+    ok(n3.none && !n3.v.room && /Get an invite link/.test(n3.v.go) && (await listed()).length === heard0, 'TK3 AN ADDRESS ALONE STARTS NOTHING: the same ?online=1 with no token is the Play online page it always was (no room, nothing listed)', J(n3.v));
+    // { quick } on the plain page: Find an opponent, by itself
+    await arrive({ what: 'quick' }, 'online=1&openquick=500');
+    const found = await a.waitFor('window.__arenaOnline.state.stage === "open" && window.__arenaOnline.state.quick === true', { timeoutMs: 30000 }).then(() => true, () => false);
+    const v5 = await view();
+    const onBoard = found && await (async () => { for (let i = 0; i < 40; i++) { if ((await listed(v5.room)).some((m) => m.q === 1)) return true; await sleep(150); } return false; })();
+    ok(found && v5.open === true && v5.quick === true && v5.hosting === true && v5.tok === null && onBoard, 'TK5 with { quick } the plain page FINDS AN OPPONENT BY ITSELF, as pressing Find an opponent does: nobody was waiting, so a game is opened and listed for anyone', J(v5));
+    await a.navigate('about:blank'); await sleep(300);
+    // { host, room } on that room's own address: Open the room, by itself
+    await arrive({ what: 'host', room: 'AXYZ1' }, 'np=AXYZ1&host=1');
+    const named = await a.waitFor('window.__arenaOnline.state.stage === "open" && !document.getElementById("olCode").hidden', { timeoutMs: 30000 }).then(() => true, () => false);
+    const v6 = await view();
+    ok(named && v6.role === 'host' && v6.room === 'AXYZ1' && v6.code === 'AXYZ1' && v6.open === false && v6.tok === null, 'TK6 with { host, room } the room\'s own address (?np=ROOM&host=1) OPENS THAT ROOM BY ITSELF, as pressing Open the room does', J(v6));
+    // a token on an address that is not its own: nothing starts (and the token is gone all the same)
+    for (const [tok, query, label] of [
+      [{ what: 'host', room: 'AXYZ1' }, 'np=AXYZ2&host=1', 'a token for ANOTHER room'],
+      [{ what: 'host' }, 'np=AXYZ3&host=1', 'a { host } token that names no room, on a room\'s address'],
+      [{ what: 'host', room: 'AXYZ4' }, 'online=1', 'a room\'s token on the plain page'],
+      [{ what: 'quick' }, 'np=AXYZ5&host=1', 'a { quick } token on a room\'s address'],
+      [{ what: 'host', room: 'AXYZ6' }, 'np=AXYZ6&join=1', 'a host token on the room\'s JOIN address'],
+    ]) {
+      await arrive(tok, query);
+      const x = await nothing(2000);
+      ok(x.none, 'TK7 ' + label + ' starts nothing (and is gone)', J(x.v));
+    }
+    // a token that is not fresh, or not a token
+    for (const [tok, age, label] of [[{ what: 'host' }, 61000, 'a token a minute old'], [{ what: 'quick' }, -60000, 'a token dated in the future'], ['{"what":"host"', 0, 'a malformed token'], [{ what: 'join' }, 0, 'a token that names no known start']]) {
+      await arrive(tok, 'online=1', age);
+      const x = await nothing(2000);
+      ok(x.none && !x.v.room, 'TK8 ' + label + ' starts nothing (and is gone)', J(x.v));
+    }
+    // an accepted-challenge address with no accept token is the ordinary panel with its notice; a START token does not turn it into a room
+    await arrive({ what: 'host' }, 'online=1&auto=host&for=' + 'ab'.repeat(8) + '&rq=' + 'cd'.repeat(8) + '&format=3v3');
+    const x9 = await nothing();
+    ok(x9.none && !x9.v.room && /ignored/.test(x9.v.status), 'TK9 a START token does not make an accepted-challenge address host anything: the ordinary panel with its notice', J(x9.v));
+    ok(uiErrs(a, guest).length === 0 && !prompted && !(await view()).prompt, 'TK10 no page errors, and the library\'s Allow prompt never appeared', J(uiErrs(a, guest)).slice(0, 300));
+  });
+}
+
+// ---- TP: the online preferences. The battle page pre-selects the preferred team and size, falls back to what it did before when the team is gone, and an accepted challenge plays with the preferred team
+async function tkPrefs(c) {
+  const { ok } = c;
+  const PAGE = c.origin + '/pokemonarena/battle.html', BLANK = c.origin + '/pokemonarena/input.css';
+  await withBrowser({ port: c.cdp(1), width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (a) => {
+    await a.navigate(PAGE + '?online=1&net=local&anim=0');
+    await a.waitFor(TK_SETTLED, { timeoutMs: 90000 });
+    const seeded = await a.eval(SEED_PROFILES_JS([['RED', [['ALPHA', ['Pikachu', 'Charizard', 'Snorlax', 'Blastoise', 'Gengar', 'Eevee']], ['BETA', ['Pikachu', 'Charizard', 'Snorlax']]]]]));
+    const pid = seeded.profiles[0].id, [tA, tB] = seeded.profiles[0].teams;
+    const keyA = 'saved:' + pid + ':' + tA, keyB = 'saved:' + pid + ':' + tB;
+    const setPrefs = (prefs) => a.eval('(() => { ' + (prefs ? 'localStorage.setItem("arena.online.team", ' + J(J(prefs)) + ')' : 'localStorage.removeItem("arena.online.team")') + '; return true; })()');
+    const panel = async (prefs, query = 'online=1') => {
+      await setPrefs(prefs);
+      await a.navigate(PAGE + '?' + query + '&net=local&anim=0');
+      await a.waitFor(TK_SETTLED, { timeoutMs: 90000 });
+      return a.eval('({ team: document.getElementById("olTeam").value, fmt: document.getElementById("olFmt").value, name: document.getElementById("olName").value, keys: [...document.getElementById("olTeam").options].map((o) => o.value), stage: window.__arenaOnline.state.stage })');
+    };
+    const p0 = await panel(null);
+    ok(!seeded.notSaved && J(p0.keys.slice(0, 2)) === J([keyA, keyB]) && p0.team === keyA && p0.fmt === '6v6' && p0.stage === 'setup', 'TP0 (the rig, and the control) with no preference the page selects what it always did: the first saved team, 6 v 6 for a team of six', J(p0));
+    const p1 = await panel({ teamKey: keyB, fmt: null });
+    ok(p1.team === keyB && p1.fmt === '3v3' && p1.name === 'RED' && p1.stage === 'setup', 'TP1 the PREFERRED TEAM is pre-selected (and its default size, 3 v 3 for a team of three); nothing starts', J(p1));
+    const p2 = await panel({ teamKey: keyA, fmt: '3v3' });
+    ok(p2.team === keyA && p2.fmt === '3v3', 'TP2 the PREFERRED SIZE is pre-selected (3 v 3 for the team of six, where the page would have said 6 v 6)', J(p2));
+    const p3 = await panel({ teamKey: 'saved:' + pid + ':t_gone', fmt: '3v3' });
+    ok(p3.team === keyA && p3.fmt === '3v3', 'TP3 a preferred team that is GONE falls back to what the page did before (the first saved team); the preferred size still stands', J(p3));
+    const p4 = await panel({ teamKey: 'random', fmt: null });
+    ok(p4.team === 'random' && p4.fmt === '3v3', 'TP4 "a random team" can be the preference', J(p4));
+    const p5 = await panel({ teamKey: keyB, fmt: '6v6' }, 'online=1&format=3v3');
+    ok(p5.team === keyB && p5.fmt === '3v3', 'TP5 the address\'s format= comes before the preferred size', J(p5));
+    const p6 = await panel({ teamKey: keyB, fmt: '6v6' }, 'np=APREF&host=1');
+    ok(p6.team === keyB && p6.fmt === '6v6' && p6.stage === 'setup', 'TP6 a room\'s own page (the site lobby\'s hand-off) pre-selects them too, and starts nothing', J(p6));
+    // an accepted challenge plays with the preferred team: the accept token is what Accept leaves in the tab
+    const accepted = async (prefs) => {
+      await setPrefs(prefs);
+      await a.eval('(() => { sessionStorage.clear(); sessionStorage.setItem("arena.accept", JSON.stringify({ for: ' + J('ab'.repeat(8)) + ', rq: ' + J('cd'.repeat(8)) + ', ck: ' + J(PK_SHAPE) + ', at: Date.now() })); return true; })()');
+      await a.navigate(PAGE + '?online=1&auto=host&for=' + 'ab'.repeat(8) + '&rq=' + 'cd'.repeat(8) + '&format=3v3&net=local&anim=0');
+      const up = await a.waitFor('window.__arenaOnline && window.__arenaOnline.state.stage === "open"', { timeoutMs: 60000 }).then(() => true, () => false);
+      const st = await a.eval('(() => { const st = window.__arenaOnline.state; return { stage: st.stage, role: st.role, size: st.mine ? st.mine.size : null, profileId: st.profileId, fmt: st.fmt, invite: !!st.invite, team: document.getElementById("olTeam").value }; })()');
+      await a.navigate(BLANK); await sleep(300);          // (the room is closed by leaving the page, for a same-origin page: the next case writes this origin's storage)
+      return { up, ...st };
+    };
+    const a7 = await accepted({ teamKey: keyB, fmt: '6v6' });
+    ok(a7.up && a7.invite && a7.role === 'host' && a7.team === keyB && a7.size === 3 && a7.profileId === pid && a7.fmt === '3v3', 'TP7 THE PAGE AN ACCEPTED CHALLENGE OPENS PLAYS WITH THE PREFERRED TEAM (the team of three, not the first saved one), as that trainer, 3 v 3 as every accepted challenge is', J(a7));
+    const a8 = await accepted({ teamKey: 'saved:' + pid + ':t_gone', fmt: null });
+    ok(a8.up && a8.team === keyA && a8.size === 6 && a8.profileId === pid, 'TP8 ... and with a preferred team that is gone, the first saved team, as before', J(a8));
+    const a9 = await accepted(null);
+    ok(a9.up && a9.team === keyA && a9.size === 6, 'TP9 ... and with no preference, the first saved team, as before (the control)', J(a9));
+    ok(uiErrs(a).length === 0, 'TP10 no page errors', J(uiErrs(a)).slice(0, 300));
+  });
+}
+const TK_SESSIONS = { start: tkStart, prefs: tkPrefs };
+// every defect below must fail the NAMED case; the session that holds it is run against a copy of the game with only that defect in it
+const TOKEN_MUTANTS = [
+  { id: 'T01', what: 'the plain address opens a friend\'s room with or without a token', file: 'js/online.js', from: 'startTok = startPlan(takeStartToken(ss, Date.now()), cfg.query); }', to: "takeStartToken(ss, Date.now()); startTok = cfg.query.role === null && !cfg.query.room && !cfg.query.auto ? 'host' : null; }", run: 'start', fails: 'TK3' },
+  { id: 'T02', what: 'the hub\'s press is lost: the start token is never honoured', file: 'js/online.js', from: '    else if (startTok) { const what = startTok;', to: '    else if (false) { const what = startTok;', run: 'start', fails: 'TK1' },
+  { id: 'T03', what: 'a { quick } token opens a private room instead of finding an opponent', file: 'js/online.js', from: "if (what === 'quick') quick(); else if (what === 'room') go(); else startAs('host'); }", to: "if (what === 'room') go(); else startAs('host'); }", run: 'start', fails: 'TK5' },
+  { id: 'T04', what: 'the preferred team is not pre-selected', file: 'js/online.js', from: '    ui.team.value = pre.teamKey;\n    nameFollowsTeam();\n    ui.fmt.value = pre.fmt;\n', to: '    ui.team.value = choices[0].key;\n    nameFollowsTeam();\n    ui.fmt.value = pre.fmt;\n', run: 'prefs', fails: 'TP1' },
+  { id: 'T05', what: 'the preferred size is not pre-selected', file: 'js/online.js', from: '    ui.fmt.value = pre.fmt;\n', to: "    ui.fmt.value = cfg.formatParam === '6v6' ? '6v6' : cfg.formatParam === '3v3' ? '3v3' : (choices[0].size >= 6 ? '6v6' : '3v3');\n", run: 'prefs', fails: 'TP2' },
+  { id: 'T06', what: 'an accepted challenge plays with the first saved team whatever is preferred', file: 'js/online.js', from: "    setRole('host');\n    // the PROFILE speaks for the player here", to: "    setRole('host'); ui.team.value = state.choices[0].key;\n    // the PROFILE speaks for the player here", run: 'prefs', fails: 'TP7' },
+];
+
 /* ---------------------------------------------------------------------------------------------- case ids
  * A failure is named by its case id, so an id used by two groups names two different things (the open and presence groups once reused L, T, R, V, B and F, and B3 failing could mean either).
  * Every id belongs to ONE group; inside a group the same id may repeat (a loop makes one assertion for several inputs). This reads this very file, so it also holds when a subset of the groups is run. */
@@ -3011,7 +3328,7 @@ const started = await startServer();
 const S = await loadStack();
 const t0 = Date.now();
 checkCaseIds();
-const groups = { profile: groupProfile, hub: groupHub, lobby: groupLobby, match: groupMatch, leaving: groupLeaving, rejoin: groupRejoin, resume: groupResume, timeout: groupTimeout, easyjoin: groupEasyJoin, refusals: groupRefusals, teams: groupTeams, lead: groupLead, layout: groupLayout, open: async (S) => { if (!process.env.ARENA_OP) await groupOpen(S); await groupOpenSessions(S); }, openlayout: groupOpenLayout, presence: groupPresence, presenceui: groupPresenceUi, onlineux: groupOnlineUx };
+const groups = { profile: groupProfile, hub: groupHub, lobby: groupLobby, match: groupMatch, leaving: groupLeaving, rejoin: groupRejoin, resume: groupResume, timeout: groupTimeout, easyjoin: groupEasyJoin, refusals: groupRefusals, teams: groupTeams, lead: groupLead, layout: groupLayout, open: async (S) => { if (!process.env.ARENA_OP) await groupOpen(S); await groupOpenSessions(S); }, openlayout: groupOpenLayout, presence: groupPresence, presenceui: groupPresenceUi, onlineux: groupOnlineUx, tokens: groupTokens };
 let crashed = null;
 try {
   for (const [name, fn] of Object.entries(groups)) {

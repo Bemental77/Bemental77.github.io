@@ -91,10 +91,11 @@ async function main() {
   let model = null, screen = null, ui = null, pack = null, romBytes = null, store = null, touchPad = false, dialogOpen = false, errNav = null;
   const storage = (() => { try { return window.localStorage; } catch (_e) { return null; } })();
   const session = (() => { try { return window.sessionStorage; } catch (_e) { return null; } })();
-  // WHO holds the "a dialog is up" state (the hub ignores its own keys and pointer while it is true): the Sound panel, the Controls dialog, and the Open-to-battles dialogs can be up TOGETHER (a
-  // challenge arrives while Controls is open), so it is a SET of owners, not one boolean: closing one dialog never un-pauses the page behind another that is still open
+  // WHO holds the "a DOM panel is up" state (the hub ignores its own keys and pointer while it is true): the Sound panel, the Controls dialog and the audio bar's music list can be up TOGETHER,
+  // so it is a SET of owners, not one boolean: closing one never un-pauses the page behind another that is still open. (The OPEN TO BATTLES questions are not among them any more: they are
+  // asked in the picture, by the dialog layer. The presence service is told when a panel opens or closes, because a question must not be drawn under a panel: hub_presence.js panels().)
   const dlgOwners = new Set();
-  const setDialog = (who, v) => { if (v) dlgOwners.add(who); else dlgOwners.delete(who); dialogOpen = dlgOwners.size > 0; if (dialogOpen) held.clear(); };          // (a button held as a DOM dialog opens is not held in the picture behind it)
+  const setDialog = (who, v) => { if (v) dlgOwners.add(who); else dlgOwners.delete(who); dialogOpen = dlgOwners.size > 0; if (dialogOpen) held.clear(); if (hook.presence) hook.presence.panels(); };          // (a button held as a DOM dialog opens is not held in the picture behind it)
 
   /* ---- the loading panel's reveal ---- */
   // THE LOADING PANEL ONLY APPEARS IF LOADING TAKES A MOMENT, so a repeat visit (up in ~110 ms) never flashes it. The FIRST reveal, 400 ms after the page started, is not made here: it is a stylesheet
@@ -247,6 +248,7 @@ async function main() {
       else if (eff.type === 'battle') startBattle(eff);
       else if (eff.type === 'record-reset') resetRecord(eff.profileId);
       else if (eff.type === 'tower-new' || eff.type === 'tower-fight' || eff.type === 'tower-pick' || eff.type === 'tower-giveup') towerEffect(eff);
+      else if (eff.type === 'dialog' && hook.presence) hook.presence.answer(eff);          // a question that no app asked: OPEN TO BATTLES' own two (hub_presence.js: "<name> wants to battle you", the first-time disclosure)
     }
     if (model) syncFamily();
     dirty = true;
@@ -694,13 +696,14 @@ async function main() {
     if (openFx.length) run(openFx);
     openProfiles();                                  // the team list fills in when the store answers; the menu is usable at once
     loadTower().then((m) => { if (m) refreshData(); });          // the Tower's code loads behind the menu (the hub itself carries no engine); its rows fill in when it has
-    // OPEN TO BATTLES (presence_boot.js): the switch beside Play online, and a "<name> wants to battle you" dialog whatever the player is doing; loaded after the menu is up, so it can never delay or break it
-    import('./presence_boot.js').then((m) => {
-      hook.presence = m.mountPresence({
-        win: window, doc: document, pack, input, enableDomNav: nav.enableDomNav, navigate, button: $('openToggle'), focusHome: focusCanvas,
-        onDialog: { open: (which) => { setDialog('presence:' + which, true); }, close: (which) => { setDialog('presence:' + which, false); setTimeout(() => { if (!dialogOpen) focusCanvas(); }, 0); } },
-      });
-    }).catch((e) => { console.warn('[presence] not available', e); const b = $('openToggle'); if (b) b.hidden = true; });      // arena.css gives #openToggle[hidden] its own display:none: .textbtn's display would otherwise win and leave a dead switch
+    // OPEN TO BATTLES (hub_presence.js: the page's ONE presence service, which mounts presence_boot.js): the switch beside Play online, and "<name> wants to battle you" whatever the player is doing,
+    // asked IN THE PICTURE by the dialog layer (run() hands its answer back, setDialog() says when a DOM panel covers the picture). Loaded after the menu is up, so it can never delay or break it.
+    // The hub's apps reach the same service through hubPresence(env).
+    const noSwitch = (e) => { console.warn('[presence] not available', e); const b = $('openToggle'); if (b) b.hidden = true; };      // arena.css gives #openToggle[hidden] its own display:none: .textbtn's display would otherwise win and leave a dead switch
+    import('./hub_presence.js').then((m) => {
+      hook.presence = m.hubPresence({ win: window, doc: document, hook, model, pack, ui, navigate, input, storage, session, button: $('openToggle'), focusHome: focusCanvas, panelOpen: () => dialogOpen, redraw: () => { dirty = true; } });
+      return hook.presence.ready.then((ok) => { if (!ok) noSwitch('presence_boot.js did not load'); });
+    }).catch(noSwitch);
     document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshData(); });
     window.addEventListener('pageshow', (e) => { if (e.persisted) { startGuard.reset(); refreshData(); } });          // restored from the back / forward cache: not leaving for the floor any more, so START works again
     window.addEventListener('pagehide', saveSettings);

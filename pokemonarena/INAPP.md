@@ -565,3 +565,203 @@ when the key holds a valid path, and to `/pokemonarena/` otherwise. The key is r
 * Every new guard gets a named check AND a source mutant that the check kills, the way the existing suites do it.
 * A hook for tests (`window.__arenaHub`, `window.__arenaBattle`, `window.__arenaOnline`) drives the picture; a test never needs a DOM control that a player does not have.
 * Known before you start, not yours: `tools/pokemonarena_fullscreen_test.mjs` fails 28 cases in this environment on the commit before any of this work as well (identical list); `tools/pokemonarena_hub_return_test.mjs` case F1 (back / forward cache) fails now and then when the machine is loaded.
+
+## SEAM: as built
+
+What ONLINE, CENTER and BATTLE start from (2026-11-18). Every name below is the name in the code. Nothing in the protocol moved: `js/netmatch.js`, `js/online_match.js`, `js/openlobby.js`,
+`js/matchctl.js`, `js/engine*.js` and `lib/netplay.js` are byte for byte what they were, and so are `PROTO`, `MSG`, `BEACON_V` / `TOPIC`, `SEAL_INFO`, `ACCEPT_KEY`, `MEET_KEY`, `resumeKey`, `GAME_KEY`.
+
+### What exists
+
+| File | What | Tests |
+|---|---|---|
+| `js/presence.js` (+53 lines) | THE START TOKEN, beside the meet token: `START_KEY`, `START_MAX_AGE_MS`, `writeStartToken`, `takeStartToken`, `startPlan` | `tools/pokemonarena_presence_test.mjs` group P |
+| `js/online_prefs.js` (new, pure) | THE ONLINE PREFERENCES: `ONLINE_TEAM_KEY`, `ONLINE_FMTS`, `RANDOM_TEAM`, `readOnlinePrefs`, `writeOnlinePrefs`, `savedTeamKey`, `parseTeamKey`, `preselect` | `tools/pokemonarena_online_prefs_test.mjs` |
+| `js/online.js` (hunks) | takes the START token and honours it, pre-selects the preferences, exports `roomFromInput` | page test group `tokens` |
+| `js/presence_boot.js` (hunks) | `mountPresence(opts)` takes `opts.dialogs`, and its returned object can be driven and read without a DOM button | `tools/pokemonarena_hub_presence_test.mjs` group H |
+| `js/hub_presence.js` (new) | THE HUB PAGE'S PRESENCE SERVICE, and the hub's half of Contract 1 and Contract 6 | `tools/pokemonarena_hub_presence_test.mjs`; page test groups `presence`, `presenceui` |
+| `js/boot.js` (three hunks) | mounts presence through the service; hands it the answers of its questions; tells it when a DOM panel opens or closes | page test group `presenceui` (mutants M01, M04, M06, M07) |
+
+### The START token (Contract 1) : `js/presence.js`
+
+```js
+START_KEY = 'arena.go'                    // sessionStorage, this tab only
+START_MAX_AGE_MS = 60000
+writeStartToken(storage, { what, room? }, nowMs) -> boolean      // what: 'host' | 'quick'. room: only with 'host', must match ROOM_RE (stored in capitals). nowMs: WALL clock (Date.now())
+takeStartToken(storage, nowMs, maxAgeMs?) -> { what, room } | null   // one use: whatever is found is removed. null: none, stale (> 60 s), from the future (> 5 s ahead), malformed, or a storage that will not remove it
+startPlan(token, query) -> 'host' | 'room' | 'quick' | null      // what a token starts ON AN ADDRESS (query = online.js parseOnlineQuery(...)); null = nothing
+```
+
+The stored value is `{"what":"host","room":null,"at":1763...}`. `startPlan`: `{ host }` -> `'host'` only on the plain `?online=1` address (no room, no role, no `auto=`); `{ host, room }` -> `'room'` only on
+`?np=<that room>&host=1`; `{ quick }` -> `'quick'` only on the plain address. `js/online.js createOnline` takes the token ONCE, right after the accept and the meet token, whatever the address
+(`startTok = startPlan(takeStartToken(ss, Date.now()), cfg.query)`), and honours it at the end of `setupForm()`, where the meet token is honoured: `'host'` -> `startAs('host')` (what `#olGo` does on the
+plain page), `'room'` -> `go()` (what `#olGo` does on a room's page), `'quick'` -> `quick()`. A reload into a battle (`resumeFlow`) drops it. With no token the page is exactly the page it was.
+**BATTLE:** these three calls are the whole seam; keep the token taken once per page load, and keep `startTok` out of any path a reload or a stored record can reach.
+
+### The online preferences (Contract 2) : `js/online_prefs.js`
+
+```js
+ONLINE_TEAM_KEY = 'arena.online.team'     // localStorage: '{"teamKey":"saved:<profileId>:<teamId>","fmt":"6v6"}'
+readOnlinePrefs(storage) -> { teamKey, fmt }          // teamKey: 'saved:<profileId>:<teamId>' | 'random' | null;  fmt: '3v3' | '6v6' | null. Never throws; junk reads as null, field by field
+writeOnlinePrefs(storage, patch) -> boolean           // patch: { teamKey?, fmt? }. A key left out is kept, null forgets it, a value that is not one is REFUSED and nothing is written
+savedTeamKey(profileId, teamId) -> 'saved:..:..' | null      parseTeamKey(key) -> { kind: 'saved', profileId, teamId } | { kind: 'random' } | null
+preselect(prefs, choices, { formatParam }) -> { teamKey, fmt }   // what the battle page selects; choices = its own team list [{ key, size }], first = its old default
+```
+
+`js/online.js setupForm` calls `preselect(readOnlinePrefs(win.localStorage), choices, { formatParam: cfg.formatParam })` where it used to select `choices[0]`: the preferred team when the page still
+lists it (it lists a saved team only while it exists and is legal, so "gone or not legal" is "not on the list" -> the first choice, as before); the address's `format=`, else the preferred size, else
+the old default for the team selected; a team of fewer than three is never 3v3; an address that brings its own team (`?team=`) keeps it. The page an accepted challenge opens (`autoStart`) plays with
+what is selected there, so it follows the preference with the same fallback (its size stays 3v3: the Accept address says `format=3v3`). The trainer NAME is not here: it is still `arena.online.name`.
+`roomFromInput(raw)` is exported from `js/online.js` (pure; module level): a code in any case with spaces and dashes dropped, at most 8 characters, or the `np=` of a pasted invite link, or `null` for an
+address that names no room. `ROOM_RE.test(...)` then says whether it is a room code.
+
+### Dialog injection : `js/presence_boot.js mountPresence(opts)`
+
+`opts.dialogs = { challenge?, disclosure? }`. Whichever is left out is the DOM dialog of that file, built as before (the battle page injects nothing and is untouched).
+
+```js
+challenge:  { show({ name, rec, s, r, fmtText }), hide(), isOpen(), destroy() }   // show: ask; the host answers with mount.accept() or mount.decline(). hide: it is over (answered, cancelled, timed out)
+disclosure: { show(onYes), hide(), isOpen(), destroy() }                           // show: say what is published and ask; YES = call onYes() (it remembers and switches on); NO = do nothing
+```
+
+The returned object (also `window.__arenaPresence`), new members in bold: `setOn(on, { persist })`, `isOn()`, `refresh()`, `dispose()`, `presence`, `lobbies`, **`status()`** (`'off' | 'starting' | 'on' |
+'offline'`), **`toggle()`** (what the button does: the first switch-on asks), **`needsDisclosure()`**, **`confirmDisclosure({ persist })`**, **`onChange(fn) -> off`** (the switch, a start that finished,
+the board connection, the board's list), **`accept()`**, **`decline()`**, **`pending()`**, **`challenge(target, handlers)`** (presence.js `createChallenge` on this page's board connection, under the
+listing's trainer name and record, with the `openchal` seam), **`canChallenge()`**, **`trainer()`**, **`timing`**. `opts.onDialog` is called for the DOM dialogs only: an injected dialog pauses its own page.
+**BATTLE:** the CPU battle's question in the picture is `mountPresence({ ..., dialogs: { challenge, disclosure } })` with two objects of that shape; `hub_presence.js` is a worked example.
+**CENTER:** `presence_boot.js` still imports `loadAvatar` from `js/avatar.js` for the listing's `av`; when `avatar.js` goes, that import and the `av:` of `identity` are yours to change (one line each).
+
+### The hub page's presence service (Contract 3) : `js/hub_presence.js`
+
+```js
+import { hubPresence } from './hub_presence.js';
+const svc = hubPresence(env);      // env = your ctl's env. ONE service per hub page: the first caller makes it (boot.js does, right after the menu is up), everybody gets the same object
+```
+
+**Nothing else on the hub page calls `mountPresence`.** The service is the only one; a second mount would dispose it.
+
+| Member | What |
+|---|---|
+| `ready` | `Promise<boolean>`: presence_boot.js is loaded and mounted. `false`: it could not load; `status()` is then `'unavailable'` and nothing switches on (nothing throws) |
+| `status()` | `'loading' \| 'unavailable' \| 'off' \| 'starting' \| 'on' \| 'offline'` (`offline`: on, but no public server can be reached, so nobody can see the listing) |
+| `isOn()` | boolean |
+| `stored()` | what the BROWSER's stored switch says (`localStorage 'arena.open'`), whatever this page is doing |
+| `turnOn({ persist = true, also })` | `Promise<boolean>` (is it on). The first time, THE DISCLOSURE IS ASKED IN THE PICTURE first: nothing is published before YES, NO is not remembered and resolves `false`. `persist: false`: on for this page only (the stored switch is left alone: the Trainer Center). `also`: ONE more sentence for the disclosure (at most 200 characters), e.g. what walking into the Center lists |
+| `turnOff({ persist = true })` | `Promise<boolean>` (is it off). The listing comes down at once |
+| `toggle()` | what the Open switch does. `Promise<boolean>` (is it on afterwards) |
+| `onChange(fn) -> off` | `fn()` whenever something a screen may draw has changed: the switch, the board connection, the players, a question put or answered. Read the state through the getters |
+| `watchPlayers(bool)` | keep the list of open players current (the board is asked who is open, and listings age off it). Off by default; re-applied by itself when the board connection is rebuilt |
+| `players()` | `[{ id, name, rec: [wins, losses] \| null, look, doing: 'menu' \| 'looking' \| 'waiting', room, fmt, compatible, entry }]`, longest waiting first; `[]` while off. `doing 'menu'` = open from the hub or a CPU battle (`room` is null: ASK them); `'looking'` / `'waiting'` = they wait in a listed room (`room`: JOIN it). `look` is the 7-character code they list (`av`), or null. `compatible: false` = another game file or engine build (cannot be battled). This page's own listing is never among them |
+| `boardId()` | this page's id on the board (a Center walker's `b`), or null while off. It changes when the switch goes off and on |
+| `trainer()` | `{ name, rec }` of this page's listing, or null while off |
+| `canChallenge()` | false: no WebCrypto, so nobody can be asked (say so) |
+| `challenge(player, { state(name), accepted(room), failed(why) })` | ask a player of `players()` with `doing: 'menu'`. `-> { r, ready, cancel(), done() }` or null while off. `why`: `'declined' \| 'busy' \| 'timeout' \| 'unsupported'`. On `accepted(room)`: `svc.goBattle('join', room)` |
+| `refresh()` | `Promise<boolean>`: read the trainer again (a rename, a record that was reset) and list again if it changed (boot.js calls it after RESET RECORD) |
+| `relist()` | say the listing again as it is now (the look changed) |
+| `goBattle(kind, room?, { back })` | LEAVE THE HUB FOR THE BATTLE PAGE (below). `false` and nothing happens for a kind that is not one or a room that is not a room code |
+| `state()` | `{ status, on, challenge: null \| 'shown' \| 'waiting', disclosure: null \| 'shown' \| 'waiting', players, back }` (tests; `window.__arenaHub.presence.state()`) |
+| `mount` | the presence_boot.js mount itself, or null before `ready` |
+| `answer(effect)`, `panels()` | boot.js only: a dialog answer that has no `app`; a DOM panel opened or closed |
+| `dispose()` | closes its questions, disposes the mount; the next `hubPresence(env)` makes a new one |
+
+**The two questions** are the hub's dialog layer (ids `presence:challenge`, `presence:disclosure`, no `app`; a note `presence:note`). They sit over ANY hub screen, yours included, and take every press
+while they are up; your screen is told no button is held. You do not open, close or answer them.
+
+* `<NAME> (W-L online)` / `wants to battle you.`, then `YES opens a 3 v 3 battle with them and leaves this screen.` with **YES / NO**.
+* the disclosure: five pages of two lines (what is listed, where, who sees it, that nothing else is shared, how it stops), then `Go open to battles?` with **YES / NO**.
+
+What the DOM dialogs guaranteed, and where each guarantee is now (Node = `tools/pokemonarena_hub_presence_test.mjs`, page = `tools/pokemonarena_online_page_test.mjs`):
+
+| Guarantee | Where it lives | Node check / mutant | Page check / mutant |
+|---|---|---|---|
+| NO is the default | `cursor: NO` | E2 / `yes-default`, `labels-swapped` | A4, UK1-UK4, UD1 |
+| B answers NO | NO is the LAST option (`ANSWERS`, `YES = 0`, `NO = 1`); the layer's B is the last option | E6 / `b-accepts`, `layer-b-first-option` | UK1-UK4 (pad B, X, Backspace, Escape), UD2 / M01 |
+| YES is inert for 600 ms | `armTicks: DIALOG_ARM_TICKS` (36 frames) | E3, E4, E5 / `never-armed`, `challenge-not-armed`, `layer-unarmed-answers` | PB1, UA1, UA2 (measured in real time), UT2 / M03 |
+| a held direction that only drifted does not arm A | the layer ignores a held direction's repeats, and boot.js tells it which presses are repeats | E8, E12 / `layer-repeats-move` | UA3, UA5, UA6 / M04, M22 |
+| one question at a time, a second asker is told busy | presence.js (unchanged) | E10 | C1 |
+| the 25 s automatic NO | presence.js's own clock calls `hide()` | E17, F8 / `hide-leaves-question` | D1 |
+| a cancel from the asker closes it | `hide()` | E18 | C2, C4 |
+| hostile names are safe text | `cleanName` (netmatch.js) before the picture; the layer draws what the font cannot as `?` | A4, A6 / `name-as-given`, `size-as-given`, `font-draws-anything` | G1, G1b |
+| Accept writes the token, then navigates; no token = busy | presence.js `accept()`; the service says why in the picture | E13, E14, E21, E22 / `yes-declines`, `no-note` | PB2, PB11, UA4, UT4 |
+| the disclosure's NO is not remembered; nothing is published before YES | `askDisclosure` / presence_boot.js `toggle`, `confirmDisclosure` | D6, D8, D9, D15, H2 / `publishes-before-yes`, `turn-on-unasked`, `no-is-yes`, `boot-toggle-unasked`, `boot-yes-not-remembered` | UD1-UD6 / M14 |
+| a stored "on" nobody was told about is dropped | presence_boot.js (unchanged line) | D18 / `boot-untold-on-honoured` | UD7 / M15 |
+| while the Controls dialog or the Sound panel is open the question WAITS, and appears when it closes | `place()` / `panels()`; boot.js `setDialog` calls `panels()` | F1-F10 / `shown-under-panel`, `never-flushed`, `stays-under-panel`, `waited-not-armed` | US1-US9, UA5, UA6 / M05, M06, M07 |
+
+Two more things a question does that the DOM dialog did not: a question that waited behind a panel, or that a panel opened over, appears (again) from its first page and listens only after the arm delay;
+and a question the dialog layer cannot take (its queue of 8 is full) is answered NO at once.
+
+### From the hub to the battle page and back (Contract 1 and Contract 6) : `js/hub_presence.js`
+
+```js
+svc.goBattle('host')                 // INVITE A FRIEND:  START { what: 'host' }         then /pokemonarena/battle.html?online=1
+svc.goBattle('quick')                // BATTLE ANYONE:    START { what: 'quick' }        then ?online=1
+svc.goBattle('room', ROOM)           // OPEN THE ROOM:    START { what: 'host', room }   then ?np=ROOM&host=1
+svc.goBattle('join', ROOM)           // JOIN A FRIEND, and the Center's "accepted" / "join their game":  MEET { room }  then ?np=ROOM&join=1&meet=1
+```
+
+It writes the token, writes or clears `arena.back`, then calls the page's `navigate`. When the token cannot be written (storage blocked) the address says so, as Contract 1 asks: `?online=1&ask=host`,
+`?online=1&ask=quick`, the plain `?np=ROOM&host=1`, the plain `?np=ROOM&join=1` (no `meet=1`). Every address carries the test seams of the hub page's own address and nothing else of it
+(`PASS_PARAMS`: `net anim arenaturn arenagrace openquick openchal openjoin openhold opendisc`). The pure half is exported: `battleStart(kind, room, { session, now, search }) -> { url, token } | null`,
+`passThrough(search)`.
+
+**Coming back.** `{ back }` is the hub path the battle comes back to; left out, it is the open screen when that is the Trainer Center's (`center`, `center-...`: `backPathFor(path)`), else the main menu;
+`{ back: null }` is the main menu. An accepted challenge (YES in the picture) does the same by itself: accepted while a Center screen is open, the battle comes back to it. The key is cleared when the
+service is made (the hub page is up) and when the page is restored from the back / forward cache.
+
+```js
+BACK_KEY = 'arena.back'              // sessionStorage: a hub path, /^[a-z][a-z0-9-]{0,31}$/, never 'main'
+writeBack(session, path) -> boolean  // anything that is not such a path FORGETS the key
+readBack(session) -> path | null     // BATTLE: this is the read ("never trusted further than that pattern"). It does not remove the key
+clearBack(session)
+```
+
+### What `js/boot.js` does now (three hunks, all in the shell)
+
+1. `start()`: `import('./hub_presence.js')` -> `hook.presence = hubPresence({ win, doc, hook, model, pack, ui, navigate, input, storage, session, button: #openToggle, focusHome, panelOpen, redraw })`.
+   `window.__arenaHub.presence` is the SERVICE (it was the mount; `window.__arenaPresence` is still the mount). If presence_boot.js cannot load, `#openToggle` is hidden, as before.
+2. `run(effects)`: a `{ type: 'dialog' }` effect with no `app` goes to `hook.presence.answer(eff)`. (This amends item 5 of "Effects: who carries what out": the presence service hears those.)
+3. `setDialog(who, v)`: after the set of DOM panels changed, `hook.presence.panels()`. The owners `presence:challenge` / `presence:disclosure` are gone from that set: the questions are not DOM.
+
+The HTML row `#onlineLink` is untouched: `#openToggle` works through the service (a click asks the disclosure in the picture). **ONLINE:** when the row goes, nothing here needs to change: the service
+looks `#openToggle` up when it is made and takes `null`; drop `button: $('openToggle')` and the `noSwitch` helper from the hunk in `start()` if you like.
+
+### Storage keys
+
+| Store | Key | Value | Writer / reader |
+|---|---|---|---|
+| sessionStorage | `arena.go` (new) | `{ what, room, at }`, one use, 60 s | hub (`goBattle`) / battle page (`online.js`) |
+| localStorage | `arena.online.team` (new) | `{ teamKey, fmt }` | the hub's `online` app / battle page (`online.js setupForm`) |
+| sessionStorage | `arena.back` (new) | a hub path | hub (`goBattle`, an accepted challenge) / battle page (`readBack`); cleared when the hub page loads |
+| unchanged | `arena.accept`, `arena.meet`, `arena.open`, `arena.open.seen`, `arena.online.name`, `arena.avatar`, `arena.online:<ROOM>:<role>` | | |
+
+### What was deleted, and what was not
+
+Deleted: nothing from the tree. On the HUB page the DOM dialogs `#challenge` and `#openInfo` are no longer built (and `boot.js` no longer passes `enableDomNav` / `onDialog` to presence). `presence_boot.js`
+keeps `mountDialog`, `mountChallengeDialog`, their style sheet and the drift guard, because a battle against the CPU still asks in the DOM: BATTLE deletes them with that page's dialog. `center_boot.js` still
+mounts presence by itself on `center.html` (CENTER deletes that page).
+
+### Known limits (measured or read, not fixed here)
+
+* On a 390 px phone a YES / NO row is 59 x 26 css px (measured, page test UT1: 16 logical px at 1.625x): smaller than the 44 px the DOM buttons had. The on-screen B button (NO) is 64 px, and a tap on
+  the question's text never answers.
+* The hub's clock stops while the tab is hidden, so a question that arrives in a hidden tab starts to listen 0.6 s after the tab is shown; it still becomes a NO after 25 s (presence.js's own clock).
+  Measured in real Chrome (page test UA2): 580 ms from the frame the question is first drawn to the frame it listens.
+* The disclosure is six pages (the DOM dialog was one glance). B is NO from any of them.
+* The question has no sound of its own, and the live region reads it only when the hub next draws (it does not draw while the tab is hidden).
+
+### Tests (2026-11-18, this tree)
+
+```bash
+node tools/pokemonarena_presence_test.mjs --mutants        # 140 cases, 67 mutants: + group P (the START token and startPlan) and O12-O15 (roomFromInput)
+node tools/pokemonarena_online_prefs_test.mjs --mutants    # 35 cases, 21 mutants: the online preferences
+node tools/pokemonarena_hub_presence_test.mjs --mutants    # 117 cases, 63 mutants (about 20 minutes with them; ARENA_HP_MUTANT=<id> runs one): the service on a real hub model, the real renderer,
+                                                           # presence_boot.js, presence.js and the board over Node's BroadcastChannel. A mutant counts only when the case it NAMES fails
+node tools/pokemonarena_online_page_test.mjs tokens --mutants       # 30 cases, 6 mutants, real Chrome: the three starts with and without their token; the preferences; an accepted challenge plays the preferred team
+node tools/pokemonarena_online_page_test.mjs presence               # 49 cases: the hub sessions read and drive the PICTURE (window.__arenaHub); the CPU-battle session (PF) still reads the DOM
+node tools/pokemonarena_online_page_test.mjs presenceui --mutants   # 104 cases, 36 mutants (the count ONLINE.md states is unchanged): M01, M03-M07 and M22 are re-homed onto the code above
+```
+
+In the page test the hub sessions that read `#challenge` / `#openInfo` now read the picture: `presence` A, PB, C, D, G (PF, the battle against the CPU, is as it was) and `presenceui` keys, accept, drift, stack,
+refresh (UR3), disclosure, touch. `stack` and `drift` changed meaning with the decision that a question WAITS behind a DOM panel: they used to prove the DOM dialog was on top of the panel. UR4 / UR5 mount
+presence_boot.js by hand with no dialogs handed in, so the DOM dialogs keep their two mutants (M12, M19); UK6 (M02) calls `mountDialog` itself. Moved deliberately: mutant `X13` of `onlineux` now breaks
+`ui.team.value = pre.teamKey;` (the line it broke was replaced by the preferences). ONLINE.md (BATTLE's file) still says the presence suite breaks things "50 ways": it is 67 now.

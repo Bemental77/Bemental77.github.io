@@ -31,7 +31,8 @@ import { PINNED } from './rom.js';
 import { isId } from './profile.js';
 import { navigationType } from './battle_resume.js';
 import { createOpenLobbies, createLocalBus, createMqttBus, ROOM_RE, MQTT_LIB } from './openlobby.js';
-import { createChallenge, createAcceptor, takeAcceptToken, takeMeetToken, admission, canSeal, ACCEPT_MAX_AGE_MS, TIMING as PRESENCE_TIMING } from './presence.js';
+import { createChallenge, createAcceptor, takeAcceptToken, takeMeetToken, takeStartToken, startPlan, admission, canSeal, ACCEPT_MAX_AGE_MS, TIMING as PRESENCE_TIMING } from './presence.js';
+import { readOnlinePrefs, preselect } from './online_prefs.js';
 
 export const GAME_KEY = 'Pokemon Arena';
 export { ROOM_RE };
@@ -105,6 +106,18 @@ export function boardAddress(href) {
   return u.pathname + u.search + u.hash;
 }
 
+/**
+ * What a room-code box was given: a code (any case, spaces and dashes dropped, at most 8 characters) or a whole invite link pasted in (its np= is taken). -> the code to show, or null to leave the
+ * text alone (an address that names no room). Pure: the battle page's code box and the hub's JOIN A FRIEND entry normalise with this one function; ROOM_RE then says whether it is a room code.
+ */
+export function roomFromInput(raw) {
+  const s = String(raw || '').trim();
+  const m = /[?&]np=([A-Za-z0-9]{4,8})(?:&|#|$)/.exec(s);
+  if (m) return m[1].toUpperCase();
+  if (/^https?:|\//i.test(s)) return null;
+  return s.replace(/[\s-]+/g, '').toUpperCase().slice(0, 8);
+}
+
 const fmtClock = (ms) => { const s = Math.ceil(ms / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
 
 function el(doc, tag, props, ...kids) {
@@ -137,6 +150,11 @@ export function createOnline(cfg) {
   // THE TRAINER CENTER'S HAND-OFF: a join it was let into (an accepted challenge, a listed game) presses Join by itself, but only against the one-time token the Center left in THIS tab (presence.js takeMeetToken)
   let meetTok = false;
   if (query.meet) { let ss = null; try { ss = win.sessionStorage; } catch (_e) { ss = null; } meetTok = takeMeetToken(ss, query.room, Date.now()); }
+  // THE HUB'S HAND-OFF (INAPP.md "Contract 1"): INVITE A FRIEND, BATTLE ANYONE and OPEN THE ROOM are pressed in the hub's picture, which leaves a one-time START token in THIS tab and opens this page.
+  // It is taken (and gone) here, once, whatever the address; startPlan says what it starts ON THIS ADDRESS ('host' | 'room' | 'quick'), or null: no token, a stale one, one for another room or for
+  // another kind of address. The same address from anywhere else starts nothing and is the page it always was. (cfg.query: the address as it was read, before an unbacked auto= was struck out above.)
+  let startTok = null;
+  { let ss = null; try { ss = win.sessionStorage; } catch (_e) { ss = null; } startTok = startPlan(takeStartToken(ss, Date.now()), cfg.query); }
   // every use of the clock here is a DURATION (a turn's allowance, a link's grace), so it is the monotonic one: a wall-clock step (NTP, a changed timezone) must not time anyone out
   const now = cfg.now || (() => (win.performance && typeof win.performance.now === 'function' ? win.performance.now() : Date.now()));
   const state = { stage: 'setup', role: query.role, room: query.room, transport: query.transport, nm: null, session: null, mine: null, name: null, fmt: null, error: null, info: null, matches: 0, open: false, quick: false, listed: null, openWanted: false, admitted: false, admittedId: null, defecting: false, invite: null, profileId: null, rec: null };
@@ -282,14 +300,6 @@ export function createOnline(cfg) {
   async function share() {
     try { await win.navigator.share({ title: 'Pokemon Arena battle', text: 'Battle me in Pokemon Arena! Room ' + state.room, url: inviteLink() }); }
     catch (e) { if (!e || e.name !== 'AbortError') copy(inviteLink(), ui.copyLink); }
-  }
-  /** What the code box was given: a code (any case, spaces and dashes dropped) or a whole invite link pasted in (its np= is taken). -> the code to show, or null to leave the text alone. */
-  function roomFromInput(raw) {
-    const s = String(raw || '').trim();
-    const m = /[?&]np=([A-Za-z0-9]{4,8})(?:&|#|$)/.exec(s);
-    if (m) return m[1].toUpperCase();
-    if (/^https?:|\//i.test(s)) return null;
-    return s.replace(/[\s-]+/g, '').toUpperCase().slice(0, 8);
   }
   // the plain Play online page: no role and no room in the address
   const boardPage = () => query.role === null && !query.room;
@@ -1103,6 +1113,7 @@ export function createOnline(cfg) {
 
   /** -> true when the battle is being resumed (the scene is mounted by the match's 'controller' event), false when the page should show the setup form after all. */
   async function resumeFlow(rec) {
+    startTok = null;          // (a start token is for the page load the hub's press led to, never for a battle that is picked up again: a resume that is given up shows the setup form and starts nothing)
     state.stage = 'resuming'; state.role = rec.role; state.room = rec.room; state.name = rec.myName; state.fmt = rec.fmt;
     state.myTeamCode = rec.myTeam; state.oppTeamCode = rec.oppTeam;
     state.profileId = isId(rec.profileId) ? rec.profileId : null;
@@ -1131,9 +1142,13 @@ export function createOnline(cfg) {
     // (the first saved team is the active profile's, but not when that profile has no legal team, or the address brings a team of its own).
     nameTouched = !!saved;
     ui.name.value = cleanName(saved || name, query.role === 'guest' ? 'Guest' : 'Host');
-    ui.team.value = choices[0].key;
+    // THE ONLINE PREFERENCES (online_prefs.js, written by the hub's online menu): the preferred team when it is still on the list (a saved team is listed only while it exists and is legal), else the
+    // first choice as before; the address's format, else the preferred size, else the default for the team selected. An accepted challenge (autoStart, below) plays with what is selected here.
+    let prefs = null; try { prefs = readOnlinePrefs(win.localStorage); } catch (_e) { prefs = null; }
+    const pre = preselect(prefs, choices, { formatParam: cfg.formatParam });
+    ui.team.value = pre.teamKey;
     nameFollowsTeam();
-    ui.fmt.value = cfg.formatParam === '6v6' ? '6v6' : cfg.formatParam === '3v3' ? '3v3' : (choices[0].size >= 6 && choices[0].key !== 'random' && choices[0].key !== 'paste' ? '6v6' : '3v3');
+    ui.fmt.value = pre.fmt;
     refreshFormats();
     if (query.room) { ui.room.value = query.room; state.room = query.room; }
     setRole(query.role || (query.room ? 'guest' : 'host'));
@@ -1144,6 +1159,7 @@ export function createOnline(cfg) {
     if (!ui.openBox.hidden) { ensureLobbies(); lobbies.startWatching(); renderOpenList(); ui.quick.disabled = false; }
     if (query.auto) autoStart(name); else if (autoNotice) say(autoNotice);
     else if (meetTok && state.role === 'guest' && state.room) { meetTok = false; startAs('guest'); }
+    else if (startTok) { const what = startTok; startTok = null; if (what === 'quick') quick(); else if (what === 'room') go(); else startAs('host'); }
   }
 
   // (flashNow: the one-line notice the bar would show this instant, '' when there is none; the page test reads it)
