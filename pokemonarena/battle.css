@@ -119,121 +119,9 @@ body[data-layout="landscape"] #top { min-height: 44px; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 
 
-/* ONLINE (js/online.js): the setup panel that takes the screen's place until the handshake has produced the battle, and the status bar under it */
-#online { width: min(100%, 440px); background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px 20px; text-align: left; }
-#online[hidden] { display: none; }
-#online h2 { margin: 0 0 6px; font-size: 18px; }
-#online .dim { margin: 0 0 12px; line-height: 1.4; }
-#online .row { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
-#online .row[hidden], #online .field[hidden] { display: none; }
-#online .field { display: block; margin: 10px 0; }
-#online .field > span { display: block; font-size: 12px; color: var(--dim); margin-bottom: 4px; }
-#online input, #online select, #online textarea { width: 100%; min-height: 44px; padding: 8px 10px; background: #0e0e12; color: var(--fg); border: 1px solid var(--line); border-radius: 6px; font: inherit; font-size: 15px; }
-#online textarea { min-height: 76px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; resize: vertical; }
-#online input:focus-visible, #online select:focus-visible, #online textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-#online .textbtn.primary { background: #27466f; border-color: var(--accent); }
-#online .textbtn[aria-pressed="true"] { background: #27466f; border-color: var(--accent); }
-#online button:disabled, #online input:disabled, #online select:disabled, #online textarea:disabled { opacity: .55; cursor: default; }
-#online .code { margin: 12px 0 4px; padding: 12px; text-align: center; font: 700 30px/1.1 ui-monospace, Menlo, Consolas, monospace; letter-spacing: 6px; color: #9f9; background: #0e1013; border: 1px dashed #4a4; border-radius: 8px; user-select: all; }
-#online .code[hidden] { display: none; }
-#online .status { min-height: 20px; margin: 10px 0 0; font-size: 13px; color: #9aa; overflow-wrap: anywhere; }
-#online .status.bad { color: #f88; }
-/* OPEN GAMES (js/openlobby.js): the board under the team and the name, and the Open-to-anyone switch. .textbtn's display would win over [hidden], so the hidden states are spelled out */
-#online #olOpen { margin: 14px 0 6px; padding: 12px; background: #0e1013; border: 1px solid var(--line); border-radius: 8px; }
-#online #olOpen[hidden], #online #olPublicBox[hidden], #online #olQuick[hidden], #online #olCancelAsk[hidden] { display: none; }
-#online #olOpen h3 { margin: 0 0 6px; font-size: 15px; }
-#online #olOpenNote { margin: 0 0 8px; font-size: 13px; line-height: 1.4; }
-#online .openlist { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
-#online .openlist:empty { display: none; }
-#online .openlist li { display: flex; align-items: center; gap: 10px; min-height: 44px; }
-#online .openlist .who { flex: 1 1 auto; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
-#online .openlist .fmt { color: var(--dim); font-size: 12px; white-space: nowrap; }
-#online .openlist .rec { color: #9f9; font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
-#online #olOpen .row { margin: 8px 0 0; }
-#online .small { font-size: 12px; }
-/* THE NEW PANEL (online.js renderView): YOUR TRAINER in one row, two cards (PLAY A FRIEND, QUICK MATCH), then PLAYERS ONLINE; while something is under way one PROGRESS card. */
-/* BATTLE ONLINE (js/online.js): one question per screen. Play online = your team + three cards (Invite a friend / Join a friend / Battle anyone); anything under way = one card that says
-   who you are in it (#olRole), what is happening now (the big heading), the invite for a friend, the steps, and Cancel. */
-#online { width: min(100%, 860px); box-sizing: border-box; }
-#online h2 { font-size: 24px; margin-bottom: 4px; }
-#online #olLede { margin-bottom: 14px; font-size: 15px; }
-#online [hidden] { display: none !important; }
-#online .olyou { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1.2fr) minmax(0, 1.2fr); gap: 0 12px; padding: 12px 14px; background: #0e1013; border: 1px solid var(--line); border-radius: 8px; }
-#online .olyou .field { margin: 0 0 4px; }
-#online .olyou .field.wide { grid-column: 1 / -1; margin-top: 8px; }
-#online .olslot .status:empty { display: none; }
-#online .olslot .status { margin: 10px 0 0; font-size: 14px; }
-#online .olslot .status.bad { padding: 10px 12px; background: #2a1517; border: 1px solid #6a2a30; border-radius: 6px; color: #fbb; }
-#online .olcards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 14px 0 0; }
-#online .olcard { padding: 16px; background: #15161c; border: 1px solid var(--line); border-radius: 10px; display: flex; flex-direction: column; }
-#online .olcards .olcard { border-top: 3px solid var(--accent); }
-#online .olcards #olQuickCard { border-top-color: #c9a227; }
-#online .olcard h3 { margin: 0 0 6px; font-size: 18px; }
-#online .olcard .dim { font-size: 13px; margin-bottom: 10px; }
-#online .olcards .olcard > .row, #online .olcards .olcard > .codefield { margin-top: auto; margin-bottom: 0; }
-#online .textbtn.big { min-height: 52px; padding: 10px 18px; font-size: 16px; font-weight: 600; flex: 1 1 auto; }
-#online .textbtn.primary:not(:disabled):hover { background: #31578a; }
-#online .codefield { margin: 6px 0 0; }
-#online .codefield > span:first-child { font-size: 12px; }
-#online .field > span.coderow { display: flex; gap: 8px; margin: 0; }
-#online .coderow input { flex: 1 1 auto; min-width: 0; min-height: 52px; text-transform: uppercase; letter-spacing: 3px; font: 700 20px ui-monospace, Menlo, Consolas, monospace; text-align: center; }
-#online .coderow input::placeholder { letter-spacing: 3px; font-weight: 400; color: #555; }
-#online .coderow .textbtn { flex: 0 0 auto; min-width: 84px; min-height: 52px; font-size: 16px; font-weight: 600; }
-#online .openlist li { padding: 4px 4px 4px 10px; background: #15161c; border: 1px solid var(--line); border-radius: 8px; }
-#online .openlist li .textbtn { background: #27466f; border-color: var(--accent); }
-#online #olOpen { margin-top: 14px; }
-#online #olAddr { margin: 14px 0 0; flex-direction: column; align-items: stretch; }
-#online #olAddr .textbtn.big { flex: 1 1 100%; min-height: 56px; font-size: 18px; }
-#online .foot { margin-top: 14px; }
-#online .olfoot { margin-top: 6px; border-top: 1px solid var(--line); padding-top: 8px; }
-#online .olfoot .dim { font-size: 11px; color: #6f6f7a; margin: 0 0 6px; }
-/* PROGRESS: the card is the whole page while something is under way */
-#online[data-going="1"] { background: none; border-color: transparent; padding: 0; }
-#online .progress { margin: 0; padding: 18px 18px 14px; border-color: #2c3a52; }
-#online .olrole { display: inline-block; align-self: flex-start; margin: 0 0 8px; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; color: #cfe3ff; background: #1d3352; border: 1px solid #36598a; }
-#online .progress[data-role="guest"] .olrole { color: #d9ffd9; background: #1d3b26; border-color: #3f7a4c; }
-#online .progress[data-role="either"] .olrole { color: #fff0c2; background: #3a3016; border-color: #7a6526; }
-#online .progress h3 { font-size: 24px; margin: 0 0 12px; line-height: 1.2; }
-#online .invitebox { margin: 0 0 6px; padding: 14px; background: #0e1013; border: 1px solid var(--line); border-radius: 10px; }
-#online .invitehead { margin: 0 0 8px; font-size: 15px; font-weight: 600; }
-#online .linkrow input { font: 13px ui-monospace, Menlo, Consolas, monospace; color: #cfe3ff; }
-#online .invite { margin: 8px 0 0; }
-#online .invite .textbtn { flex: 1 1 0; min-height: 48px; font-size: 15px; font-weight: 600; }
-#online .textbtn.copied { background: #1f5a37 !important; border-color: #5c5 !important; }
-#online .codelabel { margin: 12px 0 4px; font-size: 13px; }
-#online .coderow2 { display: flex; gap: 8px; align-items: stretch; }
-#online .coderow2 .code { flex: 1 1 auto; margin: 0; }
-#online .coderow2 .textbtn { flex: 0 0 auto; }
-#online .progress .code { font-size: 34px; letter-spacing: 10px; padding: 10px; }
-#online .steps { list-style: none; display: flex; gap: 6px; margin: 16px 0 6px; padding: 0; }
-#online .steps li { flex: 1 1 0; display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 0; text-align: center; font-size: 12px; color: var(--dim); position: relative; }
-#online .steps li:not(:first-child)::before { content: ''; position: absolute; top: 13px; right: calc(50% + 16px); width: calc(100% - 26px); border-top: 2px solid var(--line); }
-#online .steps li.done:not(:first-child)::before, #online .steps li.now:not(:first-child)::before { border-color: var(--accent); }
-#online .steps .dot { width: 26px; height: 26px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; font-size: 13px; border: 2px solid var(--line); background: #0e1013; box-sizing: border-box; }
-#online .steps li.done { color: var(--fg); }
-#online .steps li.done .dot { background: #27466f; border-color: var(--accent); color: #fff; }
-#online .steps li.now { color: #fff; font-weight: 600; }
-#online .steps li.now .dot { border-color: var(--accent); color: var(--accent); animation: olpulse 1.4s ease-in-out infinite; }
-@keyframes olpulse { 50% { box-shadow: 0 0 0 5px rgba(102, 170, 255, .25); } }
-@media (prefers-reduced-motion: reduce) { #online .steps li.now .dot { animation: none; } }
-#online .progline { display: flex; align-items: baseline; gap: 10px; }
-#online .progline .olslot { flex: 1 1 auto; min-width: 0; }
-#online .progline .status { font-size: 15px; color: var(--fg); margin: 8px 0; }
-#online .elapsed { font-variant-numeric: tabular-nums; color: var(--dim); font-size: 13px; white-space: nowrap; }
-#online .olhint { margin: 2px 0 6px; padding: 8px 10px; color: #fc8; background: #2a2414; border: 1px solid #5a4a20; border-radius: 6px; font-size: 13px; }
-/* the "start the sound" pill would sit on top of the online page's buttons; any press on them starts the sound anyway */
-body:has(#online:not([hidden])) #soundPrompt { display: none !important; }
-@media (max-width: 760px) {
-  #online .olcards { grid-template-columns: 1fr; }
-}
-@media (max-width: 620px) {
-  #online { padding: 14px 14px; }
-  #online .olyou { grid-template-columns: 1fr 1fr; }
-  #online .olyou .field:first-child { grid-column: 1 / -1; }
-  #online .progress { padding: 14px 12px 12px; }
-  #online .progress h3 { font-size: 21px; }
-  #online .progress .code { font-size: 28px; letter-spacing: 6px; }
-}
+/* ONLINE (js/online.js): before a battle the page's screens are IN THE PICTURE (js/online_draw.js draws them in the battle canvas from the ROM; INAPP.md "everything in the app"), so there is no
+   panel to style. What is left in the DOM is the slim status line of a battle (#netbar) under the picture. The Menu button opens the battle's pause menu: there is none before the battle. */
+body[data-state="online"] #menuBtn { visibility: hidden; }
 #netbar { width: 100%; max-width: 640px; display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); font-size: 13px; }
 #netbar #nbWho { color: var(--accent); font-weight: 600; white-space: nowrap; }
 #netbar #nbMsg { flex: 1 1 auto; min-width: 0; color: var(--fg); overflow-wrap: anywhere; }
@@ -286,8 +174,8 @@ body[data-full="1"][data-layout="landscape"] #ab .pbtn.small { width: 44px; heig
 body[data-full="1"][data-layout="landscape"] #ab .abrow:last-child #bB { margin-top: 18px; }
 body[data-full="1"][data-layout="landscape"] { padding-left: max(8px, env(safe-area-inset-left)); padding-right: max(8px, env(safe-area-inset-right)); }
 body[data-full="1"][data-layout="landscape"] #play { gap: 6px; }
-/* the boot, error and online-setup panels live inside the screen's box, which now reaches the screen's edges: they keep the page's gutters */
-body[data-edge="1"] #boot, body[data-edge="1"] #error, body[data-edge="1"] #online { width: min(calc(100% - var(--gutter) * 2), 440px); }
+/* the boot and error panels live inside the screen's box, which now reaches the screen's edges: they keep the page's gutters */
+body[data-edge="1"] #boot, body[data-edge="1"] #error { width: min(calc(100% - var(--gutter) * 2), 440px); }
 /* an error screen has no game to fullscreen: its header carries the same buttons as the editor's (coherence test D7) */
 body[data-state="error"] #fullBtn, body[data-state="error"] #fullExit { visibility: hidden; }
 

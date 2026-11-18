@@ -723,7 +723,7 @@ async function groupBfcache(proxyOrigin) {
     page.handlers.push((m) => { if (m.method !== 'Page.backForwardCacheNotUsed') return; const add = (e) => why.push(e.type + ':' + e.reason + (e.context ? '(' + e.context + ')' : '')); for (const e of m.params.notRestoredExplanations || []) add(e); const walk = (t) => { if (!t) return; for (const e of t.explanations || []) add(e); for (const c of t.children || []) walk(c); }; walk(m.params.notRestoredExplanationsTree); });
     await visit(page, proxyOrigin + '/pokemonarena/');
     await page.eval('window.__marker = 424242; true');
-    await page.eval('location.href = "/pokemonarena/battle.html?online=1&net=local"; true');
+    await page.eval('location.href = "/pokemonarena/battle.html?online=1&ask=host&net=local"; true');          // (ask=host: the plain ?online=1 address has nothing to ask any more and would leave for the hub's menu by itself; this one rests at a question, as the old page rested at its form)
     await page.waitFor('window.__arenaBattle && window.__arenaBattle.state === "online"', { timeoutMs: 60000 });
     await page.eval('history.back(); true');
     await page.waitFor('window.__marker === 424242 && window.__arenaHub && window.__arenaHub.state === "ready"', { timeoutMs: 15000 }).catch(() => {});

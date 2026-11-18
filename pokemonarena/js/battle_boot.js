@@ -39,6 +39,8 @@ import { matchFromSummary, onlineMatchId } from './career_stats.js';  // ST1: th
 import { cleanName } from './netmatch.js';                              // an online opponent's name as the career keeps it (the same reduction the match used)
 import { createResumeStore, resumeKey, resumeKeyOfTag, adoptRecord, navigationType } from './battle_resume.js';       // W1 fix D11: a reload mid-battle resumes it
 import { parseOnlineQuery, createOnline } from './online.js';                         // two players, one battle (netmatch.js + lib/netplay.js); see ONLINE.md
+import { createOnlinePanel, speakOnline } from './online_view.js';                    // the online screens before a battle: which row the cursor is on, what a press means, the screen reader's words (pure)
+import { readBack, passThrough } from './hub_presence.js';                            // INAPP.md "Contract 6": the hub screen a battle comes back to; the test seams a hop to the hub carries (pure, strings only)
 import { engineFingerprint } from './online_match.js';
 import { fitScale, fitPicture, createFullscreen, PROMPT_ROOM } from './screenfit.js';
 import { summarizeMatch } from './match_stats.js';                      // the Tower hears the match the moment the engine ends it (tower_fight.js watchEngine), so it needs the same summary the scene makes
@@ -142,6 +144,12 @@ async function main() {
   const canvas = $('battle'), ctx = canvas.getContext('2d', { alpha: false });
   const els = { boot: $('boot'), bar: $('bar'), bootText: $('bootText'), err: $('error'), errTitle: $('errTitle'), errMsg: $('errMsg'), errDetail: $('errDetail'), retry: $('retry'), note: $('note'), top: $('top'), padA: $('dpad'), padB: $('ab'), sound: $('soundBtn'), menu: $('menuBtn') };
   const hook = window.__arenaBattle = { state: 'boot', kind: null, error: null, params: null, seed: null };
+  // BACK TO THE HUB IS BACK TO WHERE THE PLAYER WAS (INAPP.md "Contract 6"): a battle started from the Trainer Center ends back in it. The hub leaves the screen's path in this tab (arena.back);
+  // it is read through the one pattern hub_presence.js readBack allows and never trusted further. Every way out of this page uses it: the result screen, the pause menu, BACK on an online
+  // confirm screen, a wait that is given up, the error screen, the header's link.
+  const hubUrl = () => { let ss = null; try { ss = window.sessionStorage; } catch (_e) { ss = null; } const p = readBack(ss); return p ? HUB_PAGE_URL + '#' + p : HUB_PAGE_URL; };
+  hook.hubUrl = hubUrl;
+  { const h = $('homeLink'); if (h) h.addEventListener('click', () => { try { h.setAttribute('href', hubUrl()); } catch (_e) { /* the link keeps its own address */ } }, true); }
   const mbs = (n) => (n / 1048576).toFixed(1);
   const input = createInput();
   let nav = null, scene = null, ctl = null, ui = null, packRef = null, romBytes = null, last = null;
@@ -167,8 +175,9 @@ async function main() {
     canvas.hidden = true;
     showRomError({ boot: els.boot, err: els.err, errTitle: els.errTitle, errMsg: els.errMsg, errDetail: els.errDetail, retry: els.retry }, { kind: kind || 'internal', title, message, detail, retry, tech: tech || '' });          // W1 D7: the one shared error experience (rom_error.js)
     { const q = $('quickBtn'); if (q) q.hidden = kind !== 'params'; }          // 'Quick Battle' belongs to a refused ADDRESS, not to a missing game file
+    { const b = $('hubBtn'); if (b && kind !== 'tower') b.setAttribute('href', hubUrl()); }          // (a Tower fight's error goes back to the Tower: towerError names it)
     document.body.dataset.state = 'error';
-    if (!nav) { try { nav = enableDomNav(els.err, { input, onBack: () => { location.href = hook.params && hook.params.tower ? TOWER_HUB_URL : HUB_PAGE_URL; } }); } catch (_e) { nav = null; } }
+    if (!nav) { try { nav = enableDomNav(els.err, { input, onBack: () => { location.href = hook.params && hook.params.tower ? TOWER_HUB_URL : hubUrl(); } }); } catch (_e) { nav = null; } }
     else { try { nav.refresh(); } catch (_e) { /* ignore */ } }
     if (nav) { try { nav.focusFirst(); } catch (_e) { /* ignore */ } }
     fit();
@@ -180,7 +189,7 @@ async function main() {
   // The picture takes the room it is given (screenfit.js fitPicture): a phone held upright runs it edge to edge, fullscreen gives it the whole viewport.
   // The old rule here was a whole scale only (floor), which left a 390 px phone a 324 px picture and a 360 px phone a 244 px one.
   function fit() {
-    hook.scale = fitPicture({ doc: document, win: window, canvas, top: els.top, padA: els.padA, padB: els.padB, touchPad, hint: ((!touchPad && document.body.dataset.state === 'ready') ? 40 + PROMPT_ROOM : 0) + (towerFight && document.body.dataset.state === 'ready' ? 30 : 0) });          // a Tower floor has its status line under the picture
+    hook.scale = fitPicture({ doc: document, win: window, canvas, top: els.top, padA: els.padA, padB: els.padB, touchPad, hint: ((!touchPad && (document.body.dataset.state === 'ready' || document.body.dataset.state === 'online')) ? 40 + PROMPT_ROOM : 0) + (towerFight && document.body.dataset.state === 'ready' ? 30 : 0) });          // a Tower floor has its status line under the picture
     try { syncChips(); } catch (_e) { /* the chips are placed again on the next frame */ }
   }
   window.addEventListener('resize', fit);
@@ -280,7 +289,7 @@ async function main() {
     if (choice === 'EDIT TEAM') editTeam();
     else if (choice === 'REMATCH') { const a = new Uint32Array(1); (window.crypto || {}).getRandomValues ? window.crypto.getRandomValues(a) : (a[0] = (hook.seed * 1103515245 + 12345) >>> 0); navigate(rematchUrl(a[0])); }
     else if (choice === 'NEW BATTLE') { const u = new URL(location.href); const keep = new URLSearchParams(); ['cpu', 'format'].forEach((k) => { if (u.searchParams.has(k)) keep.set(k, u.searchParams.get(k)); }); navigate(u.pathname + (keep.toString() ? '?' + keep.toString() : '')); }
-    else navigate(HUB_PAGE_URL);             // BACK TO HUB (and the old LEAVE)
+    else navigate(hubUrl());             // BACK TO HUB (and the old LEAVE)
   }
 
   /* ---- ST1: the career. When the RESULT screen appears the finished battle is written into the profile that fought it, ONCE (scene.js hooks.onMatchEnd fires once per page).
@@ -462,14 +471,38 @@ async function main() {
       hook.state = 'ready'; hook.kind = null; hook.error = null; hook.sha256 = sha256;
       if (towerFight) showTowerBar();
       makeHook();
-      if (soundSys) { soundSys.setRom({ bytes, pack: packRef }); window.__arenaSound = soundSys; }       // MU3: the ROM's music; nothing is heard before the first click / tap / key
+      giveSoundTheRom();       // MU3: the ROM's music; nothing is heard before the first click / tap / key
       try { canvas.focus({ preventScroll: true }); } catch (_e) { /* ignore */ }
       runLoop();
     };
 
-    /* ---- ONLINE: a battle against a person. The scene is built when the handshake has produced the controller (and again for each rematch). ---- */
+    let romGiven = false;
+    const giveSoundTheRom = () => { if (soundSys && !romGiven) { romGiven = true; soundSys.setRom({ bytes, pack: packRef }); window.__arenaSound = soundSys; } };
+
+    /* ---- ONLINE: a battle against a person. The scene is built when the handshake has produced the controller (and again for each rematch).
+     * UNTIL THEN THE PAGE'S SCREENS ARE IN THE PICTURE (INAPP.md: everything in the app): what an address without the hub's token must ask (YOU'RE INVITED, YOUR ROOM, the one-press questions) and
+     * what is under way (the room code, the steps, the sentence, the way out). online.js says WHAT (view(): one pure function of its state), online_draw.js draws it from the ROM through the hub's
+     * shell renderer, online_view.js's panel is the cursor over its rows. The canvas is up, fitted and listening BEFORE the first scene exists (showOnline); the loop draws the screen while there is
+     * no scene, and the buttons and the pointer go to it until a scene takes over. ---- */
     if (onlineQuery) {
       let shown = false;
+      const showOnline = () => {
+        els.boot.hidden = true; els.err.hidden = true; canvas.hidden = false;
+        document.body.dataset.state = 'online'; hook.state = 'online';
+        if (nav) { try { nav.disable(); } catch (_e) { /* ignore */ } }
+        touchPad = coarse();
+        fit();
+        wireInput();
+        giveSoundTheRom();
+        Object.assign(hook, { canvas, ui, pack: packRef });
+        hook.onlineScreen = {
+          up: () => onlineUp(), press: (a) => onlinePress(a), pointer: (ev) => onlinePointer(ev), rects: () => onlinePanel.rects(online.view()), cursor: () => onlinePanel.cursor(online.view()),
+          frameHash: () => fnv(renderOnline(online.view(), onlinePanel.cursor(online.view())).rgba), canvasHash: () => fnv(ctx.getImageData(0, 0, SCREEN_W, SCREEN_H).data),
+          fits: () => onlineScreen.app('online').fits(online.view()), spoken: () => onlineSpoken, draw: () => drawOnline(true),
+        };
+        try { canvas.focus({ preventScroll: true }); } catch (_e) { /* ignore */ }
+        runLoop();
+      };
       const mountOnlineScene = (c, info) => {
         ctl = c; battleRuleset = c.netMeta.ruleset;
         hook.seed = info.seed; hook.params.seed = info.seed;
@@ -498,24 +531,35 @@ async function main() {
         if (soundSys) soundSys.hookScene(scene);
         if (scene.mode === 'steps') scene.tick();
         hook.online = online;
-        if (!shown) { shown = true; showReady(); hook.mountCount = 1; }
+        if (!shown) { shown = true; say(''); showReady(); hook.mountCount = 1; }          // (the screen reader's line of the online screens is taken back: the battle speaks for itself)
         else { hook.mountCount++; Object.assign(hook, { scene, ctl }); lastSig = ''; draw(true); }
       };
       try {
-        els.boot.hidden = true; document.body.dataset.state = 'online'; hook.state = 'online';
+        const [{ createHubScreen }, drawMod] = await Promise.all([import('./hub_screen.js'), import('./online_draw.js')]);
+        onlineScreen = createHubScreen(ui, { appScreens: { online: drawMod.createScreen } });          // the hub's shell renderer (its frame, its text and window helpers) with ONE app: the online screens
+        const pass = passThrough(location.search);          // the test seams this page was opened with ride along on a hop to the hub, as they do on the way here
         online = createOnline({
-          win: window, doc: document, pack: packRef, root: $('screenWrap'), bar: $('note'), query: onlineQuery, teamParam: params.team,
+          win: window, doc: document, pack: packRef, bar: $('note'), query: onlineQuery, teamParam: params.team,
           formatParam: new URLSearchParams(location.search).get('format'), fingerprint: engineFingerprint(packRef),
           hooks: {
             stage: (s) => { hook.onlineStage = s; },
             mountScene: mountOnlineScene,
             sceneState: () => ({ mode: scene ? scene.mode : null, pending: !!(ctl && online && online.state.info && ctl.pending(online.state.info.mySide)) }),
-            showFatal: ({ title, message }) => { canvas.hidden = true; showError({ title, message, kind: 'online' }); },
-            toHub: () => navigate(HUB_PAGE_URL),
+            showFatal: ({ title, message }) => { canvas.hidden = true; say(''); showError({ title, message, kind: 'online' }); },
+            changed: () => { onlineSig = ''; },          // (the next frame draws view() again)
+            toHub: () => navigate(hubUrl()),
+            // the plain address with nothing to start: the hub's online menu takes this page's place in the tab's history (Back does not come back here to be sent away again)
+            toMenu: () => navigateReplacing(HUB_PAGE_URL + (pass ? '?' + pass.slice(1) : '') + '#online'),
+            // CHANGE TEAM: the hub's online menu sees the room and the role in ITS OWN address and opens its invite screen for them (INAPP.md "Contract 1")
+            toTeam: (room, role) => navigate(HUB_PAGE_URL + '?np=' + encodeURIComponent(room) + (role === 'host' ? '&host=1' : '&join=1') + pass + '#online'),
           },
         });
         window.__arenaOnline = online;
-        await online.begin();
+        // (begin()'s first step is synchronous: by the time the first frame is drawn the page knows what it is - a question, a wait, a battle being picked up again, or an address with nothing
+        //  to ask that is already leaving for the hub, which must not flash a question it will never ask)
+        const began = online.begin();
+        showOnline();
+        await began;
       } catch (e) { showError({ title: 'Online play could not start', message: String(e && e.message ? e.message : e), kind: 'internal' }); }
       return;
     }
@@ -539,7 +583,7 @@ async function main() {
         const left = await towerFight.leaveUnrestorable(); resumeStore.clear(); hook.towerRefused = { status: 'abandoned', why: 'the saved fight could not be resumed' };
         towerError(left.message, 'The last fight was left'); return;
       }
-      const sceneOpts = { ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: towerFight ? 'LEAVE TOWER' : 'BACK TO HUB', leaveAsk: towerFight ? (kind, where) => towerFight.leaveAsk(kind, where) : undefined, anim: animCfg, style: styleCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: mkHooks({ onResult: onResult, onMatchEnd: towerFight ? towerMatchEnd : recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); if (towerFight) { towerFight.onQuit(); return; } whenCareerSettled(() => navigate(HUB_PAGE_URL)); } }) };
+      const sceneOpts = { ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: towerFight ? 'LEAVE TOWER' : 'BACK TO HUB', leaveAsk: towerFight ? (kind, where) => towerFight.leaveAsk(kind, where) : undefined, anim: animCfg, style: styleCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: mkHooks({ onResult: onResult, onMatchEnd: towerFight ? towerMatchEnd : recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); if (towerFight) { towerFight.onQuit(); return; } whenCareerSettled(() => navigate(hubUrl())); } }) };
       // (leaveAsk: LEAVE TOWER and FORFEIT say what leaving this fight costs NOW: nothing before the first choice, an Extra Life or one of the retries left after it, the climb when none is left)
       // the result buttons are read when the result screen comes up (scene.js startResult), so a Tower floor's can follow who won
       if (towerFight) Object.defineProperty(sceneOpts, 'resultOptions', { enumerable: true, get: () => resultOptionsFor() });
@@ -571,7 +615,10 @@ async function main() {
   }
 
   /* ---- input ---- */
+  let inputWired = false;
   function wireInput() {
+    if (inputWired) return;          // (an online page wires it for its screens before the first scene; the first scene must not wire it again)
+    inputWired = true;
     hook.input = input;
     // W1 fix A4: the on-screen pad is shown from the FIRST TOUCH on any touch screen (a laptop or desktop touch monitor reports a fine pointer, so the media query at start said no);
     // registered before the hint line so that the line already describes the pad that is about to appear
@@ -583,10 +630,12 @@ async function main() {
     input.on('source', (e) => { if (e.source === 'touch' && !touchPad) padTo(true); else if (e.source === 'mouse' && touchPad) padTo(false); });
     if ($('keys')) watchHints(input, $('keys'), { menu: true, battle: true, pad: () => touchPad });         // the hint line speaks of the device the player last used
     const toLocal = input.mapClientToLogical(canvas, SCREEN_W, SCREEN_H);
-    input.registerPointerTarget(canvas, { toLocal, cursor: { actionable: (x, y) => { const h = scene.hit(x, y); return !!h && h.kind !== 'text'; } } });
+    input.registerPointerTarget(canvas, { toLocal, cursor: { actionable: (x, y) => { if (onlineUp()) return !!onlinePanel.hit(x, y, online.view()); if (!scene) return false; const h = scene.hit(x, y); return !!h && h.kind !== 'text'; } } });
     for (const b of document.querySelectorAll('[data-btn]')) input.bindPad(b, b.dataset.btn);
     input.on('action', (e) => {
       if (controlsOpen) return;
+      if (onlineUp()) { if (e.pressed && !e.native) onlinePress(e.action); return; }          // (inside the key handler: COPY and SHARE need the user gesture)
+      if (!scene) return;
       scene.hold(input.isDown('a'), input.isDown('b'));
       if (!e.pressed || e.native) return;
       // Esc is B everywhere, except at the top action menu where B has nothing to go back to: there it opens the pause menu (RESUME / CONTROLS / SOUND / FORFEIT / BACK TO HUB)
@@ -595,6 +644,13 @@ async function main() {
     });
     input.on('pointer', (e) => {
       if (controlsOpen) return;
+      if (onlineUp()) {
+        if (e.kind === 'wheel' || e.el !== canvas || !e.inside) return;
+        if (e.kind === 'move' || (e.kind === 'down' && e.source === 'touch')) onlinePointer({ kind: 'move', x: e.x, y: e.y });
+        else if (e.kind === 'click') onlinePointer({ kind: 'click', x: e.x, y: e.y });
+        return;
+      }
+      if (!scene) return;
       if (e.kind === 'wheel') { if (e.el === canvas || e.x === null) scene.pointer({ kind: 'wheel', steps: e.steps }); return; }
       if (e.el !== canvas || !e.inside) return;
       if (e.kind === 'move' || (e.kind === 'down' && e.source === 'touch')) scene.pointer({ kind: 'move', x: e.x, y: e.y });
@@ -605,6 +661,39 @@ async function main() {
   /* ---- the clock: a fixed 59.7275 Hz step regardless of the display rate ---- */
   const img = new ImageData(SCREEN_W, SCREEN_H);
   let lastSig = '', renders = 0;
+  const fnv = (u8) => { let h = 0x811c9dc5; for (let i = 0; i < u8.length; i++) h = Math.imul(h ^ u8[i], 0x01000193) >>> 0; return h.toString(16).padStart(8, '0'); };
+  /* ---- the online screens before a battle (online_view.js / online_draw.js): drawn here while there is no scene, pressed here until a scene takes over ---- */
+  const onlinePanel = createOnlinePanel();
+  let onlineScreen = null, onlineSig = '', onlineSpoken = '';
+  const onlineUp = () => !!online && !!onlineScreen && !scene;
+  const say = (t) => { onlineSpoken = t; const n = $('live'); if (n && n.textContent !== t) n.textContent = t; };          // the polite live region: the canvas has only a static label
+  const renderOnline = (v, cursor) => onlineScreen.render({ app: 'online', screen: 'online', env: 0, tick: 0, online: v, cursor });
+  function drawOnline(force) {
+    const v = online.view(), cursor = onlinePanel.cursor(v);
+    const sig = JSON.stringify(v) + '#' + cursor;
+    if (!force && sig === onlineSig) return;
+    onlineSig = sig;
+    if (v.screen === 'hidden') return;          // (the error screen has the page, or it is leaving)
+    const f = renderOnline(v, cursor);
+    if (f.fault && !hook.onlineFault) { hook.onlineFault = f.fault; console.error('[online] the screen could not be drawn:', f.fault.message); }
+    img.data.set(f.rgba); ctx.putImageData(img, 0, 0); renders++;
+    const words = speakOnline(v, cursor); if (words !== onlineSpoken) say(words);
+  }
+  /** A button on an online screen. A row that is pressed acts HERE, in the same task as the key or the tap (online.act): the browser's copy and share need that. */
+  function onlinePress(action) {
+    const r = onlinePanel.press(action, online.view());
+    if (r && r.kind === 'act') online.act(r.id);
+    if (soundSys) { try { soundSys.menuSfx(action, !!r && r.kind !== 'refused', true, r && r.kind === 'refused' ? [{ type: 'blocked' }] : undefined); } catch (_e) { /* a sound is never worth a press */ } }
+    drawOnline(true);
+    return r;
+  }
+  function onlinePointer(ev) {
+    const r = onlinePanel.pointer(ev, online.view());
+    if (r && r.kind === 'act') online.act(r.id);
+    if (soundSys && ev.kind === 'click' && r) { try { soundSys.menuSfx('a', true, true, r.kind === 'refused' ? [{ type: 'blocked' }] : undefined); } catch (_e) { /* ignore */ } }
+    drawOnline(true);
+    return r;
+  }
   function draw(force) {
     const v = scene.view();
     const sig = JSON.stringify(v);
@@ -613,10 +702,14 @@ async function main() {
     const f = ui.render(v);
     img.data.set(f.rgba); ctx.putImageData(img, 0, 0); renders++;
   }
+  let looping = false;
   function runLoop() {
+    if (looping) { draw(true); return; }          // (an online page started the clock for its screens; the first scene only needs its first frame)
+    looping = true;
     last = performance.now(); let acc = 0;
     const loop = (now) => {
       const dt = Math.min(250, now - last); last = now;
+      if (!scene) { if (onlineUp()) drawOnline(false); requestAnimationFrame(loop); return; }          // no scene yet: the online screen is the picture
       if (!document.hidden && !hook.paused && !controlsOpen) {
         acc += dt;
         let n = 0;
@@ -628,13 +721,12 @@ async function main() {
       if (soundSys) soundSys.battleFrame(scene, params.cpu, opensOnPreview(ctl));       // MU3: team preview / battle / result music follows the scene's mode; the pause menu ducks it
       requestAnimationFrame(loop);
     };
-    draw(true);
+    if (scene) draw(true); else if (onlineUp()) drawOnline(true);
     requestAnimationFrame(loop);
   }
 
   /* ---- the test hook ---- */
   function makeHook() {
-    const fnv = (u8) => { let h = 0x811c9dc5; for (let i = 0; i < u8.length; i++) h = Math.imul(h ^ u8[i], 0x01000193) >>> 0; return h.toString(16).padStart(8, '0'); };
     Object.assign(hook, {
       scene, ctl, ui, pack: packRef, canvas, scale: hook.scale,
       getState: () => scene.state(),
