@@ -33,6 +33,7 @@ import { navigationType } from './battle_resume.js';
 import { createOpenLobbies, createLocalBus, createMqttBus, ROOM_RE, MQTT_LIB } from './openlobby.js';
 import { createChallenge, createAcceptor, takeAcceptToken, takeMeetToken, takeStartToken, startPlan, admission, canSeal, ACCEPT_MAX_AGE_MS, TIMING as PRESENCE_TIMING } from './presence.js';
 import { readOnlinePrefs, preselect } from './online_prefs.js';
+import { onlineView, UNDER_WAY, fmtClock } from './online_view.js';
 
 export const GAME_KEY = 'Pokemon Arena';
 export { ROOM_RE };
@@ -79,7 +80,9 @@ export function parseOnlineQuery(search) {
     const jm = Number(q.get('openjoin')); if (Number.isInteger(jm) && jm >= 500 && jm <= 120000) limits.joinMs = jm;                                          // how long a listed game may stay silent before the joiner gives up on it
     const hm = Number(q.get('openhold')); if (Number.isInteger(hm) && hm >= 300 && hm <= 120000) limits.holdMs = hm;                                          // how long an admitted player who knocks again may take to be let back in before the seat is given up on
   }
-  return { role: auto || host ? 'host' : join ? 'guest' : null, room: auto ? null : room, transport, limits, auto, meet: q.get('meet') === '1' && join && room !== null };
+  // ask=host | quick: the hub could not leave its one-time token (storage blocked), so the page ASKS before it starts that (INAPP.md "Contract 1"); read only on the plain address (no room, no role)
+  const ask = np === null && !host && !join && !auto && (q.get('ask') === 'host' || q.get('ask') === 'quick') ? q.get('ask') : null;
+  return { role: auto || host ? 'host' : join ? 'guest' : null, room: auto ? null : room, transport, limits, auto, ask, meet: q.get('meet') === '1' && join && room !== null };
 }
 
 /**
@@ -118,8 +121,6 @@ export function roomFromInput(raw) {
   return s.replace(/[\s-]+/g, '').toUpperCase().slice(0, 8);
 }
 
-const fmtClock = (ms) => { const s = Math.ceil(ms / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
-
 function el(doc, tag, props, ...kids) {
   const n = doc.createElement(tag);
   for (const [k, v] of Object.entries(props || {})) {
@@ -134,7 +135,7 @@ function el(doc, tag, props, ...kids) {
 /**
  * cfg: { win, doc, pack, root (the element the panel goes in), bar (where the status bar is inserted before), query (parseOnlineQuery), teamParam (the ?team= code or null),
  *        formatParam, hooks: { mountScene(ctl, info), sceneState() -> { mode, pending }, showFatal({ title, message }), toHub() }, now }
- * -> { begin(), onResult(choice), leaveToHub(), state }
+ * -> { begin(), onResult(choice), leaveToHub(), state, view(), and the named actions: setForm(patch), startAs(role), go(), quick(), cancel(), copyLink(), copyCode(), share(), joinListed(room), challengeResident(room) }
  */
 export function createOnline(cfg) {
   const { win, doc, pack, root } = cfg;
@@ -158,6 +159,15 @@ export function createOnline(cfg) {
   // every use of the clock here is a DURATION (a turn's allowance, a link's grace), so it is the monotonic one: a wall-clock step (NTP, a changed timezone) must not time anyone out
   const now = cfg.now || (() => (win.performance && typeof win.performance.now === 'function' ? win.performance.now() : Date.now()));
   const state = { stage: 'setup', role: query.role, room: query.room, transport: query.transport, nm: null, session: null, mine: null, name: null, fmt: null, error: null, info: null, matches: 0, open: false, quick: false, listed: null, openWanted: false, admitted: false, admittedId: null, defecting: false, invite: null, profileId: null, rec: null };
+  // THE FORM IS A MODEL, NOT NODES (INAPP.md "Wave 2"): what the player chose (in the hub's online menu, through the preferences; a test through setForm). The logic below reads this and nothing on the page.
+  //   teamKey: the key of one of state.choices | name | nameTouched: the name is one the player gave (a stored one), not one filled in from a team's owner | fmt: '3v3' | '6v6' | room: the code to join | paste: a pasted team code
+  const form = state.form = { teamKey: null, name: '', nameTouched: false, fmt: '3v3', room: '', paste: '' };
+  // WHAT THE SCREEN SAYS, as state (view() reads it, and whatever presents the page reads view()): the one sentence, the way out of what is under way, whether the room's code may be shown, what can be pressed
+  state.status = { text: '', bad: false }; state.cancel = { shown: false, label: 'Cancel' }; state.codeShown = false; state.goOff = true; state.quickOff = true; state.locked = false; state.copied = null; state.canShare = false; state.bar = null;
+  const setCancel = (shown, label) => { state.cancel = { shown: !!shown, label: label || state.cancel.label }; };
+  // THE STAGE IS A PROPERTY: when it last changed is what the elapsed time counts from ("Waiting for your friend... 0:42"), whoever changed it
+  let stageNow = 'setup', stageAt = 0;
+  Object.defineProperty(state, 'stage', { enumerable: true, get: () => stageNow, set: (s) => { if (s !== stageNow) { stageNow = s; stageAt = UNDER_WAY.includes(s) ? now() : 0; } } });
   // quickCtx: what Find a battle was launched with, to open the same game again if a game it left its own for turns out not to be there. openText / openLead: what the host of an open game was last told.
   let panel = null, bar = null, barTimer = 0, preMsgs = [], wired = false, closed = false, reconnecting = false, lobbies = null, joinTimer = 0, relisting = false, asking = null, acceptor = null, quickCtx = null, openText = '', openLead = '';
   const sleep = (ms) => new Promise((r) => win.setTimeout(r, ms));
@@ -220,34 +230,34 @@ export function createOnline(cfg) {
     ui.lede = el(doc, 'p', { class: 'dim', id: 'olLede', text: HOME_LEDE });
     // YOUR TEAM
     ui.teamField = el(doc, 'label', { class: 'field' }, el(doc, 'span', { text: 'Team' }));
-    ui.team = el(doc, 'select', { id: 'olTeam', onchange: () => { ui.pasteField.hidden = ui.team.value !== 'paste'; refreshFormats(); nameFollowsTeam(); } });
+    ui.team = el(doc, 'select', { id: 'olTeam', onchange: () => { form.teamKey = ui.team.value; refreshFormats(); nameFollowsTeam(); paint(); } });
     ui.teamField.append(ui.team);
     ui.pasteField = el(doc, 'label', { class: 'field wide', hidden: true }, el(doc, 'span', { text: 'Team code' }));
-    ui.paste = el(doc, 'textarea', { id: 'olPaste', rows: '3', spellcheck: 'false', placeholder: 'ARENA1.…' });
+    ui.paste = el(doc, 'textarea', { id: 'olPaste', rows: '3', spellcheck: 'false', placeholder: 'ARENA1.…', oninput: () => { form.paste = ui.paste.value; } });
     ui.pasteField.append(ui.paste);
     ui.nameField = el(doc, 'label', { class: 'field' }, el(doc, 'span', { text: 'Name' }));
-    ui.name = el(doc, 'input', { id: 'olName', type: 'text', maxlength: String(NAME_MAX), autocomplete: 'nickname', spellcheck: 'false', oninput: () => { nameTouched = true; } });
+    ui.name = el(doc, 'input', { id: 'olName', type: 'text', maxlength: String(NAME_MAX), autocomplete: 'nickname', spellcheck: 'false', oninput: () => { form.name = ui.name.value; form.nameTouched = true; } });
     ui.nameField.append(ui.name);
     ui.fmtField = el(doc, 'label', { class: 'field' }, el(doc, 'span', { text: 'Battle size' }));
-    ui.fmt = el(doc, 'select', { id: 'olFmt' }, el(doc, 'option', { value: '3v3', text: '3 v 3 (pick 3 of 6)' }), el(doc, 'option', { value: '6v6', text: '6 v 6 (whole team)' }));
+    ui.fmt = el(doc, 'select', { id: 'olFmt', onchange: () => { form.fmt = ui.fmt.value; } }, el(doc, 'option', { value: '3v3', text: '3 v 3 (pick 3 of 6)' }), el(doc, 'option', { value: '6v6', text: '6 v 6 (whole team)' }));
     ui.fmtField.append(ui.fmt);
     ui.you = el(doc, 'section', { class: 'olyou', id: 'olYou', 'aria-label': 'Your team' }, ui.teamField, ui.nameField, ui.fmtField, ui.pasteField);
     // the status line: under the team in the first two views (a refusal, "Checking your team..."), inside the progress card while something is under way
     ui.status = el(doc, 'p', { id: 'olStatus', class: 'status', role: 'status', 'aria-live': 'polite' });
     ui.setupSlot = el(doc, 'div', { class: 'olslot' });
     // INVITE A FRIEND (a private room: only the link or the code gets anyone in)
-    ui.go = el(doc, 'button', { type: 'button', class: 'textbtn primary big', id: 'olGo', text: 'Get an invite link', disabled: true, onclick: () => (boardPage() ? startAs('host') : go()) });      // enabled once the team list has loaded (begin)
+    ui.go = el(doc, 'button', { type: 'button', class: 'textbtn primary big', id: 'olGo', text: 'Get an invite link', disabled: true, onclick: () => { pullForm(); if (boardPage()) startAs('host'); else go(); } });      // enabled once the team list has loaded (begin)
     ui.goSlot = el(doc, 'div', { class: 'row' });
     ui.friendCard = card('olFriend', 'Invite a friend', el(doc, 'p', { class: 'dim', text: 'You get a link to send them. They open it, press Join, and the battle starts.' }), ui.goSlot);
     // JOIN A FRIEND
     ui.room = el(doc, 'input', { id: 'olRoom', type: 'text', maxlength: '300', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false', placeholder: 'CODE', 'aria-label': 'Your friend\'s room code or link', enterkeyhint: 'go',
-      oninput: () => { const v = roomFromInput(ui.room.value); if (v !== null && v !== ui.room.value) ui.room.value = v; },
-      onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); startAs('guest'); } } });
-    ui.joinBtn = el(doc, 'button', { type: 'button', class: 'textbtn primary', id: 'olJoin', text: 'Join', onclick: () => startAs('guest') });
+      oninput: () => { const v = roomFromInput(ui.room.value); if (v !== null && v !== ui.room.value) ui.room.value = v; form.room = ui.room.value; },
+      onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); pullForm(); startAs('guest'); } } });
+    ui.joinBtn = el(doc, 'button', { type: 'button', class: 'textbtn primary', id: 'olJoin', text: 'Join', onclick: () => { pullForm(); startAs('guest'); } });
     ui.roomField = el(doc, 'label', { class: 'field codefield' }, el(doc, 'span', { text: 'Their room code (or paste their link)' }), el(doc, 'span', { class: 'coderow' }, ui.room, ui.joinBtn));
     ui.joinCard = card('olJoinCard', 'Join a friend', el(doc, 'p', { class: 'dim', text: 'Your friend made a room and sent you a code or a link.' }), ui.roomField);
     // BATTLE ANYONE (the only public way in: what it shows other players is said right here)
-    ui.quick = el(doc, 'button', { type: 'button', class: 'textbtn primary big', id: 'olQuick', text: 'Find an opponent', disabled: true, onclick: () => quick() });
+    ui.quick = el(doc, 'button', { type: 'button', class: 'textbtn primary big', id: 'olQuick', text: 'Find an opponent', disabled: true, onclick: () => { pullForm(); quick(); } });
     ui.quickCard = card('olQuickCard', 'Battle anyone', el(doc, 'p', { class: 'dim', id: 'olQuickNote', text: 'Get matched with whoever is looking right now. Other players see your trainer name and your online record (wins and losses).' }), el(doc, 'div', { class: 'row' }, ui.quick));
     ui.cards = el(doc, 'div', { class: 'olcards', id: 'olCards' }, ui.friendCard, ui.joinCard, ui.quickCard);
     ui.addrBox = el(doc, 'div', { class: 'row', id: 'olAddr' });
@@ -266,8 +276,8 @@ export function createOnline(cfg) {
     ui.share = el(doc, 'button', { type: 'button', class: 'textbtn primary', id: 'olShare', text: 'Share', hidden: true, onclick: () => share() });
     ui.inviteHead = el(doc, 'p', { class: 'invitehead', id: 'olInviteHead', text: 'Send your friend this link' });
     ui.linkText = el(doc, 'input', { id: 'olLinkText', type: 'text', readonly: true, 'aria-label': 'Invite link', onfocus: () => { try { ui.linkText.select(); } catch (_e) { /* ignore */ } } });
-    ui.copyLink = el(doc, 'button', { type: 'button', class: 'textbtn primary', id: 'olCopyLink', text: 'Copy link', onclick: () => copy(inviteLink(), ui.copyLink) });
-    ui.copyCode = el(doc, 'button', { type: 'button', class: 'textbtn', id: 'olCopyCode', text: 'Copy code', onclick: () => copy(state.room, ui.copyCode) });
+    ui.copyLink = el(doc, 'button', { type: 'button', class: 'textbtn primary', id: 'olCopyLink', text: 'Copy link', onclick: () => copyLink() });
+    ui.copyCode = el(doc, 'button', { type: 'button', class: 'textbtn', id: 'olCopyCode', text: 'Copy code', onclick: () => copyCode() });
     ui.linkBox = el(doc, 'div', { class: 'linkbox', id: 'olLinkBox' }, ui.inviteHead, el(doc, 'div', { class: 'linkrow' }, ui.linkText), el(doc, 'div', { class: 'row invite' }, ui.copyLink, ui.share));
     ui.invite = el(doc, 'div', { class: 'invitebox', id: 'olInvite', hidden: true }, ui.linkBox, ui.codeLabel, el(doc, 'div', { class: 'coderow2' }, ui.codeBox, ui.copyCode));
     ui.steps = el(doc, 'ol', { id: 'olSteps', class: 'steps', 'aria-label': 'Progress' });
@@ -282,55 +292,60 @@ export function createOnline(cfg) {
     ui.setupSlot.append(ui.status);
     root.append(panel);
   }
-  const say = (t, bad) => { ui.status.textContent = t || ''; ui.status.classList.toggle('bad', !!bad); };
+  /** The one sentence on the screen (a refusal when `bad`). It is state: view().status. */
+  const say = (t, bad) => { state.status = { text: t || '', bad: !!bad }; paint(); };
+  /** The DOM panel reads its own controls into the form (a button of the panel was pressed): whatever the boxes hold counts, typed or set from outside. */
+  function pullForm() {
+    if (ui.team.value) form.teamKey = ui.team.value;
+    form.name = ui.name.value; form.fmt = ui.fmt.value || form.fmt; form.room = ui.room.value; form.paste = ui.paste.value;
+  }
   const formControls = () => [ui.room, ui.joinBtn, ui.team, ui.paste, ui.name, ui.fmt, ui.go, ui.quick];
   const inviteLink = () => win.location.origin + '/pokemonarena/battle.html?np=' + encodeURIComponent(state.room) + '&join=1' + (state.transport === 'local' ? '&net=local' : '');
-  /** Copy, and say so ON THE BUTTON for two seconds: the sentence under the steps says what is happening, and a "Copied." there used to replace "Waiting for your friend...". */
-  const copyTimers = new WeakMap();
-  async function copy(text, btn) {
+  /** Copy, and say so WHERE THE PRESS WAS for two seconds (view().copied: 'link' | 'code'): the sentence says what is happening, and a "Copied." there used to replace "Waiting for your friend...".
+   *  clipboard.writeText is called in the same task as the press that asked for it (nothing is awaited before it): a browser may refuse a copy that no user gesture stands behind. */
+  let copiedTimer = 0;
+  async function copy(text, what) {
     let ok = false;
     try { await win.navigator.clipboard.writeText(text); ok = true; } catch (_e) { ok = false; }
-    if (!ok) { try { ui.linkText.focus(); ui.linkText.select(); } catch (_e) { /* ignore */ } say('Your browser would not let the page copy. The link is selected above: copy it yourself.', true); return; }
-    if (!btn) return;
-    if (!btn.dataset.label) btn.dataset.label = btn.textContent;
-    btn.textContent = 'Copied ✓'; btn.classList.add('copied');
-    win.clearTimeout(copyTimers.get(btn));
-    copyTimers.set(btn, win.setTimeout(() => { btn.textContent = btn.dataset.label; btn.classList.remove('copied'); }, 2000));
+    if (!ok) { try { ui.linkText.focus(); ui.linkText.select(); } catch (_e) { /* ignore */ } say('Your browser would not let the page copy. The link is selected above: copy it yourself.', true); return false; }
+    state.copied = what; paint();
+    win.clearTimeout(copiedTimer);
+    copiedTimer = win.setTimeout(() => { state.copied = null; paint(); }, 2000);
+    return true;
   }
+  const copyLink = () => copy(inviteLink(), 'link');
+  const copyCode = () => copy(state.room, 'code');
   async function share() {
     try { await win.navigator.share({ title: 'Pokemon Arena battle', text: 'Battle me in Pokemon Arena! Room ' + state.room, url: inviteLink() }); }
-    catch (e) { if (!e || e.name !== 'AbortError') copy(inviteLink(), ui.copyLink); }
+    catch (e) { if (!e || e.name !== 'AbortError') copyLink(); }
   }
   // the plain Play online page: no role and no room in the address
   const boardPage = () => query.role === null && !query.room;
   function startAs(role) {
     if (state.stage !== 'setup' || busy) return;
-    if (role === 'guest') { const v = roomFromInput(ui.room.value); if (v !== null) ui.room.value = v; }
+    if (role === 'guest') { const v = roomFromInput(form.room); if (v !== null) form.room = v; }
     setRole(role);
     go();
   }
   function setRole(role) {
     if (state.stage !== 'setup') return;
     state.role = role;
+    state.goOff = false;
+    if (role === 'guest' && state.room && !form.room) form.room = state.room;
     syncSetupUi();
-    if (!boardPage()) ui.go.textContent = role === 'host' ? 'Open the room' : 'Join the battle';
-    ui.go.disabled = false;
-    if (role === 'guest' && state.room && !ui.room.value) ui.room.value = state.room;
   }
+  const choiceNow = () => (state.choices ? state.choices.find((c) => c.key === form.teamKey) || state.choices[0] : null);
   function refreshFormats() {
     // a team of fewer than three cannot play 3v3
-    const opt = ui.team.selectedOptions[0];
-    const size = opt && opt.dataset.size ? Number(opt.dataset.size) : 6;
-    ui.fmt.querySelector('option[value="3v3"]').disabled = size < 3;
-    if (size < 3) ui.fmt.value = '6v6';
+    const c = choiceNow(), size = c && c.size ? c.size : 6;
+    if (size < 3) form.fmt = '6v6';
   }
 
   // THE NAME IS THE TRAINER'S: picking a saved team fills in the name of the profile that owns it, unless the player has typed a name of their own on this page
-  let nameTouched = false;
   function nameFollowsTeam() {
-    if (nameTouched || !state.choices) return;
-    const c = state.choices.find((x) => x.key === ui.team.value);
-    if (c && c.trainer) ui.name.value = cleanName(c.trainer, ui.name.value || 'Player');
+    if (form.nameTouched || !state.choices) return;
+    const c = state.choices.find((x) => x.key === form.teamKey);
+    if (c && c.trainer) form.name = cleanName(c.trainer, form.name || 'Player');
   }
   async function gatherTeams() {
     const out = [];
@@ -354,7 +369,7 @@ export function createOnline(cfg) {
   async function teamCodeOf(choice) {
     if (choice.key === 'url') return { ok: true, code: choice.code };
     if (choice.key === 'random') { const a = new Uint32Array(1); win.crypto.getRandomValues(a); try { return { ok: true, code: await randomTeamCode(pack, a[0]) }; } catch (e) { return { ok: false, message: 'A random team could not be made (' + (e && e.message ? e.message : e) + ').' }; } }
-    if (choice.key === 'paste') { const t = ui.paste.value.replace(/\s+/g, ''); return t ? { ok: true, code: t } : { ok: false, message: 'Paste a team code first, or pick a saved team.' }; }
+    if (choice.key === 'paste') { const t = form.paste.replace(/\s+/g, ''); return t ? { ok: true, code: t } : { ok: false, message: 'Paste a team code first, or pick a saved team.' }; }
     // a SAVED team is the only choice that needs the store, and the only one that has a profile to take a record from: one open serves both
     let store = null;
     try {
@@ -372,13 +387,13 @@ export function createOnline(cfg) {
   const NO_SEAL = 'This browser cannot challenge a player in private (it has no WebCrypto, which keeps the room code off the public list), so challenging is not available here. Join an open game instead, or host one and give your friend the code.';
   /** The part every way in shares (Host, Join, a game from the list, Find a battle): the name, and the team read and judged. -> { mine, tc, name, release } | null (the reason is on the screen) */
   async function prepare(role) {
-    const name = cleanName(ui.name.value, role === 'host' ? 'Host' : role === 'guest' ? 'Guest' : 'Player');
+    const name = cleanName(form.name, role === 'host' ? 'Host' : role === 'guest' ? 'Guest' : 'Player');
     // only a name the player TYPED is remembered for the next visit. The field also fills itself in from the team's owner (nameFollowsTeam) and from the profile (setupForm); remembering THAT made the next
     // visit start with the last team's owner under a different team's name.
-    if (nameTouched) { try { win.localStorage.setItem(LS_NAME, name); } catch (_e) { /* private mode */ } }
-    ui.go.disabled = true; ui.quick.disabled = true; say('Checking your team...');
-    const release = () => { ui.go.disabled = false; ui.quick.disabled = false; };
-    const choice = { ...(state.choices.find((c) => c.key === ui.team.value) || state.choices[0]) };
+    if (form.nameTouched) { try { win.localStorage.setItem(LS_NAME, name); } catch (_e) { /* private mode */ } }
+    state.goOff = true; state.quickOff = true; say('Checking your team...');
+    const release = () => { state.goOff = false; state.quickOff = false; paint(); };
+    const choice = { ...(state.choices.find((c) => c.key === form.teamKey) || state.choices[0]) };
     const tc = await teamCodeOf(choice);
     if (!tc.ok) { release(); say(tc.message, true); return null; }
     const mine = await judgeTeamCode(tc.code, pack);
@@ -410,10 +425,10 @@ export function createOnline(cfg) {
     const role = state.role;
     // a host on the plain Play online page always gets a FRESH room (state.room may still hold the code of a join or a room that was just cancelled); the lobby's hand-off names its room in the address
     let room = role === 'host' && boardPage() ? null : state.room;
-    if (role === 'guest') { room = (roomFromInput(ui.room.value) || '').trim().toUpperCase(); if (!ROOM_RE.test(room)) { say(room ? 'That is not a room code. A code is 4 to 8 letters and numbers, like K7Q2P.' : 'Type the room code your friend sent you, then press Join.', true); try { ui.room.focus(); } catch (_e) { /* ignore */ } return; } }
+    if (role === 'guest') { room = (roomFromInput(form.room) || '').trim().toUpperCase(); if (!ROOM_RE.test(room)) { say(room ? 'That is not a room code. A code is 4 to 8 letters and numbers, like K7Q2P.' : 'Type the room code your friend sent you, then press Join.', true); try { ui.room.focus(); } catch (_e) { /* ignore */ } return; } }
     const p = await prepare(role);
     if (!p) return;
-    const fmt = role === 'host' ? ui.fmt.value : null;
+    const fmt = role === 'host' ? form.fmt : null;
     if (fmt === '3v3' && p.mine.size < 3) { p.release(); say('A 3v3 battle needs at least 3 Pokemon on your team.', true); return; }
     launch({ role, room, p, fmt, open: false, quick: false, listed: null });
   });
@@ -432,13 +447,11 @@ export function createOnline(cfg) {
   }
   function lockSetup(role, room) {
     state.stage = 'waiting';
-    for (const n of formControls()) n.disabled = true;
-    ui.openBox.hidden = true;
+    state.locked = true;
     // The host's code is shown only once the room is open (openedRoom): a friend who is handed it earlier would knock on a door that is not there yet.
     // Anything under way can be cancelled until the other player is connected: a join (the board is public, so a listed game may be made up: it used to hold the joiner for the whole watchdog with only
     // the page's Back link as a way out), and a host's room that nobody has come to.
-    ui.cancelAsk.hidden = false; ui.cancelAsk.disabled = false;
-    ui.cancelAsk.textContent = role === 'host' ? (state.quick ? 'Stop looking' : 'Close the room') : 'Cancel';
+    state.cancel = { shown: true, label: role === 'host' ? (state.quick ? 'Stop looking' : 'Close the room') : 'Cancel' };
     say(role === 'host' ? 'Opening your room...' : state.listed ? 'Joining ' + state.listed.name + '... It gives up after ' + Math.round(joinGiveUpMs() / 1000) + ' seconds if nobody answers; Cancel stops it sooner.' : 'Connecting to the room ' + room + '...');
     setStage('waiting');
   }
@@ -457,25 +470,45 @@ export function createOnline(cfg) {
     return lobbies;
   }
   function closeLobbies() { if (acceptor) { acceptor.stop(); acceptor = null; } if (lobbies) { const l = lobbies; lobbies = null; try { l.close(); } catch (_e) { /* ignore */ } } }
-  /** Which parts of the setup form show, for the stage and the role. */
-  function syncSetupUi() {
-    const setup = state.stage === 'setup', ok = supportedHere();
-    ui.openBox.hidden = !(setup && ok && boardPage());
-    renderView();
-  }
+  /** The board is on the page: the plain Play online page, at its form, in a browser that can connect two players. */
+  const boardShown = () => state.stage === 'setup' && supportedHere() && boardPage();
+  function syncSetupUi() { paint(); }
   /* ---------------------------------------------------------------------------------------------- which view, and the steps */
-  const UNDER_WAY = ['waiting', 'open', 'searching', 'asking', 'handshake', 'resuming'];
+  /* ---------------------------------------------------------------------------------------------- the view: ONE pure function of a snapshot of the state (online_view.js) */
+  function snapshot() {
+    const c = choiceNow();
+    return { stage: state.stage, role: state.role, room: state.room, codeShown: state.codeShown, open: state.open, quick: state.quick, invite: !!state.invite, admitted: state.admitted, defecting: state.defecting, listedName: state.listed ? state.listed.name : null,
+      played: state.matches > 0, status: state.status, since: stageAt && UNDER_WAY.includes(state.stage) ? Math.max(0, now() - stageAt) : null, board: boardPage(), ready: !!state.choices, canGo: !state.goOff && !state.locked, canQuick: !state.quickOff && !state.locked,
+      cancel: state.cancel, link: state.room ? inviteLink() : '', canShare: state.canShare, copied: state.copied, team: c ? { key: c.key, label: c.label, size: c.size || 6 } : null, name: form.name, fmt: form.fmt, bar: state.bar };
+  }
+  /** What the page shows now, as plain data (online_view.js says what each field is). Changes nothing. */
+  const view = () => onlineView(snapshot());
+  /** Something the screen shows has changed. (The DOM panel is a consumer of view(): it draws what view() says and holds no state of its own.) */
+  function paint() { if (panel) renderView(); }
   const GO_HOME_LABEL = 'Get an invite link';
-  let viewTimer = 0, stageAt = 0, stageWas = '';
+  let viewTimer = 0;
+  const painted = {};
   function renderView() {
     if (!panel) return;
-    const st = state.stage, setup = st === 'setup', going = UNDER_WAY.includes(st), board = boardPage();
-    if (st !== stageWas) { stageWas = st; stageAt = going ? now() : 0; }          // the clock counts from the start of THIS step ("Waiting for your friend... 0:42")
+    const v = view(), setup = v.screen === 'confirm', going = v.screen === 'wait', board = boardPage();
+    panel.hidden = v.screen === 'hidden';
+    // the form: a field is written only when the MODEL changed (a box the player is typing in is never overwritten with what it already says)
+    for (const [k, n] of [['teamKey', ui.team], ['name', ui.name], ['fmt', ui.fmt], ['room', ui.room], ['paste', ui.paste]]) if (painted[k] !== form[k]) { painted[k] = form[k]; if (form[k] !== null && n.value !== form[k]) n.value = form[k]; }
+    ui.pasteField.hidden = form.teamKey !== 'paste';
+    { const c = choiceNow(); ui.fmt.querySelector('option[value="3v3"]').disabled = !!c && (c.size || 6) < 3; }
+    for (const n of formControls()) n.disabled = state.locked;
+    if (!state.locked) { ui.go.disabled = state.goOff; ui.quick.disabled = state.quickOff; }
+    ui.openBox.hidden = !boardShown();
+    ui.status.textContent = v.status.text; ui.status.classList.toggle('bad', v.status.bad);
+    ui.cancelAsk.hidden = !v.cancel.shown; ui.cancelAsk.disabled = false; if (ui.cancelAsk.textContent !== v.cancel.label) ui.cancelAsk.textContent = v.cancel.label;
+    ui.codeBox.hidden = !v.code; if (v.code && ui.codeBox.textContent !== v.code) ui.codeBox.textContent = v.code;
+    ui.invite.hidden = !v.code; ui.codeLabel.hidden = !v.code; ui.share.hidden = !(v.code && v.canShare); if (ui.linkText.value !== v.link) ui.linkText.value = v.link;
+    for (const [n, what, label] of [[ui.copyLink, 'link', 'Copy link'], [ui.copyCode, 'code', 'Copy code']]) { const t = v.copied === what ? 'Copied ✓' : label; if (n.textContent !== t) n.textContent = t; n.classList.toggle('copied', v.copied === what); }
     // under way, the progress card IS the page: the page's own heading, the form, the cards, the board and the way back all go (Cancel is the way out of anything under way)
     ui.title.hidden = going;
     ui.lede.hidden = !setup;
     ui.you.hidden = !setup;
-    ui.fmtField.hidden = !(board || state.role === 'host');
+    ui.fmtField.hidden = !v.fmtShown;
     ui.cards.hidden = !(setup && board);
     ui.addrBox.hidden = !(setup && !board);
     ui.progress.hidden = !going;
@@ -484,65 +517,38 @@ export function createOnline(cfg) {
     panel.dataset.going = going ? '1' : '';
     const goHome = board ? ui.goSlot : ui.addrBox;
     if (ui.go.parentNode !== goHome) goHome.append(ui.go);
-    if (board && ui.go.textContent !== GO_HOME_LABEL) ui.go.textContent = GO_HOME_LABEL;
+    if (setup) { const t = board ? GO_HOME_LABEL : v.kind === 'invited' ? 'Join the battle' : 'Open the room'; if (ui.go.textContent !== t) ui.go.textContent = t; }
     const slot = going ? ui.progSlot : ui.setupSlot;
     if (ui.status.parentNode !== slot) slot.append(ui.status);
-    if (!board && setup) {
-      ui.title.textContent = state.role === 'guest' ? 'You\'re invited to a battle' : 'Your room' + (state.room ? ' ' + state.room : '');
-      ui.lede.textContent = state.role === 'guest' ? 'Room ' + (state.room || '') + '. Check your team, then press Join the battle.' : 'Pick your team and the battle size, then open the room. Your friend joins with the code ' + (state.room || '') + '.';
-    } else { ui.title.textContent = 'Battle online'; ui.lede.textContent = HOME_LEDE; }
+    if (setup) { ui.title.textContent = v.heading; ui.lede.textContent = v.lede; }
     // the invite (link, Copy / Share, the code) is for a PRIVATE room a friend is coming to. A game waiting for anyone (Battle anyone) shows its code small, as a fallback, under a heading that says so.
-    const friendRoom = state.role === 'host' && !state.open && !state.quick;
-    ui.linkBox.hidden = !friendRoom;
-    ui.codeLabel.textContent = friendRoom ? 'or tell them the room code' : 'Your room code (a friend can use it too)';
-    renderSteps();
+    ui.linkBox.hidden = !v.friendRoom;
+    ui.codeLabel.textContent = v.codeLabel;
+    renderSteps(v);
     if (going && !viewTimer) viewTimer = win.setInterval(renderElapsed, 1000);
     if (!going && viewTimer) { win.clearInterval(viewTimer); viewTimer = 0; }
     renderElapsed();
   }
-  const SLOW_JOIN_MS = 12000;
   function renderElapsed() {
     if (!ui.elapsed) return;
-    const going = stageAt && UNDER_WAY.includes(state.stage), ms = going ? Math.max(0, now() - stageAt) : 0;
-    const t = going ? fmtClock(ms) : '';
-    if (ui.elapsed.textContent !== t) ui.elapsed.textContent = t;
-    // A JOIN BY CODE THAT IS TAKING A WHILE says what to check. A code nobody has opened is not refused by the network at once (lib/netplay.js keeps trying), so the player is told what usually causes it.
-    let hint = '';
-    if (going && ms >= SLOW_JOIN_MS && state.stage === 'waiting' && state.role === 'guest' && !state.listed) hint = 'Taking a while? Check the code ' + (state.room || '') + ' with your friend, and that their screen still says "Waiting for your friend". If they closed it, ask them for a new link.';
-    if (ui.hint.textContent !== hint) ui.hint.textContent = hint;
-    ui.hint.hidden = !hint;
+    const v = view();
+    if (ui.elapsed.textContent !== v.elapsed) ui.elapsed.textContent = v.elapsed;
+    if (ui.hint.textContent !== v.hint) ui.hint.textContent = v.hint;
+    ui.hint.hidden = !v.hint;
   }
-  /** Who the player is in what is under way (#olRole), and what is happening now (#olProgTitle), with the steps and which one it is at (aria-current). */
-  function stepsNow() {
-    const st = state.stage, host = state.role === 'host', room = state.room || '';
-    if (st === 'resuming') return { role: 'Your battle', title: 'Reconnecting to your battle...', steps: ['Reconnect', 'Battle'], at: 0 };
-    if (st === 'asking') return { role: 'Challenge', title: 'Waiting for an answer...', steps: ['Ask', 'They accept', 'Check teams', 'Battle'], at: 1 };
-    if (state.quick || st === 'searching' || (state.defecting && !host)) {
-      const at = st === 'searching' ? 0 : st === 'handshake' ? 2 : 1;
-      const title = st === 'searching' ? 'Looking for an opponent...' : st === 'handshake' ? 'Opponent found! Checking the teams...' : host ? (state.admitted ? 'Someone is joining...' : 'Waiting for an opponent...') : 'Opponent found! Connecting...';
-      return { role: 'Battle anyone', title, steps: ['Search', 'Opponent joins', 'Check teams', 'Battle'], at };
-    }
-    if (host) {
-      const at = st === 'waiting' ? 0 : st === 'open' ? 1 : 2;
-      const who = state.open ? 'Someone' : state.invite ? 'Your challenger' : 'Your friend';
-      const title = st === 'waiting' ? 'Opening your room...' : st === 'handshake' ? who + ' is here! Checking the teams...' : state.admitted ? who + ' is joining...' : state.invite ? 'Waiting for your challenger...' : state.open ? 'Waiting for someone to join...' : 'Waiting for your friend to join';
-      return { role: 'You\'re hosting' + (room && st !== 'waiting' ? ' · room ' + room : ''), title, steps: ['Open room', state.open ? 'Someone joins' : state.invite ? 'They join' : 'Friend joins', 'Check teams', 'Battle'], at };
-    }
-    const g = state.listed;
-    return { role: g ? 'You\'re joining ' + g.name : 'You\'re joining · room ' + room, title: st === 'handshake' ? 'Connected! Checking the teams...' : g ? 'Joining ' + g.name + '...' : 'Connecting to your friend...', steps: ['Connect', 'Check teams', 'Battle'], at: st === 'handshake' ? 1 : 0 };
-  }
-  function renderSteps() {
-    if (!UNDER_WAY.includes(state.stage)) { if (ui.steps.childElementCount) ui.steps.replaceChildren(); return; }
-    const s = stepsNow();
+  /** Who the player is in what is under way (#olRole), what is happening now (#olProgTitle), the steps and which one it is at (aria-current): all of it is the view's (online_view.js stepsNow). */
+  function renderSteps(v) {
+    if (v.screen !== 'wait') { if (ui.steps.childElementCount) { ui.steps.replaceChildren(); ui.steps.dataset.sig = ''; } return; }
+    const s = { role: v.who, title: v.title, steps: v.steps, at: v.at };
     if (ui.progTitle.textContent !== s.title) ui.progTitle.textContent = s.title;
     if (ui.role.textContent !== s.role) ui.role.textContent = s.role;
-    ui.progress.dataset.role = state.role === 'host' ? 'host' : state.role === 'guest' ? 'guest' : 'either';
+    ui.progress.dataset.role = v.role;
     const sig = s.steps.join('|') + '#' + s.at;
     if (ui.steps.dataset.sig === sig) return;
     ui.steps.dataset.sig = sig; ui.steps.dataset.at = String(s.at);
     ui.steps.replaceChildren(...s.steps.map((t, i) => el(doc, 'li', { class: i < s.at ? 'done' : i === s.at ? 'now' : 'todo', 'aria-current': i === s.at ? 'step' : null }, el(doc, 'span', { class: 'dot', 'aria-hidden': 'true', text: i < s.at ? '✓' : String(i + 1) }), el(doc, 'span', { class: 'lbl', text: t }))));
   }
-  function setStage(s) { renderView(); if (hooks.stage) hooks.stage(s); }
+  function setStage(s) { paint(); if (hooks.stage) hooks.stage(s); }
   function onBoardChange() { renderOpenList(); maybeDefect(); refreshOpenNote(); }
   function renderOpenList() {
     if (!lobbies || !ui.openList || state.stage !== 'setup') return;
@@ -565,7 +571,7 @@ export function createOnline(cfg) {
   const fmtLabel = (g) => (g.fmt === '3v3' ? '3 v 3' : '6 v 6');
   function buildRow(g) {
     const li = el(doc, 'li', { 'data-room': g.room }, el(doc, 'span', { class: 'who' }), el(doc, 'span', { class: 'fmt' }),
-      el(doc, 'button', { type: 'button', class: 'textbtn', onclick: () => { const cur = rowGame.get(li); if (cur) (cur.h ? challengeResident(cur) : joinListed(cur)); } }));
+      el(doc, 'button', { type: 'button', class: 'textbtn', onclick: () => { const cur = rowGame.get(li); if (cur) { pullForm(); if (cur.h) challengeResident(cur); else joinListed(cur); } } }));
     return li;
   }
   function fillRow(li, g) {
@@ -607,7 +613,7 @@ export function createOnline(cfg) {
     if (!p) return;
     const why = whyNot(g, p.mine);
     if (why) { p.release(); say(why, true); return; }
-    ui.room.value = g.room;
+    form.room = g.room;
     launch({ role: 'guest', room: g.room, p, fmt: null, open: false, quick: false, listed: g });
   });
   /** A RESIDENT game (h:1) belongs to a player who is somewhere else in the Arena and has not opened a room: ask them. Their dialog says who is asking; if they accept, their battle page opens a room
@@ -620,9 +626,7 @@ export function createOnline(cfg) {
     if (!p) return;
     const why = whyNot(g, p.mine);
     if (why) { p.release(); say(why, true); return; }
-    state.stage = 'asking'; setStage('asking');
-    for (const n of formControls()) n.disabled = true;
-    ui.cancelAsk.hidden = false; ui.cancelAsk.disabled = false; ui.cancelAsk.textContent = 'Cancel';
+    state.stage = 'asking'; state.locked = true; state.cancel = { shown: true, label: 'Cancel' }; setStage('asking');
     say('Asked ' + g.name + ' to battle. Waiting for an answer...');
     const lim = query.limits || {};
     const timing = lim.chalMs ? { ...PRESENCE_TIMING, answerMs: lim.chalMs, connectMs: lim.chalMs * 2 } : PRESENCE_TIMING;
@@ -631,9 +635,9 @@ export function createOnline(cfg) {
       lobbies, target: g, name: p.name, rec: p.rec || null, now, timing, crypto: win.crypto,
       on: {
         state: () => say(g.name + ' accepted. Connecting...'),
-        accepted: (room) => { asking = null; ui.cancelAsk.hidden = true; ui.room.value = room; launch({ role: 'guest', room, p, fmt: null, open: false, quick: false, listed: g }); },
+        accepted: (room) => { asking = null; setCancel(false); form.room = room; launch({ role: 'guest', room, p, fmt: null, open: false, quick: false, listed: g }); },
         failed: (code) => {
-          asking = null; ui.cancelAsk.hidden = true;
+          asking = null; setCancel(false);
           const text = code === 'declined' ? g.name + ' is not available for a battle right now.' : code === 'busy' ? g.name + ' is answering another challenge. Try again in a moment.' : code === 'unsupported' ? NO_SEAL : g.name + ' did not answer.';
           if (lobbies && code !== 'unsupported') lobbies.mute(g.room, 8000);
           reopenSetup(); say(text, true);
@@ -643,7 +647,7 @@ export function createOnline(cfg) {
   });
   /** Cancel: a challenge that has not been answered, or a join that has not connected (a listed game that never answers, a code nobody opened). Neither can be taken back any other way than leaving the page. */
   function cancelAsk() {
-    if (asking) { const a = asking; asking = null; a.cancel(); ui.cancelAsk.hidden = true; reopenSetup(); say('Cancelled.'); return; }
+    if (asking) { const a = asking; asking = null; a.cancel(); reopenSetup(); say('Cancelled.'); return; }
     if (state.stage === 'waiting' && state.role === 'guest' && !state.nm && state.session && !closed) { reopenSetup(); say('Cancelled.'); return; }
     // a host whose room nobody has come to yet (opening, or open and waiting; a Find-a-battle game too): the room is closed and comes off the list
     if ((state.stage === 'waiting' || state.stage === 'open') && state.role === 'host' && !state.nm && !closed) { const q = state.quick; quickCtx = null; reopenSetup(); say(q ? 'Stopped looking for an opponent.' : 'Room closed.'); return; }
@@ -654,11 +658,11 @@ export function createOnline(cfg) {
     if (!acceptTok || !query.auto) return;            // (only reached with the token; see the top of createOnline)
     setRole('host');
     // the PROFILE speaks for the player here: they were challenged as that trainer (the name on the board), not as whatever was last typed into this browser's name box
-    if (profileName) { ui.name.value = cleanName(profileName, 'Host'); nameTouched = false; }          // (and that name is the profile's, not one the player typed: prepare() must not remember it as theirs)
-    ui.lede.textContent = 'Opening a game for the player who challenged you...';
+    if (profileName) { form.name = cleanName(profileName, 'Host'); form.nameTouched = false; }          // (and that name is the profile's, not one the player typed: prepare() must not remember it as theirs)
+    say('Opening a game for the player who challenged you...');
     const p = await prepare('host');
     if (!p) return;                         // the reason is on the screen; pressing Host by hand still works (as a private game)
-    const fmt = ui.fmt.value === '3v3' && p.mine.size < 3 ? '6v6' : ui.fmt.value;
+    const fmt = form.fmt === '3v3' && p.mine.size < 3 ? '6v6' : form.fmt;
     launch({ role: 'host', room: null, p, fmt, open: false, quick: false, listed: null, invite: { for: query.auto.for, rq: query.auto.rq, ck: acceptTok.ck } });
   });
   /** Find a battle: join the game that has waited longest, or, if nobody is waiting, open one and wait. */
@@ -667,9 +671,7 @@ export function createOnline(cfg) {
     if (!supportedHere()) { say(UNSUPPORTED, true); return; }
     const p = await prepare('either');
     if (!p) return;
-    state.stage = 'searching';
-    for (const n of formControls()) n.disabled = true;
-    ui.cancelAsk.hidden = false; ui.cancelAsk.disabled = false; ui.cancelAsk.textContent = 'Cancel';
+    state.stage = 'searching'; state.locked = true; state.cancel = { shown: true, label: 'Cancel' };
     setStage('searching');
     say('Looking for a player who is waiting...');
     const lim = query.limits || {}, t0 = now();
@@ -681,10 +683,10 @@ export function createOnline(cfg) {
     const t1 = now(); let g = pick();
     while (!g && lobbies && now() - t1 < (lim.quickMs !== undefined ? lim.quickMs : 2500) && !closed) { await sleep(100); g = pick(); }
     if (closed || state.stage !== 'searching') return;
-    state.stage = 'setup'; renderView();
-    if (g) { ui.room.value = g.room; launch({ role: 'guest', room: g.room, p, fmt: null, open: false, quick: false, listed: g }); return; }
+    state.stage = 'setup'; paint();
+    if (g) { form.room = g.room; launch({ role: 'guest', room: g.room, p, fmt: null, open: false, quick: false, listed: g }); return; }
     if (!lobbies || lobbies.status() === 'down') { reopenSetup(); say('The list of players online could not be reached, so there is nobody to find. Invite a friend instead, or try again.', true); return; }
-    const fmt = ui.fmt.value === '3v3' && p.mine.size < 3 ? '6v6' : ui.fmt.value;
+    const fmt = form.fmt === '3v3' && p.mine.size < 3 ? '6v6' : form.fmt;
     quickCtx = { p, fmt };
     launch({ role: 'host', room: null, p, fmt, open: true, quick: true, listed: null });
   });
@@ -699,8 +701,8 @@ export function createOnline(cfg) {
     if (lobbies) lobbies.unhost();
     state.session = null; state.open = false; state.quick = false; state.roomOpen = false;
     state.role = 'guest'; state.listed = g; state.fmt = null; state.room = g.room; state.defecting = true;       // defecting: if this join fails the player's OWN game comes back (failJoin)
-    ui.codeBox.hidden = true; ui.invite.hidden = true; ui.codeLabel.hidden = true; ui.share.hidden = true;
-    ui.cancelAsk.hidden = false; ui.cancelAsk.textContent = 'Cancel'; ui.cancelAsk.disabled = false;          // a join can be cancelled (cancelAsk)
+    state.codeShown = false;
+    state.cancel = { shown: true, label: 'Cancel' };          // a join can be cancelled (cancelAsk)
     state.stage = 'waiting';
     canonicalizeUrl('guest', g.room);
     say('Found a game: joining ' + g.name + '...');
@@ -764,7 +766,8 @@ export function createOnline(cfg) {
     clearRecord();
     try { if (state.session) state.session.close(); } catch (_e) { /* ignore */ }
     state.session = null; state.nm = null; preMsgs = []; state.admitted = false; state.admittedId = null;
-    stopBar(); if (bar) { bar.remove(); bar = null; }
+    stopTick(); if (bar) { bar.remove(); bar = null; }
+    state.bar = null; state.codeShown = false;          // (the code of the room that is gone is not shown while the new one is being opened)
     // the words of the match that just ended ("Connection lost. Waiting for the other player...", said when the link dropped under it) are kept for 8 s by flash(); a NEW opponent who connects inside
     // those 8 s would be shown them on a healthy handshake
     flashText = ''; flashUntil = 0;
@@ -812,7 +815,7 @@ export function createOnline(cfg) {
       if (e.state === 'connected') {
         everConnected = true; state.defecting = false;
         win.clearTimeout(joinTimer); joinTimer = 0;
-        ui.cancelAsk.hidden = true;                  // connected: there is a handshake now, not a wait for somebody who may not be there
+        setCancel(false);                  // connected: there is a handshake now, not a wait for somebody who may not be there
         if (role === 'host' && lobbies) lobbies.unhost();            // somebody is in: the game comes off the board (it already did when they were let in; this covers a player the lib re-admitted by itself)
         if (acceptor) { acceptor.stop(); acceptor = null; }           // ... and the challenger has found us: no more "come in"
         if (state.nm) state.nm.linkChanged(true);          // a reconnection, or a page that was reloaded into a match
@@ -849,7 +852,7 @@ export function createOnline(cfg) {
   function openedRoom(room) {
     relisting = false;
     state.stage = 'open'; state.roomOpen = true;
-    ui.codeBox.hidden = false; ui.codeBox.textContent = room; ui.invite.hidden = false; ui.linkText.value = inviteLink();
+    state.codeShown = true;
     if (state.open && lobbies) {
       try {
         listGame(room);
@@ -862,8 +865,7 @@ export function createOnline(cfg) {
         onFail: () => { if (!closed && state.stage === 'open') say('Your room is open, but the player who challenged you could not be told which room it is (their one-time key was not usable, or this browser has no WebCrypto). A friend can still use the code ' + room + '.', true); } });
       say('Waiting for the player who challenged you to connect. (A friend can also use the code ' + room + '.)');
     } else say(friendWaitText(room));
-    ui.codeLabel.hidden = false;
-    ui.share.hidden = !(win.navigator && typeof win.navigator.share === 'function');
+    state.canShare = !!(win.navigator && typeof win.navigator.share === 'function');
     setStage('open');
     maybeDefect();
   }
@@ -896,7 +898,7 @@ export function createOnline(cfg) {
       try { listGame(state.room); const n = openNote(state.room); openText = n.text; say(n.text, n.bad); }          // listed again, and the words are the open game's again (not "a player is joining")
       catch (_e) { /* the next beacon tries again */ }
     } else if (!state.invite) say('The player who tried to join could not connect. ' + friendWaitText(state.room));
-    renderView();
+    paint();
   }
   /** Somebody is in (the join-request handler let them in, or the library re-admitted them by itself): the seat is taken and the game comes off the board; a host of an open game is told, because "your game is open" is not true now. */
   function noteAdmitted(id) {
@@ -906,7 +908,7 @@ export function createOnline(cfg) {
     if (lobbies) lobbies.unhost();
     if (first && !state.nm && state.stage === 'open') {
       openText = '';
-      renderView();
+      paint();
       say(state.open ? 'A player is joining your game. It is off the list of open games while they connect.' : state.invite ? 'The player who challenged you is connecting...' : 'Someone is joining with your code. Connecting...');
     }
   }
@@ -940,12 +942,9 @@ export function createOnline(cfg) {
     // A page that was opened as the BOARD (?online=1) and then joined a listed game had its address rewritten to ?np=ROOM&join=1 by launch() (so a reload finds the room). The join has ended without a match (Cancel, a game that
     // never answered, one that was taken) and the page is the board again: a reload of that address would open the join-by-code form with the dead room filled in and no board, so the plain address comes back.
     if (query.role === null && !query.room) { try { win.history.replaceState(null, '', boardAddress(win.location.href)); } catch (_e) { /* the address stays as it was */ } }
-    ui.cancelAsk.hidden = true;
-    for (const n of formControls()) n.disabled = false;
-    ui.codeBox.hidden = true; ui.invite.hidden = true; ui.codeLabel.hidden = true; ui.share.hidden = true;
-    root.querySelector('#online').hidden = false;
+    setCancel(false); state.locked = false; state.goOff = false; state.quickOff = false; state.codeShown = false;
     syncSetupUi();
-    if (!ui.openBox.hidden) { ensureLobbies(); lobbies.startWatching(); renderOpenList(); }
+    if (boardShown()) { ensureLobbies(); lobbies.startWatching(); renderOpenList(); }
   }
 
   function createMatch(role, room, teamCode, resume) {
@@ -965,7 +964,7 @@ export function createOnline(cfg) {
         progress: () => { renderBar(); persist(); },
       },
     });
-    startBar();
+    startBar(); startTick();
     if (!wired) { wired = true; win.addEventListener('pagehide', onPageHide); }
     if (resume) {                      // a reloaded page: the battle is rebuilt from the record (this fires 'controller' with the replayed match, or 'failed')
       state.stage = 'resuming'; setStage('resuming');
@@ -990,7 +989,7 @@ export function createOnline(cfg) {
     const info = { mySide: nm.mySide, names: nm.names.slice(), myName: nm.myName, oppName: nm.oppName, seed: nm.seed, fmt: nm.fmt, mn: nm.mn, room: state.room, role: nm.role, resumed: !!nm.resumed };
     state.info = info;
     state.stage = 'playing';
-    panel.hidden = true;
+    paint();
     hooks.mountScene(ctl, info);
     renderBar();
     persist();
@@ -1019,9 +1018,9 @@ export function createOnline(cfg) {
   function fatal(title, message) {
     if (closed) return;
     state.stage = 'failed'; state.error = { title, message };
-    clearRecord(); stopBar(); closeLobbies(); win.clearTimeout(joinTimer);
+    clearRecord(); stopTick(); closeLobbies(); win.clearTimeout(joinTimer);
     try { if (state.session) state.session.close(); } catch (_e) { /* ignore */ }
-    panel.hidden = true;
+    paint();
     hooks.showFatal({ title, message });
     renderBar();
   }
@@ -1033,7 +1032,7 @@ export function createOnline(cfg) {
   }
   function leaveToHub() {
     if (state.nm && !closed) { try { state.nm.leave('left'); } catch (_e) { /* ignore */ } }
-    clearRecord(); closed = true; stopBar(); closeLobbies(); win.clearTimeout(joinTimer);
+    clearRecord(); closed = true; stopTick(); closeLobbies(); win.clearTimeout(joinTimer);
     setTimeout(() => { try { if (state.session) state.session.close(); } catch (_e) { /* ignore */ } hooks.toHub(); }, 60);       // let the goodbye leave before the channel closes
   }
 
@@ -1046,10 +1045,12 @@ export function createOnline(cfg) {
     // the message is the live region; the per-second clock is NOT (a screen reader would read it out every second), so it is hidden from them and the thresholds are announced instead (renderBar)
     bar = el(doc, 'div', { id: 'netbar', role: 'group', 'aria-label': 'Online battle status' }, el(doc, 'span', { id: 'nbWho' }), el(doc, 'span', { id: 'nbMsg', role: 'status', 'aria-live': 'polite' }), el(doc, 'span', { id: 'nbClock', 'aria-hidden': 'true' }));
     (cfg.bar && cfg.bar.parentNode ? cfg.bar.parentNode.insertBefore(bar, cfg.bar) : root.after(bar));
-    barTimer = win.setInterval(tick, 250);
     renderBar();
   }
-  function stopBar() { if (barTimer) { win.clearInterval(barTimer); barTimer = 0; } }
+  // THE 250 ms TICK IS THE PROTOCOL'S, NOT THE BAR'S: it runs the match's clocks (nm.tick), tells the other side when this screen can take a choice (screenReady) and times this player out (timeOutSelf).
+  // It is started when a match is made and stopped when the match is given up, whatever is or is not drawn: the bar is only one of the things that are painted after it.
+  function startTick() { if (!barTimer) barTimer = win.setInterval(tick, 250); }
+  function stopTick() { if (barTimer) { win.clearInterval(barTimer); barTimer = 0; } }
   function tick() {
     const nm = state.nm;
     if (!nm || closed) return;
@@ -1061,8 +1062,8 @@ export function createOnline(cfg) {
     if (ms !== null && ms <= 0) nm.timeOutSelf();
     renderBar();
   }
+  /** What the status line says now: worked out from the match (state.bar, view().bar), then painted if the line is on the page. */
   function renderBar() {
-    if (!bar) return;
     const nm = state.nm; if (!nm) return;
     const st = nm.status();
     const who = st.opponent ? 'vs ' + st.opponent : '';
@@ -1083,11 +1084,17 @@ export function createOnline(cfg) {
       if (st.myClockMs <= 10000 && !warned.w10) { warned.w10 = warned.w30 = true; flash('10 seconds left to choose.', 'warn'); }
       else if (st.myClockMs <= 30000 && !warned.w30) { warned.w30 = true; flash('30 seconds left to choose.', 'warn'); }
     }
-    const set = (id, v) => { const n = bar.querySelector(id); if (n.textContent !== v) n.textContent = v; };
-    set('#nbWho', who); set('#nbMsg', msg); set('#nbClock', clock);
-    bar.dataset.kind = kind; bar.dataset.low = st.myClockMs !== null && st.myClockMs < 15000 ? '1' : '';
-    bar.dataset.phase = st.phase;
+    state.bar = { who, msg, clock, kind, low: st.myClockMs !== null && st.myClockMs < 15000, phase: st.phase };
     state.last = st;
+    paintBar();
+  }
+  function paintBar() {
+    const b = state.bar;
+    if (!bar || !b) return;
+    const set = (id, v) => { const n = bar.querySelector(id); if (n.textContent !== v) n.textContent = v; };
+    set('#nbWho', b.who); set('#nbMsg', b.msg); set('#nbClock', b.clock);
+    bar.dataset.kind = b.kind; bar.dataset.low = b.low ? '1' : '';
+    bar.dataset.phase = b.phase;
   }
   const reasonText = (why, opp) => ({ forfeit: 'a forfeit.', left: (opp || 'your friend') + ' left.', closed: (opp || 'your friend') + ' left.', timeout: 'out of time.', 'lost-link': 'the connection was lost.' }[why] || 'the match ended early.');
 
@@ -1119,7 +1126,6 @@ export function createOnline(cfg) {
     state.profileId = isId(rec.profileId) ? rec.profileId : null;
     // the player this host had let in: a reloaded host lets them (and only them) back in without a prompt (startSession). A record from the build before has none: the first to knock is let in.
     if (rec.role === "host" && typeof rec.admittedId === "string" && rec.admittedId.length > 0 && rec.admittedId.length <= 128) { state.admittedId = rec.admittedId; state.admitted = true; }          // the profile this battle is written to when it ends (a record from an older build, or a damaged one, has none: the career then finds the team's owner itself)
-    ui.lede.textContent = 'Picking your battle up again...';
     say('Picking your battle up again...');
     setStage('resuming');
     const giveUp = async (why) => { clearRecord(); state.stage = 'setup'; state.nm = null; await setupForm(); say(why + ' Start a new battle below.', true); return false; };
@@ -1140,29 +1146,49 @@ export function createOnline(cfg) {
     let saved = ''; try { saved = win.localStorage.getItem(LS_NAME) || ''; } catch (_e) { /* ignore */ }
     // a remembered name is one the player TYPED (prepare() keeps no other): it is theirs, and stays when the team changes. With none, the name is the trainer who owns the team that is pre-selected
     // (the first saved team is the active profile's, but not when that profile has no legal team, or the address brings a team of its own).
-    nameTouched = !!saved;
-    ui.name.value = cleanName(saved || name, query.role === 'guest' ? 'Guest' : 'Host');
+    form.nameTouched = !!saved;
+    form.name = cleanName(saved || name, query.role === 'guest' ? 'Guest' : 'Host');
     // THE ONLINE PREFERENCES (online_prefs.js, written by the hub's online menu): the preferred team when it is still on the list (a saved team is listed only while it exists and is legal), else the
     // first choice as before; the address's format, else the preferred size, else the default for the team selected. An accepted challenge (autoStart, below) plays with what is selected here.
     let prefs = null; try { prefs = readOnlinePrefs(win.localStorage); } catch (_e) { prefs = null; }
     const pre = preselect(prefs, choices, { formatParam: cfg.formatParam });
-    ui.team.value = pre.teamKey;
+    form.teamKey = pre.teamKey;
     nameFollowsTeam();
-    ui.fmt.value = pre.fmt;
+    form.fmt = pre.fmt;
     refreshFormats();
-    if (query.room) { ui.room.value = query.room; state.room = query.room; }
+    if (query.room) { form.room = query.room; state.room = query.room; }
     setRole(query.role || (query.room ? 'guest' : 'host'));
     // (the words of an invite / hand-off page are renderView()'s: they follow the room and the role)
     setStage('setup');
     say('');
     syncSetupUi();
-    if (!ui.openBox.hidden) { ensureLobbies(); lobbies.startWatching(); renderOpenList(); ui.quick.disabled = false; }
+    if (boardShown()) { ensureLobbies(); lobbies.startWatching(); renderOpenList(); state.quickOff = false; paint(); }
     if (query.auto) autoStart(name); else if (autoNotice) say(autoNotice);
     else if (meetTok && state.role === 'guest' && state.room) { meetTok = false; startAs('guest'); }
     else if (startTok) { const what = startTok; startTok = null; if (what === 'quick') quick(); else if (what === 'room') go(); else startAs('host'); }
   }
 
+  // THE NAMED ACTIONS (what a press on the page means), view() (what the page shows) and the form (setForm): whatever presents the page calls these, and so does tools/pokemonarena_online_page_test.mjs.
+  const gameOf = (x) => (x && typeof x === 'object' ? x : lobbies ? lobbies.list().find((g) => g.room === x) || null : null);
+  /** The form, set from outside (what the hub's online menu stores as preferences; a test sets it here because its two players are two tabs of one browser, which share one localStorage). -> the form.
+   *  patch: { teamKey (one of the page's team choices), name, typed (the name is one the player gave: it is remembered), fmt, room, paste }. A team is set first, so a name given with it is kept. */
+  function setForm(patch) {
+    const p = patch || {};
+    if (typeof p.teamKey === 'string' && state.choices && state.choices.some((c) => c.key === p.teamKey)) { form.teamKey = p.teamKey; refreshFormats(); nameFollowsTeam(); }
+    if (typeof p.name === 'string') { form.name = p.name; if (p.typed) form.nameTouched = true; }
+    if (p.fmt === '3v3' || p.fmt === '6v6') form.fmt = p.fmt;
+    if (typeof p.room === 'string') form.room = p.room;
+    if (typeof p.paste === 'string') form.paste = p.paste;
+    paint();
+    return { ...form };
+  }
+  /** The open games this page can play (the board's list without the ones on another build), as plain data: [{ room, who, fmt, rec, h }]. [] when the page is not on the board. */
+  const board = () => (lobbies ? lobbies.list().filter((g) => g.compatible).map((g) => ({ room: g.room, who: g.name, fmt: g.fmt, rec: g.rec || null, h: !!g.h })) : []);
   // (flashNow: the one-line notice the bar would show this instant, '' when there is none; the page test reads it)
-  const api = { begin, onResult, leaveToHub, state, nm: () => state.nm, session: () => state.session, flash, flashNow: () => (flashText && now() < flashUntil ? flashText : ''), renderBar, lobbies: () => lobbies, quick, joinListed, challengeResident };
+  const api = { begin, onResult, leaveToHub, state, nm: () => state.nm, session: () => state.session, flash, flashNow: () => (flashText && now() < flashUntil ? flashText : ''), renderBar, lobbies: () => lobbies, board,
+    view, setForm, startAs, go, quick, cancel: cancelAsk, copyLink, copyCode, share,
+    joinListed: (x) => { const g = gameOf(x); return g ? joinListed(g) : undefined; }, challengeResident: (x) => { const g = gameOf(x); return g ? challengeResident(g) : undefined; },
+    /** A game of the board, by its room: join it, or ask its owner when it is a resident (a player who is open from the hub). */
+    pick: (x) => { const g = gameOf(x); return !g ? undefined : g.h ? challengeResident(g) : joinListed(g); } };
   return api;
 }
