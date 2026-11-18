@@ -376,7 +376,7 @@ async function browserCases(origin, cdp, only) {
     const hub = await a.openTab({ width: 900, height: 760 });
     await hub.navigate(origin + '/pokemonarena/?net=local');
     await hub.waitFor('document.body.dataset.state === "ready" && window.__arenaPresence', { timeoutMs: 90000 });
-    await hub.eval('localStorage.setItem("arena.avatar", "2234847"); document.getElementById("openToggle").click()');
+    await hub.eval('localStorage.setItem("arena.avatar", "2234847"); window.__arenaHub.presence.toggle()');
     await hub.waitFor('window.__arenaPresence.isOn() && window.__arenaPresence.presence', { timeoutMs: 30000 });
     await b.waitFor('window.__arenaCenter.people().some((p) => p.seated)', { timeoutMs: 20000 }).catch(() => {});
     const seated = (await people(b)).filter((p) => p.seated);

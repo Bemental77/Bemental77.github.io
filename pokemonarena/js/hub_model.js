@@ -152,7 +152,7 @@ export const MAIN_LABELS = Object.freeze(MAIN_ITEMS.map((i) => i.label));
 export const ABOUT_PAGES = Object.freeze([
   ['POK{E}MON ARENA', 'A Gen 3 style battle game. Fight a CPU with', 'random teams, or with teams you build.', 'It all runs in this browser. Nothing you', 'make is uploaded anywhere.'],
   ['FROM THE ROM', 'Every picture, font, window, menu and cry', 'is read from the Pokemon SoulGold v1.1.1', 'ROM this site already serves, in your', 'browser. Battle messages use the ROM text;', 'a few menu words are written by this site.'],
-  ['PLAY ONLINE', 'Play online: battle a friend with a room', 'code, or find someone who is open to battle.', 'Turn Open on to be listed with your trainer', 'name and record, so anyone can challenge you.'],
+  ['PLAY ONLINE', 'Invite a friend with a link or a room code,', 'or battle anyone who is looking. Switch', 'OPEN TO BATTLES on to be listed with your', 'trainer name and record, so anyone can', 'challenge you while the Arena is open.'],
   ['YOUR DATA', 'Your profile, teams and battle record stay', 'in this browser only. Use Export in the', 'TEAM BUILDER to keep a copy; clearing the', 'site data in your browser erases them.'],
 ]);
 
@@ -207,8 +207,17 @@ export function createHubModel(opts = {}) {
   }
 
   /* ------------------------------------------------------------------------------------------ the rows of each screen */
+  // AN APP MAY WORD ITS OWN ROW OF THE MAIN MENU: its model's optional mainRow() -> { label?, help? } | null (PLAY ONLINE says there, at a glance, whether the player is open to battles).
+  // It is taken no further than a short label and two lines of help, and a model without one, or one that throws, leaves the row as the menu words it.
+  function appRow(id) {
+    try {
+      const a = apps.raw(id), r = a && typeof a.mainRow === 'function' ? a.mainRow() : null;
+      if (!r || typeof r !== 'object') return null;
+      return { label: typeof r.label === 'string' && r.label && r.label.length <= 24 ? r.label : null, help: Array.isArray(r.help) && r.help.length === 2 && r.help.every((l) => typeof l === 'string') ? [r.help[0], r.help[1]] : null };
+    } catch (_e) { return null; }
+  }
   function mainRows() {
-    return MAIN_ITEMS.map((it) => ({ id: it.id, kind: 'item', label: it.label === 'SOUND' ? 'SOUND: ' + (S.sound ? 'ON' : 'OFF') : it.label }));
+    return MAIN_ITEMS.map((it) => ({ id: it.id, kind: 'item', label: it.label === 'SOUND' ? 'SOUND: ' + (S.sound ? 'ON' : 'OFF') : (appRow(it.id) || {}).label || it.label }));
   }
   function quickRows() {
     return [
@@ -300,7 +309,7 @@ export function createHubModel(opts = {}) {
     if (S.flash) return S.flash;
     if (S.path === 'main') {
       if (row.id === 'sound') return S.sound ? ['A opens the SOUND panel: volume,', 'music, effects and soundtrack.'] : ['Sound is muted. The SOUND panel', 'unmutes it and sets the volume.'];
-      const it = MAIN_ITEMS.find((x) => x.id === row.id); return it ? it.help : ['', ''];
+      const it = MAIN_ITEMS.find((x) => x.id === row.id); return (appRow(row.id) || {}).help || (it ? it.help : ['', '']);
     }
     if (S.path === 'quick') {
       if (row.id === 'format') return S.quick.format === '3v3' ? ['3v3: pick 3 of 6 at a team preview.', 'A or the arrows change it.'] : ['6v6: all six Pokemon fight.', 'A or the arrows change it.'];

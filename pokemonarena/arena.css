@@ -132,10 +132,8 @@ body[data-pad="on"] canvas#hub:focus-visible, body[data-edge="1"] canvas#hub:foc
 /* edge to edge: the screen's box reaches over the page's gutters (the margin-box stays the grid area, so nothing widens the page) */
 body[data-edge="1"] #screenWrap { margin-inline: calc(var(--gutter) * -1); width: calc(100% + var(--gutter) * 2); max-width: none; }
 
-/* a phone held upright: the picture is as wide as the phone allows (its height is whatever 3:2 gives), so the room under it goes to the controls, in the MIDDLE of that room: the very bottom edge is where a phone's swipe-up gesture lives and where the browser's "exit full screen" toast lands (a real phone showed both on top of the buttons), and it is the hardest place for a thumb to reach on a tall phone;
-   the link to the online lobby stays up under the header, where it is seen */
+/* a phone held upright: the picture is as wide as the phone allows (its height is whatever 3:2 gives), so the room under it goes to the controls, in the MIDDLE of that room: the very bottom edge is where a phone's swipe-up gesture lives and where the browser's "exit full screen" toast lands (a real phone showed both on top of the buttons), and it is the hardest place for a thumb to reach on a tall phone */
 body[data-pad="on"][data-layout="portrait"] #top { order: -2; }
-body[data-pad="on"][data-layout="portrait"] #onlineLink { order: -1; }
 body[data-pad="on"][data-layout="portrait"] #play { flex: 1 1 auto; grid-template-rows: auto 1fr; }
 body[data-pad="on"][data-layout="portrait"] #dpad, body[data-pad="on"][data-layout="portrait"] #ab { align-self: center; }
 
@@ -157,16 +155,7 @@ body[data-edge="1"] #boot, body[data-edge="1"] #error { width: min(calc(100% - v
 /* an error screen has no game to fullscreen: its header carries the same buttons as the editor's (coherence test D7) */
 body[data-state="error"] #fullBtn, body[data-state="error"] #fullExit { visibility: hidden; }
 
-/* OPEN TO BATTLES (js/presence_boot.js): the switch sits beside the Play online link on the same row, so the footer stays one 44 px line (screenfit.js reserves exactly that on a phone) */
-#onlineLink { display: flex; flex-wrap: nowrap; justify-content: center; align-items: center; gap: 8px; }
-#onlineLink .textbtn { white-space: nowrap; }
-#openToggle[aria-pressed="true"] { background: #1f5a37; border-color: #5c5; }
-/* the switch only works once the menu is up (the module is mounted then): before that, and on an error screen, the link stands alone as it always did */
-body:not([data-state="ready"]) #openToggle { display: none; }
-/* .textbtn's display:inline-flex is an author rule and beats the browser's [hidden]: boot.js hides the switch with [hidden] when presence_boot.js could not load, and without this line a dead "Open: off" stayed on screen */
-#openToggle[hidden] { display: none; }
-/* and until presence_boot.js has mounted and wired the click (it sets data-presence="ready") the switch is invisible and so unclickable and unfocusable: a press before then was silently dropped. visibility, not display: the row does not shift when it appears */
-#openToggle:not([data-presence="ready"]) { visibility: hidden; }
+/* (PLAY ONLINE, the Trainer Center and OPEN TO BATTLES are rows of the picture: js/online_hub.js. The HTML row that stood under the picture is gone, and its rules with it.) */
 
 /* THE LOADING PANEL ONLY APPEARS IF LOADING TAKES A MOMENT. A repeat visit (the ROM comes from this browser's own cache, js/romcache.js) is on screen well inside this, so coming back to the hub
    is not a loading screen; a first visit still shows the panel and its progress bar. visibility, not display: no layout moves.
@@ -177,5 +166,3 @@ body:not([data-state="ready"]) #openToggle { display: none; }
 body[data-state="boot"] #boot { visibility: hidden; animation: arena-boot-in 0s linear 0.4s forwards; }
 @keyframes arena-boot-in { to { visibility: visible; } }
 body[data-state="boot"][data-slow] #boot { visibility: visible; }
-/* ... and until the hub is up the page shows only its header: the Play online link on its own, centred on an empty screen, read as a glitch (visibility again: nothing moves) */
-body[data-state="boot"] #onlineLink { visibility: hidden; }
