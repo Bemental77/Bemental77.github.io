@@ -1,0 +1,24 @@
+{
+ "note": "frame hashes (FNV-1a of the 240x160 RGBA) of the battle page's online screens: tools/pokemonarena_online_view_test.mjs --update. Hashes only: nothing of the ROM is stored.",
+ "frames": {
+  "invited": "2d3c3e0c",
+  "invited_loading": "411f4024",
+  "invited_refused": "8bc21b13",
+  "room": "a8b4ff0a",
+  "ask_host": "61610647",
+  "ask_quick": "4f0ad756",
+  "ask_quick_stopped": "d4658c9e",
+  "ignored": "9d0d75d3",
+  "host_opening": "dc0fe6b5",
+  "host_open": "955e40b3",
+  "host_open_share": "247e2cfd",
+  "host_copy_refused": "c5fb0a13",
+  "host_handshake": "10b1e224",
+  "quick_search": "d03ad66c",
+  "quick_open": "9b7838dc",
+  "guest_join": "b1e47bbf",
+  "guest_slow": "cfa0bff6",
+  "asking": "39ba0c74",
+  "resuming": "465722cc"
+ }
+}

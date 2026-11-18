@@ -1164,3 +1164,139 @@ node tools/pokemonarena_hub_online_test.mjs --update          # rewrites pokemon
 ```
 
 The browser part has no mutants of its own: every guard it relies on is one of the Node mutants, or one of the page test's (`presenceui --mutants`: M16, M17, M18, M20, M23; `onlineux --mutants`: X22).
+
+## BATTLE: as built
+
+Stage 1 of 2 (2026-11-18): **the battle page's online screens are in the picture**. `battle.html?online=1...` has no HTML panel any more (`<section id="online">`: the cards, inputs, selects, buttons, the
+players list, the progress card): the battle canvas shows ROM-drawn screens for the few things the page still has to say before a battle, and everything a player CHOOSES is the hub's (`online` app).
+Stage 2 (the "wants to battle you" question on a battle against the CPU, in the picture) is NOT done: that page still mounts `presence_boot.js` with its DOM dialogs and the header's `#openBtn`, untouched.
+Nothing in the protocol moved: `js/netmatch.js`, `js/online_match.js`, `js/openlobby.js`, `js/matchctl.js`, `js/engine*.js`, `lib/netplay.js`, `js/presence.js`, `js/presence_boot.js`, `js/hub_presence.js`
+and `js/online_prefs.js` are byte for byte what SEAM left; `PROTO`, `MSG`, `BEACON_V` / `TOPIC`, `SEAL_INFO`, `ACCEPT_KEY`, `MEET_KEY`, `START_KEY`, `resumeKey`, `GAME_KEY` keep their values;
+`canonicalAddress`, `boardAddress`, `parseOnlineQuery` and `roomFromInput` are in `js/online.js` with the source strings the mutants of `pokemonarena_presence_test.mjs` and `pokemonarena_center_test.mjs` replace.
+
+### What exists
+
+| File | What | Tests |
+|---|---|---|
+| `js/online_view.js` (new, pure, no imports) | WHAT THE PAGE SHOWS: `onlineView(snapshot)` (the view), `stepsNow`, `layoutOf` / `rowRects` / `OGEOM` (where everything stands in 240x160), `sentencesOf` / `sentenceLayout` / `wrapWords` / `SENTENCE` (the sentence, in the normal ROM font when it fits, else the small one, else cut with "..."), `createOnlinePanel()` (the cursor over the rows), `speakOnline(view, cursor)`, `WORDS`, `UNDER_WAY`, `SLOW_JOIN_MS`, `fmtClock`, `fmtWords` | `tools/pokemonarena_online_view_test.mjs` |
+| `js/online_draw.js` (new, pure) | THE PIXELS, from the ROM: `createScreen(ui, h) -> { render(f, view), fits(onlineView) }`, the shape of a hub app's renderer; `SCREEN_ID` | the same suite (D, F, golden hashes in `online_screens.golden.json`) |
+| `js/online.js` (rewritten presentation half) | no DOM but the status line of a battle (`#netbar`). `createOnline(cfg)` returns `view()`, `act(id)` and the named actions; `parseOnlineQuery` reads `ask=host \| quick`; `ONLINE_SHARES` (exported words) | page test, every battle-page group; `pokemonarena_online_view_test.mjs` X1-X4 |
+| `js/battle_boot.js` (hunks) | the canvas is up, fitted and listening before the first scene (`showOnline`), the loop draws the online screen while there is no scene, the buttons and the pointer go to it until a scene takes over; `hubUrl()` (Contract 6) | page test groups `easyjoin`, `screens`, `layout`, `openlayout` |
+| `battle.css` | the panel's 116 lines are gone; `body[data-state="online"] #menuBtn { visibility: hidden; }` (the pause menu's button before there is a battle) | `screens` SC8c; view test X2 |
+| `online_screens.golden.json` (new) | 19 frame hashes (FNV-1a of 240x160 RGBA). Hashes only | view test D8 (`--update`) |
+
+### The battle page with NO valid token (Contract 1, as built)
+
+| Address | The picture (`view().kind`) | Rows (`view().rows[].id`) |
+|---|---|---|
+| `?online=1` | none: `hooks.toMenu()` = `location.replace('/pokemonarena/' + <test seams> + '#online')`. Nothing is opened or dialled first | |
+| `?online=1&ask=host` | `ask-host`: INVITE A FRIEND / OPEN A ROOM FOR A FRIEND? | YES `host`, BACK `back` |
+| `?online=1&ask=quick` | `ask-quick`: BATTLE ANYONE / FIND AN OPPONENT?, with what other players will see. The board is watched (nothing is published) | YES `quick`, BACK `back` |
+| `?np=ROOM&join=1` | `invited`: YOU'RE INVITED TO A BATTLE, ROOM, AS <name>, TEAM | JOIN THE BATTLE `go`, CHANGE TEAM `team`, BACK `back` |
+| `?np=ROOM&host=1` | `room`: YOUR ROOM <ROOM>, ROOM, AS <name>, TEAM, the battle size | OPEN THE ROOM `go`, CHANGE TEAM `team`, BACK `back` |
+| `?online=1&auto=host&for=..&rq=..`, no accept token | `ignored`: the words say it was ignored. No board is dialled | BACK `back` |
+
+With the hub's token the page starts by itself exactly as SEAM built it (`startPlan`): START `{ host }` / `{ quick }` on the plain address, START `{ host, room }` on the room's host address, MEET on
+`&meet=1`, ACCEPT on `auto=host`. **A question the page falls back to after a token** (a room that could not open, a search that found nothing): the plain address shows `ask-host` or `ask-quick`
+for what the token started, and the address gets `ask=<that>` so a reload is the same question.
+`CHANGE TEAM` = `hooks.toTeam(room, role)` = `/pokemonarena/?np=ROOM&join=1<test seams>#online` (or `&host=1`): **ONLINE reads `np` and `join` / `host` in the hub's own address.**
+The team used is the preference (`js/online_prefs.js preselect`) with the old fallback; the invite link the waiting screen hands out is unchanged (`/pokemonarena/battle.html?np=ROOM&join=1`).
+
+### The API other code calls
+
+```js
+const online = createOnline({ win, doc, pack, bar, query, teamParam, formatParam, fingerprint, hooks });     // window.__arenaOnline
+online.view()                 // online_view.js onlineView(snapshot): { screen: 'confirm' | 'wait' | 'hidden', kind, stage, role, heading, lede, ask, info, who, title, steps, at, status: { text, bad },
+                              //   hint, elapsed, code, codeLabel, friendRoom, link, canShare, copied, cancel: { shown, label }, team, name, fmt, fmtShown, ready, canGo, canQuick, rows: [{ id, label, disabled? }], bar }
+online.act(id)                // a row was pressed: 'go' | 'host' | 'quick' | 'cancel' | 'copy-link' | 'copy-code' | 'share' | 'team' | 'back'. Call it INSIDE the key / pointer handler
+online.setForm({ teamKey, name, typed, fmt, room })      // the form model (what the hub stores as preferences; the tests' way in). -> a copy of the form
+online.startAs(role) / go() / quick() / cancel() / copyLink() / copyCode() / share() / changeTeam() / back()
+online.board()                // the games this page can play, as the list showed them: [{ room, who, fmt, rec, h }]
+online.pick(room) / joinListed(room) / challengeResident(room)      // what a press on a list row meant (no row of the picture calls them)
+// unchanged: begin(), onResult(choice), leaveToHub(), state, nm(), session(), flash, flashNow(), renderBar, lobbies()
+// hooks: mountScene(ctl, info), sceneState(), showFatal({ title, message }), stage(s), changed(), toHub(), toMenu(), toTeam(room, role)
+
+window.__arenaBattle.onlineScreen   // the picture, for tests: up(), press(action), pointer({ kind, x, y }), rects(), cursor(), frameHash(), canvasHash(), fits(), spoken(), draw()
+window.__arenaBattle.hubUrl()       // '/pokemonarena/#<arena.back>' or '/pokemonarena/'
+```
+
+`createOnlinePanel()` (online_view.js): `press(action, view)` / `pointer(ev, view)` -> `null | { kind: 'move', index } | { kind: 'act', id } | { kind: 'refused', id }`; `hit(x, y, view)`, `rects(view)`,
+`cursor(view)`. **B on a confirm screen is its BACK row; B on a waiting screen never closes anything** (it puts the cursor on the way out). The cursor keeps its row (by id) when a row appears.
+`createScreen(ui, h)` is drawn through the hub's shell renderer: `createHubScreen(ui, { appScreens: { online: createScreen } }).render({ app: 'online', screen: 'online', env, tick, online: view, cursor })`.
+**Stage 2** can draw a question over a battle the same way: that render call takes `dialog` (a hub_dialog.js view) and draws it over anything.
+
+### Coming back (Contract 6)
+
+`battle_boot.js hubUrl()` = `HUB_PAGE_URL + '#' + readBack(sessionStorage)` when `arena.back` holds a hub path (`hub_presence.js readBack`: the one pattern, never `main`), else `HUB_PAGE_URL`. It is where
+EVERY way back goes: the result screen's BACK TO HUB, the pause menu's quit, BACK (and B) on a confirm screen, a wait the hub's token started that the player gives up, the error screen's button and its
+B, the header's "Arena" link (CPU battles too; a Tower fight goes back to the Tower as before). The key is read, never removed, never written here.
+**A cancelled wait:** started by a token of the hub (no press on this page) -> the hub (`hubUrl()`); started from one of this page's questions -> back to that question, no page load; a wait that
+FAILED -> always this page's question, with the reason.
+
+### What was deleted, and what was kept without a screen
+
+Deleted: `buildPanel` and everything only it used (`ui`, `card`, the form nodes, `formControls`, `renderView`, `renderElapsed`, `renderSteps`, `renderOpenList`, `buildRow` / `fillRow` / `syncRows` and the
+list's focus-heir logic, the open-games note, the privacy foot on the page), `PASTE A TEAM CODE` (the `paste` choice and its words), the join-by-typed-code box, the panel's CSS. `battle.html` held
+no node of the panel (it was built in script): only its comment on `#live` changed.
+Kept, with no row in the picture: the board connection (`ensureLobbies`, dialled by BATTLE ANYONE, an accepted challenge and a challenge sent from this page: **a private room's page no longer dials the
+public brokers at all**), defecting to a listed game, `joinListed` / `challengeResident` / `pick` (the hub's tests and the page test's challenger drive them through the hook), `board()`.
+`boardPrivacyText` and `ONLINE_SHARES` are exported words with nowhere on this page to stand: **ONLINE: show them in the hub's menu** (what going online shares; what BATTLE ANYONE dials).
+
+### Sentences re-worded (they could not fit their window in a ROM font that reads well)
+
+The small ROM font's `m` and `w` read as `n` and `H`, so the layout sets sentences in the NORMAL font (about 35 characters a line) and these were shortened to fit:
+
+| Was | Is |
+|---|---|
+| "You're hosting · room X" / "You're joining · room X" (the ROM font has no middle dot) | "You're hosting, room X" / "You're joining, room X" |
+| "Waiting for your friend. The battle starts by itself as soon as they open your link (or type the code X) and press Join." | "Waiting for your friend. The battle starts by itself when they join." (the code is drawn large over it) |
+| "Nobody was waiting, so your game is open: anyone can join it. The next player who presses Find an opponent, or picks you under Players online, joins you." | "Nobody was waiting, so your game is open: anyone who picks BATTLE ANYONE can join it." |
+| "Your room is open, but the list of open games is not connected yet, so nobody can see your game yet. A friend can use the code X." (and "... cannot be reached ...") | "Your game is open, but the list of open games is not connected yet: nobody can see it yet." / "... cannot be reached: nobody can find it." |
+| "Taking a while? ... If they closed it, ask them for a new link." | the last sentence dropped; the hint takes the place of "Connecting to the room X..." |
+| "Your browser would not let the page copy. The link is selected above: copy it yourself." | "Copy was refused. Tell your friend the room code X on this screen." |
+| "The player who tried to join could not connect. " + the friend sentence | "That player could not connect. Still waiting for your friend." |
+| "Waiting for the player who challenged you to connect. (A friend can also use the code X.)" | "Waiting for the player who challenged you to connect." |
+| "Your room is open, but the player who challenged you could not be told which room it is (their one-time key was not usable, or this browser has no WebCrypto). A friend can still use the code X." | "The player who challenged you could not be told your room. A friend can still use the code X." |
+| "This browser cannot connect two players (it has no WebRTC or BroadcastChannel). Try a current ..." | "This browser cannot connect two players. Try a current Chrome, Firefox, Safari or Edge." |
+| the NO_SEAL sentence (220 characters) | "This browser cannot challenge a player in private (it has no WebCrypto), so challenging is not available here." |
+| "That game was just taken by someone else. Pick another one, or press Find an opponent." / "... not open any more. Pick another one, ..." | "... Try again to find another." |
+| "The list of players online could not be reached, so there is nobody to find. Invite a friend instead, or try again." | "... so there is nobody to find. Try again later." |
+| "That address tried to open a game ... so it was ignored. Host a game, or pick one below." | "... so it was ignored." |
+| "... Start a new battle below." (a resume given up) | "... You can start a new battle here." |
+| "Room X. Check your team, then press Join the battle." / "Pick your team and the battle size, then open the room. ..." | "Check your team, then press JOIN THE BATTLE." / "Check your team and the battle size, then press OPEN THE ROOM. Your friend joins with the code X." |
+| "Get an invite link, or type the code your friend sent and press Join." / "Type the room code your friend sent you, then press Join." / "Paste a team code first, or pick a saved team." | gone with what they spoke of (the last guard says "This page has no room code to join. Open your friend's link again.") |
+
+Every other sentence of the old tables is word for word. `tools/pokemonarena_online_view_test.mjs` F1-F6 holds each one against its window with the widest name and room code.
+
+### Storage
+
+No new key. Read: `sessionStorage` `arena.go`, `arena.meet`, `arena.accept` (taken once, as before), `arena.back` (read only), `arena.online:<ROOM>:<role>`; `localStorage` `arena.online.team`,
+`arena.online.name` (written when the player gave a name: `setForm({ typed: true })`).
+
+### Known limits (measured or read, not fixed here)
+
+* A row of the picture is 12 logical px high: 19.5 css px on a 390 px phone (the picture is 1.625x there). The on-screen A / B / d-pad (44 css px or more) drive the same rows. Page test V2, Y2, SC10f.
+* A controller's button is not a user gesture in every browser, so COPY or SHARE pressed on a pad may be refused; the page then says so and points at the code on the screen. Not tested with a real pad.
+* The online screens have no music; the menu sounds are the hub's (`sound_system.js menuSfx`).
+* The DOM error screen (address errors, a stopped match) is what it was; so is `#netbar`.
+* `ONLINE.md`'s Trainer Center section still describes the first Trainer Center (a note at its top says so): CENTER's section here is the truth for the new one.
+
+### Tests (this tree)
+
+The counts are what each command prints as "passed". The battle-page sessions of the page test read and drive the picture; its hub sessions (ONLINE's) were not rewritten.
+
+```bash
+node tools/pokemonarena_online_view_test.mjs --mutants                    # 60 passed, 34 mutants: the screens in Node with the real ROM renderer (see its header)
+node tools/pokemonarena_online_page_test.mjs                              # every group passes, 20 groups (profile hub lobby match leaving rejoin resume timeout easyjoin screens refusals teams lead layout open openlayout presence presenceui onlineux tokens)
+node tools/pokemonarena_online_page_test.mjs screens --mutants            # 21 mutants (new group: SC1-SC13, sessions bare ask copy back input battle; ARENA_SC=<session,...> picks some)
+node tools/pokemonarena_online_page_test.mjs onlineux tokens --mutants    # 18 + 6 mutants (was 22 + 6: X06-X08 went with the list, X20 with the page's foot; X04, X05, X10-X13, X21, T04-T06 re-homed)
+node tools/pokemonarena_online_page_test.mjs open --mutants               # 10 mutants, unchanged strings
+node tools/pokemonarena_presence_test.mjs --mutants                       # 140 passed, 67 mutants (its 12 online.js mutants still apply)
+node tools/pokemonarena_openlobby_test.mjs --mutants                      # 144 passed, 56 mutants
+node tools/pokemonarena_netmatch_test.mjs --mutants                       # 333 passed, 39 mutants
+```
+
+Where the old presentation checks went (old id -> new check, or why it is gone) is the table at the end of `ONLINE.md` ("What the picture replaced, check by check").
+Not this track's and not edited: `tools/pokemonarena_center_test.mjs` CB11 reads `#olGo` on the battle page (the first Trainer Center's browser cases; CENTER rewrites them): with the panel gone it
+times out. The equivalent facts are page test SC7d (a MEET-token join, and its CANCEL going back to the Center) and EZ10 (the same address without the token is YOU'RE INVITED, one press).
+One line of `tools/pokemonarena_hub_return_test.mjs` changed (F1 opens `?online=1&ask=host`: the bare address leaves for the hub by itself now).

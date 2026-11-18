@@ -49,7 +49,7 @@
         <button id="chipBack" class="chip" type="button" aria-label="Back to the action menu">&lsaquo; Back</button>
         <button id="chipInfo" class="chip" type="button" aria-label="Read the highlighted move's description">Info</button>
       </div>
-      <div id="live" class="sr" role="status" aria-live="polite"></div>   <!-- what the Open switch tells a screen reader (presence_boot.js say()): "No longer open to battles." -->
+      <div id="live" class="sr" role="status" aria-live="polite"></div>   <!-- the polite live region: what the Open switch tells a screen reader in a battle against the CPU (presence_boot.js say(): "No longer open to battles."), and what an online screen in the picture says before a battle (battle_boot.js: online_view.js speakOnline; the canvas has only a static label) -->
       <div id="boot" role="status">
         <p id="bootText">Starting...</p>
         <progress id="bar" max="1" value="0"></progress>

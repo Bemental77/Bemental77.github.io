@@ -1,26 +1,32 @@
-// pokemonarena/js/online.js -- the page half of a networked battle: the setup panel (team, name, format, host or join), the lib/netplay.js session, the status bar,
-// and the glue that hands the match controller to the battle page. The protocol itself is netmatch.js; the Arena-specific halves (team judging, building the
+// pokemonarena/js/online.js -- the page half of a networked battle: what a press on the battle page starts (a private room, a join, a search for anyone), the lib/netplay.js session, the open-games
+// board, the status line of a battle, and the glue that hands the match controller to the battle page. The protocol itself is netmatch.js; the Arena-specific halves (team judging, building the
 // controller, the engine fingerprint) are online_match.js. Both are DOM-free and tested in Node (tools/pokemonarena_netmatch_test.mjs); this file is what
 // tools/pokemonarena_online_page_test.mjs drives in two real browser pages.
 //
-// WHAT lib/netplay.js DOES FOR US, AND WHAT IT DOES NOT. It pairs two browsers: a room code, the HOST'S approval of the joiner (a human clicks Allow, with a
-// four-character confirmation code to read out), ICE / relay fallback, link health. It does not know what a Pokemon is. Our messages ride on its channel as
-// type 'lsarena' (the 'ls' prefix is what its inbound router passes to _onRoomMsg; gba.html does the same with 'lsgbahostbye'), sent with session._send() and
+// NOTHING HERE DRAWS (INAPP.md "Wave 2"). Everything a player CHOOSES (the team, the battle size, the name, invite / join / battle anyone) is chosen in the hub's online menu, which hands over with a
+// one-time token (presence.js: START, MEET, ACCEPT) and the online preferences (online_prefs.js). What this page still says before a battle is STATE: view() is one pure function of a snapshot of it
+// (online_view.js: which screen, who the player is in it, the heading, the steps, the sentence, the room code, the rows that can be pressed), js/online_draw.js draws that view in the battle canvas
+// from the ROM, and js/battle_boot.js routes the buttons and the pointer to act(id). The one piece of DOM this file makes is the slim status line of a battle (#netbar).
+//
+// WHAT lib/netplay.js DOES FOR US, AND WHAT IT DOES NOT. It pairs two browsers: a room code, the host's admission of the joiner, ICE / relay fallback, link health. It does not know what a Pokemon is.
+// Our messages ride on its channel as type 'lsarena' (the 'ls' prefix is what its inbound router passes to _onRoomMsg; gba.html does the same with 'lsgbahostbye'), sent with session._send() and
 // received by wrapping session._onRoomMsg. Every inbound path - the direct channel and the relay - ends in that router, so the relay carries a battle too.
 //
-// THE URL CONTRACT (battle.html?...)
-//   online=1                    the setup panel with Host / Join choices
-//   np=CODE&host=1 | &join=1    the lobby's hand-off (multiplayer.html): the role and room code are preset
-//   team=<ARENA1 code>          preselects "the team in the address"            format=6v6|3v3   the host's default format
-//   auto=host&for=<sender id>&rq=<request id>&format=..   an ACCEPTED CHALLENGE (presence.js): the owner was in the hub or a CPU battle, pressed Accept (which left a ONE-TIME TOKEN in this tab's
-//                               sessionStorage) and lands here; with that token the page picks the first saved team, opens a room, tells the challenger the room SEALED to the challenger's one-time key
-//                               (`acc`: the room is never on the public board in the clear), and lets the first player in without a prompt. WITHOUT the token (a link from anywhere) auto/for/rq are ignored: the
-//                               ordinary online panel shows, with a notice. Once the room is open the address becomes np=ROOM&host=1 and the token is gone, so a reload resumes like any host. For net=local also openchal=<ms>.
+// THE URL CONTRACT (battle.html?...)        AN ADDRESS DOES NOT START A GAME: only a one-time token of this tab does (INAPP.md "Contract 1"). Without one the page ASKS (a confirm screen).
+//   online=1                    with the hub's START token: INVITE A FRIEND (a private room is opened) or BATTLE ANYONE (a search). Without it: back to the hub's online menu (location.replace)
+//   online=1&ask=host | quick   the hub could not leave a token (storage blocked): the page asks once, OPEN A ROOM FOR A FRIEND? / FIND AN OPPONENT?
+//   np=CODE&host=1 | &join=1    the lobby's hand-off (multiplayer.html) and a friend's invite link: YOUR ROOM / YOU'RE INVITED, one press. With the hub's token (START { room }, or MEET with &meet=1): no press
+//   team=<ARENA1 code>          adds "the team in the address" to the teams the page can play            format=6v6|3v3   the host's default format
+//   auto=host&for=<sender id>&rq=<request id>&format=..   an ACCEPTED CHALLENGE (presence.js): the owner was in the hub or a CPU battle, pressed YES (which left a ONE-TIME TOKEN in this tab's
+//                               sessionStorage) and lands here; with that token the page plays the preferred team, opens a room, tells the challenger the room SEALED to the challenger's one-time key
+//                               (`acc`: the room is never on the public board in the clear), and lets the first player in without a prompt. WITHOUT the token (a link from anywhere) auto/for/rq are ignored
+//                               and the page says so. Once the room is open the address becomes np=ROOM&host=1 and the token is gone, so a reload resumes like any host. For net=local also openchal=<ms>.
 //   (a board page that joined a listed game has its address rewritten to np=ROOM&join=1 so a reload finds the room; when that join ends without a match the plain online=1 address is put back: boardAddress)
 //   net=local test seams for the open games: openquick / openjoin / openchal (above) and openhold=<ms>, how long a seat is held for an admitted player who knocks again before looking whether they got a link.
-//   (online=1, no np) the panel also shows OPEN GAMES (js/openlobby.js): players who are waiting, each with a Join button, a Find a battle button that joins the first one or opens one,
-//                               and an "Open to anyone" switch for a host. An open game lets the first player who asks in WITHOUT the host pressing Allow: that is what open means.
 //   net=local                   BroadcastChannel pairing (two tabs of one browser; the test rigs)       arenaturn=<ms> / arenagrace=<ms>  (net=local only) a short turn limit / link grace; NOT 'turn', which lib/netplay.js reads as a TURN relay
+// THE OPEN-GAMES BOARD (js/openlobby.js) is still dialled here, by what needs it: BATTLE ANYONE (join the game that has waited longest, or list one and wait; defect to a rival's), an accepted
+// challenge (the sealed "come in"), and a challenge sent from this page (challengeResident: reachable through the hook only; players challenge each other in the hub's Trainer Center).
+// THE PLAYERS ONLINE LIST IS GONE (INAPP.md "Wave 2", decision 2): board() is what it showed, as data, for the tests.
 // Test hook: window.__arenaOnline.
 
 import { openStore } from './store.js';
@@ -40,10 +46,10 @@ export { ROOM_RE };
 const LS_NAME = 'arena.online.name';
 const resumeKey = (room, role) => 'arena.online:' + room + ':' + role;       // sessionStorage: per tab, gone when the tab closes, never sent anywhere
 const RESUME_MAX_AGE_MS = 4 * 3600 * 1000;
-// WHAT THE PAGE SAYS ABOUT ITSELF. Both are true of the code as it is (ONLINE.md, "What is public"): a battle needs BOTH teams in BOTH browsers (the engines are lockstep), so the team you play does go to
+// WHAT ONLINE PLAY SAYS ABOUT ITSELF (the hub's online menu shows it before a player leaves for this page; ONLINE.md "What is public"). Both are true of the code as it is (ONLINE.md, "What is public"): a battle needs BOTH teams in BOTH browsers (the engines are lockstep), so the team you play does go to
 // the other player (directly, or over lib/netplay.js's relay when there is no direct path); and the board is a topic on the third-party brokers lib/netplay.js pairs through, read with mqtt.js from a CDN.
-const LEDE = 'Two players, each on their own device, one battle. Your teams stay in your browser until a battle starts; then the team you play and your choices go to the other player, directly when your browsers can reach each other and through a public relay when they cannot.';
-/** The Open games section's disclosure, built from what the page REALLY dials: the brokers Netplay.signalBrokers() returns (a deployment or a ?wsbroker= address can change the list) and the script openlobby.js loads. -> a sentence or two. */
+export const ONLINE_SHARES = 'Two players, each on their own device, one battle. Your teams stay in your browser until a battle starts; then the team you play and your choices go to the other player, directly when your browsers can reach each other and through a public relay when they cannot.';
+/** What BATTLE ANYONE dials, in words, built from what the page REALLY dials: the brokers Netplay.signalBrokers() returns (a deployment or a ?wsbroker= address can change the list) and the script openlobby.js loads. -> a sentence or two. */
 export function boardPrivacyText(brokers, scriptUrl) {
   const host = (u) => { try { return new URL(String(u).split('|')[0]).hostname; } catch (_e) { return ''; } };
   const names = [...new Set((Array.isArray(brokers) ? brokers : []).map(host).filter(Boolean))];
@@ -133,20 +139,22 @@ function el(doc, tag, props, ...kids) {
 }
 
 /**
- * cfg: { win, doc, pack, root (the element the panel goes in), bar (where the status bar is inserted before), query (parseOnlineQuery), teamParam (the ?team= code or null),
- *        formatParam, hooks: { mountScene(ctl, info), sceneState() -> { mode, pending }, showFatal({ title, message }), toHub() }, now }
- * -> { begin(), onResult(choice), leaveToHub(), state, view(), and the named actions: setForm(patch), startAs(role), go(), quick(), cancel(), copyLink(), copyCode(), share(), joinListed(room), challengeResident(room) }
+ * cfg: { win, doc, pack, bar (the element the battle's status line is inserted before), query (parseOnlineQuery), teamParam (the ?team= code or null), formatParam, fingerprint, now,
+ *        hooks: { mountScene(ctl, info), sceneState() -> { mode, pending }, showFatal({ title, message }), stage(s), changed() (something view() shows has changed),
+ *                 toHub() (leave for the hub: the screen the player came from), toMenu() (leave for the hub's online menu, in this page's place), toTeam(room, role) (CHANGE TEAM) } }
+ * -> { begin(), onResult(choice), leaveToHub(), state, view() (online_view.js), act(id) (a row of the screen was pressed), and the named actions act() calls and the tests drive:
+ *      setForm(patch), startAs(role), go(), quick(), cancel(), copyLink(), copyCode(), share(), changeTeam(), back(), joinListed(room), challengeResident(room), pick(room), board() }
  */
 export function createOnline(cfg) {
-  const { win, doc, pack, root } = cfg;
+  const { win, doc, pack } = cfg;
   const hooks = cfg.hooks;
   // AN ADDRESS DOES NOT START A GAME. An accepted challenge (query.auto) is hosted only if this tab holds the one-time token presence.js wrote when the owner pressed Accept; it is taken (and gone) here, once.
-  // Any other way of arriving at ?online=1&auto=host&for=..&rq=.. (a link from anywhere, an old history entry, a reload before the room opened) is the ordinary online panel with a one-line notice.
+  // Any other way of arriving at ?online=1&auto=host&for=..&rq=.. (a link from anywhere, an old history entry, a reload before the room opened) says so in one line and starts nothing.
   let query = cfg.query, acceptTok = null, autoNotice = '';
   if (query.auto) {
     let ss = null; try { ss = win.sessionStorage; } catch (_e) { ss = null; }
     acceptTok = takeAcceptToken(ss, query.auto, Date.now(), ACCEPT_MAX_AGE_MS);        // wall clock: the token was written by the PREVIOUS page, and a monotonic clock does not span a page load
-    if (!acceptTok) { query = { ...query, role: null, room: null, auto: null }; autoNotice = 'That address tried to open a game for you without you pressing Accept, so it was ignored. Host a game, or pick one below.'; }
+    if (!acceptTok) { query = { ...query, role: null, room: null, auto: null }; autoNotice = 'That address tried to open a game for you without you pressing Accept, so it was ignored.'; }
   }
   // THE TRAINER CENTER'S HAND-OFF: a join it was let into (an accepted challenge, a listed game) presses Join by itself, but only against the one-time token the Center left in THIS tab (presence.js takeMeetToken)
   let meetTok = false;
@@ -160,8 +168,14 @@ export function createOnline(cfg) {
   const now = cfg.now || (() => (win.performance && typeof win.performance.now === 'function' ? win.performance.now() : Date.now()));
   const state = { stage: 'setup', role: query.role, room: query.room, transport: query.transport, nm: null, session: null, mine: null, name: null, fmt: null, error: null, info: null, matches: 0, open: false, quick: false, listed: null, openWanted: false, admitted: false, admittedId: null, defecting: false, invite: null, profileId: null, rec: null };
   // THE FORM IS A MODEL, NOT NODES (INAPP.md "Wave 2"): what the player chose (in the hub's online menu, through the preferences; a test through setForm). The logic below reads this and nothing on the page.
-  //   teamKey: the key of one of state.choices | name | nameTouched: the name is one the player gave (a stored one), not one filled in from a team's owner | fmt: '3v3' | '6v6' | room: the code to join | paste: a pasted team code
-  const form = state.form = { teamKey: null, name: '', nameTouched: false, fmt: '3v3', room: '', paste: '' };
+  //   teamKey: the key of one of state.choices | name | nameTouched: the name is one the player gave (a stored one), not one filled in from a team's owner | fmt: '3v3' | '6v6' | room: the code to join
+  const form = state.form = { teamKey: null, name: '', nameTouched: false, fmt: '3v3', room: '' };
+  // WHAT A BOARD PAGE ASKS (the plain address: no room, no role): 'host' (OPEN A ROOM FOR A FRIEND?) or 'quick' (FIND AN OPPONENT?). It is what the address says (ask=), or what the hub's START token started:
+  // a room that is closed again, or a search that found nothing, comes back to that question. null on every other page.
+  state.ask = cfg.query.ask || (startTok === 'quick' ? 'quick' : startTok === 'host' ? 'host' : null);
+  // viaToken: what is under way was started by a token of the hub, with no press on this page. A way out the player takes then (CLOSE THE ROOM, STOP LOOKING, CANCEL) goes back to the hub, where they pressed;
+  // a failure stays here, with the reason and the question (the player must be able to read why).
+  let viaToken = false;
   // WHAT THE SCREEN SAYS, as state (view() reads it, and whatever presents the page reads view()): the one sentence, the way out of what is under way, whether the room's code may be shown, what can be pressed
   state.status = { text: '', bad: false }; state.cancel = { shown: false, label: 'Cancel' }; state.codeShown = false; state.goOff = true; state.quickOff = true; state.locked = false; state.copied = null; state.canShare = false; state.bar = null;
   const setCancel = (shown, label) => { state.cancel = { shown: !!shown, label: label || state.cancel.label }; };
@@ -169,7 +183,7 @@ export function createOnline(cfg) {
   let stageNow = 'setup', stageAt = 0;
   Object.defineProperty(state, 'stage', { enumerable: true, get: () => stageNow, set: (s) => { if (s !== stageNow) { stageNow = s; stageAt = UNDER_WAY.includes(s) ? now() : 0; } } });
   // quickCtx: what Find a battle was launched with, to open the same game again if a game it left its own for turns out not to be there. openText / openLead: what the host of an open game was last told.
-  let panel = null, bar = null, barTimer = 0, preMsgs = [], wired = false, closed = false, reconnecting = false, lobbies = null, joinTimer = 0, relisting = false, asking = null, acceptor = null, quickCtx = null, openText = '', openLead = '';
+  let bar = null, barTimer = 0, preMsgs = [], wired = false, closed = false, reconnecting = false, lobbies = null, joinTimer = 0, relisting = false, asking = null, acceptor = null, quickCtx = null, openText = '', openLead = '';
   const sleep = (ms) => new Promise((r) => win.setTimeout(r, ms));
   const Netplay = () => win.Netplay;
   // ONE WAY IN AT A TIME. Host, Join, a game from the list, Challenge, Find a battle and the accepted-challenge start all read the team (IndexedDB, the judge) BEFORE they open anything, and each
@@ -212,102 +226,19 @@ export function createOnline(cfg) {
     catch (_e) { /* the address stays as it was; a reload just starts a new setup */ }
   }
 
-  /* ---------------------------------------------------------------------------------------------- the setup panel */
-  /* THE PANEL HAS THREE VIEWS, and only one is on screen at a time (renderView). The rule: ONE QUESTION PER SCREEN, and while anything is under way the screen says WHO YOU ARE in it
-   * (hosting / joining / matching) and WHAT IS HAPPENING NOW, in a heading, never in a sentence under a form.
-   *   choose    the plain Play online page (?online=1): YOUR TEAM (team, name, battle size), then three separate cards, one per way in - INVITE A FRIEND (#olGo: Get an invite link),
-   *             JOIN A FRIEND (their code or link, Join) and BATTLE ANYONE (#olQuick: Find an opponent) - then PLAYERS ONLINE (the board) and, at the foot, what going online shares.
-   *             Friends and strangers never share a card: a room made for a friend is private, full stop; the only public way in is Battle anyone.
-   *   address   a page whose address already says what to do (an invite link ?np=CODE&join=1, the lobby's hand-off ?np=CODE&host=1): YOUR TEAM and ONE button (#olGo).
-   *   progress  anything under way: who you are in it (#olRole), what is happening now (#olProgTitle), for a host the invite link itself with Copy / Share and the room code, a row of steps
-   *             (#olSteps), one sentence (#olStatus), how long it has taken, a hint when a join is slow (#olHint), and Cancel. */
-  const ui = {};
-  const card = (id, title, ...kids) => el(doc, 'section', { class: 'olcard', id, 'aria-labelledby': id + 'T' }, el(doc, 'h3', { id: id + 'T', text: title }), ...kids);
-  const HOME_LEDE = 'Battle someone on another phone or computer. Pick how:';
-  function buildPanel() {
-    panel = el(doc, 'section', { id: 'online', 'aria-labelledby': 'olTitle' });
-    ui.title = el(doc, 'h2', { id: 'olTitle', text: 'Battle online' });
-    ui.lede = el(doc, 'p', { class: 'dim', id: 'olLede', text: HOME_LEDE });
-    // YOUR TEAM
-    ui.teamField = el(doc, 'label', { class: 'field' }, el(doc, 'span', { text: 'Team' }));
-    ui.team = el(doc, 'select', { id: 'olTeam', onchange: () => { form.teamKey = ui.team.value; refreshFormats(); nameFollowsTeam(); paint(); } });
-    ui.teamField.append(ui.team);
-    ui.pasteField = el(doc, 'label', { class: 'field wide', hidden: true }, el(doc, 'span', { text: 'Team code' }));
-    ui.paste = el(doc, 'textarea', { id: 'olPaste', rows: '3', spellcheck: 'false', placeholder: 'ARENA1.…', oninput: () => { form.paste = ui.paste.value; } });
-    ui.pasteField.append(ui.paste);
-    ui.nameField = el(doc, 'label', { class: 'field' }, el(doc, 'span', { text: 'Name' }));
-    ui.name = el(doc, 'input', { id: 'olName', type: 'text', maxlength: String(NAME_MAX), autocomplete: 'nickname', spellcheck: 'false', oninput: () => { form.name = ui.name.value; form.nameTouched = true; } });
-    ui.nameField.append(ui.name);
-    ui.fmtField = el(doc, 'label', { class: 'field' }, el(doc, 'span', { text: 'Battle size' }));
-    ui.fmt = el(doc, 'select', { id: 'olFmt', onchange: () => { form.fmt = ui.fmt.value; } }, el(doc, 'option', { value: '3v3', text: '3 v 3 (pick 3 of 6)' }), el(doc, 'option', { value: '6v6', text: '6 v 6 (whole team)' }));
-    ui.fmtField.append(ui.fmt);
-    ui.you = el(doc, 'section', { class: 'olyou', id: 'olYou', 'aria-label': 'Your team' }, ui.teamField, ui.nameField, ui.fmtField, ui.pasteField);
-    // the status line: under the team in the first two views (a refusal, "Checking your team..."), inside the progress card while something is under way
-    ui.status = el(doc, 'p', { id: 'olStatus', class: 'status', role: 'status', 'aria-live': 'polite' });
-    ui.setupSlot = el(doc, 'div', { class: 'olslot' });
-    // INVITE A FRIEND (a private room: only the link or the code gets anyone in)
-    ui.go = el(doc, 'button', { type: 'button', class: 'textbtn primary big', id: 'olGo', text: 'Get an invite link', disabled: true, onclick: () => { pullForm(); if (boardPage()) startAs('host'); else go(); } });      // enabled once the team list has loaded (begin)
-    ui.goSlot = el(doc, 'div', { class: 'row' });
-    ui.friendCard = card('olFriend', 'Invite a friend', el(doc, 'p', { class: 'dim', text: 'You get a link to send them. They open it, press Join, and the battle starts.' }), ui.goSlot);
-    // JOIN A FRIEND
-    ui.room = el(doc, 'input', { id: 'olRoom', type: 'text', maxlength: '300', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false', placeholder: 'CODE', 'aria-label': 'Your friend\'s room code or link', enterkeyhint: 'go',
-      oninput: () => { const v = roomFromInput(ui.room.value); if (v !== null && v !== ui.room.value) ui.room.value = v; form.room = ui.room.value; },
-      onkeydown: (e) => { if (e.key === 'Enter') { e.preventDefault(); pullForm(); startAs('guest'); } } });
-    ui.joinBtn = el(doc, 'button', { type: 'button', class: 'textbtn primary', id: 'olJoin', text: 'Join', onclick: () => { pullForm(); startAs('guest'); } });
-    ui.roomField = el(doc, 'label', { class: 'field codefield' }, el(doc, 'span', { text: 'Their room code (or paste their link)' }), el(doc, 'span', { class: 'coderow' }, ui.room, ui.joinBtn));
-    ui.joinCard = card('olJoinCard', 'Join a friend', el(doc, 'p', { class: 'dim', text: 'Your friend made a room and sent you a code or a link.' }), ui.roomField);
-    // BATTLE ANYONE (the only public way in: what it shows other players is said right here)
-    ui.quick = el(doc, 'button', { type: 'button', class: 'textbtn primary big', id: 'olQuick', text: 'Find an opponent', disabled: true, onclick: () => { pullForm(); quick(); } });
-    ui.quickCard = card('olQuickCard', 'Battle anyone', el(doc, 'p', { class: 'dim', id: 'olQuickNote', text: 'Get matched with whoever is looking right now. Other players see your trainer name and your online record (wins and losses).' }), el(doc, 'div', { class: 'row' }, ui.quick));
-    ui.cards = el(doc, 'div', { class: 'olcards', id: 'olCards' }, ui.friendCard, ui.joinCard, ui.quickCard);
-    ui.addrBox = el(doc, 'div', { class: 'row', id: 'olAddr' });
-    // PLAYERS ONLINE (the board)
-    ui.openNote = el(doc, 'p', { class: 'dim', id: 'olOpenNote', role: 'status', 'aria-live': 'polite' });
-    ui.openList = el(doc, 'ul', { id: 'olOpenList', class: 'openlist' });
-    ui.openBox = el(doc, 'section', { id: 'olOpen', 'aria-labelledby': 'olOpenTitle', hidden: true }, el(doc, 'h3', { id: 'olOpenTitle', text: 'Players online' }), ui.openNote, ui.openList);
-    // what going online does, in words, on screen (a tooltip is not disclosure); small, at the foot, out of the way of the buttons
-    ui.openPrivacy = el(doc, 'p', { class: 'dim small', id: 'olOpenPrivacy', text: boardPrivacyText((() => { try { const N = Netplay(); return N && typeof N.signalBrokers === 'function' ? N.signalBrokers() : []; } catch (_e) { return []; } })(), MQTT_LIB) });
-    ui.privacy = el(doc, 'div', { class: 'olfoot', id: 'olPrivacy' }, el(doc, 'p', { class: 'dim small', id: 'olShares', text: LEDE }), ui.openPrivacy);
-    // PROGRESS
-    ui.role = el(doc, 'p', { class: 'olrole', id: 'olRole' });
-    ui.progTitle = el(doc, 'h3', { id: 'olProgTitle' });
-    ui.codeBox = el(doc, 'div', { id: 'olCode', class: 'code', hidden: true, 'aria-live': 'polite' });
-    ui.codeLabel = el(doc, 'p', { class: 'dim small codelabel', hidden: true, text: 'or tell them the room code' });
-    ui.share = el(doc, 'button', { type: 'button', class: 'textbtn primary', id: 'olShare', text: 'Share', hidden: true, onclick: () => share() });
-    ui.inviteHead = el(doc, 'p', { class: 'invitehead', id: 'olInviteHead', text: 'Send your friend this link' });
-    ui.linkText = el(doc, 'input', { id: 'olLinkText', type: 'text', readonly: true, 'aria-label': 'Invite link', onfocus: () => { try { ui.linkText.select(); } catch (_e) { /* ignore */ } } });
-    ui.copyLink = el(doc, 'button', { type: 'button', class: 'textbtn primary', id: 'olCopyLink', text: 'Copy link', onclick: () => copyLink() });
-    ui.copyCode = el(doc, 'button', { type: 'button', class: 'textbtn', id: 'olCopyCode', text: 'Copy code', onclick: () => copyCode() });
-    ui.linkBox = el(doc, 'div', { class: 'linkbox', id: 'olLinkBox' }, ui.inviteHead, el(doc, 'div', { class: 'linkrow' }, ui.linkText), el(doc, 'div', { class: 'row invite' }, ui.copyLink, ui.share));
-    ui.invite = el(doc, 'div', { class: 'invitebox', id: 'olInvite', hidden: true }, ui.linkBox, ui.codeLabel, el(doc, 'div', { class: 'coderow2' }, ui.codeBox, ui.copyCode));
-    ui.steps = el(doc, 'ol', { id: 'olSteps', class: 'steps', 'aria-label': 'Progress' });
-    ui.elapsed = el(doc, 'span', { id: 'olElapsed', class: 'elapsed', 'aria-hidden': 'true' });
-    ui.progSlot = el(doc, 'div', { class: 'olslot progslot' });
-    ui.hint = el(doc, 'p', { class: 'dim small olhint', id: 'olHint', hidden: true });
-    ui.cancelAsk = el(doc, 'button', { type: 'button', class: 'textbtn', id: 'olCancelAsk', text: 'Cancel', hidden: true, onclick: () => cancelAsk() });
-    ui.progress = el(doc, 'section', { id: 'olProgress', class: 'olcard progress', hidden: true, 'aria-labelledby': 'olProgTitle' }, ui.role, ui.progTitle, ui.invite, ui.steps, el(doc, 'div', { class: 'progline' }, ui.progSlot, ui.elapsed), ui.hint, el(doc, 'div', { class: 'row' }, ui.cancelAsk));
-    ui.cancel = el(doc, 'a', { class: 'textbtn', id: 'olBack', href: '/pokemonarena/', text: 'Back to the Arena' });
-    ui.actions = el(doc, 'div', { class: 'row foot' }, ui.cancel);
-    panel.append(ui.title, ui.lede, ui.you, ui.setupSlot, ui.addrBox, ui.cards, ui.progress, ui.openBox, ui.actions, ui.privacy);
-    ui.setupSlot.append(ui.status);
-    root.append(panel);
-  }
+  /* ---------------------------------------------------------------------------------------------- what the page says (state; online_view.js makes the view of it, online_draw.js draws it) */
   /** The one sentence on the screen (a refusal when `bad`). It is state: view().status. */
   const say = (t, bad) => { state.status = { text: t || '', bad: !!bad }; paint(); };
-  /** The DOM panel reads its own controls into the form (a button of the panel was pressed): whatever the boxes hold counts, typed or set from outside. */
-  function pullForm() {
-    if (ui.team.value) form.teamKey = ui.team.value;
-    form.name = ui.name.value; form.fmt = ui.fmt.value || form.fmt; form.room = ui.room.value; form.paste = ui.paste.value;
-  }
-  const formControls = () => [ui.room, ui.joinBtn, ui.team, ui.paste, ui.name, ui.fmt, ui.go, ui.quick];
   const inviteLink = () => win.location.origin + '/pokemonarena/battle.html?np=' + encodeURIComponent(state.room) + '&join=1' + (state.transport === 'local' ? '&net=local' : '');
   /** Copy, and say so WHERE THE PRESS WAS for two seconds (view().copied: 'link' | 'code'): the sentence says what is happening, and a "Copied." there used to replace "Waiting for your friend...".
    *  clipboard.writeText is called in the same task as the press that asked for it (nothing is awaited before it): a browser may refuse a copy that no user gesture stands behind. */
   let copiedTimer = 0;
+  const COPY_REFUSED = (room) => 'Copy was refused. Tell your friend the room code ' + room + ' on this screen.';
   async function copy(text, what) {
     let ok = false;
     try { await win.navigator.clipboard.writeText(text); ok = true; } catch (_e) { ok = false; }
-    if (!ok) { try { ui.linkText.focus(); ui.linkText.select(); } catch (_e) { /* ignore */ } say('Your browser would not let the page copy. The link is selected above: copy it yourself.', true); return false; }
+    // REFUSED (no clipboard here, or a press the browser does not count as a user gesture: a controller's): say so, and point at what always works. The room code is on the screen.
+    if (!ok) { say(COPY_REFUSED(state.room), true); return false; }
     state.copied = what; paint();
     win.clearTimeout(copiedTimer);
     copiedTimer = win.setTimeout(() => { state.copied = null; paint(); }, 2000);
@@ -332,7 +263,7 @@ export function createOnline(cfg) {
     state.role = role;
     state.goOff = false;
     if (role === 'guest' && state.room && !form.room) form.room = state.room;
-    syncSetupUi();
+    paint();
   }
   const choiceNow = () => (state.choices ? state.choices.find((c) => c.key === form.teamKey) || state.choices[0] : null);
   function refreshFormats() {
@@ -360,16 +291,14 @@ export function createOnline(cfg) {
         const act = profiles.find((p) => p.id === hub.activeId) || profiles[0];
         if (act) name = act.name;
       } finally { try { await store.close(); } catch (_e) { /* ignore */ } }
-    } catch (_e) { /* no profiles in this browser: random and pasted teams still work */ }
+    } catch (_e) { /* no profiles in this browser: a random team (and one in the address) still works */ }
     out.push({ key: 'random', label: 'A random team (6 Pokemon)', size: 6 });
-    out.push({ key: 'paste', label: 'Paste a team code...', size: 6 });
     return { choices: out, name };
   }
 
   async function teamCodeOf(choice) {
     if (choice.key === 'url') return { ok: true, code: choice.code };
     if (choice.key === 'random') { const a = new Uint32Array(1); win.crypto.getRandomValues(a); try { return { ok: true, code: await randomTeamCode(pack, a[0]) }; } catch (e) { return { ok: false, message: 'A random team could not be made (' + (e && e.message ? e.message : e) + ').' }; } }
-    if (choice.key === 'paste') { const t = form.paste.replace(/\s+/g, ''); return t ? { ok: true, code: t } : { ok: false, message: 'Paste a team code first, or pick a saved team.' }; }
     // a SAVED team is the only choice that needs the store, and the only one that has a profile to take a record from: one open serves both
     let store = null;
     try {
@@ -383,8 +312,8 @@ export function createOnline(cfg) {
 
   /* ---------------------------------------------------------------------------------------------- connect */
   const supportedHere = () => !!(Netplay() && typeof Netplay().supported === 'function' && Netplay().supported());
-  const UNSUPPORTED = 'This browser cannot connect two players (it has no WebRTC or BroadcastChannel). Try a current Chrome, Firefox, Safari or Edge.';
-  const NO_SEAL = 'This browser cannot challenge a player in private (it has no WebCrypto, which keeps the room code off the public list), so challenging is not available here. Join an open game instead, or host one and give your friend the code.';
+  const UNSUPPORTED = 'This browser cannot connect two players. Try a current Chrome, Firefox, Safari or Edge.';
+  const NO_SEAL = 'This browser cannot challenge a player in private (it has no WebCrypto), so challenging is not available here.';
   /** The part every way in shares (Host, Join, a game from the list, Find a battle): the name, and the team read and judged. -> { mine, tc, name, release } | null (the reason is on the screen) */
   async function prepare(role) {
     const name = cleanName(form.name, role === 'host' ? 'Host' : role === 'guest' ? 'Guest' : 'Player');
@@ -420,12 +349,12 @@ export function createOnline(cfg) {
   }
   const go = exclusive(async function go() {
     if (state.stage !== 'setup' || !state.choices) return;
-    if (!state.role) { say('Get an invite link, or type the code your friend sent and press Join.', true); return; }
+    if (!state.role) return;
     if (!supportedHere()) { say(UNSUPPORTED, true); return; }
     const role = state.role;
     // a host on the plain Play online page always gets a FRESH room (state.room may still hold the code of a join or a room that was just cancelled); the lobby's hand-off names its room in the address
     let room = role === 'host' && boardPage() ? null : state.room;
-    if (role === 'guest') { room = (roomFromInput(form.room) || '').trim().toUpperCase(); if (!ROOM_RE.test(room)) { say(room ? 'That is not a room code. A code is 4 to 8 letters and numbers, like K7Q2P.' : 'Type the room code your friend sent you, then press Join.', true); try { ui.room.focus(); } catch (_e) { /* ignore */ } return; } }
+    if (role === 'guest') { room = (roomFromInput(form.room) || '').trim().toUpperCase(); if (!ROOM_RE.test(room)) { say(room ? 'That is not a room code. A code is 4 to 8 letters and numbers, like K7Q2P.' : 'This page has no room code to join. Open your friend\'s link again.', true); return; } }
     const p = await prepare(role);
     if (!p) return;
     const fmt = role === 'host' ? form.fmt : null;
@@ -459,7 +388,7 @@ export function createOnline(cfg) {
 
   /* ---------------------------------------------------------------------------------------------- open games (the board is js/openlobby.js)
    * A host who switched "Open to anyone" on, or who pressed Find a battle and found nobody, LISTS the game: a small beacon on the public brokers lib/netplay.js already pairs
-   * through (a BroadcastChannel for net=local). Everyone with the panel open sees it and can join with one press. The pairing underneath is unchanged: the joiner still needs the
+   * through (a BroadcastChannel for net=local). Everyone who is looking (BATTLE ANYONE, the hub's Trainer Center) sees it and can join with one press. The pairing underneath is unchanged: the joiner still needs the
    * room code (the board hands it over) and the host's admission is still the lib's; an OPEN game answers it for the host, once, for the first player who asks. */
   function ensureLobbies() {
     if (lobbies) return lobbies;
@@ -470,142 +399,21 @@ export function createOnline(cfg) {
     return lobbies;
   }
   function closeLobbies() { if (acceptor) { acceptor.stop(); acceptor = null; } if (lobbies) { const l = lobbies; lobbies = null; try { l.close(); } catch (_e) { /* ignore */ } } }
-  /** The board is on the page: the plain Play online page, at its form, in a browser that can connect two players. */
-  const boardShown = () => state.stage === 'setup' && supportedHere() && boardPage();
-  function syncSetupUi() { paint(); }
-  /* ---------------------------------------------------------------------------------------------- which view, and the steps */
+  /** The board is watched while the page rests at the question that may go on it: the plain address asking FIND AN OPPONENT? (a private room has no business on the public brokers). */
+  const boardWatched = () => state.stage === 'setup' && supportedHere() && boardPage() && state.ask === 'quick';
   /* ---------------------------------------------------------------------------------------------- the view: ONE pure function of a snapshot of the state (online_view.js) */
   function snapshot() {
     const c = choiceNow();
     return { stage: state.stage, role: state.role, room: state.room, codeShown: state.codeShown, open: state.open, quick: state.quick, invite: !!state.invite, admitted: state.admitted, defecting: state.defecting, listedName: state.listed ? state.listed.name : null,
-      played: state.matches > 0, status: state.status, since: stageAt && UNDER_WAY.includes(state.stage) ? Math.max(0, now() - stageAt) : null, board: boardPage(), ready: !!state.choices, canGo: !state.goOff && !state.locked, canQuick: !state.quickOff && !state.locked,
+      played: state.matches > 0, status: state.status, since: stageAt && UNDER_WAY.includes(state.stage) ? Math.max(0, now() - stageAt) : null, board: boardPage(), ask: state.ask, ignored: !!autoNotice, ready: !!state.choices, canGo: !state.goOff && !state.locked, canQuick: !state.quickOff && !state.locked,
       cancel: state.cancel, link: state.room ? inviteLink() : '', canShare: state.canShare, copied: state.copied, team: c ? { key: c.key, label: c.label, size: c.size || 6 } : null, name: form.name, fmt: form.fmt, bar: state.bar };
   }
   /** What the page shows now, as plain data (online_view.js says what each field is). Changes nothing. */
   const view = () => onlineView(snapshot());
-  /** Something the screen shows has changed. (The DOM panel is a consumer of view(): it draws what view() says and holds no state of its own.) */
-  function paint() { if (panel) renderView(); }
-  const GO_HOME_LABEL = 'Get an invite link';
-  let viewTimer = 0;
-  const painted = {};
-  function renderView() {
-    if (!panel) return;
-    const v = view(), setup = v.screen === 'confirm', going = v.screen === 'wait', board = boardPage();
-    panel.hidden = v.screen === 'hidden';
-    // the form: a field is written only when the MODEL changed (a box the player is typing in is never overwritten with what it already says)
-    for (const [k, n] of [['teamKey', ui.team], ['name', ui.name], ['fmt', ui.fmt], ['room', ui.room], ['paste', ui.paste]]) if (painted[k] !== form[k]) { painted[k] = form[k]; if (form[k] !== null && n.value !== form[k]) n.value = form[k]; }
-    ui.pasteField.hidden = form.teamKey !== 'paste';
-    { const c = choiceNow(); ui.fmt.querySelector('option[value="3v3"]').disabled = !!c && (c.size || 6) < 3; }
-    for (const n of formControls()) n.disabled = state.locked;
-    if (!state.locked) { ui.go.disabled = state.goOff; ui.quick.disabled = state.quickOff; }
-    ui.openBox.hidden = !boardShown();
-    ui.status.textContent = v.status.text; ui.status.classList.toggle('bad', v.status.bad);
-    ui.cancelAsk.hidden = !v.cancel.shown; ui.cancelAsk.disabled = false; if (ui.cancelAsk.textContent !== v.cancel.label) ui.cancelAsk.textContent = v.cancel.label;
-    ui.codeBox.hidden = !v.code; if (v.code && ui.codeBox.textContent !== v.code) ui.codeBox.textContent = v.code;
-    ui.invite.hidden = !v.code; ui.codeLabel.hidden = !v.code; ui.share.hidden = !(v.code && v.canShare); if (ui.linkText.value !== v.link) ui.linkText.value = v.link;
-    for (const [n, what, label] of [[ui.copyLink, 'link', 'Copy link'], [ui.copyCode, 'code', 'Copy code']]) { const t = v.copied === what ? 'Copied ✓' : label; if (n.textContent !== t) n.textContent = t; n.classList.toggle('copied', v.copied === what); }
-    // under way, the progress card IS the page: the page's own heading, the form, the cards, the board and the way back all go (Cancel is the way out of anything under way)
-    ui.title.hidden = going;
-    ui.lede.hidden = !setup;
-    ui.you.hidden = !setup;
-    ui.fmtField.hidden = !v.fmtShown;
-    ui.cards.hidden = !(setup && board);
-    ui.addrBox.hidden = !(setup && !board);
-    ui.progress.hidden = !going;
-    ui.privacy.hidden = !(setup && board);
-    ui.actions.hidden = going;
-    panel.dataset.going = going ? '1' : '';
-    const goHome = board ? ui.goSlot : ui.addrBox;
-    if (ui.go.parentNode !== goHome) goHome.append(ui.go);
-    if (setup) { const t = board ? GO_HOME_LABEL : v.kind === 'invited' ? 'Join the battle' : 'Open the room'; if (ui.go.textContent !== t) ui.go.textContent = t; }
-    const slot = going ? ui.progSlot : ui.setupSlot;
-    if (ui.status.parentNode !== slot) slot.append(ui.status);
-    if (setup) { ui.title.textContent = v.heading; ui.lede.textContent = v.lede; }
-    // the invite (link, Copy / Share, the code) is for a PRIVATE room a friend is coming to. A game waiting for anyone (Battle anyone) shows its code small, as a fallback, under a heading that says so.
-    ui.linkBox.hidden = !v.friendRoom;
-    ui.codeLabel.textContent = v.codeLabel;
-    renderSteps(v);
-    if (going && !viewTimer) viewTimer = win.setInterval(renderElapsed, 1000);
-    if (!going && viewTimer) { win.clearInterval(viewTimer); viewTimer = 0; }
-    renderElapsed();
-  }
-  function renderElapsed() {
-    if (!ui.elapsed) return;
-    const v = view();
-    if (ui.elapsed.textContent !== v.elapsed) ui.elapsed.textContent = v.elapsed;
-    if (ui.hint.textContent !== v.hint) ui.hint.textContent = v.hint;
-    ui.hint.hidden = !v.hint;
-  }
-  /** Who the player is in what is under way (#olRole), what is happening now (#olProgTitle), the steps and which one it is at (aria-current): all of it is the view's (online_view.js stepsNow). */
-  function renderSteps(v) {
-    if (v.screen !== 'wait') { if (ui.steps.childElementCount) { ui.steps.replaceChildren(); ui.steps.dataset.sig = ''; } return; }
-    const s = { role: v.who, title: v.title, steps: v.steps, at: v.at };
-    if (ui.progTitle.textContent !== s.title) ui.progTitle.textContent = s.title;
-    if (ui.role.textContent !== s.role) ui.role.textContent = s.role;
-    ui.progress.dataset.role = v.role;
-    const sig = s.steps.join('|') + '#' + s.at;
-    if (ui.steps.dataset.sig === sig) return;
-    ui.steps.dataset.sig = sig; ui.steps.dataset.at = String(s.at);
-    ui.steps.replaceChildren(...s.steps.map((t, i) => el(doc, 'li', { class: i < s.at ? 'done' : i === s.at ? 'now' : 'todo', 'aria-current': i === s.at ? 'step' : null }, el(doc, 'span', { class: 'dot', 'aria-hidden': 'true', text: i < s.at ? '✓' : String(i + 1) }), el(doc, 'span', { class: 'lbl', text: t }))));
-  }
+  /** Something the screen shows has changed: the page draws view() again. (The elapsed time changes by itself; the page's own loop draws that.) */
+  function paint() { if (hooks.changed) { try { hooks.changed(); } catch (_e) { /* a page that cannot draw must not stop a match */ } } }
   function setStage(s) { paint(); if (hooks.stage) hooks.stage(s); }
-  function onBoardChange() { renderOpenList(); maybeDefect(); refreshOpenNote(); }
-  function renderOpenList() {
-    if (!lobbies || !ui.openList || state.stage !== 'setup') return;
-    const all = lobbies.list();
-    const shown = all.filter((g) => g.compatible), hidden = all.length - shown.length;
-    syncRows(shown);
-    const st = lobbies.status();
-    ui.openBox.dataset.board = st; ui.openBox.dataset.count = String(shown.length);
-    // games on another build are hidden (the handshake would refuse them by name) and COUNTED, whether or not there are games to show beside them
-    const hiddenNote = hidden ? ' (' + hidden + ' open on a different version of the Arena, hidden.)' : '';
-    const note = st === 'down' ? 'The list of open games could not be reached. You can still host a game and give a friend the code.'
-      : shown.length ? (shown.length === 1 ? '1 game is' : shown.length + ' games are') + ' waiting for an opponent.' + hiddenNote
-      : (st === 'connecting' ? 'Looking for open games...' : 'Nobody is waiting right now. Press Find an opponent and you will be first on this list, or invite a friend.') + hiddenNote;
-    if (ui.openNote.textContent !== note) ui.openNote.textContent = note;          // (a live region: the same words again would be read out again at every beacon)
-  }
-  // THE LIST IS UPDATED IN PLACE, by room: a row that is still on the board keeps its <li> and its button, so a keyboard / switch / gamepad user who is on a Join button keeps their place when some
-  // other game appears, changes or expires (the list used to be rebuilt from nothing at every beacon, which dropped the focus to the page body). Only a row that LEAVES takes its focus with it.
-  const rowGame = new WeakMap();          // <li> -> the board entry it shows NOW (its button reads this at the press, never the entry it was built from)
-  const setText = (n, t) => { if (n.textContent !== t) n.textContent = t; };
-  const fmtLabel = (g) => (g.fmt === '3v3' ? '3 v 3' : '6 v 6');
-  function buildRow(g) {
-    const li = el(doc, 'li', { 'data-room': g.room }, el(doc, 'span', { class: 'who' }), el(doc, 'span', { class: 'fmt' }),
-      el(doc, 'button', { type: 'button', class: 'textbtn', onclick: () => { const cur = rowGame.get(li); if (cur) { pullForm(); if (cur.h) challengeResident(cur); else joinListed(cur); } } }));
-    return li;
-  }
-  function fillRow(li, g) {
-    rowGame.set(li, g);
-    setText(li.querySelector('.who'), g.name);
-    setText(li.querySelector('.fmt'), fmtLabel(g));
-    let rec = li.querySelector('.rec');
-    if (g.rec) {
-      if (!rec) { rec = el(doc, 'span', { class: 'rec' }); li.insertBefore(rec, li.querySelector('.fmt')); }
-      setText(rec, g.rec[0] + '-' + g.rec[1]); rec.setAttribute('title', g.rec[0] + ' online wins, ' + g.rec[1] + ' losses');
-    } else if (rec) rec.remove();
-    const btn = li.querySelector('button'), label = (g.h ? 'Challenge ' : 'Join ') + g.name + ' (' + fmtLabel(g) + ')';
-    setText(btn, g.h ? 'Challenge' : 'Join');
-    if (btn.getAttribute('aria-label') !== label) btn.setAttribute('aria-label', label);
-  }
-  function syncRows(shown) {
-    const list = ui.openList, have = new Map(), want = new Set(shown.map((g) => g.room));
-    for (const li of list.children) have.set(li.dataset.room, li);
-    const active = doc.activeElement;
-    let heir = null;                         // where the focus goes if the row it was on is leaving: the row that took its place, else the one before it, else Find a battle
-    for (const [room, li] of have) {
-      if (want.has(room)) continue;
-      if (active && li.contains(active)) { let n = li.nextElementSibling; while (n && !want.has(n.dataset.room)) n = n.nextElementSibling; if (!n) { n = li.previousElementSibling; while (n && !want.has(n.dataset.room)) n = n.previousElementSibling; } heir = n || ui.quick; }
-      li.remove(); have.delete(room);
-    }
-    let at = list.firstElementChild;           // the row that belongs at this position; a row already there is left alone (moving a node would drop its focus too)
-    for (const g of shown) {
-      let li = have.get(g.room);
-      if (!li) li = buildRow(g);
-      fillRow(li, g);
-      if (li === at) at = at.nextElementSibling; else list.insertBefore(li, at);
-    }
-    if (heir) { const t = heir === ui.quick ? heir : heir.querySelector('button'); if (t && !t.disabled) t.focus(); }
-  }
+  function onBoardChange() { maybeDefect(); refreshOpenNote(); paint(); }
   const joinListed = exclusive(async function joinListed(g) {
     if (state.stage !== 'setup' || !state.choices) return;
     if (!supportedHere()) { say(UNSUPPORTED, true); return; }
@@ -647,13 +455,28 @@ export function createOnline(cfg) {
   });
   /** Cancel: a challenge that has not been answered, or a join that has not connected (a listed game that never answers, a code nobody opened). Neither can be taken back any other way than leaving the page. */
   function cancelAsk() {
-    if (asking) { const a = asking; asking = null; a.cancel(); reopenSetup(); say('Cancelled.'); return; }
-    if (state.stage === 'waiting' && state.role === 'guest' && !state.nm && state.session && !closed) { reopenSetup(); say('Cancelled.'); return; }
+    const tok = viaToken;
+    let out = false;
+    if (asking) { const a = asking; asking = null; a.cancel(); reopenSetup(); say('Cancelled.'); out = true; }
+    else if (state.stage === 'waiting' && state.role === 'guest' && !state.nm && state.session && !closed) { reopenSetup(); say('Cancelled.'); out = true; }
     // a host whose room nobody has come to yet (opening, or open and waiting; a Find-a-battle game too): the room is closed and comes off the list
-    if ((state.stage === 'waiting' || state.stage === 'open') && state.role === 'host' && !state.nm && !closed) { const q = state.quick; quickCtx = null; reopenSetup(); say(q ? 'Stopped looking for an opponent.' : 'Room closed.'); return; }
-    if (state.stage === 'searching' && !closed) { reopenSetup(); say('Stopped looking for an opponent.'); }          // (quick() sees the stage change and stops)
+    else if ((state.stage === 'waiting' || state.stage === 'open') && state.role === 'host' && !state.nm && !closed) { const q = state.quick; quickCtx = null; reopenSetup(); say(q ? 'Stopped looking for an opponent.' : 'Room closed.'); out = true; }
+    else if (state.stage === 'searching' && !closed) { reopenSetup(); say('Stopped looking for an opponent.'); out = true; }          // (quick() sees the stage change and stops)
+    // THE HUB STARTED THIS (its token; no press on this page): the way out leads back to where the player pressed, not to a question they never saw
+    if (out && tok) backToHub();
   }
-  /** The page was opened by Accept (presence.js): host a game for the player who challenged, with the first saved team (or a random one) and the name the panel would have offered. */
+  /** Leave for the hub (INAPP.md "Contract 6": the screen the player came from, when the hub named one). Nothing is under way any more, or what is under way is given up. */
+  function backToHub() {
+    if (closed) return;
+    clearRecord(); closed = true; stopTick(); closeLobbies(); win.clearTimeout(joinTimer);
+    try { if (state.session) state.session.close(); } catch (_e) { /* ignore */ }
+    hooks.toHub();
+  }
+  /** BACK on a confirm screen. */
+  function back() { if (state.stage === 'setup') backToHub(); }
+  /** CHANGE TEAM on a confirm screen whose address names a room: the hub's online menu opens its invite screen for that room (team, name, size) and comes back with its token. */
+  function changeTeam() { if (state.stage === 'setup' && !closed && state.room && (state.role === 'host' || state.role === 'guest') && hooks.toTeam) hooks.toTeam(state.room, state.role); }
+  /** The page was opened by Accept (presence.js): host a game for the player who challenged, with the preferred team (the first saved one, or a random one, when there is none) under the profile's name. */
   const autoStart = exclusive(async function autoStart(profileName) {
     if (!acceptTok || !query.auto) return;            // (only reached with the token; see the top of createOnline)
     setRole('host');
@@ -667,8 +490,9 @@ export function createOnline(cfg) {
   });
   /** Find a battle: join the game that has waited longest, or, if nobody is waiting, open one and wait. */
   const quick = exclusive(async function quick() {
-    if (state.stage !== 'setup' || !state.choices || !lobbies) return;
+    if (state.stage !== 'setup' || !state.choices || !boardPage()) return;
     if (!supportedHere()) { say(UNSUPPORTED, true); return; }
+    ensureLobbies(); lobbies.startWatching();          // (the board is dialled by what needs it: a page that asked OPEN A ROOM FOR A FRIEND? has not dialled it)
     const p = await prepare('either');
     if (!p) return;
     state.stage = 'searching'; state.locked = true; state.cancel = { shown: true, label: 'Cancel' };
@@ -685,7 +509,7 @@ export function createOnline(cfg) {
     if (closed || state.stage !== 'searching') return;
     state.stage = 'setup'; paint();
     if (g) { form.room = g.room; launch({ role: 'guest', room: g.room, p, fmt: null, open: false, quick: false, listed: g }); return; }
-    if (!lobbies || lobbies.status() === 'down') { reopenSetup(); say('The list of players online could not be reached, so there is nobody to find. Invite a friend instead, or try again.', true); return; }
+    if (!lobbies || lobbies.status() === 'down') { reopenSetup(); say('The list of players online could not be reached, so there is nobody to find. Try again later.', true); return; }
     const fmt = form.fmt === '3v3' && p.mine.size < 3 ? '6v6' : form.fmt;
     quickCtx = { p, fmt };
     launch({ role: 'host', room: null, p, fmt, open: true, quick: true, listed: null });
@@ -732,8 +556,8 @@ export function createOnline(cfg) {
       if (state.defecting) lobbies.muteRivals(DEFECT_MUTE_MS);
     }
     return /full|already|busy|taken/i.test(String(why || ''))
-      ? 'That game was just taken by someone else. Pick another one, or press Find an opponent.'
-      : 'That game is not open any more' + (why && why !== 'no answer' ? ' (' + String(why).slice(0, 60) + ')' : '') + '. Pick another one, or press Find an opponent.';
+      ? 'That game was just taken by someone else. Try again to find another.'
+      : 'That game is not open any more' + (why && why !== 'no answer' ? ' (' + String(why).slice(0, 60) + ')' : '') + '. Try again to find another.';
   }
   /** A join that did not work. A player who LEFT their own Find-a-battle game to join a rival (maybeDefect) gets that game back, listed again, with the rival left off the board: the rival may have been
    *  a ghost (the board is public and anyone can publish a beacon), or taken by somebody else a moment earlier, and the player asked to be found, not to be sent to a setup form. Anyone else goes
@@ -751,6 +575,7 @@ export function createOnline(cfg) {
     state.session = null; state.nm = null; state.defecting = false; state.listed = null; state.stage = 'setup'; relisting = false;
     launch({ role: 'host', room: null, p: c.p, fmt: c.fmt, open: true, quick: true, listed: null });
     openLead = 'The game you tried to join was not there. ';
+    paint();
     return true;
   }
   const PRE_BATTLE = ['hello', 'judging', 'seed', 'start'];
@@ -862,23 +687,24 @@ export function createOnline(cfg) {
       // tell the challenger the room SEALED to the one-time key they sent (the token carried it here); if it cannot be sealed the room is still open for a friend who is given the code
       if (acceptor) acceptor.stop();
       acceptor = createAcceptor({ lobbies, to: state.invite.for, r: state.invite.rq, room, ck: state.invite.ck, crypto: win.crypto,
-        onFail: () => { if (!closed && state.stage === 'open') say('Your room is open, but the player who challenged you could not be told which room it is (their one-time key was not usable, or this browser has no WebCrypto). A friend can still use the code ' + room + '.', true); } });
-      say('Waiting for the player who challenged you to connect. (A friend can also use the code ' + room + '.)');
+        onFail: () => { if (!closed && state.stage === 'open') say('The player who challenged you could not be told your room. A friend can still use the code ' + room + '.', true); } });
+      say('Waiting for the player who challenged you to connect.');
     } else say(friendWaitText(room));
     state.canShare = !!(win.navigator && typeof win.navigator.share === 'function');
     setStage('open');
     maybeDefect();
   }
-  const friendWaitText = (room) => 'Waiting for your friend. The battle starts by itself as soon as they open your link (or type the code ' + room + ') and press Join.';
+  // (the room code is drawn LARGE over this sentence, with COPY LINK and COPY CODE beside it: the sentence does not spell it again)
+  const friendWaitText = (_room) => 'Waiting for your friend. The battle starts by itself when they join.';
   function listGame(room) {
     lobbies.host({ room, name: state.name, fmt: state.fmt, rom: PINNED.sha256, fp: cfg.fingerprint, rs: state.mine.rs, q: state.quick, rec: state.rec || null });
   }
   /** What the host of an OPEN game is told, true to what the board can do right now (a board that lost every broker cannot show the game to anybody). */
   function openNote(room) {
     const st = lobbies ? lobbies.status() : 'down';
-    if (st === 'up') return { bad: false, text: openLead + (state.quick ? 'Nobody was waiting, so your game is open: anyone can join it. The next player who presses Find an opponent, or picks you under Players online, joins you.' : 'Your game is open: anyone can join it from Players online. A friend can also use the code ' + room + ' or the invite link.') };
-    if (st === 'connecting') return { bad: false, text: openLead + 'Your room is open, but the list of open games is not connected yet, so nobody can see your game yet. A friend can use the code ' + room + '.' };
-    return { bad: true, text: openLead + 'Your room is open, but the list of open games cannot be reached, so nobody can find your game. A friend can still use the code ' + room + '.' };
+    if (st === 'up') return { bad: false, text: openLead + (state.quick ? 'Nobody was waiting, so your game is open: anyone who picks BATTLE ANYONE can join it.' : 'Your game is open: anyone can join it. A friend can also use the code ' + room + '.') };
+    if (st === 'connecting') return { bad: false, text: openLead + 'Your game is open, but the list of open games is not connected yet: nobody can see it yet.' };
+    return { bad: true, text: openLead + 'Your game is open, but the list of open games cannot be reached: nobody can find it.' };
   }
   /** The board's connection changed under a game that is waiting on it: say what is true now. */
   function refreshOpenNote() {
@@ -897,7 +723,7 @@ export function createOnline(cfg) {
     if (state.open && lobbies) {
       try { listGame(state.room); const n = openNote(state.room); openText = n.text; say(n.text, n.bad); }          // listed again, and the words are the open game's again (not "a player is joining")
       catch (_e) { /* the next beacon tries again */ }
-    } else if (!state.invite) say('The player who tried to join could not connect. ' + friendWaitText(state.room));
+    } else if (!state.invite) say('That player could not connect. Still waiting for your friend.');
     paint();
   }
   /** Somebody is in (the join-request handler let them in, or the library re-admitted them by itself): the seat is taken and the game comes off the board; a host of an open game is told, because "your game is open" is not true now. */
@@ -942,9 +768,13 @@ export function createOnline(cfg) {
     // A page that was opened as the BOARD (?online=1) and then joined a listed game had its address rewritten to ?np=ROOM&join=1 by launch() (so a reload finds the room). The join has ended without a match (Cancel, a game that
     // never answered, one that was taken) and the page is the board again: a reload of that address would open the join-by-code form with the dead room filled in and no board, so the plain address comes back.
     if (query.role === null && !query.room) { try { win.history.replaceState(null, '', boardAddress(win.location.href)); } catch (_e) { /* the address stays as it was */ } }
+    // ... and it says what this page ASKS (ask=host | quick), also when the hub's token started it on the bare address: a reload is then the same question, not a page with nothing to ask
+    if (boardPage() && state.ask) { try { const u = new URL(win.location.href); if (u.searchParams.get('ask') !== state.ask) { u.searchParams.set('ask', state.ask); win.history.replaceState(null, '', u.pathname + u.search + u.hash); } } catch (_e) { /* the address stays as it was */ } }
     setCancel(false); state.locked = false; state.goOff = false; state.quickOff = false; state.codeShown = false;
-    syncSetupUi();
-    if (boardShown()) { ensureLobbies(); lobbies.startWatching(); renderOpenList(); }
+    win.clearTimeout(copiedTimer); state.copied = null;          // (a COPIED that was said for the room that is gone is not said for the next one)
+    viaToken = false;          // (the page is at a question again: whatever is started from it now was started HERE)
+    paint();
+    if (boardWatched()) { ensureLobbies(); lobbies.startWatching(); }
   }
 
   function createMatch(role, room, teamCode, resume) {
@@ -1044,7 +874,7 @@ export function createOnline(cfg) {
     if (bar) return;
     // the message is the live region; the per-second clock is NOT (a screen reader would read it out every second), so it is hidden from them and the thresholds are announced instead (renderBar)
     bar = el(doc, 'div', { id: 'netbar', role: 'group', 'aria-label': 'Online battle status' }, el(doc, 'span', { id: 'nbWho' }), el(doc, 'span', { id: 'nbMsg', role: 'status', 'aria-live': 'polite' }), el(doc, 'span', { id: 'nbClock', 'aria-hidden': 'true' }));
-    (cfg.bar && cfg.bar.parentNode ? cfg.bar.parentNode.insertBefore(bar, cfg.bar) : root.after(bar));
+    if (cfg.bar && cfg.bar.parentNode) cfg.bar.parentNode.insertBefore(bar, cfg.bar); else doc.body.append(bar);
     renderBar();
   }
   // THE 250 ms TICK IS THE PROTOCOL'S, NOT THE BAR'S: it runs the match's clocks (nm.tick), tells the other side when this screen can take a choice (screenReady) and times this player out (timeOutSelf).
@@ -1100,7 +930,6 @@ export function createOnline(cfg) {
 
   /* ---------------------------------------------------------------------------------------------- start */
   async function begin() {
-    buildPanel();
     // closing the page takes an open game off the board at once (best effort: the board drops it a few seconds later anyway)
     // ... and a challenge that is still waiting for an answer is withdrawn, so the owner's dialog does not stay up for a player who has gone (it would also be accepted for nobody)
     win.addEventListener('pagehide', () => {
@@ -1115,6 +944,8 @@ export function createOnline(cfg) {
       if (nt === 'reload' || nt === 'back_forward') { await resumeFlow(rec); return; }
       else { state.room = rec.room; state.role = rec.role; clearRecord(); }
     }
+    // THE PLAIN ADDRESS WITH NOTHING TO START AND NOTHING TO ASK (no token of the hub, no ask=, no challenge named): there is nothing to choose on this page any more. The hub's online menu takes its place.
+    if (boardPage() && !state.ask && !autoNotice) { closed = true; state.stage = 'left'; paint(); if (hooks.toMenu) hooks.toMenu(); return; }
     await setupForm();
   }
 
@@ -1128,7 +959,7 @@ export function createOnline(cfg) {
     if (rec.role === "host" && typeof rec.admittedId === "string" && rec.admittedId.length > 0 && rec.admittedId.length <= 128) { state.admittedId = rec.admittedId; state.admitted = true; }          // the profile this battle is written to when it ends (a record from an older build, or a damaged one, has none: the career then finds the team's owner itself)
     say('Picking your battle up again...');
     setStage('resuming');
-    const giveUp = async (why) => { clearRecord(); state.stage = 'setup'; state.nm = null; await setupForm(); say(why + ' Start a new battle below.', true); return false; };
+    const giveUp = async (why) => { clearRecord(); state.stage = 'setup'; state.nm = null; await setupForm(); say(why + ' You can start a new battle here.', true); return false; };
     if (!Netplay() || typeof Netplay().supported !== 'function' || !Netplay().supported()) return giveUp('This browser cannot connect two players any more.');
     const [mine, theirs] = await Promise.all([judgeTeamCode(rec.myTeam, pack), judgeTeamCode(rec.oppTeam, pack)]);
     if (!mine.ok || !theirs.ok) return giveUp('Your battle could not be picked up again: a team no longer checks out.');
@@ -1139,12 +970,12 @@ export function createOnline(cfg) {
     return true;
   }
 
+  /** The page is at its question (or starts what a token of the hub asked for): the teams it can play are read, the form is filled from the preferences, and the board is dialled if this page may go on it. */
   async function setupForm() {
     const { choices, name } = await gatherTeams();
     state.choices = choices;
-    for (const c of choices) ui.team.append(el(doc, 'option', { value: c.key, text: c.label, 'data-size': String(c.size || 6) }));
     let saved = ''; try { saved = win.localStorage.getItem(LS_NAME) || ''; } catch (_e) { /* ignore */ }
-    // a remembered name is one the player TYPED (prepare() keeps no other): it is theirs, and stays when the team changes. With none, the name is the trainer who owns the team that is pre-selected
+    // a remembered name is one the player GAVE (prepare() keeps no other): it is theirs, and stays when the team changes. With none, the name is the trainer who owns the team that is pre-selected
     // (the first saved team is the active profile's, but not when that profile has no legal team, or the address brings a team of its own).
     form.nameTouched = !!saved;
     form.name = cleanName(saved || name, query.role === 'guest' ? 'Guest' : 'Host');
@@ -1158,27 +989,44 @@ export function createOnline(cfg) {
     refreshFormats();
     if (query.room) { form.room = query.room; state.room = query.room; }
     setRole(query.role || (query.room ? 'guest' : 'host'));
-    // (the words of an invite / hand-off page are renderView()'s: they follow the room and the role)
+    state.quickOff = false;
     setStage('setup');
     say('');
-    syncSetupUi();
-    if (boardShown()) { ensureLobbies(); lobbies.startWatching(); renderOpenList(); state.quickOff = false; paint(); }
-    if (query.auto) autoStart(name); else if (autoNotice) say(autoNotice);
+    if (boardWatched()) { ensureLobbies(); lobbies.startWatching(); }
+    // (the Trainer Center's hand-off is honoured two lines down, in a line a test of the Center pins word for word: a join it starts is the hub's too)
+    if (!query.auto && !autoNotice && meetTok && state.role === 'guest' && state.room) viaToken = true;
+    if (query.auto) { viaToken = true; autoStart(name); } else if (autoNotice) say(autoNotice);
     else if (meetTok && state.role === 'guest' && state.room) { meetTok = false; startAs('guest'); }
-    else if (startTok) { const what = startTok; startTok = null; if (what === 'quick') quick(); else if (what === 'room') go(); else startAs('host'); }
+    else if (startTok) { const what = startTok; startTok = null; viaToken = true; if (what === 'quick') quick(); else if (what === 'room') go(); else startAs('host'); }
   }
 
   // THE NAMED ACTIONS (what a press on the page means), view() (what the page shows) and the form (setForm): whatever presents the page calls these, and so does tools/pokemonarena_online_page_test.mjs.
+  /** A row of the screen was pressed (the ids are the view's rows: online_view.js). CALLED INSIDE THE KEY OR POINTER HANDLER, and nothing is awaited before the browser's own call: a copy or a share
+   *  that no user gesture stands behind may be refused. -> true when the id is one. */
+  function act(id) {
+    switch (id) {
+      // (a press on THIS page: whatever it starts was started here, so its way out comes back to this page's question, not to the hub)
+      case 'go': viaToken = false; void go(); return true;
+      case 'host': viaToken = false; void startAs('host'); return true;
+      case 'quick': viaToken = false; void quick(); return true;
+      case 'cancel': cancelAsk(); return true;
+      case 'copy-link': void copyLink(); return true;
+      case 'copy-code': void copyCode(); return true;
+      case 'share': void share(); return true;
+      case 'team': changeTeam(); return true;
+      case 'back': back(); return true;
+      default: return false;
+    }
+  }
   const gameOf = (x) => (x && typeof x === 'object' ? x : lobbies ? lobbies.list().find((g) => g.room === x) || null : null);
   /** The form, set from outside (what the hub's online menu stores as preferences; a test sets it here because its two players are two tabs of one browser, which share one localStorage). -> the form.
-   *  patch: { teamKey (one of the page's team choices), name, typed (the name is one the player gave: it is remembered), fmt, room, paste }. A team is set first, so a name given with it is kept. */
+   *  patch: { teamKey (one of the page's team choices), name, typed (the name is one the player gave: it is remembered), fmt, room }. A team is set first, so a name given with it is kept. */
   function setForm(patch) {
     const p = patch || {};
     if (typeof p.teamKey === 'string' && state.choices && state.choices.some((c) => c.key === p.teamKey)) { form.teamKey = p.teamKey; refreshFormats(); nameFollowsTeam(); }
     if (typeof p.name === 'string') { form.name = p.name; if (p.typed) form.nameTouched = true; }
     if (p.fmt === '3v3' || p.fmt === '6v6') form.fmt = p.fmt;
     if (typeof p.room === 'string') form.room = p.room;
-    if (typeof p.paste === 'string') form.paste = p.paste;
     paint();
     return { ...form };
   }
@@ -1186,7 +1034,7 @@ export function createOnline(cfg) {
   const board = () => (lobbies ? lobbies.list().filter((g) => g.compatible).map((g) => ({ room: g.room, who: g.name, fmt: g.fmt, rec: g.rec || null, h: !!g.h })) : []);
   // (flashNow: the one-line notice the bar would show this instant, '' when there is none; the page test reads it)
   const api = { begin, onResult, leaveToHub, state, nm: () => state.nm, session: () => state.session, flash, flashNow: () => (flashText && now() < flashUntil ? flashText : ''), renderBar, lobbies: () => lobbies, board,
-    view, setForm, startAs, go, quick, cancel: cancelAsk, copyLink, copyCode, share,
+    view, act, setForm, startAs, go, quick, cancel: cancelAsk, copyLink, copyCode, share, changeTeam, back,
     joinListed: (x) => { const g = gameOf(x); return g ? joinListed(g) : undefined; }, challengeResident: (x) => { const g = gameOf(x); return g ? challengeResident(g) : undefined; },
     /** A game of the board, by its room: join it, or ask its owner when it is a resident (a player who is open from the hub). */
     pick: (x) => { const g = gameOf(x); return !g ? undefined : g.h ? challengeResident(g) : joinListed(g); } };
