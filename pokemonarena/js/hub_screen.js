@@ -12,6 +12,8 @@
 // WHO DRAWS WHAT: the hub's own screens and the Tower's are drawn here (tower_screen.js); an APP's view (view.app = its id) is drawn by that app's renderer (hub_app_screens.js lists them), on the
 // frame this module has laid the terrain on, with the helpers `h` this module gives it. Over ANY of them: a text entry when the view carries `entry` (textentry_screen.js), then the dialog layer
 // when it carries `dialog` (the ROM message box, and the ROM window for the options).
+// AN APP CANNOT BREAK THE PICTURE: its renderer is made the first time one of its views is drawn (never for the hub's first paint), and a createScreen or a render that throws is caught here: the
+// shell's own note is drawn in its place and render() says what happened (frame.fault). A view whose `fault` is set (the app's MODEL threw making it: hub_model.js) gets the same note.
 //
 // WHAT IS NOT THE GAME'S OWN: the layout (which window goes where) is this module's composition of ROM pieces, as the party / preview /
 // result screens of scene.js are; the words on the menu are written by this site (the ROM has no such menu), set in the ROM font.
@@ -56,7 +58,9 @@ class Frame {
   }
 }
 
-export function createHubScreen(ui) {
+/** opts: { appScreens: { id: createScreen } } to draw apps OTHER than hub_app_screens.js APP_SCREENS (tests give fakes, as createHubModel's `apps` option does for the models). */
+export function createHubScreen(ui, opts = {}) {
+  const appScreens = opts.appScreens && typeof opts.appScreens === 'object' ? opts.appScreens : APP_SCREENS;
   const TEXT = ui.TEXT, COL = ui.COL, A = ui.assets;
   const R = ui.R;
   const textbox = A.get('textbox.message');
@@ -159,35 +163,61 @@ export function createHubScreen(ui) {
   const chip = (f, r, label, on) => { ui.panel(f, r.x, r.y, r.w, r.h, on ? 'sel' : 'normal', true); textCentre(f, pickFont(label, r.w - 6), label, r.x + r.w / 2, r.y, TEXT.dark, TEXT.shadow); };
   const helpers = Object.freeze({ text, textRight, textCentre, width, fitFont: (s, px, fonts) => ui.fitFont(s, px, fonts), fitText, wrap: tower.wrap, drawMenu, drawMessage, chip, SCREEN_W, SCREEN_H });
   const entry = createTextEntryScreen(ui, helpers);
-  const apps = {};
-  for (const id of Object.keys(APP_SCREENS)) apps[id] = APP_SCREENS[id](ui, helpers);
+  // AN APP'S RENDERER IS MADE THE FIRST TIME ONE OF ITS VIEWS IS DRAWN, not when the hub is: createScreen(ui, h) may decode ROM art, and a hub that made every app's renderer for its first paint would
+  // wait for all of them and DIE with any one that throws. A createScreen that throws is remembered (faults[id]) and its screens show the shell's note instead; so does a render(f, view) that throws.
+  const apps = {}, faults = {};
+  function appScreen(id) {
+    if (!Object.prototype.hasOwnProperty.call(appScreens, id)) return null;
+    if (!Object.prototype.hasOwnProperty.call(apps, id)) {
+      apps[id] = null;
+      try { const a = appScreens[id](ui, helpers); if (!a || typeof a.render !== 'function') throw new Error(id + '_screen.js createScreen did not return { render }'); apps[id] = a; } catch (e) { faults[id] = String(e && e.message ? e.message : e); }
+    }
+    return apps[id];
+  }
+  const NOTE = Object.freeze({ none: ['This screen has no picture yet.', 'B goes back.'], fault: ['This screen hit a problem.', 'B goes back.'] });
+  /** Draw an app's view. -> null, or { app, where, message } when its picture could not be made (the shell's note is drawn in its place, on a clean terrain). */
+  function drawApp(f, view) {
+    if (view.fault) { drawMessage(f, NOTE.fault); return null; }          // the app's MODEL threw making this view (hub_model.js): there is nothing of the app's to draw
+    const a = appScreen(view.app);
+    if (!a) { drawMessage(f, NOTE.none); return faults[view.app] ? { app: view.app, where: 'createScreen', message: faults[view.app] } : null; }          // no renderer listed in hub_app_screens.js, or one that could not be made
+    try { a.render(f, view); return null; } catch (e) {
+      f.rgba.set(ui.env(Math.max(0, Math.min(22, view.env | 0))).rgba);          // (whatever the renderer had drawn before it threw is taken back)
+      drawMessage(f, NOTE.fault);
+      return { app: view.app, where: 'render', message: String(e && e.message ? e.message : e) };
+    }
+  }
 
-  // THE DIALOG LAYER (hub_dialog.js view): the ROM message box with the page's two lines, the ROM "more" arrow while there is another page, and one ROM window with the options and the menu cursor
+  // THE DIALOG LAYER (hub_dialog.js view): the ROM message box with the page's two lines, the ROM "more" arrow while there is another page, and one ROM window with the options and the menu cursor.
+  // While the dialog is not armed yet (view.armed === false: it answers nothing) the cursor and the "more" arrow are left out: they appear when a press starts to count.
   const dialogFont = (s, maxPx) => pickFont(s, maxPx);
   function drawDialog(f, d) {
+    const live = d.armed !== false;
     f.blit(240, 48, boxRGBA, 0, 112);
     f.rect(R.msg.x, R.msg.y, R.msg.w, R.msg.h, TEXT.white);
     d.lines.forEach((ln, i) => { if (ln) text(f, dialogFont(ln, R.msg.w - 4), ln, R.msg.x + 2, R.msg.y + 1 + i * 16); });
-    if (d.more) text(f, 'normal', '{DOWN}', R.msg.x + R.msg.w - 12, R.msg.y + 17, TEXT.dark);
+    if (d.more && live) text(f, 'normal', '{DOWN}', R.msg.x + R.msg.w - 12, R.msg.y + 17, TEXT.dark);
     if (d.choice) {
       const c = d.choice;
       ui.drawWindow(f, c.x, c.y, c.w, c.h);
-      c.options.forEach((o, i) => { const y = c.y + i * c.pitch; text(f, dialogFont(o, c.w - 14), o, c.x + 12, y + 1); if (i === c.cursor) text(f, 'normal', '{CURSOR}', c.x + 2, y + 1, TEXT.dark); });
+      c.options.forEach((o, i) => { const y = c.y + i * c.pitch; text(f, dialogFont(o, c.w - 14), o, c.x + 12, y + 1); if (i === c.cursor && live) text(f, 'normal', '{CURSOR}', c.x + 2, y + 1, TEXT.dark); });
     }
   }
 
   return {
     GEOM, tower, apps, entry, helpers,
+    /** The renderer of an app (made now if it was not yet), or null when none is listed or it could not be made; appFaults() -> { id: why } for the ones that could not. */
+    app: (id) => appScreen(id),
+    appFaults: () => ({ ...faults }),
+    /** view -> { width, height, rgba } and, when an app's picture could not be made, fault: { app, where: 'createScreen' | 'render', message } (the frame then shows the shell's note; the page reports the fault). */
     render(view) {
       const f = new Frame();
+      let fault = null;
       f.rgba.set(ui.env(Math.max(0, Math.min(22, view.env | 0))).rgba);
       const isTower = typeof view.screen === 'string' && view.screen.startsWith('tower');
       const isApp = typeof view.app === 'string';
       if (view.screen !== 'record' && !isTower && !isApp) mascot(f, view.mascot, view.tick | 0);
       if (isApp) {
-        const a = Object.prototype.hasOwnProperty.call(apps, view.app) ? apps[view.app] : null;
-        if (a) a.render(f, view);
-        else { drawMessage(f, ['This screen has no picture yet.', 'B goes back.']); }          // an app with a model and no renderer listed in hub_app_screens.js
+        fault = drawApp(f, view);
       } else if (isTower && view.tower) {
         tower.render(f, view);
       } else if (view.screen === 'record' && view.record) {
@@ -206,7 +236,7 @@ export function createHubScreen(ui) {
       }
       if (view.entry) entry.draw(f, view.entry, view.tick | 0);          // a text entry covers the screen that opened it ...
       if (view.dialog) drawDialog(f, view.dialog);                       // ... and a dialog sits over everything
-      return { width: SCREEN_W, height: SCREEN_H, rgba: f.rgba };
+      return fault ? { width: SCREEN_W, height: SCREEN_H, rgba: f.rgba, fault } : { width: SCREEN_W, height: SCREEN_H, rgba: f.rgba };
     },
     /** A new empty frame (240x160, every pixel transparent black) with rect / blit / blitRoles: what render() draws on, for a test that draws one app's screen by itself. */
     frame: () => new Frame(),

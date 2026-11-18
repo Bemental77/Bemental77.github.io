@@ -25,7 +25,16 @@
 // DIALOGS   hub.dialog.open({ id, pages, choice, ticksLeft?, app? }) / close(id) / current(): a message box with an optional list of options OVER ANY SCREEN (hub_dialog.js). While one is open it
 //           takes every press and pointer event; its answer is the effect { type: 'dialog', id, value, app? }, and the model of the app that asked hears it first (app.onDialog(id, value))
 // TEXT      while the open app says wantsText(path) (it has a text entry open: textentry.js), hub.type({ text } | { key }) hands it a real keyboard's keys and pastes
-// EFFECTS   { type: 'screen', path }        the screen changed (mirror it into history)
+// THE TRAIL the screens above the main menu that lead to the open one, outermost first (hub.trail(): ['online', 'center']; [] on the main menu). B walks down it, and the page keeps the browser's
+//           history equal to it, one entry per screen, so B, the browser's Back button and a reload agree. ONE RULE for the hub's screens, the Tower and every app (go / back, below in the code):
+//           a screen that is already on the trail (or the main menu) is STEPPED BACK TO; any other opens ON TOP of the open one (B returns to the screen it was opened from) or, with
+//           { replace: true }, IN ITS PLACE; from the main menu the screens that lead to it by parent() are put under it. hub.arrive(path, trail) is the other direction: the ADDRESS moved
+//           (the page booted at #path, the browser's Back / Forward landed there) and the model follows without asking for a history change
+// FAULTS    an app's model that throws does not stop the hub (hub_apps.js guards every call): the call answers nothing, a throw in view() shows the shell's note, B still leaves, and
+//           hub.faults() hands the page what happened (once per distinct fault) to say in the console and in the picture
+// EFFECTS   { type: 'screen', path, back?, steps?, replace? }   the screen changed: the page makes the browser history equal to hub.trail(). back: true = a step back to a screen that is not
+//                                           the main menu; steps: n = it went back over n > 1 entries; replace: true = it took the open screen's place
+//           { type: 'sfx', key }            play this ROM sound effect (a music_map.js key: 'se_success') INSTEAD of the default menu sound of the press or click that returned it; key null = none
 //           { type: 'navigate', url }       leave for another page (the team builder; IMPORT SAVE opens its save-import screen)
 //           { type: 'sound', on }           the SOUND row was toggled (persist it, play a cry)
 //           { type: 'controls' }            open the Controls panel (a DOM dialog)
@@ -76,11 +85,50 @@ export function arrivalTrail(path, apps = APPS) {
   for (let p = path, n = 0; p && p !== 'main' && n < 16; p = parentOf(p, apps), n++) out.unshift(p);
   return out;
 }
-/** What the hub page must do about its browser history when it has just booted on `path`: tower_hub.js historySeedPlan's rule, with the trail of ANY hub path (an app's included). -> { trail, write } */
+const trailOk = (t, path, paths) => t.length <= 64 && t.every((p, i) => typeof p === 'string' && p !== 'main' && paths.includes(p) && t.indexOf(p) === i) && (path === 'main' ? t.length === 0 : t[t.length - 1] === path);
+const pathsFor = (apps) => (apps === APPS ? PATHS : [...HUB_PATHS, ...pathsOf(apps)]);
+/**
+ * The trail a history entry stands for. The page writes { arenaHub: path, trail: [...] } into every entry it makes; that trail is used when it is a list of known screens, none twice, that ends
+ * at `path`. Anything else (an entry written before trails were kept, a hand-typed address, a state somebody else wrote) gets the screens that lead to `path` by parent() (arrivalTrail).
+ */
+export function entryTrail(state, path, apps = APPS) {
+  const t = state && typeof state === 'object' && Array.isArray(state.trail) ? state.trail : null;
+  return t && trailOk(t, path, pathsFor(apps)) ? t.slice() : arrivalTrail(path, apps);
+}
+/**
+ * What the hub page must do about its browser history when it has just booted on `path`: tower_hub.js historySeedPlan's rule, with the trail of ANY hub path (an app's included). -> { trail, write }
+ * trail = the entries the page stands on when it is done: the ones a fresh arrival is given (write: true), or the ones the entry it came back to already recorded (entryTrail).
+ */
 export function historySeedPlan(path, state, apps = APPS) {
-  const trail = arrivalTrail(path, apps);
   const marked = !!state && typeof state === 'object' && typeof state.arenaHub === 'string';
+  const trail = marked ? entryTrail(state, path, apps) : arrivalTrail(path, apps);
   return { trail, write: trail.length > 0 && !marked };
+}
+/**
+ * How the page gets its browser history from the entry it stands on (whose trail is `have`) to the one the model is on (`want` = hub.trail()). -> { back, write }
+ *   back   > 0: step that many entries back first (history.go(-back)) and ask again when the browser has landed (write is then empty)
+ *   write  the entries to write now, in order: { how: 'replace' | 'push', trail } (the entry's path is the last of its trail)
+ * The two trails share their first entries; what `have` holds beyond them is stepped back over, what `want` holds beyond them is written. One entry to drop AND something to write is ONE
+ * synchronous operation (the entry is replaced): that is what ctx.go(path, { replace: true }) and a list holding back() + go(path) come to, so the browser never shows the screen in between.
+ */
+export function historyPlan(have, want) {
+  let c = 0; while (c < have.length && c < want.length && have[c] === want[c]) c++;
+  const drop = have.length - c, add = want.length - c;
+  if (drop > 1 || (drop === 1 && add === 0)) return { back: drop, write: [] };
+  const write = [];
+  for (let i = 0; i < add; i++) write.push({ how: i === 0 && drop === 1 ? 'replace' : 'push', trail: want.slice(0, c + i + 1) });
+  return { back: 0, write };
+}
+
+/** The twelve actions (input.js) and "none of them held": what an app's tick(path, held) is given when the hub has no held state for it. */
+export const ACTIONS = Object.freeze(['up', 'down', 'left', 'right', 'a', 'b', 'x', 'y', 'l', 'r', 'start', 'select']);
+export const HELD_NONE = Object.freeze(Object.fromEntries(ACTIONS.map((a) => [a, false])));
+/** Anything -> a frozen { up, down, ... } of twelve booleans: a list of the actions held (['left', 'a']), or an object with a truthy value for each one held. */
+export function heldOf(x) {
+  if (!x || typeof x !== 'object') return HELD_NONE;
+  const on = Array.isArray(x) ? (a) => x.includes(a) : (a) => !!x[a];
+  if (!ACTIONS.some(on)) return HELD_NONE;
+  return Object.freeze(Object.fromEntries(ACTIONS.map((a) => [a, on(a)])));
 }
 
 /** Row spacing of a menu of n rows: seven rows do not fit above the text box at the normal 16 px, so they sit 14 px apart; the eight rows of the main menu (RECORD joined it) sit 12 px apart. */
@@ -113,6 +161,7 @@ export const ABOUT_PAGES = Object.freeze([
 const CPU_HELP = Object.freeze({ easy: 'EASY: the CPU picks random moves.', normal: 'NORMAL: best damage, some tactics.', hard: 'HARD: it also looks one turn ahead.' });
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const FRESH = Object.freeze({ repeat: false }), REPEAT = Object.freeze({ repeat: true });          // what an app's press(path, action, info) is told about the press
 const cycle = (list, cur, dir) => list[(list.indexOf(cur) + dir + list.length) % list.length];
 const hasOwn = Object.prototype.hasOwnProperty;
 
@@ -130,7 +179,7 @@ export function defaultFormat(size) { return size >= 4 ? '6v6' : size === 3 ? '3
  */
 export function createHubModel(opts = {}) {
   const S = {
-    path: 'main', cursor: { main: 0, quick: 0, team: 0 }, from: 'main',
+    path: 'main', trail: [], cursor: { main: 0, quick: 0, team: 0 }, from: 'main',          // trail: the screens above the main menu that lead to `path` (its last entry), outermost first
     sound: !!opts.sound, mascot: Number.isInteger(opts.mascot) ? opts.mascot : 25, env: Number.isInteger(opts.env) ? opts.env : 0,
     quick: { format: opts.quick && FORMATS.includes(opts.quick.format) ? opts.quick.format : '3v3', cpu: opts.quick && CPU_LEVELS.includes(opts.quick.cpu) ? opts.quick.cpu : 'normal' },
     team: { profileId: opts.selection && opts.selection.profileId || null, teamId: opts.selection && opts.selection.teamId || null, format: null, formatTouched: false, cpu: opts.selection && CPU_LEVELS.includes(opts.selection.cpu) ? opts.selection.cpu : 'normal' },
@@ -193,22 +242,45 @@ export function createHubModel(opts = {}) {
     return { off, n, size: Math.min(n, MAIN_VISIBLE) };
   }
   /* ------------------------------------------------------------------------------------------ the dialog layer and the apps */
-  const measureFont = typeof opts.measureFont === 'function' ? (font, s) => opts.measureFont(font, String(s)) : (font, s) => (font === 'normal' && typeof opts.measure === 'function' ? opts.measure(String(s)) : String(s).length * 6);
+  // (a measure never throws here: a text the font's own measure chokes on is taken at 6 px a character, so an app's ctx.measure and the dialog layer cannot be stopped by a string)
+  const measureRaw = typeof opts.measureFont === 'function' ? (font, s) => opts.measureFont(font, String(s)) : (font, s) => (font === 'normal' && typeof opts.measure === 'function' ? opts.measure(String(s)) : String(s).length * 6);
+  const measureFont = (font, s) => { try { const px = measureRaw(font, s); if (Number.isFinite(px)) return px; } catch (_e) { /* fall through */ } return String(s).length * 6; };
   const msgPx = Number.isFinite(opts.msgPx) && opts.msgPx > 40 ? opts.msgPx : 204;
   const dialog = createDialogLayer({ measure: measureFont });
   const appList = Array.isArray(opts.apps) ? opts.apps : APPS;
   { const bad = checkRegistry(appList, HUB_PATHS, (p) => parentOf(p, [])); if (bad.length) throw new Error('the hub app registry is broken: ' + bad.join('; ')); }
   const paths = appList === APPS ? PATHS : Object.freeze([...HUB_PATHS, ...pathsOf(appList)]);
   const fxOf = (r) => (Array.isArray(r) ? r : []);
-  const pagesOf = (lines) => { const out = []; for (let i = 0; i < lines.length; i += 2) out.push([String(lines[i]), lines[i + 1] === undefined ? '' : String(lines[i + 1])]); return out.length ? out : [['', '']]; };
+  const lineOf = (l) => (l === undefined || l === null ? '' : String(l));
+  const pagesOf = (lines) => { const out = []; for (let i = 0; i < lines.length; i += 2) out.push([lineOf(lines[i]), lineOf(lines[i + 1])]); return out; };
+  // AN APP THAT THROWS (hub_apps.js calls this for every method of an app's model that threw; what it returns stands in for the call): the fault is kept for the page (faults(), each distinct
+  // one once), the call answers "nothing", a view that could not be made becomes one the renderer draws the shell's note for, and the B press that threw still goes back.
+  const faultList = [], faultSeen = new Set();
+  function onFault(id, where, err, args) {
+    const message = String(err && err.message ? err.message : err).slice(0, 200), key = id + '\n' + where + '\n' + message;
+    if (!faultSeen.has(key) && faultSeen.size < 64) { faultSeen.add(key); faultList.push({ app: id, where, message }); }
+    switch (where) {
+      case 'view': return { ...(args[1] && typeof args[1] === 'object' ? args[1] : {}), fault: { where, message } };
+      case 'press': return args[1] === 'b' && S.path === args[0] ? back() : [];
+      case 'hit': return null;
+      case 'wantsText': return false;
+      case 'speak': case 'title': return '';
+      case 'state': return { fault: message };
+      default: return [];          // enter, leave, pointer, rects, tick, onData, onDialog, type
+    }
+  }
   // what an app's factory is given: the data the store reader built, the screen changes, the font, a notice, and its own door to the dialog layer (the answers come back to its onDialog)
   const apps = createAppHost(appList, (desc) => ({
     profiles: () => S.data.profiles, activeId: () => S.data.activeId, dataState: () => S.data.state,
-    go: (path) => go(path), back: () => back(), path: () => S.path,
+    go: (path, o) => go(path, o), back: () => back(), path: () => S.path, trail: () => S.trail.slice(),
     measure: measureFont, msgPx,
-    notify(lines) { const id = 'notice:' + desc.id; dialog.close(id); return dialog.open({ id, pages: Array.isArray(lines) ? pagesOf(lines) : wrapDialog(lines, measureFont, msgPx), choice: null }); },
-    dialog: Object.freeze({ open: (spec) => dialog.open({ ...spec, app: desc.id }), close: (id) => dialog.close(id), current: () => dialog.current() }),
-  }));
+    notify(lines) {
+      const pages = Array.isArray(lines) ? (lines.some((l) => lineOf(l).trim()) ? pagesOf(lines) : null) : typeof lines === 'string' && lines.trim() ? wrapDialog(lines, measureFont, msgPx) : null;
+      if (!pages) return false;          // nothing to say (null, [], '', only blanks): no empty box is opened
+      const id = 'notice:' + desc.id; dialog.close(id); return dialog.open({ id, pages, choice: null });
+    },
+    dialog: Object.freeze({ open: (spec) => dialog.open({ ...spec, app: desc.id }), close: (id) => dialog.closeOwn(id, desc.id), current: () => dialog.current() }),
+  }), onFault);
   // a dialog's answer: the model of the app that asked hears it first (its effects follow the answer's), then the page hands the answer to that app's ctl
   function dialogFx(fx) {
     let out = [];
@@ -332,8 +404,8 @@ export function createHubModel(opts = {}) {
     }
   }
 
-  // (a dialog rides on whatever the screen's view is: the key exists only while one is open, so an ordinary view is exactly what it was)
-  function view() { const v = screenView(), d = dialog.view(); if (d) v.dialog = d; return v; }
+  // (a dialog rides on whatever the screen's view is: the key exists only while one is open, so an ordinary view is exactly what it was. `dialog` is the hub's key: one an app's view carries is dropped)
+  function view() { const v = screenView(), d = dialog.view(); if (d) v.dialog = d; else if ('dialog' in v) delete v.dialog; return v; }
   function screenView() {
     clampCursor();
     const base = { screen: S.path, env: S.env, mascot: mascotNow(), tick: S.tick, sound: S.sound };
@@ -355,22 +427,45 @@ export function createHubModel(opts = {}) {
   }
 
   /* ------------------------------------------------------------------------------------------ transitions */
-  function go(path) {
-    if (!paths.includes(path) || path === S.path) return [];
+  // THE TRAIL (S.trail): the screens above the main menu that lead to the open one, outermost first. S.path is its last entry, and it is empty on the main menu. The page keeps the browser's
+  // history equal to it (historyPlan), so what B does here is what the browser's Back button does there. Every move goes through open(): go / back from a press, arrive from the address.
+  //   go(path)                      a screen already on the trail, or the main menu, is STEPPED BACK TO (everything above it is dropped: "saved, back to the list", "deleted, up two levels",
+  //                                 "home"). Any other screen opens ON TOP of the open one, so B returns to the screen it was opened from (the builder opened from the Center's PC returns to
+  //                                 the Center, not to the main menu its parent is). From the MAIN MENU the screens that lead to it by parent() are put under it, as its address would
+  //   go(path, { replace: true })   ... opens IN PLACE of the open one: B then goes where B went from the screen replaced (a wizard's next step, a redirect). On the main menu it is a plain go
+  //   back()                        one step down the trail. For a screen reached the usual way that is parent(path)
+  // Each returns the 'screen' effect of the move, then whatever the screen's enter(path) asked for.
+  function open(path, trail) {
     { const was = apps.of(S.path); if (was) was.leave(S.path); }          // (the app is told while its screen is still the open one)
     S.from = S.path; S.path = path; S.flash = null;
+    S.trail = trail;
     if (isTowerPath(path)) tower.enter(path);
-    { const now = apps.of(path); if (now) now.enter(path); }
+    let enterFx = [];
+    { const now = apps.of(path); if (now) enterFx = fxOf(now.enter(path)); }
     if (path === 'about') S.about.page = 0;
     if (path === 'team') normaliseTeamSel();
     if (path === 'record') { const rp = curRecordProfile(); S.record.profileId = rp ? rp.id : null; S.record.page = 0; S.record.focus = 'page'; S.record.confirm = null; S.record.hover = null; }
     clampCursor();
-    return [{ type: 'screen', path }];
+    return [{ type: 'screen', path }].concat(enterFx);
+  }
+  // n entries down the trail (n >= 1). A step back to a screen that is not the main menu says so (back: true), and how far when it is more than one entry (steps: n)
+  function stepBack(n) {
+    const trail = S.trail.slice(0, Math.max(0, S.trail.length - n)), up = trail.length ? trail[trail.length - 1] : 'main';
+    const fx = open(up, trail).map((e) => (e.type === 'screen' && up !== 'main' ? { ...e, back: true } : e));
+    return n > 1 ? fx.map((e, i) => (i === 0 ? { ...e, steps: n } : e)) : fx;
+  }
+  function go(path, o) {
+    if (!paths.includes(path) || path === S.path) return [];
+    const at = path === 'main' ? -1 : S.trail.lastIndexOf(path);
+    if (path === 'main' || at >= 0) return stepBack(S.trail.length - 1 - at);          // it is on the way here: step back to it
+    const replace = !!(o && o.replace) && S.trail.length > 0;
+    const trail = replace ? S.trail.slice(0, -1).concat([path]) : S.trail.length ? S.trail.concat([path]) : arrivalTrail(path, appList);
+    const fx = open(path, trail);
+    return replace ? fx.map((e, i) => (i === 0 ? { ...e, replace: true } : e)) : fx;
   }
   function back() {
     if (S.path === 'main') return [];
-    const up = parentOf(S.path, appList);
-    return go(up).map((e) => (e.type === 'screen' && up !== 'main' ? { ...e, back: true } : e));          // a step back to a Tower screen says so (the page steps the browser history back rather than adding an entry); the page already treats a return to 'main' as one
+    return stepBack(1);
   }
 
   function change(row, dir) {
@@ -425,29 +520,39 @@ export function createHubModel(opts = {}) {
   const api = {
     view,
     path: () => S.path,
-    state: () => JSON.parse(JSON.stringify({ path: S.path, cursor: S.cursor, quick: S.quick, team: S.team, sound: S.sound, about: S.about, record: { page: S.record.page, focus: S.record.focus, confirm: S.record.confirm ? S.record.confirm.cursor : null }, data: { state: S.data.state, profiles: S.data.profiles.length }, tower: tower.state(), apps: apps.state(), dialog: dialog.state() })),
+    state: () => JSON.parse(JSON.stringify({ path: S.path, trail: S.trail, cursor: S.cursor, quick: S.quick, team: S.team, sound: S.sound, about: S.about, record: { page: S.record.page, focus: S.record.focus, confirm: S.record.confirm ? S.record.confirm.cursor : null }, data: { state: S.data.state, profiles: S.data.profiles.length }, tower: tower.state(), apps: apps.state(), dialog: dialog.state() })),
     /** The rows of the open menu (on an app's screen: the rows of the menu its view carries, [] when it has none). */
     rows: () => { const a = apps.of(S.path); if (a) { const mn = a.view(S.path, { screen: S.path, env: S.env, mascot: null, tick: S.tick, sound: S.sound }).menu; return mn && Array.isArray(mn.rows) ? mn.rows.map((r) => ({ ...r })) : []; } return rows().map(({ values, ...r }) => r); },
     /** The Tower's screens (tower_hub.js): a handle for the page and the tests. */
     tower,
-    /** THE APPS (hub_apps.js): { id: the app's model } for the page and the tests; app(id) -> one of them or null; appOf(path) -> the one that owns the path or null. */
+    /** THE APPS (hub_apps.js): { id: the app's model } for the page and the tests; app(id) -> one of them or null; appOf(path) -> the one that owns the path or null. (The app's OWN model, with its own methods: the hub itself calls an app only through the guard of hub_apps.js.) */
     apps: Object.freeze(apps.handles()),
-    app: (id) => apps.byId(id),
-    appOf: (path) => apps.of(path),
+    app: (id) => apps.raw(id),
+    appOf: (path) => apps.rawOf(path),
+    /** What apps threw since this was last asked: [{ app, where, message }], each distinct fault once. The page says them in the console and in the picture. */
+    faults: () => faultList.splice(0),
+    /** The screens above the main menu that lead to the open one, outermost first ([] on the main menu): what B walks down and what the page keeps the browser's history equal to. */
+    trail: () => S.trail.slice(),
     /** Every path this model knows (the hub's, the Tower's, every hosted app's). */
     paths,
     /** THE DIALOG LAYER (hub_dialog.js): open(spec) -> bool (shown, or queued behind the open one; false = refused), close(id) -> bool, current() -> the dialog shown or null, isOpen(). */
     dialog: Object.freeze({ open: (spec) => dialog.open(spec), close: (id) => dialog.close(id), current: () => dialog.current(), isOpen: () => dialog.isOpen() }),
-    /** One frame (59.7275 a second). -> effects: a dialog that timed out, and whatever the open app's tick(path) asks for (an app is ticked only while one of its screens is open). */
-    tick() {
+    /**
+     * One frame (59.7275 a second). -> effects: a dialog that timed out, and whatever the open app's tick(path, held) asks for (an app is ticked only while one of its screens is open).
+     * held: the actions the player is holding down (a list of them, or { up: true, ... }); the app gets a frozen { up, down, left, right, a, b, x, y, l, r, start, select } of booleans,
+     * all false while a dialog is open over it (the dialog has the buttons) or when the caller gave none.
+     */
+    tick(held) {
       S.tick = (S.tick + 1) >>> 0;
       let fx = dialogFx(dialog.tick());
       const a = apps.of(S.path);
-      if (a) fx = fx.concat(fxOf(a.tick(S.path)));
+      if (a) fx = fx.concat(fxOf(a.tick(S.path, dialog.isOpen() ? HELD_NONE : heldOf(held))));
       return fx;
     },
     /** Is the open screen taking typed text (an app with a text entry open, and no dialog over it)? The page then sends a real keyboard's keys to type() instead of treating them as buttons. */
     wantsText() { if (dialog.isOpen()) return false; const a = apps.of(S.path); return !!(a && a.wantsText(S.path)); },
+    /** Is a dialog open OVER a text entry? The page then keeps a real keyboard's letters from acting as buttons (the word being typed must not answer the question): Enter, Escape, Backspace and the arrows still do. */
+    textUnder() { if (!dialog.isOpen()) return false; const a = apps.of(S.path); return !!(a && a.wantsText(S.path)); },
     /** Typed text for the open app: { text } (a key, or a paste) or { key: 'backspace' | 'delete' | 'left' | 'right' | 'home' | 'end' | 'enter' | 'escape' }. -> effects ([] when nothing is taking text). */
     type(input) { if (dialog.isOpen()) return []; const a = apps.of(S.path); return a && a.wantsText(S.path) ? fxOf(a.type(S.path, input)) : []; },
     /** The screen reader's words for a view that an app, a text entry or a dialog owns; null for the hub's own screens (the page words those). */
@@ -455,6 +560,7 @@ export function createHubModel(opts = {}) {
       if (!v) return null;
       if (v.dialog) return speakDialog(v.dialog);
       if (v.entry) return speakEntry(v.entry);
+      if (v.fault) return 'This screen hit a problem. B goes back.';
       const a = typeof v.app === 'string' ? apps.byId(v.app) : null;
       return a ? String(a.speak(v) || '') : null;
     },
@@ -480,13 +586,27 @@ export function createHubModel(opts = {}) {
       const towerFx = tower.onData();         // the Tower's screens follow the data (a ball taken closes the offer): the effects are screen changes the page mirrors into history
       return towerFx.concat(apps.onData());   // ... and so does every app (open or not: an app keeps its own copy of what it needs)
     },
-    goto(path) { if (!paths.includes(path) || path === S.path) return []; if (isTowerPath(path) && S.path === 'main') S.link = true; return go(path); },          // (also what a link or the browser's history does: a Tower screen reached that way may open the pending offer by itself)
+    /** Open `path` as an app's ctx.go(path, o) does (THE TRAIL, above) -> effects for the page to run. What a ctl navigates with: env.run(env.model.goto('center')). o: { replace: true }. */
+    goto(path, o) { if (!paths.includes(path) || path === S.path) return []; if (isTowerPath(path) && S.path === 'main') S.link = true; return go(path, o); },          // (a Tower screen reached from the menu this way may open the pending offer by itself)
+    /**
+     * THE ADDRESS NOW NAMES `path`: the page booted there, or the browser's Back / Forward landed there. The model opens it WITHOUT asking for a history change (there is no 'screen' effect
+     * for the move itself), with the trail that history entry stands for (entryTrail; default: the screens that lead to `path` by parent()). -> what the screen's enter(path) asked for.
+     * An unknown path is the main menu.
+     */
+    arrive(path, trail) {
+      const to = paths.includes(path) ? path : 'main';
+      const tr = Array.isArray(trail) && trailOk(trail, to, paths) ? trail.slice() : arrivalTrail(to, appList);
+      if (to === S.path) { S.trail = tr; return []; }
+      if (isTowerPath(to) && S.path === 'main') S.link = true;
+      return open(to, tr).slice(1);
+    },
     back,
-    press(action) {
-      if (dialog.isOpen()) return dialogFx(dialog.press(action));          // an open dialog takes every press, whatever is under it
+    /** A button. info: { repeat: true } for the synthesized repeat of a held direction (a dialog ignores those; an app is handed { repeat } as its third argument). */
+    press(action, info) {
+      if (dialog.isOpen()) return dialogFx(dialog.press(action, info));          // an open dialog takes every press, whatever is under it
       if (S.path === 'record') return recordPress(action);
       if (isTowerPath(S.path)) return tower.press(S.path, action);
-      { const a = apps.of(S.path); if (a) return fxOf(a.press(S.path, action)); }
+      { const a = apps.of(S.path); if (a) return fxOf(a.press(S.path, action, info && info.repeat ? REPEAT : FRESH)); }
       if (S.path === 'about') {
         const last = ABOUT_PAGES.length - 1;
         if (action === 'a' || action === 'down' || action === 'right' || action === 'r') { if (S.about.page < last) { S.about.page++; return []; } return action === 'a' ? back() : []; }

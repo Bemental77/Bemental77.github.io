@@ -10,6 +10,9 @@
 // app's screens is entered or one of its effects appears. A REAL KEYBOARD TYPES INTO A TEXT ENTRY: while the model says wantsText(), a capture listener turns printable keys, Backspace, Enter,
 // Escape, Delete, Home, End and the left / right arrows into model.type(...) and keeps them from the input layer (so Z, X, W, A, S, D, M, P and Enter are letters, not buttons), and a paste
 // delivers its text. pokemonarena/INAPP.md "The app interface" is the contract.
+// THE BROWSER'S HISTORY IS THE MODEL'S TRAIL (hub_model.js): one entry per screen above the main menu, each recording its trail, so B, the browser's Back button, a reload and a deep link
+// agree (syncHistory / popstate / seedHistory below). NOTHING AN APP THROWS STOPS THE PAGE: its model is guarded (hub_apps.js; reportFaults says what happened), its renderer too
+// (hub_screen.js), its ctl's failures are said in the picture, and the frame loop asks for the next frame before it does anything else.
 //
 // Import-safe in Node: nothing touches `document` unless it exists (tools/pokemonarena_page_test.mjs imports computeScale).
 //
@@ -18,7 +21,7 @@
 import { loadVerifiedRom, romUrl, RomLoadError } from './romfetch.js';
 import { loadPack } from './tables.js';
 import { createBattleUi } from './battle_ui.js';
-import { createHubModel, SCREEN_W, SCREEN_H, PATHS, arrivalTrail, historySeedPlan } from './hub_model.js';          // (arrivalTrail / historySeedPlan: the history a screen opened by address should have, for ANY hub path: the Tower's and every app's)
+import { createHubModel, SCREEN_W, SCREEN_H, PATHS, historySeedPlan, historyPlan, entryTrail } from './hub_model.js';          // (historySeedPlan / historyPlan / entryTrail: how the browser's history is kept equal to the model's trail, for ANY hub path: the Tower's and every app's)
 import { createHubScreen } from './hub_screen.js';
 import { APP_CTLS } from './hub_app_ctls.js';          // how each hub app's ctl is loaded (a function per app that imports the file when called: nothing is loaded here)
 import { readHubData, teamCodeFor, battleHref, pickMascot } from './hub_data.js';
@@ -83,14 +86,15 @@ async function main() {
   const hook = window.__arenaHub = { state: 'boot', kind: null, error: null, effects: [], store: 'pending' };
   const mbs = (n) => (n / 1048576).toFixed(1);
   const input = typeof createInput === 'function' ? createInput() : null;
-  let pushed = 0;                                // history entries this page load added for hub screens
+  let hist = [], flying = 0;                     // hist: the TRAIL of the history entry the browser stands on (hub_model.js: the screens above the main menu, one entry each); flying: when a step back of ours (history.go) was asked for and has not landed yet (0: none)
+  const held = new Set();                        // the actions whose press the hub took and that are still down: what an app's tick(path, held) is told
   let model = null, screen = null, ui = null, pack = null, romBytes = null, store = null, touchPad = false, dialogOpen = false, errNav = null;
   const storage = (() => { try { return window.localStorage; } catch (_e) { return null; } })();
   const session = (() => { try { return window.sessionStorage; } catch (_e) { return null; } })();
   // WHO holds the "a dialog is up" state (the hub ignores its own keys and pointer while it is true): the Sound panel, the Controls dialog, and the Open-to-battles dialogs can be up TOGETHER (a
   // challenge arrives while Controls is open), so it is a SET of owners, not one boolean: closing one dialog never un-pauses the page behind another that is still open
   const dlgOwners = new Set();
-  const setDialog = (who, v) => { if (v) dlgOwners.add(who); else dlgOwners.delete(who); dialogOpen = dlgOwners.size > 0; };
+  const setDialog = (who, v) => { if (v) dlgOwners.add(who); else dlgOwners.delete(who); dialogOpen = dlgOwners.size > 0; if (dialogOpen) held.clear(); };          // (a button held as a DOM dialog opens is not held in the picture behind it)
 
   /* ---- the loading panel's reveal ---- */
   // THE LOADING PANEL ONLY APPEARS IF LOADING TAKES A MOMENT, so a repeat visit (up in ~110 ms) never flashes it. The FIRST reveal, 400 ms after the page started, is not made here: it is a stylesheet
@@ -146,6 +150,15 @@ async function main() {
     onMenuOpen: () => { setDialog('musicmenu', true); },           // the audio bar's music list is a dialog: the menu behind it takes no key or pad press while it is open (no focusCanvas on close: Esc gives the focus to the music button)
     onMenuClose: () => { setDialog('musicmenu', false); },
   }) : null; } catch (e) { console.warn('[sound] the sound system could not start; the old switch is used:', e); return null; } })();
+  // what the picture's own screens and the hub's apps ask of the sound: always there and never throwing, whether or not the sound system loaded
+  const sound = Object.freeze({
+    /** Play one ROM sound effect by its music_map.js key ('se_select', 'se_success', 'se_menu_open' ...). -> true when it was handed to the sound system (it is silent while the sound is muted or not started). */
+    sfx(key) { try { return !!(soundSys && typeof soundSys.sfx === 'function' && soundSys.sfx(key)); } catch (_e) { return false; } },
+    /** Say which SCREEN the hub is showing, for its music ('hub', 'pokecenter', 'town' ...: a music key of music_map.js). The player's own pick in the audio bar still wins. -> true when it was taken. */
+    music(screenKey) { try { if (!soundSys || typeof screenKey !== 'string') return false; soundSys.menuMusic.set(screenKey); return true; } catch (_e) { return false; } },
+    /** The sound system itself (sound_system.js: mixer, director, menuMusic, state()), or null when it did not load. */
+    system: () => soundSys,
+  });
   const snd = { ctx: null, cry: new Map(), plays: 0 };
   function updateSoundButton() { if (soundSys) return; const on = cries.isSoundOn(storage || undefined); els.sound.textContent = 'Sound: ' + (on ? 'on' : 'off'); els.sound.setAttribute('aria-pressed', on ? 'true' : 'false'); }
   function ensureAudio() {
@@ -220,14 +233,14 @@ async function main() {
       if (hook.effects.length > 4000) hook.effects.splice(0, 2000);          // (a log for the tests: an app that asks for something every frame must not grow it for ever)
       if (typeof eff.app === 'string') { appEffect(eff); continue; }          // an app's effect (a dialog's answer for an app included) goes to that app's ctl, whatever its type
       if (eff.type === 'screen') {
-        // going into a screen adds a history entry; coming back to the menu steps BACK through that entry (so B and the browser's Back button agree and the history does not grow)
-        try {
-          if ((eff.path === 'main' || eff.back) && pushed > 0) { pushed--; history.back(); }
-          else { history.pushState({ arenaHub: eff.path }, '', hashFor(eff.path)); if (eff.path !== 'main') pushed++; }
-        } catch (_e) { /* a sandboxed frame */ }
+        // the browser's history is made equal to the model's TRAIL: a screen opened adds an entry, a step back steps back through the entries, a replace overwrites one (so B and the browser's
+        // Back button agree and the history does not grow). The effect only says THAT the screen changed; where the model now stands (model.trail()) decides what is written, so a list
+        // holding a step back and a go is ONE history change
+        syncHistory();
         syncTitle();
         syncFamily();          // (before the effects that follow in this list: an app's ctl hears enter(path) first)
       }
+      else if (eff.type === 'sfx') sound.sfx(eff.key);          // the screen named its own sound for this input (the default menu sound is then not played: sound_system.js menuSfx); key null = none
       else if (eff.type === 'navigate') { saveSettings(); navigate(eff.url); }
       else if (eff.type === 'sound') setSound(eff.on);
       else if (eff.type === 'controls') openControls();
@@ -239,20 +252,47 @@ async function main() {
     dirty = true;
   }
   function syncTitle() { document.title = model.title(model.path()) || SCREEN_TITLES[model.path()] || SCREEN_TITLES.main; }
-  window.addEventListener('popstate', () => { if (!model) return; pushed = arrivalTrail(pathFromHash(location.hash)).length; model.goto(pathFromHash(location.hash)); syncTitle(); syncFamily(); dirty = true; });
+
+  /* ---- the browser's history mirrors the model's TRAIL (hub_model.js): one entry per screen above the main menu, each carrying { arenaHub: path, trail } in its state ---- */
+  // `hist` is the trail of the entry the browser stands on. It is READ off the entry whenever the browser lands somewhere (popstate, boot) and set here only for an entry this page has just
+  // written, so every decision starts from where the browser really is, never from a count. A step back (history.go) lands LATER, as a popstate: until it has (`flying`) nothing else is
+  // written -- a pushState issued meanwhile would be made on the entry being left -- and the landing reconciles again (what was still to write, or a move the model made in the meantime).
+  const stateFor = (trail) => ({ arenaHub: trail.length ? trail[trail.length - 1] : 'main', trail: trail.slice() });
+  const FLY_MS = 2000;                           // a step back that has not landed after this long never will (a sandboxed frame): the next change starts over from `hist`
+  function syncHistory() {
+    if (!model) return;
+    if (flying && performance.now() - flying < FLY_MS) return;
+    flying = 0;
+    const plan = historyPlan(hist, model.trail());
+    try {
+      if (plan.back > 0) { flying = performance.now(); history.go(-plan.back); return; }
+      for (const w of plan.write) {
+        const to = w.trail[w.trail.length - 1];
+        if (w.how === 'replace') history.replaceState(stateFor(w.trail), '', hashFor(to)); else history.pushState(stateFor(w.trail), '', hashFor(to));
+        hist = w.trail.slice();
+      }
+    } catch (_e) { flying = 0; /* a sandboxed frame */ }
+  }
+  window.addEventListener('popstate', (e) => {
+    if (!model) return;
+    const path = pathFromHash(location.hash), ours = flying !== 0;
+    hist = entryTrail(e.state, path); flying = 0;
+    if (ours) syncHistory();                     // our own step back has landed: whatever is still to do from here (the entries to write after it, a move the model made meanwhile) is done now
+    else run(model.arrive(path, hist));          // the browser's Back / Forward (or a typed address): the model follows the entry, with the trail it recorded
+    syncTitle(); syncFamily(); dirty = true;
+  });
   // The page was OPENED at a screen other than the menu (the way back from a Tower fight lands on #tower-offer or #tower-last, and a link may name any screen). Its history then holds only that one entry, so B
-  // (history.back) would leave the hub for the page that was just left. Give it the entries the screen would have had if it had been walked to from the menu: the menu's own, then each screen on the way.
-  // ONLY on a fresh arrival (historySeedPlan): a reload, or a back / forward step onto an entry this page wrote, already stands on the trail (its history.state carries the marker), so nothing is added and the Forward entry is kept.
+  // (a step back) would leave the hub for the page that was just left. Give it the entries the screen would have had if it had been walked to from the menu: the menu's own, then each screen on the way.
+  // ONLY on a fresh arrival (historySeedPlan): a reload, or a back / forward step onto an entry this page wrote, already stands on its trail (its history.state carries it), so nothing is added and the Forward entry is kept.
   function seedHistory(path) {
     let state = null; try { state = history.state; } catch (_e) { state = null; }
     const plan = historySeedPlan(path, state);
-    if (!plan.trail.length) return;
-    if (!plan.write) { pushed = plan.trail.length; return; }
+    if (!plan.write) { hist = plan.trail.slice(); return; }          // (the entries the page stands on, either way)
     try {
-      history.replaceState({ arenaHub: 'main' }, '', hashFor('main'));
-      for (const p of plan.trail) history.pushState({ arenaHub: p }, '', hashFor(p));
-      pushed = plan.trail.length;
-    } catch (_e) { /* a sandboxed frame: B falls back to pushing the menu */ }
+      history.replaceState(stateFor([]), '', hashFor('main'));
+      for (let i = 0; i < plan.trail.length; i++) history.pushState(stateFor(plan.trail.slice(0, i + 1)), '', hashFor(plan.trail[i]));
+      hist = plan.trail.slice();
+    } catch (_e) { /* a sandboxed frame: the model still walks its trail; only the browser's Back button does not follow */ }
   }
 
   /* ---- the hub's APPS: <id>_hub.js is the pure model the hub delegates to (hub_apps.js); <id>_ctl.js carries its effects out and is loaded the first time it is needed ---- */
@@ -265,7 +305,7 @@ async function main() {
   // what an app's ctl is given (INAPP.md "The app interface"): the page's services, the hub model and the app's own model
   const ctlEnv = (id) => ({
     win: window, doc: document, hook, model, app: model.app(id), store: () => store, whenStore: () => storeOpened, pack, rom: romBytes, ui, navigate, input, storage, session,
-    refreshData, redraw: () => { dirty = true; draw(true); }, run, freshSeed,
+    refreshData, redraw: () => { dirty = true; draw(true); }, run, freshSeed, sound,
   });
   function loadCtl(id) {
     let c = ctls.get(id);
@@ -320,7 +360,18 @@ async function main() {
   const heldAsText = new Set();                                            // the keys whose press was taken as text (their auto-repeat is text too; the repeat of a key that was a BUTTON press -- the Z that opened the entry -- is not)
   window.addEventListener('keyup', (e) => { heldAsText.delete(e.code || e.key); }, true);
   function typeText(input) { hook.typed = (hook.typed | 0) + 1; run(model.type(input)); }
+  // A QUESTION OVER A TEXT ENTRY (a hub dialog opened while the player was typing: "<name> wants to battle you"). The entry is covered, so nothing is typed; but the word being typed must not
+  // ANSWER the question either: a printable key (and a dead key) is dropped here, before the input layer can read Z as A or X as B. Enter, Escape, Backspace and the arrows are left to the
+  // input layer and drive the dialog as on any other screen (the dialog's own arm delay covers an Enter that was already on its way).
+  const coveredNow = () => !!model && hook.state === 'ready' && !dialogOpen && model.textUnder();
+  function dropCovered(e) {
+    if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey || e.isComposing || e.keyCode === 229) return;
+    const t = keyTarget(e), key = e.key;
+    if (!((typeof key === 'string' && key.length === 1) || key === 'Dead') || isTextTarget(t) || nativeUse(t, key, e.code) !== 'none') return;
+    e.preventDefault(); e.stopPropagation(); hook.dropped = (hook.dropped | 0) + 1;
+  }
   window.addEventListener('keydown', (e) => {
+    if (coveredNow()) { dropCovered(e); return; }
     if (!typingNow() || e.defaultPrevented) return;
     if (e.repeat && !heldAsText.has(e.code || e.key)) return;
     if (e.ctrlKey || e.metaKey || e.altKey) return;                       // browser shortcuts (Ctrl+V arrives as a paste event, below), AltGr: left alone
@@ -330,6 +381,7 @@ async function main() {
     let input = null;
     if (Object.prototype.hasOwnProperty.call(TEXT_KEYS, key)) input = { key: TEXT_KEYS[key] };
     else if (typeof key === 'string' && key.length === 1) input = { text: key };
+    else if (key === 'Dead') { e.preventDefault(); e.stopPropagation(); return; }          // a dead key (an accent waiting for its letter) is not a letter yet and never a button
     else return;                                                           // Tab, the function keys, the up / down arrows (those two still move the key cursor) ...
     if (nativeUse(t, key, e.code) !== 'none') return;                      // Enter or Space on a focused page button presses that button
     e.preventDefault(); e.stopPropagation();                               // ... and nothing else sees the key: not the input layer (no game button), not the M-mutes shortcut
@@ -431,16 +483,28 @@ async function main() {
   /* ---- drawing ---- */
   const img = new ImageData(SCREEN_W, SCREEN_H);
   let dirty = true, lastSig = '', renders = 0, lastSpoken = '';
+  const drawFaults = new Set();                  // the messages of the screens that could not be drawn, each said in the console once (hook.renderError is the last one)
   function sigOf(v) { return JSON.stringify({ ...v, tick: (v.tick >> 5) & 1 }); }
   function draw(force) {
     const v = model.view();
     const sig = sigOf(v);
     if (!force && sig === lastSig) { dirty = false; return; }
     lastSig = sig;
-    // (a renderer that throws -- an app's, on a view it did not expect -- must not stop the page's clock: the picture keeps its last frame and the fault is on the hook and in the console, once per message)
-    let f; try { f = screen.render(v); } catch (e) { const msg = String(e && e.message ? e.message : e); if (hook.renderError !== msg) { hook.renderError = msg; console.error('[hub] the screen could not be drawn', e); } dirty = false; return; }
+    // (a renderer that throws -- an app's, on a view it did not expect -- must not stop the page's clock. hub_screen.js catches an APP's renderer itself and draws the shell's note in its place
+    //  (f.fault says what happened); anything else that throws here leaves the last frame up. Either way the fault is on the hook and in the console, once per message)
+    const drawFault = (msg, e) => { hook.renderError = msg; if (!drawFaults.has(msg) && drawFaults.size < 32) { drawFaults.add(msg); console.error('[hub] the screen could not be drawn', e); } };
+    let f; try { f = screen.render(v); } catch (e) { drawFault(String(e && e.message ? e.message : e), e); dirty = false; return; }
+    if (f.fault) drawFault(f.fault.message, f.fault.app + ' ' + f.fault.where + ': ' + f.fault.message);
     img.data.set(f.rgba); ctx.putImageData(img, 0, 0); renders++; dirty = false;
     speak(v);
+  }
+  // what the hub's apps threw since the last frame (hub_model.js faults(): each distinct fault once): said in the console, kept on the hook, and said once in the picture
+  function reportFaults() {
+    for (const ft of model.faults()) {
+      hook.appFaults = (hook.appFaults || []).concat([ft]).slice(-20);
+      console.error('[apps] ' + ft.app + ' ' + ft.where + '() threw: ' + ft.message);
+      try { appNote(ft.app, appName(ft.app) + ' hit a problem:', ft.message); } catch (_e) { /* the note is a courtesy */ }
+    }
   }
   // a plain-text mirror of the canvas for screen readers (the canvas itself has only a static label)
   function speak(v) {
@@ -474,34 +538,45 @@ async function main() {
     // within 4 seconds leaves for the site. (A mouse, a keyboard and a touch screen have the Home link / the browser's Back; they are left as they were.)
     let leaveArmed = -1e9;
     input.on('action', (e) => {
+      if (!e.pressed) held.delete(e.action);          // (a release always counts, whatever is open: nothing stays held)
       if (!e.pressed || e.native || dialogOpen) return;
+      if (!e.repeat) held.add(e.action);              // HELD: the actions whose press the hub took (the same gate as the press itself) until they are released: an app's tick(path, held)
       if (e.action === 'b' && e.source === 'gamepad' && !e.repeat && model.path() === 'main' && !model.dialog.isOpen()) {
         const t = performance.now();
         if (t - leaveArmed < 4000) { leaveArmed = -1e9; saveSettings(); navigate('/'); return; }
         leaveArmed = t; model.notify(['Press B again to leave', 'the Arena for the site.']); dirty = true; return;
       }
-      if (soundSys) { const before = soundSys.sig(model.state()); const fx = model.press(e.action); run(fx); soundSys.menuSfx(e.action, before !== soundSys.sig(model.state()), true, fx); return; }
-      run(model.press(e.action));
+      const info = { repeat: !!e.repeat };            // (the synthesized repeat of a held direction: a dialog ignores it, an app is told)
+      if (soundSys) { const before = soundSys.sig(model.state()); const fx = model.press(e.action, info); run(fx); soundSys.menuSfx(e.action, before !== soundSys.sig(model.state()), true, fx); return; }
+      run(model.press(e.action, info));
     });
     input.on('pointer', (e) => {
       if (dialogOpen) return;
       if (e.kind === 'wheel') { if (e.el === canvas || e.x === null) run(model.pointer({ kind: 'wheel', steps: e.steps })); return; }
       if (e.el !== canvas || !e.inside) return;
-      if (e.kind === 'move' || (e.kind === 'down' && e.source === 'touch')) { model.pointer({ kind: 'move', x: e.x, y: e.y }); dirty = true; }
+      if (e.kind === 'move' || (e.kind === 'down' && e.source === 'touch')) run(model.pointer({ kind: 'move', x: e.x, y: e.y }));          // (a move may ask for something too: its effects are carried out like a click's)
       else if (e.kind === 'click') { const hitRow = !!(soundSys && model.hit(e.x, e.y)); const fx = model.pointer({ kind: 'click', x: e.x, y: e.y }); if (hitRow) soundSys.menuSfx('a', true, true, fx); run(fx); }
     });
   }
+  // the buttons held right now, for the open app's tick(path, held): none while a DOM dialog is open
+  const heldNow = () => (dialogOpen || !held.size ? null : [...held]);
 
   /* ---- the clock: a fixed 59.7275 Hz step regardless of the display rate (it only animates the Pokemon) ---- */
+  // NOTHING THAT THROWS IN A FRAME MAY STOP THE CLOCK: the next frame is asked for FIRST, the ticks and the drawing are each inside a try, and a fault is said once (hook.loopError, the console).
+  // (An app's model cannot throw into this loop at all: hub_apps.js guards every call and reportFaults says what happened. This is for everything else.)
+  function loopFault(where, e) { const msg = where + ': ' + String(e && e.message ? e.message : e); if (hook.loopError !== msg) { hook.loopError = msg; console.error('[hub] a frame failed (' + where + ')', e); } }
   function runLoop() {
     let last = performance.now(), acc = 0;
     const loop = (now) => {
-      const dt = Math.min(250, now - last); last = now;
-      if (!document.hidden && !hook.paused) { acc += dt; let n = 0; while (acc >= STEP_MS && n < 8) { const fx = model.tick(); if (fx && fx.length) run(fx); acc -= STEP_MS; n++; } if (n >= 8) acc = 0; }          // (a tick may ask for something: a dialog that timed out, the open app's tick)
-      draw(false);
       requestAnimationFrame(loop);
+      try {
+        const dt = Math.min(250, now - last); last = now;
+        if (!document.hidden && !hook.paused) { acc += dt; let n = 0; while (acc >= STEP_MS && n < 8) { acc -= STEP_MS; n++; const fx = model.tick(heldNow()); if (fx && fx.length) run(fx); } if (n >= 8) acc = 0; }          // (a tick may ask for something: a dialog that timed out, the open app's tick)
+      } catch (e) { loopFault('tick', e); }
+      try { draw(false); } catch (e) { loopFault('draw', e); }
+      try { reportFaults(); } catch (e) { loopFault('report', e); }
     };
-    draw(true);
+    try { draw(true); } catch (e) { loopFault('draw', e); }
     requestAnimationFrame(loop);
   }
 
@@ -510,13 +585,17 @@ async function main() {
   function makeHook() {
     Object.assign(hook, {
       model, ui, pack, canvas,
-      press: (a) => { run(model.press(a)); return model.path(); },
+      press: (a, info) => { run(model.press(a, info)); return model.path(); },
       pointer: (ev) => { run(model.pointer(ev)); return model.path(); },
       type: (input) => { run(model.type(input)); return model.path(); },
-      goto: (path) => { run(model.goto(path)); return model.path(); },          // open a screen as the page does (a history entry, the title, the app's ctl): what ctx.go(path) from a press leads to
+      goto: (path, o) => { run(model.goto(path, o)); return model.path(); },          // open a screen as the page does (the history, the title, the app's ctl): what ctx.go(path, o) from a press leads to
+      run: (effects) => { run(effects); return model.path(); },                       // carry out a list of effects as the page does (a test hands it what several model calls returned together)
+      trail: () => model.trail(),
+      history: () => ({ hist: hist.slice(), flying: flying !== 0 }),                  // the trail of the history entry the page believes the browser stands on, and whether a step back of its own is still to land
+      held: () => [...held],
       wantsText: () => model.wantsText(),
       view: () => model.view(),
-      tick: (n = 1) => { for (let i = 0; i < n; i++) { const fx = model.tick(); if (fx && fx.length) run(fx); } draw(true); },
+      tick: (n = 1, heldList) => { for (let i = 0; i < n; i++) { const fx = model.tick(heldList === undefined ? heldNow() : heldList); if (fx && fx.length) run(fx); } reportFaults(); draw(true); },
       pause: (v) => { hook.paused = !!v; },
       refresh: () => refreshData(),
       frameHash: () => fnv(screen.render(model.view()).rgba),
@@ -589,8 +668,9 @@ async function main() {
     if (errNav) { try { errNav.disable(); } catch (_e) { /* ignore */ } }
     els.status.textContent = 'ROM verified: Pokemon SoulGold v1.1.1 (SHA-256 ' + sha256.slice(0, 8) + '...). Everything on screen is drawn from it; nothing is uploaded.';
     touchPad = coarse();
-    model.goto(pathFromHash(location.hash));
-    seedHistory(model.path());
+    const openAt = pathFromHash(location.hash);
+    seedHistory(openAt);                             // the history entries the page stands on (`hist`): the ones a fresh arrival is given, or the ones the entry it came back to recorded
+    const openFx = model.arrive(openAt, hist);       // the model opens the screen the address names, with that trail (B then walks it); openFx = what the screen's enter(path) asked for
     syncTitle();
     syncFamily();                                    // a page opened AT an app's screen loads that app's ctl now
     fit();
@@ -611,6 +691,7 @@ async function main() {
     if (soundSys) { soundSys.setRom({ bytes, pack }); soundSys.menuMusic.set('hub'); window.__arenaSound = soundSys; soundSys.mixer.on((ev) => { if (ev.type === 'mute') { model.setSound(soundSys.audible()); dirty = true; } }); }       // MU3: the ROM's music (nothing is heard before the first click / tap / key); the SOUND row follows the M key
     focusCanvas();
     runLoop();
+    if (openFx.length) run(openFx);
     openProfiles();                                  // the team list fills in when the store answers; the menu is usable at once
     loadTower().then((m) => { if (m) refreshData(); });          // the Tower's code loads behind the menu (the hub itself carries no engine); its rows fill in when it has
     // OPEN TO BATTLES (presence_boot.js): the switch beside Play online, and a "<name> wants to battle you" dialog whatever the player is doing; loaded after the menu is up, so it can never delay or break it

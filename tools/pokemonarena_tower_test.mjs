@@ -1257,7 +1257,8 @@ async function suite(S, tag, opt = {}) {
       const bt = fs.readFileSync(path.join(opt.dir || SRC, 'boot.js'), 'utf8');
       ok(/import \{[^}]*createStartGuard[^}]*\} from '\.\/tower_hub\.js'/.test(bt) && /eff\.type === 'tower-new' && !startGuard\.enter\(eff\.token\)/.test(bt) && /startGuard\.done\(eff\.token, started\)/.test(bt) && !/createOnceGate|startGate/.test(bt), t('Q48 the hub page runs a START only through the start guard (one start under way on the page, one run per token) and ends it when the start did or did not happen'), '');
       const sh = bt.slice(bt.indexOf('function seedHistory'), bt.indexOf('/* ---- the team list'));
-      ok(/historySeedPlan\(path, state\)/.test(sh) && /if \(!plan\.write\) \{ pushed = plan\.trail\.length; return; \}/.test(sh) && sh.indexOf('plan.write') > 0 && sh.indexOf('plan.write') < sh.indexOf('history.replaceState') && sh.indexOf('history.replaceState') < sh.indexOf('history.pushState'), t('Q49 the hub page seeds its history only when the plan says to write (a reload or a back / forward step onto an entry it wrote adds nothing), and counts the entries it stands on either way'), sh.slice(0, 80));
+      // (the page used to keep a COUNT of the entries it stood on, `pushed`; it now keeps their trail, `hist`: the same line, the same rule)
+      ok(/historySeedPlan\(path, state\)/.test(sh) && /if \(!plan\.write\) \{ hist = plan\.trail\.slice\(\); return; \}/.test(sh) && sh.indexOf('plan.write') > 0 && sh.indexOf('plan.write') < sh.indexOf('history.replaceState') && sh.indexOf('history.replaceState') < sh.indexOf('history.pushState'), t('Q49 the hub page seeds its history only when the plan says to write (a reload or a back / forward step onto an entry it wrote adds nothing), and counts the entries it stands on either way'), sh.slice(0, 80));
       ok(/addEventListener\('pageshow', \(e\) => \{ if \(e\.persisted\) \{ startGuard\.reset\(\);/.test(bt), t('Q50 a hub page restored from the back / forward cache frees its start guard (START works again after START, browser Back, give up); without it the button is silently dead until a reload'), (bt.match(/addEventListener\('pageshow'[^\n]*/) || [''])[0].slice(0, 120));
     }
   }
@@ -1445,8 +1446,8 @@ const MUTANTS = [
   { id: "quit-of-a-played-run-is-dropped", why: "leaving a later floor, with floors cleared, drops the whole run", file: "tower_session.js", from: "result.result === 'f' && !cur.fighting && !countable(cur, cfg)", to: "result.result === 'f' && !cur.fighting", groups: ["Q"] },
   { id: "boot-start-guard-never-ends", why: "the hub page never ends a start (a start that failed cannot be asked for again)", file: "boot.js", from: "startGuard.done(eff.token, started)", to: "void started", groups: ["Q"] },
   { id: "boot-start-guard-is-skipped", why: "the hub page lets every START through", file: "boot.js", from: "eff.type === 'tower-new' && !startGuard.enter(eff.token)", to: "eff.type === 'tower-new' && !true", groups: ["Q"] },
-  { id: "boot-seeds-history-on-every-boot", why: "a reload adds two entries to the history", file: "boot.js", from: "if (!plan.write) { pushed = plan.trail.length; return; }", to: "", groups: ["Q"] },
-  { id: "boot-ignores-the-seed-plan", why: "the hub page seeds its history without asking the plan", file: "boot.js", from: "const plan = historySeedPlan(path, state);", to: "const plan = { trail: arrivalTrail(path), write: true };", groups: ["Q"] },
+  { id: "boot-seeds-history-on-every-boot", why: "a reload adds two entries to the history", file: "boot.js", from: "if (!plan.write) { hist = plan.trail.slice(); return; }", to: "", groups: ["Q"] },
+  { id: "boot-ignores-the-seed-plan", why: "the hub page seeds its history without asking the plan", file: "boot.js", from: "const plan = historySeedPlan(path, state);", to: "const plan = { trail: entryTrail(null, path), write: true };", groups: ["Q"] },
 ];
 
 async function runMutants() {
