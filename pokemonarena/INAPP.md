@@ -827,7 +827,7 @@ window.__arenaBattle.hubUrl()       // '/pokemonarena/#<arena.back>' or '/pokemo
 ```
 
 `createOnlinePanel()` (online_view.js): `press(action, view)` / `pointer(ev, view)` -> `null | { kind: 'move', index } | { kind: 'act', id } | { kind: 'refused', id }`; `hit(x, y, view)`, `rects(view)`,
-`cursor(view)`. **B on a confirm screen is its BACK row; B on a waiting screen never closes anything** (it puts the cursor on the way out). The cursor keeps its row (by id) when a row appears.
+`cursor(view)`. **B on a confirm screen is its BACK row; B on a waiting screen never closes anything** (it puts the cursor on the way out). A cursor the player moved keeps its row (by id) when a row appears; one nobody moved starts on the first row (COPY LINK when the room opens, not the way out).
 `createScreen(ui, h)` is drawn through the hub's shell renderer: `createHubScreen(ui, { appScreens: { online: createScreen } }).render({ app: 'online', screen: 'online', env, tick, online: view, cursor })`.
 **Stage 2** can draw a question over a battle the same way: that render call takes `dialog` (a hub_dialog.js view) and draws it over anything.
 
@@ -892,7 +892,7 @@ No new key. Read: `sessionStorage` `arena.go`, `arena.meet`, `arena.accept` (tak
 The counts are what each command prints as "passed". The battle-page sessions of the page test read and drive the picture; its hub sessions (ONLINE's) were not rewritten.
 
 ```bash
-node tools/pokemonarena_online_view_test.mjs --mutants                    # 62 passed, 36 mutants: the screens in Node with the real ROM renderer (see its header)
+node tools/pokemonarena_online_view_test.mjs --mutants                    # 63 passed, 37 mutants: the screens in Node with the real ROM renderer (see its header)
 node tools/pokemonarena_online_page_test.mjs                              # 528 passed, 20 groups (profile hub lobby match leaving rejoin resume timeout easyjoin screens refusals teams lead layout open openlayout presence presenceui onlineux tokens)
 node tools/pokemonarena_online_page_test.mjs screens --mutants            # 75 passed with them: 53 cases and 22 mutants (new group: SC1-SC13, sessions bare ask copy back input battle; ARENA_SC=<session,...> picks some)
 node tools/pokemonarena_online_page_test.mjs onlineux tokens --mutants    # 18 + 6 mutants (was 22 + 6: X06-X08 went with the list, X20 with the page's foot; X04, X05, X10-X13, X21, T04-T06 re-homed)

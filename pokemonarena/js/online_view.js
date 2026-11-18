@@ -224,18 +224,20 @@ export function sentenceLayout(measure, v, L = layoutOf(v)) {
  * for the screen before.
  */
 export function createOnlinePanel() {
-  let cursor = 0, sig = '', onId = null;
+  let cursor = 0, sig = '', onId = null, moved = false;          // moved: the PLAYER put the cursor where it is (a button, the pointer), on this screen
   function sync(v) {
     const s = v.screen + '|' + (v.kind || '') + '|' + v.rows.map((r) => r.id).join(',');
-    if (s !== sig) {          // another screen, or other rows: the cursor stays on the row it was on when that row is still there, else it starts at the top
-      const keep = sig.split('|')[0] === v.screen ? v.rows.findIndex((r) => r.id === onId) : -1;
-      sig = s; cursor = keep >= 0 ? keep : 0;
+    // ANOTHER SCREEN, OR OTHER ROWS. The cursor stays on the row it was on only if the player put it there and that row is still there (SHARE appearing does not move it off COPY CODE). A cursor
+    // nobody moved starts at the top: when a room opens it stands on COPY LINK, not on the way out it stood on while CLOSE THE ROOM was the only row (an A meant for nothing would close the room).
+    if (s !== sig) {
+      const keep = moved && sig.split('|')[0] === v.screen ? v.rows.findIndex((r) => r.id === onId) : -1;
+      sig = s; cursor = keep >= 0 ? keep : 0; if (keep < 0) moved = false;
     }
     cursor = v.rows.length ? Math.max(0, Math.min(v.rows.length - 1, cursor)) : 0;
     onId = v.rows[cursor] ? v.rows[cursor].id : null;
     return cursor;
   }
-  const setCursor = (v, i) => { cursor = i; onId = v.rows[i] ? v.rows[i].id : null; return { kind: 'move', index: i }; };
+  const setCursor = (v, i) => { cursor = i; moved = true; onId = v.rows[i] ? v.rows[i].id : null; return { kind: 'move', index: i }; };
   const activate = (v) => { const r = v.rows[cursor]; return !r ? null : r.disabled ? { kind: 'refused', id: r.id } : { kind: 'act', id: r.id }; };
   function hit(x, y, v) {
     for (const r of rowRects(v)) if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) return { kind: 'row', index: r.index, id: r.id };
