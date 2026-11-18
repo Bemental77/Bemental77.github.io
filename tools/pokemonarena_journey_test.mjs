@@ -190,14 +190,19 @@ async function journey(vp, port) {
     ok((await hubRows()).join() === 'quick,team,online,tower,builder,record,import,controls', tag + '1 hub: the main menu shows eight of its ten rows (PLAY ONLINE, TOWER, TEAM BUILDER, RECORD and IMPORT SAVE included; SOUND and ABOUT are below the fold, the menu scrolls)', JSON.stringify(await hubRows()));
     await shot(page, vp, 'hub_main');
 
-    // ---- 2 TEAM BUILDER from the menu (a mix of devices on the desktop run: keys, then the mouse). The row opens the builder SCREEN in the picture now (an app of the hub); until the
-    //      Team Builder itself is in the picture, that screen's OPEN TEAM BUILDER row is what leaves for the team editor page
+    // ---- 2 TEAM BUILDER from the menu (a mix of devices on the desktop run: keys, then the mouse). The row opens THE TEAM BUILDER IN THE PICTURE (the hub's builder app: its own suites are
+    //      tools/pokemonarena_builder_test.mjs and tools/pokemonarena_builder_page_test.mjs, which build a team there from nothing and reload). The REST of this journey (steps 3 to 5, 9, 10)
+    //      still builds its team on the old team editor page: that page stays until the builder's last stage ports this journey to the picture and turns editor.html into a redirect. The
+    //      placeholder's OPEN TEAM BUILDER row is gone, so the journey reaches that page by its address
     await hubPick('builder');
     await waitFor(page, `${HUB}.model.path() === 'builder'`);
     ok((await page.eval('location.hash')) === '#builder' && /\/pokemonarena\/$/.test(await page.eval('location.pathname')), tag + '2 TEAM BUILDER on the hub menu opens the builder screen in the picture (#builder, the same page)', await page.eval('location.pathname + location.hash'));
-    await hubRow('editor');
+    await waitFor(page, `${HUB}.model.state().apps.builder.phase === 'ready'`);
+    ok((await page.eval(`${HUB}.view().builder.kind`)) === 'trainers' && (await hubRows()).join() === 'new,back' && (await page.eval(`${HUB}.navigated`)) === undefined, tag + '2 that screen is the Team Builder\'s trainer list, drawn in the picture (no trainer yet: NEW TRAINER, BACK); nothing navigated', JSON.stringify(await hubRows()));
+    await shot(page, vp, 'builder_trainers_empty');
+    await page.navigate(BASE + '/pokemonarena/editor.html');
     await waitFor(page, 'window.__editor && (window.__editor.ready || window.__editor.error)');
-    ok(/\/pokemonarena\/editor\.html/.test(await page.eval('location.pathname')) && (await page.eval('__editor.ready')) === true, tag + '2 OPEN TEAM BUILDER on that screen opens the team editor', await page.eval('location.pathname'));
+    ok(/\/pokemonarena\/editor\.html/.test(await page.eval('location.pathname')) && (await page.eval('__editor.ready')) === true, tag + '2 the team editor page (still there until the journey is ported to the picture) opens by its address', await page.eval('location.pathname'));
     await shot(page, vp, 'editor_profiles_empty');
 
     // ---- 3 create a profile (typed name, tapped / clicked button)

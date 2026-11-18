@@ -565,3 +565,64 @@ when the key holds a valid path, and to `/pokemonarena/` otherwise. The key is r
 * Every new guard gets a named check AND a source mutant that the check kills, the way the existing suites do it.
 * A hook for tests (`window.__arenaHub`, `window.__arenaBattle`, `window.__arenaOnline`) drives the picture; a test never needs a DOM control that a player does not have.
 * Known before you start, not yours: `tools/pokemonarena_fullscreen_test.mjs` fails 28 cases in this environment on the commit before any of this work as well (identical list); `tools/pokemonarena_hub_return_test.mjs` case F1 (back / forward cache) fails now and then when the machine is loaded.
+
+## BUILDER: as built
+
+The Team Builder is built in three stages in the same worktree. This section says what EXISTS; each stage adds to it.
+
+### Stage 1 (2026-11-18): the structure, trainers, teams, the team, rules, the check, the Pokemon's BUILD tab, the two pickers
+
+**The paths** (all the builder app's; `parent` in brackets): `builder` TRAINERS (main), `builder-teams` TEAMS (builder), `builder-team` the six slots (builder-teams), `builder-rules`,
+`builder-check`, `builder-mon` the Pokemon, `builder-species` the species picker (all builder-team), `builder-item` the held-item picker (builder-mon). Which team / Pokemon / tab a screen
+shows is the model's FOCUS (`{ teamId, monId, tab }`), never part of a path; the tabs of the Pokemon screen are state too (L / R do not grow the history).
+
+**The files** (`js/`):
+
+| File | What it owns |
+|---|---|
+| `builder_hub.js` | THE ROUTER: `APP` (and `makeApp(families)`, `FAMILIES`, `collectFamilies`), the editor state, the focus, the one text entry, the one pop-up menu, YES / NO through the hub's dialog layer, the message box (help, a note, its pages), the autosave tag, the methods the ctl calls. Its header has the screen interface and the shared context `X` |
+| `builder_home.js`, `builder_team.js`, `builder_mon.js`, `builder_pick.js` | the screen FAMILIES: trainers + teams; team + rules + check; the Pokemon screen with its tabs (BUILD; MOVES and STATS are placeholders that say so) and `numberMenu`; the species and item pickers |
+| `builder_parts.js`, `builder_geom.js` | the model-side FURNITURE (`createList`: a scrolling, paging, wrapping, tappable list of any length; `createPopupSlot`; `pagesOf`; `chapterStep`; `sentence`) and every rectangle (shared with the renderer, so a tap lands on what is drawn) |
+| `builder_kit.js` | the heavy pure layers bound to the decoded pack (`editor_state.js` reduce, `editor_data.js`, `rules.js`, `charset.js displayText`), made by the ctl and handed to the model as DATA: `app.attach(kit)`. NOT in the hub's first paint; the model files import nothing heavy |
+| `builder_ctl.js` | the store sequence of the old `editor_app.js`: load on entry, a 250 ms debounce, `seq` / `savedSeq`, `saved` and `rebase`, `withStoredRecord`, the conflict question, read-only, flush on leave / pagehide / hidden; `env.refreshData()` after every save; the trainer list's store actions; the tab's focus (sessionStorage `arena.builder.at`) and the picker's sort (localStorage `arena.editor.speciesSort`, the DOM editor's key) |
+| `builder_screen.js` | the renderer's FURNITURE `K` (one text function every text goes through, the strip, chips, the list window, the pop-up, the message box and its "more" arrow, ROM art by id) and `PAINTER_SETS` |
+| `builder_screen_home.js`, `_team.js`, `_mon.js`, `_pick.js` | the painters, one module per family |
+
+**How a later stage adds a screen** (`tools/pokemonarena_builder_test.mjs`, check "A. a later stage adds a screen...", does exactly this):
+
+1. Write a family: `export const FAMILY = { id, screens: { 'builder-code': { parent: 'builder-team', title: 'Team Builder: Code', need: 'team', create(X) } }, ext: { ... } }`. `need` is
+   `'none' | 'profile' | 'team' | 'mon'`: a screen opened without it (its address, a reload, a team deleted under it) is left for the nearest one that can be shown. `create(X)` returns
+   `{ view(), press(action, info), pointer(ev), hit(x, y), rects(), state() }` and optionally `enter()`, `leave()`, `tick(held)`, `ready()`, `onEditor()`. `view()` returns
+   `{ kind, title, help: text | [line, line], say, ... }` (`pagesFirst: true`: A turns the pages of a long help before it acts; `noTag: true`: no autosave tag; `menu: { rows, cursor }` feeds `hub.rows()`).
+2. Add it to `FAMILIES` in `builder_hub.js` (an import and one word).
+3. Write its painters `(K) => ({ kind: (f, b, view) => { ... } })` and add the set to `PAINTER_SETS` in `builder_screen.js`. A tab of the Pokemon screen registers its painter as `'tab:<layout>'`.
+4. To put rows on the EXISTING screens, fill a registration point in `ext` (each entry `{ id, label, help, run(X, target) -> effects, when?(X) }`; nothing is drawn for a point nobody fills):
+   `'trainers.rows'` (IMPORT PROFILE, IMPORT SAVE, DATA), `'trainers.menu'` (PORTRAIT, EXPORT, IDENTITY KEY), `'teams.rows'` (IMPORT A CODE), `'teams.menu'`, `'team.chips'` (CODE, TEST: they
+   stand between CHECK and MENU and share the chip row), `'team.menu'` (UNDO, REDO), `'mon.tabs'` (`{ id, label, create(X) }`: a tab registered as `'moves'` or `'stats'` REPLACES the placeholder).
+5. Everything a screen needs is on `X`: `kit()`, `ed()`, `profile()`, `team()`, `mon()`, `at()` / `setAt(patch)`, `dispatch(action)` (THE ONLY WAY A PROFILE CHANGES: the reducer's error / notice goes to
+   the message box and one `{ app: 'builder', type: 'edited' }` goes to the ctl), `memo(key, make)` (kept until the profile changes), `teamCheck(teamId)`, `flash(text)`, `ask(spec, answer)`,
+   `entry`, `popup`, `go` / `back`, `eff(type, more)`, `ext(slot)`, `screen(path)`, `prefs()` / `setPref`, `measure`, `speciesName`, `monName`, `rules(id)`.
+6. Something the store, a file or the clipboard must do is an EFFECT for the ctl (`X.eff('...')`): add its case to `builder_ctl.js effect()`; more pure layers go into `builder_kit.js`.
+
+**Input, the same on every builder screen.** The d-pad moves; A acts; B goes back. Left / right change a choice row at once, jump a chapter in a picker, and open the row's menu on the
+trainer and team lists. START or X: the menu (the two lists, the team); in a picker START is FIND and Y or X the filter panel; L / R: a page (lists) or the next tab (the Pokemon); SELECT: the next page of a
+long message. EVERY ONE of those has a chip or a row in the picture (the hub's touch pad has only the d-pad, A and B): the MENU chip, the FILTER chip and its FIND row, the two page chips, the
+tab chips, a tap on the message box. A note (what the reducer answered) is read to its end before A acts again; a help text never blocks A, except on the check screen, where reading the
+reason is the point.
+
+**The test hook** (browser): `window.__arenaHub.builder = { flush(), idle(), state(), kit() }`; the model is `__arenaHub.model.apps.builder` (`editor()`, `focus()`, `phase()`, `screens`),
+its state `__arenaHub.model.state().apps.builder` (`phase`, `profile`, `seq`, `at`, `tag`, `note`, `popup`, `entry`, `screens`).
+
+**Decisions a later stage should know** (each has a check):
+
+* THE ENTER RULE of FIND takes a species only when its WHOLE name was typed or one Pokemon is left (`speciesEnterChoice(..., 'name')`). The DOM editor also took the first row under the
+  Pokedex order; there the list was on screen while the word was typed, here the keyboard covers it. The first row is under the cursor instead, one A away.
+* REMOVE (a Pokemon) asks YES / NO. The DOM editor did not ask because Undo was beside it; Undo arrives with stage 2, and the question can then go.
+* The conflict question has a third answer, LATER (it is where B lands: neither of the two real answers may be given by a stray B). It is armed, and asked again at the next edit.
+* An empty team's check says "Add a Pokemon to check it" and lists nothing (the rules module's "wrong number of Pokemon" is not shown as a problem of a team nobody has filled yet).
+* Another FORM of a species shares its name and number: its row in the picker says FORM where the number would be, and the side window shows which form it is.
+* The reducer's words are shown as a sentence (a capital first, a full stop last), otherwise unchanged.
+
+**Not there yet** (stage 2: the MOVES tab and the move picker, the STATS tab, the portrait picker, the team code, the test battle, undo / redo; stage 3: profile export / import, import
+from a save, the data screen, the identity key, deep links into a team, the hub rows and battle-page links that still point at `editor.html`, the DOM editor's deletion, the editor page
+test and the journey ported to the picture). Until stage 3 `editor.html` is still the page it was, and `tools/pokemonarena_journey_test.mjs` reaches it by its address.
