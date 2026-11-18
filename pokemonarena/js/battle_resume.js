@@ -12,7 +12,7 @@
 //   store.attach(ctl);        // from now on: every human choice is saved once the engine has settled; the end of the battle clears the record
 //   store.clear();            // result chosen, battle left
 //
-// A saved battle can carry a `tag` (a Tower floor's: the run, the floor, the lives spent and every buff held): a record is only used if its tag is exactly the one the page now computes, so a Tower fight can never
+// A saved battle can carry a `tag` (a Tower floor's: the run, the floor, the TRY of the floor (the lives spent + the retries counted) and every buff held): a record is only used if its tag is exactly the one the page now computes, so a Tower fight can never
 // be resumed as another run's, with other buffs, or as a regular battle - and a regular battle's record (no tag) is never used by a Tower fight.
 // It can also carry the `attempt` of the page that fought it (a Tower floor's identity for its fight): a record is only used by a page whose attempt is exactly that one, so a second tab that was told it is a
 // duplicate (its choices are saved too, under its own number) cannot reload into the first tab's fight. A page that asks for no attempt (every regular battle) ignores the field.

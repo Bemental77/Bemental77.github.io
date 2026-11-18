@@ -3,6 +3,7 @@
 //
 //   node tools/pokemonarena_tower_profile_test.mjs             the cases
 //   node tools/pokemonarena_tower_profile_test.mjs --mutants   ALSO break profile.js / store.js / tower_record.js / tower_session.js one way at a time; every break must fail a NAMED group
+// Group R is the RETRIES (2026-11-17): optional keys of the same schema (5) and the same record version (1), so no stored profile is migrated or rewritten for them.
 //
 // REAL USERS' STORED PROFILES ARE AT STAKE, so this file is conservative: every migration is proved to keep every value it does not own (the fixtures in tools/fixtures/pokemonarena are derived from the schema-4
 // ones by editing the JSON, never by running the code under test), a damaged Tower record is proved to cost the player at most that one field, and nothing here can pass if `stats` (totals, byCpu, online,
@@ -361,6 +362,91 @@ async function suite(S, tag, opt = {}) {
       ok(oc.ok && has(oc.profile, 'one') && has(oc.profile, 'two') && has(oc.profile, 'junk-tower') && oc.profile._unknown.v4Tower_3 === 'junk-tower', t('D6 ... and the next free name is taken when v4Tower_2 is taken too'), J(oc.profile && oc.profile._unknown).slice(0, 160));
     }
   }
+
+  /* R. THE RETRIES IN THE PROFILE (2026-11-17). They are optional keys: `tower.retries`, `tower.fewestRetries`, `tower.last.retries`, and a `retry: true` mark on a lost try of a run's history. No schema
+        bump, no migration: every stored profile is already a valid one, and a record without the keys reads as 0 retries. */
+  if (grp('R')) {
+    const pack = opt.pack;
+    // a profile whose Tower record has retries everywhere, made BY EDITING THE JSON of the populated fixture (never by running the code under test): 9 over all runs, a 3v3 climb won with 2, a last run
+    // with 3, and the run under way lost floor 1 once before it won it
+    const withRetries = () => { const d = clone(FIX.tower), tw = d.tower; tw.retries = 9; tw.fewestRetries = { '3v3': 2, '6v6': null }; tw.last.retries = 3;
+      tw.current.history.unshift({ floor: 1, result: 'l', turns: 4, faints: 3, flawless: false, boss: false, comeback: false, sweep: false, closest: null, retry: true }); return d; };
+    const R0 = withRetries(), o0 = open(R0), sum0 = o0.ok ? SS.summarizeTower(o0.profile.tower, pack) : null;
+    ok(P.SCHEMA_VERSION === 5 && R.TOWER_VERSION === 1 && P.checkProfile(R0).length === 0 && o0.ok && !o0.changed && o0.migratedFrom === null && !o0.problems.length && canon(o0.profile) === canon(R0) && T.parseRun(o0.profile.tower.current).ok && T.retriesOf(o0.profile.tower.current) === 1 && J(T.checkTower(o0.profile.tower)) === '[]' && sum0.record.retries === 9 && J(sum0.record.fewestRetries) === J({ '3v3': 2, '6v6': null }) && sum0.last.retries === 3 && sum0.run.retry.used === 1 && sum0.run.retry.left === 3, t('R1 a profile whose Tower record has retries (a total, a fewest per format, a last run with some, a run whose history marks a lost try) is a well-formed schema-5 profile with a version-1 record: it opens unchanged, nothing is repaired, and the run under way is a run'), J({ ok: o0.ok, ch: o0.changed, p: o0.problems.slice(0, 2) }));
+    // OLD DATA: every fixture written before retries existed reads as 0 retries, and reading it writes no new key
+    const oldDocs = [['v5 with a climb', FIX.tower], ['v5 empty', FIX.cur], ['v4', FIX.v4], ['v3', FIX.v3], ['v1', FIX.v1full]]; let oldWhy = '';
+    for (const [name, doc] of oldDocs) {
+      const o = open(doc); if (!o.ok) { oldWhy = oldWhy || name + ' did not open'; continue; }
+      const tw = o.profile.tower, sm = SS.summarizeTower(tw, pack);
+      if ('retries' in tw || 'fewestRetries' in tw || (tw.last && 'retries' in tw.last)) oldWhy = oldWhy || name + ': opening it wrote a retry key';
+      if (sm.record.retries !== 0 || (sm.last && sm.last.retries !== 0) || sm.record.fewestRetries['3v3'] !== (tw.winsByFormat['3v3'] > 0 ? 0 : null) || sm.record.fewestRetries['6v6'] !== (tw.winsByFormat['6v6'] > 0 ? 0 : null)) oldWhy = oldWhy || name + ': does not read as 0 retries: ' + J(sm.record);
+      if (sm.run && !sm.run.broken && (sm.run.retry.used !== 0 || sm.run.retry.left !== 3 || sm.run.lostTry !== null)) oldWhy = oldWhy || name + ': the run under way does not read as 0 retries used, 3 left';
+    }
+    ok(!oldWhy && SS.summarizeTower(FIX.tower.tower, pack).record.fewestRetries['3v3'] === 0, t('R2 OLD DATA: a profile stored before retries existed (schema 1, 3, 4 and 5, with and without a climb) opens without a single retry key being written; it reads as 0 retries, its run under way as 0 used and 3 left on its floor, and a format it has won as won with 0 (a loss used to end the run)'), oldWhy);
+    // export / import: the retries travel with the record, and the checksum covers them
+    let io = '';
+    for (const gzip of [false, true]) { const e = await P.exportBytes({ ...clone(R0), rev: 6 }, { gzip, deps: { now: () => NOW } }), r = await P.parseExport(e.bytes, {}); if (!(r.ok && !r.problems.length && canon({ ...r.profile, rev: 0 }) === canon({ ...R0, rev: 0 }))) io = io || (gzip ? 'gzip' : 'plain') + ': ' + J(r).slice(0, 120); }
+    const tamper = async (fn) => { const env = P.buildExport({ ...clone(R0), rev: 6 }, { deps: { now: () => NOW } }); fn(env.profile.tower); const r = await P.parseExport(P.serializeExport(env), {}); return !r.ok && r.code === 'import.checksum'; };
+    const caught = [await tamper((tw) => { tw.retries = 0; }), await tamper((tw) => { tw.fewestRetries['3v3'] = 0; }), await tamper((tw) => { tw.last.retries = 0; }), await tamper((tw) => { tw.current.history.shift(); }), await tamper((tw) => { delete tw.retries; })];
+    ok(!io && caught.every(Boolean), t('R3 a profile with retries exports and imports back unchanged (plain and gzip), and THE EXPORT CHECKSUM COVERS THEM: lowering the total, the fewest or the last run\'s count in the file, or taking the lost try out of the run, is caught'), io || J(caught));
+    // import new / replace / merge
+    const incoming = clone(R0); incoming.rev = 0; incoming.id = 'p_incoming';
+    const existing = clone(FIX.tower); existing.rev = 4; existing.tower.retries = 2; existing.tower.fewestRetries = { '3v3': 5, '6v6': null };
+    const pn = P.planImport(null, incoming, 'new', deps()), pr = P.planImport(existing, incoming, 'replace', deps()), pm = P.planImport(existing, incoming, 'merge', deps()), pm2 = pm.ok ? P.planImport(pm.profile, incoming, 'merge', deps()) : { ok: false };
+    ok(pn.ok && canon(pn.profile.tower) === canon(incoming.tower) && pn.profile.tower.retries === 9 && pr.ok && canon(pr.profile.tower) === canon(incoming.tower) && pr.profile.id === existing.id && pm.ok && pm.report.tower === 'kept-local' && canon(pm.profile.tower) === canon(existing.tower) && pm.profile.tower.retries === 2 && J(pm.profile.tower.fewestRetries) === J({ '3v3': 5, '6v6': null }) && pm2.ok && canon(pm2.profile.tower) === canon(existing.tower), t('R4 IMPORT follows the record\'s rules: NEW carries the file\'s retries, REPLACE takes the file\'s in place of the profile\'s, MERGE keeps the profile\'s own (2 and a fewest of 5: the file\'s 9 and 2 are not added, and not taken), and merging again changes nothing'), J([pn.ok, pr.ok, pm.report]));
+    const mine = clone(FIX.cur); mine.trainerName = 'MINE'; const stored = clone(R0); stored.rev = 9; const kept = P.withStoredRecord(mine, stored);
+    ok(kept.trainerName === 'MINE' && canon(kept.tower) === canon(stored.tower) && kept.tower.retries === 9 && kept.tower !== stored.tower, t('R5 "Keep my edits here" carries the STORED Tower record, retries and all, into the edited profile'), '');
+    // the store: restoring a revision keeps the CURRENT retries
+    {
+      const adapter = ST.createMemoryAdapter({ name: 'rr-' + (++counter), durable: true }), store = await ST.openStore({ adapter, channel: false, deps: deps() });
+      const c = await store.createProfile({ trainerName: 'ASH' });
+      await store.towerUpdate(c.id, (tower) => ({ tower: { ...tower, runs: 1, retries: 4 } }));
+      const cur = await store.loadProfile(c.id); await store.saveProfile({ ...cur.profile, trainerName: 'EDIT1' }, { reason: 'edit' });
+      await store.towerUpdate(c.id, (tower) => ({ tower: { ...tower, runs: 2, wins: 1, winsByFormat: { '3v3': 1, '6v6': 0 }, retries: 6, fewestRetries: { '3v3': 2, '6v6': null } } }));
+      const h = await store.listHistory(c.id), back = await store.restoreRevision(c.id, h.find((x) => x.reason === 'edit').rev);
+      let refused = null; try { await store.towerUpdate(c.id, (tower) => ({ tower: { ...tower, retries: -1 } })); } catch (e) { refused = e; }
+      let refused2 = null; try { await store.towerUpdate(c.id, (tower) => ({ tower: { ...tower, fewestRetries: { '3v3': 2, '6v6': 0 } } })); } catch (e) { refused2 = e; }
+      ok(back.tower.retries === 6 && J(back.tower.fewestRetries) === J({ '3v3': 2, '6v6': null }) && back.trainerName === 'ASH' && refused && refused.code === 'store.invalid' && refused2 && refused2.code === 'store.invalid' && (await store.loadProfile(c.id)).profile.tower.retries === 6, t('R6 the store: going back to an older revision keeps the CURRENT retries (they are the Tower record\'s, not the edit\'s), and a step that would write a negative total or a fewest for a format never won is refused whole'), J([back.tower.retries, refused && refused.code]));
+    }
+    // repair: each retry key is its own field
+    const damaged = [['a negative total', (tw) => { tw.retries = -1; }, 'retries'], ['a total that is text', (tw) => { tw.retries = 'x'; }, 'retries'], ['a fewest that is a number', (tw) => { tw.fewestRetries = 5; }, 'fewestRetries'], ['a fewest for a format never won', (tw) => { tw.fewestRetries = { '3v3': 2, '6v6': 1 }; }, 'fewestRetries'], ['a last run with a negative count', (tw) => { tw.last.retries = -1; }, 'last']];
+    let dmg = '';
+    for (const [name, mod, field] of damaged) {
+      const d = withRetries(); mod(d.tower); const o = open(d);
+      if (!o.ok) { dmg = dmg || name + ': did not open'; continue; }
+      const tw = o.profile.tower, again = open(o.profile), rej = tw._unknown && tw._unknown.towerRejected;
+      if (P.checkProfile(o.profile).length || !o.problems.some((x) => x.code === 'profile.tower') || again.changed) dmg = dmg || name + ': not a well-formed fixed point';
+      else if (!rej || !(field in rej)) dmg = dmg || name + ': the damaged value was not kept in the bag: ' + J(rej);
+      else if (tw.runs !== R0.tower.runs || canon(tw.current) !== canon(R0.tower.current) || canon(tw.achievements) !== canon(R0.tower.achievements) || statsOf(o.profile) !== statsOf(R0) || !tw._unknown.futureTowerThing) dmg = dmg || name + ': the damage cost more than its field';
+      else if (field !== 'retries' && tw.retries !== 9) dmg = dmg || name + ': the total was lost with another field';
+      else if (name === 'a fewest for a format never won' && J(tw.fewestRetries) !== J({ '3v3': 2, '6v6': null })) dmg = dmg || name + ': ' + J(tw.fewestRetries);
+    }
+    ok(!dmg, t('R7 a damaged retry value (a negative or text total, a fewest that is not per format or names a format never won, a last run with a negative count) opens anyway, reported as repaired: it costs that one field (the bad value is kept in the record\'s bag), never the climb, the other retry keys, the achievements or the battle record'), dmg);
+    // what a build that did not know the keys parked in the bag comes back when this build opens the profile
+    {
+      const d = withRetries(), tw = d.tower; tw._unknown = { ...tw._unknown, retries: tw.retries, fewestRetries: tw.fewestRetries, towerRejected: { last: tw.last } }; delete tw.retries; delete tw.fewestRetries; tw.last = null;
+      const o = open(d), again = o.ok ? open(o.profile) : { changed: true };
+      ok(o.ok && o.changed === true && canon(o.profile.tower) === canon(R0.tower) && P.checkProfile(o.profile).length === 0 && !again.changed && !again.problems.length, t('R8 a profile an OLDER build repaired its own way (the retry keys moved into the record\'s bag of unknown values, the last run set aside) comes back whole when this build opens it: the record is, value for value, the one with the retries, and opening it again changes nothing'), J(o.ok && o.profile.tower._unknown));
+    }
+    // a whole climb with retries through the real store: every lost try is one write, a replayed loss writes nothing, the battle record is untouched
+    {
+      const adapter = ST.createMemoryAdapter({ name: 'rc-' + (++counter), durable: true }), store = await ST.openStore({ adapter, channel: false, deps: deps() });
+      const c = await store.createProfile({ trainerName: 'ASH' }), before = await store.loadProfile(c.id), persist = SS.storePersist(store, c.id);
+      let clock = 1000; const sess = SS.createTowerSession({ pack, persist, now: () => (clock += 7) });
+      await sess.startRun({ seed: 321, format: '3v3', team: null });
+      const fin = (result, tries) => sess.finishFloor({ floor: 2, seed: 321, result: { floor: 2, result, turns: 6, faints: 3 }, tries });
+      await sess.finishFloor({ floor: 1, seed: 321, result: { floor: 1, result: 'w', turns: 6, faints: 0 }, tries: 0 });
+      let tw = await persist.read(); await sess.pick({ seed: 321, id: tw.current.offer[0].id, floor: 2, offer: SS.offerKey(tw.current) });
+      const l1 = await fin('l', 0), rev1 = (await store.loadProfile(c.id)).profile.rev, replay = await fin('l', 0), rev2 = (await store.loadProfile(c.id)).profile.rev;
+      const mid = await persist.read(), l2 = await fin('l', 1), l3 = await fin('l', 2), l4 = await fin('l', 3);
+      const after = await store.loadProfile(c.id), h = await store.listHistory(c.id);
+      ok(l1.applied && l1.next.step === 'retry' && replay.applied === false && rev2 === rev1 && T.retriesOf(mid.current) === 1 && mid.current.floor === 2 && l2.applied && l3.applied && l4.applied && l4.finished && after.profile.tower.current === null && after.profile.tower.retries === 3 && after.profile.tower.last.retries === 3 && after.profile.tower.last.cleared === 1 && after.profile.tower.runs === 1 && statsOf(after.profile) === statsOf(before.profile) && canon(after.profile.teams) === canon(before.profile.teams) && h.length === 0 && P.checkProfile(after.profile).length === 0, t('R9 PROGRESS IS SAVED, ONCE: through the real store a lost floor is one write that leaves the run on its floor with a retry counted; the same loss sent again writes nothing (the revision does not move); the fourth loss ends the run with its 3 retries; the battle record, the teams and the history ring are untouched'), J([l1.next, replay.why, after.profile.tower.retries]));
+      const data = await HD.readHubData(store, pack, { towerSummary: SS.summarizeTower });
+      const mem = ST.createMemoryAdapter({ name: 'rn-' + (++counter), durable: false }), store2 = await ST.openStore({ adapter: mem, channel: false, deps: deps() });
+      await store2.createProfile({ trainerName: 'ASH' }); const data2 = await HD.readHubData(store2, pack, { towerSummary: SS.summarizeTower });
+      ok(data.notSaved === false && data.profiles[0].tower.saved === true && data.profiles[0].tower.last.retries === 3 && data.profiles[0].tower.record.retries === 3 && store2.status.notSaved === true && data2.notSaved === true && data2.profiles.length === 1 && data2.profiles[0].tower.saved === false, t('R10 the hub\'s reader hands the Tower its retries, and tells it whether the climb is being SAVED: true for a store that keeps profiles, false for a browser that is not keeping them (so the Tower never says "saved" there)'), J([data.profiles[0].tower.saved, data2.profiles[0] && data2.profiles[0].tower.saved]));
+    }
+  }
 }
 
 /* ------------------------------------------------------------------------------------------------ mutants */
@@ -404,8 +490,28 @@ const MUTANTS = [
   { id: 'restore-takes-tower-back', why: 'restoring an old revision of the teams takes the Tower record back with it', file: 'store.js', from: 'if (now && now.ok && !now.readOnly) restored.tower = now.profile.tower;', to: '', groups: ['S'] },
   { id: 'session-persist-aliases', why: 'the store persist hands the session a record it can write into', file: 'tower_session.js', from: "async update(fn) { const r = await store.towerUpdate(profileId, (tower) => fn(tower)); return { result: r.result, tower: r.after }; },", to: "async update(fn) { const r = await store.towerUpdate(profileId, (tower) => fn(tower)); return { result: r.result, tower: null }; },", groups: ['T'] },
   { id: 'snapshot-shares', why: 'a Tower team is not a snapshot of the saved team', file: 'tower_session.js', from: 'return { name: String(t.name).slice(0, 24), recs: r.recs, meta: r.meta };', to: 'return { name: String(t.name).slice(0, 24), recs: t.mons, meta: r.meta };', groups: ['T'] },
-  { id: 'hub-reader-no-summary', why: 'the hub reader gives profiles no Tower summary', file: 'hub_data.js', from: 'try { tower = opts.towerSummary(p.tower, pack); } catch (_e) { tower = null; }', to: 'tower = null;', groups: ['T'] },
-  { id: 'hub-reader-lets-it-throw', why: 'a throwing summariser takes the whole profile list down', file: 'hub_data.js', from: 'try { tower = opts.towerSummary(p.tower, pack); } catch (_e) { tower = null; }', to: 'tower = opts.towerSummary(p.tower, pack);', groups: ['T'] },
+  // ---- the retries (group R)
+  { id: 'retry-keys-refused-by-the-check', why: 'a record that has the retry keys is not a well-formed record (every profile with a retry fails its own check)', file: 'tower_record.js', from: "if (!TOWER_KEYS.includes(k) && !TOWER_KEYS_OPTIONAL.includes(k) && k !== '_unknown') bad.push('unknown field ' + k);", to: "if (!TOWER_KEYS.includes(k) && k !== '_unknown') bad.push('unknown field ' + k);", groups: ['R'] },
+  { id: 'retry-keys-copied-into-the-bag', why: 'the repair files the retry keys as unknown values too (every open rewrites the profile)', file: 'tower_record.js', from: "if (!TOWER_KEYS.includes(k) && !TOWER_KEYS_OPTIONAL.includes(k) && k !== '_unknown') setOwn(unk, k, src[k]);", to: "if (!TOWER_KEYS.includes(k) && k !== '_unknown') setOwn(unk, k, src[k]);", groups: ['R'] },
+  { id: 'last-retries-refused', why: 'a last run that has a retries count is not a run summary (LAST RUN is set aside on every open)', file: 'tower_record.js', from: 'if (!LAST_KEYS.includes(k) && !LAST_KEYS_OPTIONAL.includes(k)) return false;', to: 'if (!LAST_KEYS.includes(k)) return false;', groups: ['R'] },
+  { id: 'retry-mark-refused-by-the-parser', why: 'a run whose history marks a lost try cannot be read', file: 'tower.js', from: "'closest', 'life', 'retry', 'pick'];", to: "'closest', 'life', 'pick'];", groups: ['R'] },
+  { id: 'old-wins-read-as-not-won', why: 'a format won before retries existed has no fewest-retries figure', file: 'tower_record.js', from: "return isObj(tower) && isObj(tower.winsByFormat) && tower.winsByFormat[format] > 0 ? 0 : null;", to: 'return null;', groups: ['R'] },
+  { id: 'opening-old-data-writes-a-total', why: 'opening a profile stored before retries writes retries: 0 into it (every stored profile is rewritten)', file: 'tower_record.js', from: "  optional('retries', (v) => isInt(v, 0, TOWER_LIMITS.counterKeep));", to: "  optional('retries', (v) => isInt(v, 0, TOWER_LIMITS.counterKeep)); if (!('retries' in out)) out.retries = 0;", groups: ['R'] },
+  { id: 'retries-merge-takes-the-file', why: 'a merge takes the file\'s Tower record (its retries with it)', file: 'profile.js', from: "  report.record = 'kept-local';", to: "  p.tower = clone(incoming.tower);\n  report.record = 'kept-local';", groups: ['R'] },
+  { id: 'retries-replace-keeps-local', why: 'a replace keeps the old retries', file: 'profile.js', from: "    report.record = 'replaced';\n    report.tower = 'replaced';", to: "    p.tower = clone(existing.tower);\n    report.record = 'replaced';\n    report.tower = 'replaced';", groups: ['R'] },
+  { id: 'retries-keep-my-edits-drops-them', why: '"Keep my edits here" loses the stored retries', file: 'profile.js', from: "tower: stored.tower === undefined ? clone(mine.tower) : clone(stored.tower) };", to: "tower: clone(mine.tower) };", groups: ['R'] },
+  { id: 'retries-restore-takes-them-back', why: 'restoring an old revision takes the retries back with it', file: 'store.js', from: 'if (now && now.ok && !now.readOnly) restored.tower = now.profile.tower;', to: '', groups: ['R'] },
+  { id: 'retries-store-skips-validation', why: 'a negative retries total is written', file: 'store.js', from: "if (bad.length) throw new ValidationError('the Tower record would not be well formed: '", to: "if (false) throw new ValidationError('the Tower record would not be well formed: '", groups: ['R'] },
+  { id: 'retries-repair-keeps-a-bad-total', why: 'the repair keeps a retries total that is not a count', file: 'tower_record.js', from: "optional('retries', (v) => isInt(v, 0, TOWER_LIMITS.counterKeep));", to: "optional('retries', () => true);", groups: ['R'] },
+  { id: 'retries-repair-loses-the-bad-value', why: 'a bad retry value is thrown away instead of kept in the bag', file: 'tower_record.js', from: "if (valid(src[k])) out[k] = clone(src[k]); else rep(k, src[k], 'was invalid'); }", to: "if (valid(src[k])) out[k] = clone(src[k]); }", groups: ['R'] },
+  { id: 'retries-never-come-back-from-the-bag', why: 'the retry keys an older build parked never come back', file: 'tower_record.js', from: '    else if (bagIn && hasOwn.call(bagIn, k) && valid(bagIn[k])) { out[k] = clone(bagIn[k]); back.push(k); }\n', to: '', groups: ['R'] },
+  { id: 'parked-last-never-comes-back', why: 'the last run an older build set aside never comes back', file: 'tower_record.js', from: 'out.last = parkedLast ? clone(parkedLast) : null; lastBack = !!parkedLast;', to: 'out.last = null;', groups: ['R'] },
+  { id: 'session-forgets-the-try-of-a-result', why: 'a lost floor sent twice counts two retries (the result does not say which try it is for)', file: 'tower_session.js', from: "  if (tries !== undefined && tries !== tryNumber(cur)) return refuse('that try of the floor is over');          // a late", to: '  // a late', groups: ['R'], andAlso: { file: 'tower_session.js', from: 'const r = recordFloorResult(cur, result, { pack, cfg, tries });', to: 'const r = recordFloorResult(cur, result, { pack, cfg });' } },
+  { id: 'fold-forgets-the-retries-of-a-run', why: 'a finished run leaves no retries in the record', file: 'tower.js', from: '  if (retries > 0 || Number.isInteger(t.retries)) t.retries = (Number.isInteger(t.retries) ? t.retries : 0) + retries;\n', to: '', groups: ['R'] },
+  { id: 'hub-reader-always-says-saved', why: 'the hub tells the Tower the climb is saved in a browser that keeps nothing', file: 'hub_data.js', from: '{ saved: !out.notSaved }', to: '{ saved: true }', groups: ['R'] },
+  { id: 'summary-ignores-saved', why: 'the Tower summary says saved whatever it is told', file: 'tower_session.js', from: 'saved: saved !== false };', to: 'saved: true };', groups: ['R'] },
+  { id: 'hub-reader-no-summary', why: 'the hub reader gives profiles no Tower summary', file: 'hub_data.js', from: 'try { tower = opts.towerSummary(p.tower, pack, { saved: !out.notSaved }); } catch (_e) { tower = null; }', to: 'tower = null;', groups: ['T'] },
+  { id: 'hub-reader-lets-it-throw', why: 'a throwing summariser takes the whole profile list down', file: 'hub_data.js', from: 'try { tower = opts.towerSummary(p.tower, pack, { saved: !out.notSaved }); } catch (_e) { tower = null; }', to: 'tower = opts.towerSummary(p.tower, pack, { saved: !out.notSaved });', groups: ['T'] },
 ];
 
 async function runMutants() {
@@ -417,6 +523,7 @@ async function runMutants() {
       const target = path.join(dir, mu.file), text = fs.readFileSync(target, 'utf8'), n = text.split(mu.from).length - 1;
       if (n !== 1) { out.push({ id: mu.id, killed: false, why: 'THE MUTANT DID NOT APPLY (pattern found ' + n + 'x)' }); continue; }
       fs.writeFileSync(target, text.replace(mu.from, () => mu.to));
+      if (mu.andAlso) { const t2 = path.join(dir, mu.andAlso.file), x2 = fs.readFileSync(t2, 'utf8'); if (x2.split(mu.andAlso.from).length - 1 !== 1) { out.push({ id: mu.id, killed: false, why: 'THE MUTANT\'S SECOND EDIT DID NOT APPLY' }); continue; } fs.writeFileSync(t2, x2.replace(mu.andAlso.from, () => mu.andAlso.to)); }
       const before = { pass, fail, nf: failures.length }, saveQ = process.env.ARENA_QUIET; process.env.ARENA_QUIET = '1';
       let threw = null;
       try { const S2 = await loadStack(dir, mu.id); S2.matchctl = S0.matchctl; await suite(S2, mu.id, { groups: mu.groups, fast: true, dir, pack: PACK, rules: RULES }); } catch (e) { threw = e; }

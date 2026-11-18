@@ -5,14 +5,17 @@
 //
 // SESSIONS (tools/headless_cdp.mjs: one muted headless Chrome per session with a throwaway profile, bare CDP; AudioContext and the gamepad are test doubles)
 //   phone    390x844 @2x, TOUCH ONLY (the on-screen pad and taps on the canvas): a plain Quick Battle first, a run made in the real IndexedDB, TOWER row -> MY BUFFS -> FIGHT; floor 1 won; the offer by TOUCH
-//            (tap a ball -> "take this buff?" -> NO -> tap it again -> YES); floor 2 with that buff on the page; the second offer SKIPPED by touch; floor 3 LEFT through the pause menu = a loss that ENDS the run;
-//            the LAST RUN and ACHIEVEMENTS screens; the profile's career record is byte-identical to before the climb; a plain Quick Battle in the same browser plays EXACTLY the battle it played before
-//   desktop  1280x800, keyboard + the synthetic controller: a mid-fight RELOAD resumes the floor (and the floor counts once); the offer by CONTROLLER; a fight LEFT by a typed address is a loss; hostile Tower
-//            addresses are refused and write nothing; NEW RUN from the hub (a random team) opens floor 1 by itself
-//   residual  1280x800: START, START, B, NEW RUN, START in one tick makes ONE profile and ONE run; LEAVE TOWER before any choice DROPS the run (nothing counted); TWO TABS on one floor (the second is told it is a
-//            duplicate, and RELOADED it does not take over the first's fight: the fight counts as left); three reloads at #tower-last add nothing to the history, B, B still ends on the main menu, a Back arrival keeps Forward
+//            (tap a ball -> "take this buff?" -> NO -> tap it again -> YES); floor 2 with that buff on the page; the second offer SKIPPED by touch; floor 3, THE RETRIES: a loss (FORFEIT), RETRY FLOOR offered,
+//            the retry counted once, a reload at the result that does not count it again, LEAVE TOWER before a choice that costs nothing, the hub showing RETRY FLOOR 3 and RETRIES LEFT 2/3, a fight left
+//            mid-way that costs one retry while the run goes on, and the loss after the third retry of the floor that ENDS the run; what LEAVE TOWER / FORFEIT say it costs at each point;
+//            the LAST RUN (with its retries) and ACHIEVEMENTS screens; the profile's career record is byte-identical to before the climb; a plain Quick Battle in the same browser plays EXACTLY the battle it played before
+//   desktop  1280x800, keyboard + the synthetic controller: a mid-fight RELOAD resumes the floor (and the floor counts once); the offer by CONTROLLER; a fight LEFT by a typed address is a lost try (it costs
+//            one retry and the run goes on); hostile Tower addresses are refused and write nothing; NEW RUN from the hub gives the run under way up (counted, with its retry) and opens floor 1 of a new one
+//   residual  1280x800: START, START, B, NEW RUN, START in one tick makes ONE profile and ONE run; LEAVE TOWER before any choice costs NOTHING (the same run still waits); TWO TABS on one floor (the second is
+//            told it is a duplicate, and RELOADED it does not take over the first's fight: the fight counts as left, one retry); three reloads at #tower-last add nothing to the history, B, B still ends on the
+//            main menu, a Back arrival keeps Forward
 //   integrity  1280x800: a double START with no profile makes ONE profile and ONE run; no OPEN TO BATTLES in a Tower fight; the Tower has the result when the ENGINE ends the match (before the result screen), and
-//            a reload there shows "already counted"; B, B from #tower-offer and from #tower-last stay inside the hub; the note after a ball is taken shows; a regular battle still mounts OPEN TO BATTLES
+//            a reload there writes nothing (a won floor shows "already counted", a lost one opens its next try); four fights of a floor left in a row end the run; B, B from #tower-offer and from #tower-last stay inside the hub; the note after a ball is taken shows; a regular battle still mounts OPEN TO BATTLES
 // Every check that reads the store reads the REAL IndexedDB through the game's own store.js. Screenshots go to ARENA_OUT.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -92,6 +95,16 @@ const barOf = (page) => ev(page, `(() => { const b = document.getElementById('to
 const resultOpts = (page) => ev(page, `(() => { const v = ${B}.view(); return v.result ? v.result.options : null; })()`);
 // the pause menu: START opens it, UP wraps to the last row (LEAVE TOWER), A asks, UP flips to YES, A answers
 const LEAVE = `(() => { const a = ${B}; a.press('start'); a.press('up'); a.press('a'); a.press('up'); a.press('a'); return a.mode; })()`;
+// ... and its two questions, read off the scene: LEAVE TOWER is the last row (UP wraps to it), FORFEIT the row above. ASK opens the question and says what it asks; ANSWER(true) is YES, ANSWER(false) is NO
+const ASK = (row) => `(() => { const a = ${B}; a.press('start'); a.press('up'); ${row === 'forfeit' ? "a.press('up');" : ''} a.press('a'); const v = a.view(), c = a.scene.S.confirm; return { mode: a.mode, kind: c ? c.kind : null, text: v.preview ? v.preview.title : v.box && v.box.text ? v.box.text.join(' ') : null }; })()`;
+const ANSWER = (yes) => `(() => { const a = ${B}; ${yes ? "a.press('up'); a.press('a');" : "a.press('b');"} return a.mode; })()`;
+// lose the floor the run is on until the run is over, through the game's own session (the history checks of the residual session need a run that ENDED)
+const LOSE_OUT = (pid) => `(async () => { ${IMPORTS}
+  const store = await S.openStore();
+  try { const ses = TS.createTowerSession({ pack, persist: TS.storePersist(store, ${J(pid)}) }); let n = 0;
+    for (let g = 0; g < 8; g++) { const t = await ses.read(); if (!t.current) break; const r = await ses.finishFloor({ floor: t.current.floor, seed: t.current.seed, result: { floor: t.current.floor, result: 'l', turns: 3, faints: 3 } }); if (r && r.applied) n++; }
+    const t = await ses.read(); return { n, current: t.current, last: t.last, runs: t.runs };
+  } finally { await store.close(); } })()`;
 
 /* ---------------------------------------------------------------------------------------------------------------- the quick battle that must be the same before and after a climb */
 const QUICK = '?seed=11&format=3v3&cpu=easy';
@@ -219,27 +232,91 @@ try {
     const t3 = await until(async () => { const t = await tw(page, pid); return t.current && t.current.phase === 'battle' && t.current.floor === 3 ? t : null; });
     ok(!!t3 && t3.current.held.length === 1, tag + 'skipping takes nothing: still one buff, floor 3 is next', J(t3 && t3.current.held.length));
 
-    // ---- floor 3: LEFT in the middle = a loss, and with no Extra Life the run ENDS
+    // ---- floor 3, THE RETRIES (2026-11-17: a loss no longer ends the climb at once; every floor has three retries)
+    const toHubP = async () => { await page.waitFor(`location.pathname.endsWith('/pokemonarena/') && window.__arenaHub && ${HUB}.state === 'ready'`, { timeoutMs: 60000 }); await hubReady(page); };
+    const begin = async () => { const m = await ev(page, DRIVE("a.mode === 'action' && a.ctl.turn >= 1")); await until(async () => { const t = await tw(page, pid); return t.current && t.current.fighting; }); return m; };
+    const panelOf = () => page.eval(`${HUB}.model.view().tower.panel.lines`);
     await until(async () => (await where(page)) === 'tower');
     await tapRect(page, 0);
     ok((await toBattle(page)) === 'ready', tag + 'floor 3 opens');
-    ok((await ev(page, DRIVE("a.mode === 'action' && a.ctl.turn >= 1"))) === 'action', tag + 'floor 3 is played by hand to turn 1');
-    const t3b = await until(async () => { const t = await tw(page, pid); return t.current && t.current.fighting ? t : null; });
-    ok(!!t3b, tag + 'the profile now says the fight has BEGUN (leaving it from here on is a loss)');
-    await ev(page, LEAVE);
-    await page.waitFor(`location.pathname.endsWith('/pokemonarena/') && window.__arenaHub && ${HUB}.state === 'ready'`, { timeoutMs: 60000 });
-    await hubReady(page);
-    const t4 = await tw(page, pid);
-    ok(t4.current === null && t4.last && t4.last.cleared === 2 && t4.runs === 1, tag + 'LEAVE TOWER ended the run: no current run, a last run that cleared 2 floors, one run counted', J({ cur: t4.current, last: t4.last && t4.last.cleared, runs: t4.runs }));
+    bar = await barOf(page);
+    ok(/FLOOR 3/.test(bar.text) && /RETRIES 3\/3$/.test(bar.text), tag + 'the Tower bar shows the retries left on this floor: RETRIES 3/3', J(bar));
+    const askPre = await ev(page, ASK('quit')); await ev(page, ANSWER(false));
+    ok(askPre.kind === 'quit' && askPre.text === 'Leave? Costs nothing.', tag + 'before the first choice LEAVE TOWER asks "Leave? Costs nothing."', J(askPre));
+    ok((await begin()) === 'action', tag + 'floor 3 is played by hand to turn 1');
+    ok(!!(await tw(page, pid)).current.fighting, tag + 'the profile now says the fight has BEGUN (leaving it from here on is a lost try)');
+    const askQ = await ev(page, ASK('quit')); await ev(page, ANSWER(false));
+    const askF = await ev(page, ASK('forfeit'));
+    ok(askQ.kind === 'quit' && askQ.text === 'Leave? It costs 1 of the 3 retries left on this floor.' && askF.kind === 'forfeit' && askF.text === 'Give up? It costs 1 of the 3 retries left on this floor.', tag + 'after it LEAVE TOWER and FORFEIT both say what leaving costs NOW: 1 of the 3 retries left on this floor', J([askQ, askF]));
+    await shot(page, 'phone_7a_forfeit_ask');
+    await ev(page, ANSWER(true));                                                 // FORFEIT, YES: the floor is LOST
+    await finish(page);
+    ok((await ev(page, `${B}.ctl.winner`)) === 1, tag + 'floor 3 is lost (a forfeit)', String(await ev(page, `${B}.ctl.winner`)));
+    const oL = await resultOpts(page);
+    ok(J(oL) === J(['RETRY FLOOR', 'BACK TO TOWER', 'BACK TO HUB']), tag + 'after a loss with a retry left the result screen offers RETRY FLOOR first, then BACK TO TOWER, then BACK TO HUB', J(oL));
+    const tL1 = await until(async () => { const t = await tw(page, pid); return t.current && t.current.history.length === 3 && !t.current.fighting ? t : null; });
+    ok(!!tL1 && tL1.current.phase === 'battle' && tL1.current.floor === 3 && tL1.current.history[2].result === 'l' && tL1.current.history[2].retry === true && tL1.current.held.length === 1 && tL1.runs === 0 && tL1.last === null, tag + 'A LOSS NO LONGER ENDS THE CLIMB: the run is still on floor 3 with its buff, and the lost try is counted as ONE retry (nothing folded, no last run)', J(tL1 && tL1.current.history.map((h) => h.result + (h.retry ? '*' : ''))));
+    await shot(page, 'phone_7b_lost_result');
+    // a RELOAD at the result screen: the retry is not counted again; the page opens the next try of the floor
+    const revL = (await ev(page, READ(pid))).rev;
+    await ev(page, `window.__marker = 1; true`); await page.send('Page.reload', {});
+    await page.waitFor(`window.__marker === undefined && ${B} && (${B}.state === 'ready' || ${B}.state === 'error')`, { timeoutMs: 90000 });
+    const afterReload = await ev(page, READ(pid));
+    ok((await ev(page, `${B}.state`)) === 'ready' && (await ev(page, `${B}.tower.status`)) === 'ok' && (await ev(page, `${B}.tower.spec.tower.tries`)) === 1 && afterReload.rev === revL && J(afterReload.tower) === J(tL1), tag + 'A RELOAD AT THE RESULT DOES NOT COUNT IT AGAIN: the profile is untouched (the same revision), and the page opens the next try of floor 3 (try 1)', J({ st: await ev(page, `${B}.state`), rev: [revL, afterReload.rev] }));
+    bar = await barOf(page);
+    ok(/RETRIES 2\/3$/.test(bar.text), tag + 'whose bar says RETRIES 2/3', J(bar));
+    // LEAVE TOWER before any choice of that try is free; the hub shows the climb where it stands
+    await ev(page, LEAVE); await toHubP();
+    const tL2 = await tw(page, pid);
+    ok(J(tL2) === J(tL1) && (await where(page)) === 'tower', tag + 'LEAVE TOWER before the first choice of the new try cost nothing: the profile is as it was, and the hub opens on the Tower screen', await where(page));
+    const homeR = await labelsOf(page), panelR = await panelOf(), msgR = await page.eval(`${HUB}.model.view().msg`);
+    ok(homeR[0] === 'RETRY FLOOR 3' && homeR.includes('MY BUFFS') && homeR.includes('NEW RUN'), tag + 'THE HUB SHOWS RETRY FLOOR 3 (instead of FIGHT) as its first row', J(homeR));
+    ok(panelR[1] === 'FLOOR 3/30' && panelR[4] === 'RETRIES LEFT 2/3' && panelR[5] === 'RETRIES USED 1', tag + 'the status panel shows the floor, RETRIES LEFT 2/3 and RETRIES USED 1', J(panelR));
+    ok(J(msgR) === J(['The climb is saved on floor 3.', '2 of 3 retries left here, 1 used.']), tag + 'and the message says the climb is saved, how many retries this floor has left and how many the climb has used', J(msgR));
+    await shot(page, 'phone_7c_retry_home');
+    // RETRY FLOOR: a new try of the same floor, at its own address
+    await tapRect(page, 0);
+    ok((await toBattle(page)) === 'ready', tag + 'RETRY FLOOR opens floor 3 again');
+    const sR = await ev(page, 'location.search'), tagR = await ev(page, `${B}.tower.tag`);
+    ok(sR.includes('floor=3') && /[?&]try=1(&|$)/.test(sR) && /^tower:4242:3:1:[0-9a-f]+$/.test(tagR) && tagR !== tag2, tag + 'the address names the try (try=1), and so does the saved battle\'s tag', sR + ' ' + tagR);
+    // leaving MID-FIGHT costs one retry, and the run goes on
+    ok((await begin()) === 'action', tag + 'the retry is begun');
+    await ev(page, LEAVE); await toHubP();
+    const tL3 = await tw(page, pid);
+    ok(!!tL3.current && tL3.current.floor === 3 && tL3.current.history.length === 4 && tL3.current.history[3].retry === true && tL3.current.fighting === false && tL3.runs === 0 && tL3.last === null && (await where(page)) === 'tower', tag + 'LEAVING MID-FIGHT COSTS ONE RETRY AND THE RUN GOES ON: two retries counted, still floor 3, nothing folded; the hub opens on the Tower screen (not on a last run)', J({ h: tL3.current && tL3.current.history.length, path: await where(page) }));
+    const panel3 = await panelOf();
+    ok((await labelsOf(page))[0] === 'RETRY FLOOR 3' && panel3[4] === 'RETRIES LEFT 1/3' && panel3[5] === 'RETRIES USED 2', tag + 'the hub shows RETRY FLOOR 3 with RETRIES LEFT 1/3, RETRIES USED 2', J(panel3));
+    // the third retry: lost, and RETRY FLOOR on the result screen goes straight to the last try
+    await tapRect(page, 0);
+    ok((await toBattle(page)) === 'ready' && (await begin()) === 'action', tag + 'the second retry opens and is begun');
+    await ev(page, ASK('forfeit')); await ev(page, ANSWER(true)); await finish(page);
+    const tL4 = await until(async () => { const t = await tw(page, pid); return t.current && t.current.history.length === 5 && !t.current.fighting ? t : null; });
+    ok(!!tL4 && tL4.current.history.slice(2).every((h) => h.result === 'l' && h.retry === true) && tL4.current.floor === 3, tag + 'it is lost: the third retry of floor 3 is counted (3 used)', J(tL4 && tL4.current.history.length));
+    await tapSel(page, '#bA');                                                    // RETRY FLOOR (the first option)
+    await page.waitFor(`/[?&]try=3(&|$)/.test(location.search) && window.__arenaBattle && (${B}.state === 'ready' || ${B}.state === 'error')`, { timeoutMs: 90000 });
+    bar = await barOf(page);
+    ok((await ev(page, `${B}.state`)) === 'ready' && /RETRIES 0\/3$/.test(bar.text) && (await ev(page, `${B}.tower.spec.tower.tries`)) === 3, tag + 'RETRY FLOOR on the result screen opens the floor again at once (try=3); its bar says RETRIES 0/3: the last try', J(bar));
+    ok((await begin()) === 'action', tag + 'the last try is begun');
+    const askEnd = await ev(page, ASK('quit')); await ev(page, ANSWER(false));
+    ok(askEnd.text === 'Leave? No retry is left on this floor: the climb ends here.', tag + 'LEAVE TOWER now says that leaving ends the climb', J(askEnd));
+    await ev(page, ASK('forfeit')); await ev(page, ANSWER(true)); await finish(page);
+    const oEnd = await resultOpts(page);
+    ok(J(oEnd) === J(['TO THE TOWER', 'BACK TO HUB']), tag + 'the loss after the third retry: the result screen is the one a lost run always had', J(oEnd));
+    const t4 = await until(async () => { const t = await tw(page, pid); return t.current === null ? t : null; });
+    ok(!!t4 && t4.last && t4.last.cleared === 2 && t4.last.retries === 3 && t4.runs === 1 && t4.retries === 3, tag + 'THE LOSS AFTER THE THIRD RETRY OF A FLOOR ENDED THE RUN: no current run, a last run that cleared 2 floors with 3 retries, one run counted', J(t4 && { cur: t4.current, last: t4.last, runs: t4.runs }));
     ok(t4.best['3v3'] === 2 && t4.floors === 2, tag + 'the best floor for 3v3 is 2', J(t4.best));
+    await shot(page, 'phone_7d_end_result');
+    await tapSel(page, '#bA');                                                    // TO THE TOWER
+    await toHubP();
     ok((await where(page)) === 'tower-last', tag + 'the hub opens on the LAST RUN screen (#tower-last)', await where(page));
     const lv = (await hview(page)).tower;
-    ok(lv.state === 'ready' && lv.last.cleared === 2 && lv.last.format === '3v3', tag + 'it shows how far the climb got', J(lv.last && [lv.last.cleared, lv.last.format]));
+    ok(lv.state === 'ready' && lv.last.cleared === 2 && lv.last.format === '3v3' && lv.last.retries === 3, tag + 'it shows how far the climb got, and its 3 retries', J(lv.last && [lv.last.cleared, lv.last.format, lv.last.retries]));
     await shot(page, 'phone_7_last');
     await tapSel(page, '#bB'); await sleep(250);
     const hl = await labelsOf(page);
     ok(hl[0] === 'NEW RUN' && hl.includes('LAST RUN'), tag + 'the Tower screen now offers NEW RUN (and LAST RUN)', J(hl));
     ok((await page.eval(`${HUB}.model.view().tower.panel.lines[2]`)) === 'BEST 3v3 2', tag + 'the panel shows BEST 3v3 2');
+    ok((await page.eval(`${HUB}.model.view().tower.panel.lines[5]`)) === 'RETRIES 3', tag + 'and the retries of the finished climb: RETRIES 3');
     await tapRow(page, 'ach');
     const av = (await hview(page)).tower;
     const earnedIds = Object.keys(t4.achievements);
@@ -315,14 +392,15 @@ try {
     await page.waitFor(`${B} && ${B}.state === 'error'`, { timeoutMs: 60000 });
     const refused = await ev(page, `${B}.towerRefused`);
     ok(refused && refused.status === 'abandoned', tag + 'a typed address for a fight that was begun is refused as "abandoned"', J(refused));
-    ok(/loss/i.test(await ev(page, `document.body.innerText`)), tag + 'and the page says it counted as a loss');
+    const body2 = await ev(page, `document.body.innerText`);
+    ok(/loss/i.test(body2) && /cost one retry/.test(body2) && /2 of 3 retries are left on this floor/.test(body2) && /saved/.test(body2), tag + 'and the page says it counted as a loss that cost one retry, how many are left, and that the climb is saved', body2.slice(0, 200));
     const t3 = await tw(page, pid);
-    ok(t3.current === null && t3.last && t3.last.cleared === 1 && t3.runs === 1, tag + 'the run is over (no Extra Life): it cleared 1 floor', J({ cur: t3.current, last: t3.last && t3.last.cleared, runs: t3.runs }));
+    ok(!!t3.current && t3.current.floor === 2 && t3.current.phase === 'battle' && t3.current.fighting === false && t3.current.history.length === 2 && t3.current.history[1].retry === true && t3.runs === 0 && t3.last === null, tag + 'THE RUN GOES ON (a left fight costs one retry of the floor): still floor 2, one retry counted, nothing folded', J({ cur: t3.current && t3.current.floor, h: t3.current && t3.current.history.length, runs: t3.runs }));
     await shot(page, 'desk_4_refused');
 
     // ---- hostile addresses: refused, and nothing is written
     const before = J(await tw(page, pid));
-    const bad = ['?tower=1', '?tower=1&floor=0&run=5', '?tower=1&floor=31&run=5', '?tower=1&floor=abc&run=5', '?tower=2&floor=1&run=5', '?tower=1&floor=1&run=-1', '?tower=1&floor=1&run=99999999999', '?tower=1&floor=1&run=5&life=x',
+    const bad = ['?tower=1', '?tower=1&floor=0&run=5', '?tower=1&floor=31&run=5', '?tower=1&floor=abc&run=5', '?tower=2&floor=1&run=5', '?tower=1&floor=1&run=-1', '?tower=1&floor=1&run=99999999999', '?tower=1&floor=1&run=5&life=x', '?tower=1&floor=1&run=5&try=x', '?tower=1&floor=1&run=5&try=-1',
       '?tower=1&floor=1&run=5&p=../../x', '?tower=1&floor=1&run=5&team=ARENA1.AAAA', '?tower=1&floor=1&run=5&seed=1', '?tower=1&floor=1&run=5&np=host', '?tower=1&floor=1&run=5&p=' + 'x'.repeat(80)];
     const results = [];
     for (const q of bad) { const st = await openBattle(page, q); results.push([q, st, await ev(page, `${B}.tower === undefined || ${B}.tower === null`)]); }
@@ -330,7 +408,7 @@ try {
     ok(J(await tw(page, pid)) === before, tag + 'and none of them wrote anything to the profile');
     // `floor` / `run` / `life` / `p` WITHOUT tower=1 are not Tower parameters: the address is a regular one and they are ignored, as before the Tower existed
     const stray = [];
-    for (const q of ['?floor=1&run=5&seed=11&format=3v3&cpu=easy', '?p=1&seed=11&format=3v3&cpu=easy', '?life=2&run=7&seed=11&format=3v3&cpu=easy']) { const st = await openBattle(page, q); stray.push([q, st, await ev(page, `${B}.tower === undefined || ${B}.tower === null`)]); }
+    for (const q of ['?floor=1&run=5&seed=11&format=3v3&cpu=easy', '?p=1&seed=11&format=3v3&cpu=easy', '?life=2&run=7&seed=11&format=3v3&cpu=easy', '?try=2&seed=11&format=3v3&cpu=easy']) { const st = await openBattle(page, q); stray.push([q, st, await ev(page, `${B}.tower === undefined || ${B}.tower === null`)]); }
     ok(stray.every(([, st, none]) => st === 'ready' && none), tag + 'an address with floor / run / life / p but no tower=1 is a regular battle that ignores them (as the build before the Tower did)', J(stray));
     ok(J(await tw(page, pid)) === before, tag + 'and wrote nothing to the profile');
     const ghost = await openBattle(page, '?tower=1&floor=1&run=123456');
@@ -341,8 +419,12 @@ try {
     await page.send('Runtime.evaluate', { expression: `window.dispatchEvent(new Event('gamepadconnected'))` });
     await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(300);
     const h2 = await labelsOf(page);
-    ok(h2[0] === 'NEW RUN', tag + 'with the run over the Tower screen offers NEW RUN first', J(h2));
-    await key(page, 'a'); await sleep(250);
+    ok(h2[0] === 'RETRY FLOOR 2' && h2[2] === 'NEW RUN', tag + 'with the run still under way the Tower screen offers RETRY FLOOR 2 first (and NEW RUN as its third row)', J(h2));
+    await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(250);          // NEW RUN over a run: it asks first
+    ok(!!(await hview(page)).tower.confirm && /Give up/.test((await hview(page)).msg[0]), tag + 'NEW RUN over a run asks "Give up this climb?"', J((await hview(page)).msg));
+    await key(page, 'left'); await key(page, 'a'); await sleep(400);                                  // YES
+    const tGave = await until(async () => { const t = await tw(page, pid); return t.current === null ? t : null; });
+    ok(!!tGave && tGave.runs === 1 && tGave.last && tGave.last.won === false && tGave.last.cleared === 1 && tGave.last.retries === 1 && tGave.retries === 1, tag + 'YES gives the run up: it is counted where it stood (1 floor cleared, 1 retry)', J(tGave && { runs: tGave.runs, last: tGave.last }));
     ok((await where(page)) === 'tower-new' && J(await labelsOf(page)) === J(['TEAM', 'FORMAT', 'START', 'BACK']), tag + 'NEW RUN opens the team screen: TEAM / FORMAT / START / BACK');
     const tv = (await hview(page)).menu.rows;
     ok(tv[0].value === 'RANDOM TEAM' && tv[0].count === 2, tag + 'the choices are a random team and the saved team of six', J(tv[0]));
@@ -357,7 +439,7 @@ try {
     await page.waitFor(`location.pathname.endsWith('/pokemonarena/') && window.__arenaHub && ${HUB}.state === 'ready'`, { timeoutMs: 60000 });
     await hubReady(page);
     const t5 = await tw(page, pid);
-    ok(t5.current === null && t5.runs === 1 && J(t5.last) === J(t3.last), tag + 'leaving at once (no choice made) DROPS that run: nothing is counted (still one run, the last run is the earlier one)', J({ cur: t5.current, runs: t5.runs }));
+    ok(!!t5.current && t5.current.seed === t4.current.seed && t5.current.floor === 1 && t5.current.history.length === 0 && t5.current.fighting === false && t5.runs === 1 && J(t5.last) === J(tGave.last) && (await where(page)) === 'tower' && (await labelsOf(page))[0] === 'FIGHT: FLOOR 1', tag + 'leaving at once (no choice made) COSTS NOTHING: the new run still waits on floor 1 (it used to be dropped), nothing is counted, and the hub offers FIGHT: FLOOR 1', J({ cur: t5.current && t5.current.floor, runs: t5.runs }));
     ok(errsOf(page).filter((e) => !/status of (4\d\d)|Failed to load resource/.test(e)).length === 0, tag + 'no console errors', errsOf(page).slice(0, 2).join(' | '));
   });
 
@@ -389,12 +471,13 @@ try {
     ok(ended.winner !== null && ended.mode !== 'result', tag + 'the ENGINE has ended the match while the scene is still playing it out (not yet on the result screen)', J(ended));
     const rec = await until(async () => { const t = await tw(page, pid1); return (t.current === null && t.runs === 1) || (t.current && t.current.history && t.current.history.length === 1) ? t : null; }, 8000);
     const modeNow = await ev(page, `${B}.mode`);
-    ok(!!rec && modeNow !== 'result' && (rec.current ? rec.current.fighting === false && rec.current.attempt === 0 : rec.last && rec.last.won === false), tag + 'the Tower had ALREADY recorded the result (' + (rec && rec.current ? 'a win: the offer is open' : 'a loss: the run is over') + ') when the scene was not yet on the result screen (so closing the page there can no longer dodge a loss)', J({ mode: modeNow, cur: !!(rec && rec.current), runs: rec && rec.runs }));
+    ok(!!rec && modeNow !== 'result' && (rec.current ? rec.current.fighting === false && rec.current.attempt === 0 : rec.last && rec.last.won === false), tag + 'the Tower had ALREADY recorded the result (' + (rec && rec.current && rec.current.phase === 'offer' ? 'a win: the offer is open' : 'a loss: a retry is counted') + ') when the scene was not yet on the result screen (so closing the page there can no longer dodge a loss)', J({ mode: modeNow, cur: !!(rec && rec.current), runs: rec && rec.runs }));
     const afterEnd = J(await tw(page, pid1));
     await page.send('Page.reload', {});
     await page.waitFor(`${B} && (${B}.state === 'ready' || ${B}.state === 'error')`, { timeoutMs: 90000 });
-    ok((await ev(page, `${B}.state`)) === 'error' && (await ev(page, `${B}.towerRefused`)).status === 'stale' && /already counted/.test(await ev(page, `document.body.innerText`)), tag + 'RELOADING there shows "the result is already counted", not a fresh fight at the team preview', J(await ev(page, `${B}.towerRefused`)));
-    ok(J(await tw(page, pid1)) === afterEnd, tag + 'and nothing was written by the reload (counted once, no free retry, no second loss)');
+    if (rec && rec.current && rec.current.phase === 'offer') ok((await ev(page, `${B}.state`)) === 'error' && (await ev(page, `${B}.towerRefused`)).status === 'stale' && /already counted/.test(await ev(page, `document.body.innerText`)), tag + 'RELOADING there (the floor was won) shows "the result is already counted", not a fresh fight at the team preview', J(await ev(page, `${B}.towerRefused`)));
+    else ok((await ev(page, `${B}.state`)) === 'ready' && (await ev(page, `${B}.tower.status`)) === 'ok' && (await ev(page, `${B}.tower.spec.tower.tries`)) === 1, tag + 'RELOADING there (the floor was lost) opens the NEXT try of the floor: the lost one is counted, not offered again', J(await ev(page, `${B}.state`)));
+    ok(J(await tw(page, pid1)) === afterEnd, tag + 'and nothing was written by the reload (counted once: no second win, no second retry)');
 
     // ---- a run with the seeded team: the way back from a won floor lands on #tower-offer; B and B stay inside the hub
     const seeded = await ev(page, SEED_TEAM('MISTY', TEAM)); const pid = seeded.id;
@@ -436,7 +519,16 @@ try {
     await until(async () => { const t = await tw(page, pid); return t.current && t.current.fighting; });
     await ev(page, LEAVE);
     await toHubFromBattle();
-    ok((await where(page)) === 'tower-last', tag + 'LEAVE TOWER lands on the last-run screen (#tower-last)', await where(page));
+    ok((await where(page)) === 'tower' && (await labelsOf(page))[0] === 'RETRY FLOOR 2', tag + 'LEAVE TOWER mid-fight costs one retry and lands on the Tower screen, which offers RETRY FLOOR 2', (await where(page)) + ' ' + J(await labelsOf(page)));
+    // three more fights of floor 2, each begun and left: the floor's retries are used up, and the fourth one left ENDS the run
+    for (let i = 0; i < 3; i++) {
+      await key(page, 'a'); if ((await toBattle(page)) !== 'ready') break;
+      await ev(page, DRIVE("a.mode === 'action' && a.ctl.turn >= 1")); await until(async () => { const t = await tw(page, pid); return t.current && t.current.fighting; });
+      await ev(page, LEAVE); await toHubFromBattle();
+    }
+    const tEnd = await tw(page, pid);
+    ok(tEnd.current === null && tEnd.last && tEnd.last.cleared === 1 && tEnd.last.retries === 3 && tEnd.runs === 1, tag + 'the fourth fight of floor 2 that is left ENDS the run: its three retries were used up (1 floor cleared, 3 retries)', J({ cur: tEnd.current, last: tEnd.last }));
+    ok((await where(page)) === 'tower-last', tag + 'and that lands on the last-run screen (#tower-last)', await where(page));
     await ev(page, `window.__m = 8; true`);
     await pressB();
     ok((await where(page)) === 'tower', tag + 'B on the last-run screen is the Tower menu');
@@ -465,18 +557,16 @@ try {
     const ps1 = await ev(page, PROFILES);
     ok(ps1.length === 1 && ps1[0].tower.current && ps1[0].tower.current.floor === 1 && ps1[0].tower.runs === 0 && ps1[0].tower.last === null, tag + 'START, START, B, NEW RUN, START in one tick made exactly ONE profile and ONE run (none made and abandoned, none counted)', J(ps1.map((p) => [p.id, p.tower.runs, !!p.tower.current])));
     ok((await ev(page, `${B}.tower && ${B}.tower.status`)) === 'ok', tag + 'and the page that opened is the fight of that run (status ok: nothing was fighting)');
-    // ---- LEAVE TOWER before any choice: the run is DROPPED (no run counted, no Rock Bottom, no last run)
+    // ---- LEAVE TOWER before any choice: it costs NOTHING and changes nothing (THE RULE CHANGED 2026-11-17: it used to drop the run)
     await ev(page, LEAVE);
     await toHubFromBattle();
     const pq = await tower1();
-    ok(pq && pq.tower.current === null && pq.tower.runs === 0 && pq.tower.last === null && Object.keys(pq.tower.achievements).length === 0, tag + 'LEAVE TOWER with no choice made DROPPED the run: no current run, no run counted, no last run, no achievement', J(pq && { cur: pq.tower.current, runs: pq.tower.runs, last: !!pq.tower.last, ach: Object.keys(pq.tower.achievements) }));
-    ok((await where(page)) === 'tower', tag + 'and the hub opens on the Tower screen (not on a last-run screen: there is none)', await where(page));
-    // ---- a new run, tab A on its floor 1
+    ok(pq && J(pq.tower) === J(ps1[0].tower) && pq.tower.current && pq.tower.current.floor === 1 && pq.tower.current.history.length === 0 && pq.tower.runs === 0 && pq.tower.last === null && Object.keys(pq.tower.achievements).length === 0, tag + 'LEAVE TOWER with no choice made cost NOTHING: the record is exactly what it was (the same run still waits on floor 1; no run counted, no last run, no achievement)', J(pq && { cur: pq.tower.current && pq.tower.current.floor, runs: pq.tower.runs, last: !!pq.tower.last, ach: Object.keys(pq.tower.achievements) }));
+    ok((await where(page)) === 'tower' && (await labelsOf(page))[0] === 'FIGHT: FLOOR 1', tag + 'and the hub opens on the Tower screen, which still offers FIGHT: FLOOR 1', (await where(page)) + ' ' + J(await labelsOf(page)));
+    // ---- tab A on floor 1 of that run
     const pid = pq.id;
-    await key(page, 'a'); await sleep(250);
-    ok((await where(page)) === 'tower-new', tag + 'NEW RUN opens the team screen again');
-    await key(page, 'down'); await key(page, 'down'); await key(page, 'a');
-    ok((await toBattle(page)) === 'ready', tag + 'START opens floor 1 of the new run (tab A)');
+    await key(page, 'a');
+    ok((await toBattle(page)) === 'ready', tag + 'FIGHT opens floor 1 again (tab A)');
     const search = await ev(page, 'location.search');
     // ---- TWO TABS: the second tab opens the same floor BEFORE any choice (so it is not told the fight is left); A chooses first and marks the fight; B's first choice is refused as a duplicate
     const tabB = await page.openTab();
@@ -497,8 +587,11 @@ try {
     const bState = await ev(tabB, `({ state: ${B}.state, restored: ${B}.resume ? ${B}.resume.restored : null, reason: ${B}.resume ? ${B}.resume.reason : null, refused: ${B}.towerRefused || null })`);
     ok(bState.state === 'error' && bState.restored === false && /another page/.test(String(bState.reason)) && bState.refused && bState.refused.status === 'abandoned', tag + 'tab B reloaded does NOT take over tab A\'s fight: its saved battle is refused as another page\'s, and the fight is counted as left', J(bState));
     const afterB = await tw(page, pid);
-    ok(afterB.current === null && afterB.runs === 1 && afterB.last && afterB.last.won === false && afterB.last.cleared === 0, tag + 'so the abandoned scouting costs what leaving costs: the run is over, one run counted, a loss on floor 1', J({ cur: afterB.current, runs: afterB.runs, last: afterB.last && afterB.last.won }));
+    ok(!!afterB.current && afterB.current.floor === 1 && afterB.current.fighting === false && afterB.current.history.length === 1 && afterB.current.history[0].result === 'l' && afterB.current.history[0].retry === true && afterB.runs === 0, tag + 'so the abandoned scouting costs what leaving costs: ONE RETRY of floor 1 (and the run goes on)', J({ cur: afterB.current && afterB.current.history, runs: afterB.runs }));
     try { tabB.ws.close(); } catch (_e) { /* the tab dies with the browser */ }
+    // (the history checks below need a run that ENDED: the floor is lost three more times through the game's own session, which uses its retries up)
+    const lostOut = await ev(page, LOSE_OUT(pid));
+    ok(lostOut.current === null && lostOut.n === 3 && lostOut.last && lostOut.last.retries === 3 && lostOut.last.cleared === 0 && lostOut.runs === 1, tag + 'three more lost tries use the floor\'s retries up: the third of them ends the run (3 retries, one run counted)', J(lostOut));
 
     // ---- THE HISTORY: a hub screen opened by address is seeded ONCE; reloads add nothing, and B, B still ends on the main menu
     await page.navigate(BASE + '/pokemonarena/#tower-last');

@@ -5,9 +5,13 @@
 //   tower = unlock(tower, unlocked, Date.now());        // the CALLER stamps the time: this module has no clock
 //
 // Each achievement is { id, name, desc, grade (1..4, shown in the rarity colours green / blue / purple / gold), test(facts) }. `facts` (runFacts) is a plain object derived from the run and the Tower record.
+//
+// RETRIES AND WHAT THEY MUST NOT CHEAPEN (2026-11-17: a lost floor is tried again, up to three times a floor). A floor counts as won WITHOUT LOSING A POKEMON only when it was won on its FIRST TRY with no
+// faint: a floor that took a second try was lost once, with every Pokemon down, so it is not "clean" however the winning try went, and neither is one an Extra Life paid for. So the five "without losing a
+// Pokemon" achievements cannot be fished for by leaving a fight that is going badly, and a lost try breaks a streak. The others say what they always said: a retry does not make "clear floor 5" untrue.
 
 import { CONFIG } from './tower_config.js';
-import { sanitiseStamp } from './tower_record.js';
+import { sanitiseStamp, retriesOf } from './tower_record.js';
 import { FAMILIES, FAMILY_BY_ID, CATEGORIES, synergyState, tierOfPower } from './tower_buffs.js';
 
 const sub = (a, b) => a.filter((x) => !b.includes(x));
@@ -15,8 +19,10 @@ const sub = (a, b) => a.filter((x) => !b.includes(x));
 /** Everything the catalogue below asks about a run and the Tower record. */
 export function runFacts(run, tower, cfg = CONFIG) {
   const wins = run.history.filter((h) => h.result === 'w'), cleared = wins.length;
+  // a floor is CLEAN when it was won with no faint ON ITS FIRST TRY: no lost try of that floor is in the history (a loss that cost a retry or an Extra Life is a row of the floor it was fought on)
+  const lostFloors = new Set(run.history.filter((h) => h.result === 'l').map((h) => h.floor)), clean = (h) => h.result === 'w' && h.flawless === true && !lostFloors.has(h.floor);
   let streak = 0, best = 0;
-  for (const h of wins) { streak = h.flawless ? streak + 1 : 0; best = Math.max(best, streak); }
+  for (const h of wins) { streak = clean(h) ? streak + 1 : 0; best = Math.max(best, streak); }          // (a floor that took a second try is not clean, so a lost try ends a streak as a faint does)
   const picks = run.history.filter((h) => h.pick).map((h) => h.pick), pickCount = {};
   for (const p of picks) pickCount[p.id] = (pickCount[p.id] || 0) + 1;
   const common = (run.types.length ? run.types[0].filter((t, i, a) => a.indexOf(t) === i) : []).filter((t) => run.types.every((ts) => ts.includes(t)));
@@ -25,7 +31,7 @@ export function runFacts(run, tower, cfg = CONFIG) {
   const winTurns = wins.map((h) => h.turns).filter((t) => t >= 1);
   return {
     format: run.format, phase: run.phase, won: run.phase === 'won', cleared, bossFloors: wins.filter((h) => h.boss).map((h) => h.floor),
-    flawless: wins.filter((h) => h.flawless).length, flawlessStreak: best, bossFlawless: wins.some((h) => h.boss && h.flawless),
+    flawless: wins.filter(clean).length, flawlessStreak: best, bossFlawless: wins.some((h) => h.boss && clean(h)),
     noBuffAt: (n) => cleared >= n && wins.slice(0, n - 1).every((h) => h.pick === null || h.pick === undefined), taken: picks.length, skips: run.skips,
     minTurns: winTurns.length ? Math.min(...winTurns) : null, maxTurns: wins.length ? Math.max(...wins.map((h) => h.turns)) : 0,
     mono: run.types.length >= 1 && common.length > 0, rainbow: run.team.recs.length === 6 && new Set(run.types.map((t) => t[0])).size === 6,
@@ -34,7 +40,7 @@ export function runFacts(run, tower, cfg = CONFIG) {
     categories: new Set(picks.map((p) => FAMILY_BY_ID[p.id].cat)), cursed: picks.filter((p) => FAMILY_BY_ID[p.id].curse).length,
     synergies: syn.active.length, combos: syn.active.filter((s) => s.kind === 'combo').length,
     comeback: wins.some((h) => h.comeback), sweep: wins.some((h) => h.sweep), photoFinish: wins.some((h) => h.closest !== null && h.closest <= 5),
-    livesUsed: run.livesUsed, over: run.phase === 'over', floorsTotal: cfg.floors,
+    livesUsed: run.livesUsed, retries: retriesOf(run), over: run.phase === 'over', floorsTotal: cfg.floors,
     t: { runs: tower.runs, wins: tower.wins, floors: tower.floors, bosses: tower.bosses, winsByFormat: tower.winsByFormat, buffsSeen: allSeen.size },
   };
 }
@@ -50,11 +56,11 @@ ach('gatekeeper', 'Gatekeeper Down', 'Beat the floor 10 boss.', 2, (f) => f.boss
 ach('warden', 'Warden Down', 'Beat the floor 20 boss.', 3, (f) => f.bossFloors.includes(20));
 ach('tower-master', 'Tower Master', 'Clear the top floor and win the run.', 4, (f) => f.won);
 // flawless
-ach('flawless-floor', 'Not a Scratch', 'Win a floor without losing a Pokemon.', 1, (f) => f.flawless >= 1);
-ach('hat-trick', 'Hat Trick', 'Win three floors in a row without losing a Pokemon.', 2, (f) => f.flawlessStreak >= 3);
-ach('flawless-10', 'Spotless', 'Win ten floors in one run without losing a Pokemon.', 3, (f) => f.flawless >= 10);
-ach('untouchable-boss', 'Untouchable', 'Beat a boss without losing a Pokemon.', 3, (f) => f.bossFlawless);
-ach('flawless-run', 'Perfect Climb', 'Win the run without losing a single Pokemon on any floor.', 4, (f) => f.won && f.flawless === f.floorsTotal);
+ach('flawless-floor', 'Not a Scratch', 'Win a floor on the first try without losing a Pokemon.', 1, (f) => f.flawless >= 1);
+ach('hat-trick', 'Hat Trick', 'Win three floors in a row on the first try without losing a Pokemon.', 2, (f) => f.flawlessStreak >= 3);
+ach('flawless-10', 'Spotless', 'Win ten floors in one run on the first try without losing a Pokemon.', 3, (f) => f.flawless >= 10);
+ach('untouchable-boss', 'Untouchable', 'Beat a boss on the first try without losing a Pokemon.', 3, (f) => f.bossFlawless);
+ach('flawless-run', 'Perfect Climb', 'Win the run without a retry and without losing a single Pokemon on any floor.', 4, (f) => f.won && f.flawless === f.floorsTotal && f.retries === 0 && f.livesUsed === 0);
 // restraint
 ach('no-buff-5', 'Bare Hands', 'Clear floor 5 without taking any buff.', 2, (f) => f.noBuffAt(5));
 ach('no-buff-10', 'Purist', 'Beat the floor 10 boss without taking any buff.', 3, (f) => f.noBuffAt(10));
@@ -92,7 +98,7 @@ ach('sweep-floor', 'Clean Sweep', 'Win a floor with one Pokemon scoring every kn
 ach('photo-finish', 'Photo Finish', 'Win a floor with a Pokemon left at 5% HP or less.', 2, (f) => f.photoFinish);
 ach('second-wind', 'Second Chance', 'Spend an extra life.', 1, (f) => f.livesUsed >= 1);
 ach('phoenix', 'Phoenix', 'Spend an extra life and still win the run.', 4, (f) => f.livesUsed >= 1 && f.won);
-ach('rock-bottom', 'Rock Bottom', 'Lose on floor 1.', 1, (f) => f.over && f.cleared === 0);
+ach('rock-bottom', 'Rock Bottom', 'Run out of tries on floor 1.', 1, (f) => f.over && f.cleared === 0);          // (a run that is over with nothing cleared: the loss that ended it was on floor 1 with no retry left; a run given up there is dropped, not counted)
 // persistence
 ach('runs-3', 'Regular', 'Finish three runs.', 1, (f) => f.t.runs >= 3);
 ach('runs-10', 'Devoted', 'Finish ten runs.', 2, (f) => f.t.runs >= 10);

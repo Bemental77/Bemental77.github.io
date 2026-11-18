@@ -12,26 +12,28 @@
 //
 // WHAT HAPPENS WHEN (the rules, each tested):
 //   * A fight begins when the player makes the first choice of it (the team preview, or the first move): the run is marked `fighting`. Reloading the battle page resumes it. Arriving at a floor whose fight is
-//     marked, any other way (the tab was closed, the address typed again), means the earlier fight was LEFT: that counts as a loss on that floor (an Extra Life, if held, is spent). Leaving a fight is never a
-//     free retry; looking at a floor and leaving before choosing anything costs nothing.
-//   * A fight ends: a win opens the offer (or wins the run on the top floor), a loss spends a life or ends the run. A result is applied ONCE: the same result sent twice, or for another floor, changes nothing.
+//     marked, any other way (the tab was closed, the address typed again), means the earlier fight was LEFT: that counts as a loss on that floor (an Extra Life, if held, is spent; else it costs a retry, and
+//     ends the run when none is left). Leaving a fight is never free; looking at a floor and leaving before choosing anything costs nothing and writes nothing.
+//   * A fight ends: a win opens the offer (or wins the run on the top floor). A LOSS LEAVES THE RUN ON THE SAME FLOOR with everything it holds: it spends an Extra Life if one is held, else it counts a
+//     RETRY while one is left (cfg.retriesPerFloor / cfg.retriesPerRun: three per floor), and only a loss with neither ends the run. A result is applied ONCE: the same result sent twice, or for another
+//     floor, or for another TRY of the floor (`tries`: tower_record.js tryNumber, the lives spent + the retries counted when the fight began), changes nothing. So a lost try can never be counted twice.
 //   * A ball is taken (or the offer skipped): the run goes back to waiting for a fight.
 //   * A fight has an IDENTITY: the page that makes the first choice marks the run `fighting` with its own `attempt` number, and only that page can finish it (a second tab on the same floor cannot finish
-//     the first tab's fight, nor mark one of its own: the first tab's abandoned fight still counts as a loss). A result also names the try of the floor it is for (`lives`, the lives spent when the
-//     fight began), so a late or replayed result of an earlier try is refused after an Extra Life was spent. A ball is taken by the OFFER it was shown in (floor + offer key): an old screen cannot answer a new offer.
+//     the first tab's fight, nor mark one of its own: the first tab's abandoned fight still counts as a loss). A result also names the try of the floor it is for (`tries`, the try number when the
+//     fight began), so a late or replayed result of an earlier try is refused after an Extra Life was spent or a retry counted. A ball is taken by the OFFER it was shown in (floor + offer key): an old screen cannot answer a new offer.
 //   * A run that cannot be read (a stored run that passes the shallow check but not the deep parser) is DROPPED by give-up and by a new run, never folded; so is a run that cleared no floor (a run
-//     counts only when a floor was cleared, so starting and abandoning runs earns nothing). Leaving a floor on which no choice was made (the fight was never marked) is the same thing: on a run that cleared no
-//     floor it is DROPPED, not counted (reduceFinishFloor); once the first choice was made, leaving is a played loss.
+//     counts only when a floor was cleared, so starting and abandoning runs earns nothing). Leaving a floor on which no choice was made (the fight was never marked) changes NOTHING: the run waits for
+//     that fight as before (a quit result for a fight that was never begun is refused: reduceFinishFloor); once the first choice was made, leaving is a played loss.
 //   * Achievements are evaluated after every step, stamped with the caller's clock, and listed in the run that earned them.
 //   * A run that ends is folded into the record (best floor, wins, buffs seen...) and summarised in `last`; `current` is emptied.
 //   * NOTHING here writes the regular career. Tower results have no slot in `stats`.
 
 import { CONFIG, TIERS } from './tower_config.js';
-import { newRun, battleSetup, recordFloorResult, takeBuff, markFighting, abandonRun, foldRunInto, offerView, floorTrainer, livesLeft, mix, parseRun, isBoss } from './tower.js';
+import { newRun, battleSetup, recordFloorResult, takeBuff, markFighting, abandonRun, foldRunInto, offerView, floorTrainer, livesLeft, mix, parseRun, isBoss, retryInfo } from './tower.js';
 import { FAMILY_BY_ID, synergyState, describeOps, foeMods, tierOfPower, capOf } from './tower_buffs.js';
 import { evaluate, unlock, ACHIEVEMENTS, ACHIEVEMENT_BY_ID } from './achievements.js';
 import { randomTeam } from './matchctl.js';
-import { emptyTower } from './tower_record.js';
+import { emptyTower, tryNumber, fewestRetriesOf } from './tower_record.js';
 import { teamFromProfile } from './teamcode.js';
 import { teamFromMons } from './matchctl.js';
 
@@ -59,7 +61,12 @@ function conclude(tower, run, now, cfg) {
   return { tower: t, run: { ...f.run, earned }, newIds: ev.unlocked.slice() };
 }
 
-const nextOf = (run) => (run.phase === 'offer' ? { step: 'offer', floor: run.floor } : run.phase === 'battle' ? { step: run.livesUsed > 0 && run.history.length && run.history[run.history.length - 1].life ? 'retry' : 'fight', floor: run.floor } : { step: run.phase, floor: run.floor });
+/** Was the last try of the floor the run is on LOST (so the fight it waits for is a try again)? -> 'life' (an Extra Life was spent) | 'retry' (a retry was counted) | null. A lost try is the last row of a run in battle. */
+export function lostTry(run) {
+  const h = run && run.phase === 'battle' && Array.isArray(run.history) && run.history.length ? run.history[run.history.length - 1] : null;
+  return h && h.result === 'l' ? (h.life ? 'life' : 'retry') : null;
+}
+const nextOf = (run) => (run.phase === 'offer' ? { step: 'offer', floor: run.floor } : run.phase === 'battle' ? (lostTry(run) ? { step: 'retry', floor: run.floor, via: lostTry(run) } : { step: 'fight', floor: run.floor }) : { step: run.phase, floor: run.floor });
 
 /* ---------------------------------------------------------------------------------------------- reducers */
 
@@ -108,47 +115,48 @@ export function reduceBeginFloor(tower, { pack, floor, seed, navType = 'navigate
   if (!parseRun(cur, { pack: null, cfg }).ok) return { applied: false, status: 'stale', why: 'the run cannot be read' };          // a stored run that passes the shallow check but not the deep parser never opens a fight (the hub offers to drop it)
   if (cur.fighting) {
     if (navType === 'reload' || navType === 'back_forward') return { applied: false, status: 'resume', run: cur };
-    const lost = reduceFinishFloor(tower, { floor, seed, result: { floor, result: 'l', turns: 0, faints: 0 }, pack, now, cfg, attempt: cur.attempt >>> 0, lives: cur.livesUsed });          // (on behalf of the fight that was left)
+    const lost = reduceFinishFloor(tower, { floor, seed, result: { floor, result: 'l', turns: 0, faints: 0 }, pack, now, cfg, attempt: cur.attempt >>> 0, tries: tryNumber(cur) });          // (on behalf of the fight that was left)
     return { ...lost, status: 'abandoned' };
   }
   return { applied: false, status: 'ok', run: cur };
 }
 
 /**
- * The player made the first choice of the floor's fight: from now on leaving it counts as a loss. `attempt` is the page's own identity for this fight; `lives` the lives spent when it began.
+ * The player made the first choice of the floor's fight: from now on leaving it counts as a loss. `attempt` is the page's own identity for this fight; `tries` the try of the floor it is (the try number when it began).
  * Idempotent for the page that marked it; another page asking is refused with `taken: true` (the floor is being fought elsewhere).
  */
-export function reduceMarkFight(tower, { floor, seed, attempt, lives }) {
+export function reduceMarkFight(tower, { floor, seed, attempt, tries }) {
   const cur = tower.current;
   if (!cur || cur.seed !== seed) return refuse('no such run');
   if (cur.phase !== 'battle' || cur.floor !== floor) return refuse('the run is not waiting for that fight');
   if (!isAttempt(attempt)) return refuse('a fight needs an attempt number');
-  if (lives !== undefined && lives !== cur.livesUsed) return refuse('that try of the floor is over');
+  if (tries !== undefined && tries !== tryNumber(cur)) return refuse('that try of the floor is over');
   if (cur.fighting) return (cur.attempt >>> 0) === (attempt >>> 0) ? { applied: false, why: 'already marked', run: cur } : refuse('this floor is being fought in another page', { taken: true });
   const m = markFighting(cur, attempt);
   return { tower: { ...clone(tower), current: m.run }, applied: true, run: m.run };
 }
 
 /**
- * The fight of `floor` ended. `result` = match_stats' summary (viewSide 0) or { floor, result: 'w'|'l'|'d'|'f', turns, faints }. -> { tower, applied, run, events, next, newIds, finished } | { applied: false, why }
- * `next`: { step: 'offer' | 'retry' | 'over' | 'won', floor }.
+ * The fight of `floor` ended. `result` = match_stats' summary (viewSide 0) or { floor, result: 'w'|'l'|'d'|'f', turns, faints }. -> { tower, applied, run, events, next, newIds, finished, retries } | { applied: false, why }
+ * `next`: { step: 'offer' | 'retry' | 'over' | 'won', floor } (a 'retry' also says `via`: 'life' or 'retry'); `retries`: retryInfo of the run as the result left it (what the page tells the player).
+ * `tries` names the try of the floor the result is for: a result of another try is refused, which is what makes a lost try count ONCE (the first loss moves the run on to the next try).
  */
-export function reduceFinishFloor(tower, { floor, seed, result, pack = null, now = 0, cfg = CONFIG, attempt, lives }) {
+export function reduceFinishFloor(tower, { floor, seed, result, pack = null, now = 0, cfg = CONFIG, attempt, tries }) {
   const cur = tower.current;
   if (!cur || cur.seed !== seed) return refuse('no such run');
   if (cur.phase !== 'battle' || cur.floor !== floor) return refuse('the run is not waiting for that fight');
-  if (lives !== undefined && lives !== cur.livesUsed) return refuse('that try of the floor is over');          // a late or replayed result of an earlier try (an Extra Life has been spent since)
+  if (tries !== undefined && tries !== tryNumber(cur)) return refuse('that try of the floor is over');          // a late or replayed result of an earlier try (an Extra Life has been spent, or a retry counted, since)
   if (cur.fighting && (cur.attempt >>> 0) !== (attempt >>> 0)) return refuse('this floor is being fought in another page', { taken: true });          // only the page that marked the fight can finish it
-  // LEAVING BEFORE THE FIRST CHOICE: a quit ('f') of a floor whose fight was never marked, on a run that has cleared no floor, is not a played run: it is dropped exactly as the hub's give-up drops it (counted as nothing)
-  if (result && result.result === 'f' && !cur.fighting && !countable(cur, cfg)) return dropped(tower, cur);
-  const r = recordFloorResult(cur, result, { pack, cfg });
+  // LEAVING BEFORE THE FIRST CHOICE costs nothing and changes nothing: a quit ('f') of a floor whose fight was never marked is not a played fight, so it is refused and the run waits for that fight as before
+  if (result && result.result === 'f' && !cur.fighting) return refuse('no fight was begun', { unplayed: true });
+  const r = recordFloorResult(cur, result, { pack, cfg, tries });
   if (!r.applied) return refuse(r.why || 'the result was not applied');
   if (r.run.phase === 'over' || r.run.phase === 'won') {
     const c = conclude(tower, r.run, now, cfg);
-    return { tower: c.tower, applied: true, run: c.run, events: r.events, next: { step: r.run.phase, floor: r.run.floor }, newIds: c.newIds, finished: true };
+    return { tower: c.tower, applied: true, run: c.run, events: r.events, next: { step: r.run.phase, floor: r.run.floor }, newIds: c.newIds, finished: true, retries: retryInfo(c.run, cfg) };
   }
   const s = stamp(tower, r.run, now, cfg);
-  return { tower: { ...clone(s.tower), current: s.run }, applied: true, run: s.run, events: r.events, next: nextOf(s.run), newIds: s.newIds, finished: false };
+  return { tower: { ...clone(s.tower), current: s.run }, applied: true, run: s.run, events: r.events, next: nextOf(s.run), newIds: s.newIds, finished: false, retries: retryInfo(s.run, cfg) };
 }
 
 /** A ball is taken (`id`) or the offer is skipped (`id` null). -> { tower, applied, run, events, next, newIds } | { applied: false, why } */
@@ -183,8 +191,8 @@ export const buffName = (id) => (FAMILY_BY_ID[id] ? FAMILY_BY_ID[id].name : Stri
 /* ---------------------------------------------------------------------------------------------- the floor's battle */
 
 const fnv = (str) => { let h = 0x811c9dc5; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; } return h >>> 0; };
-/** What a saved battle must agree with to be resumed: the run, the floor, the lives spent and every buff held (battle_resume.js keeps it beside the choices). */
-export function towerTag(run) { return 'tower:' + run.seed + ':' + run.floor + ':' + run.livesUsed + ':' + fnv(JSON.stringify(run.held)).toString(16); }
+/** What a saved battle must agree with to be resumed: the run, the floor, the TRY of the floor (the lives spent + the retries counted) and every buff held (battle_resume.js keeps it beside the choices). */
+export function towerTag(run) { return 'tower:' + run.seed + ':' + run.floor + ':' + tryNumber(run) + ':' + fnv(JSON.stringify(run.held)).toString(16); }
 
 /**
  * The battle of the run's CURRENT floor as the match builder wants it (battle_boot.js resolveBattle's `spec`): the player's records carry the run's buffs, the trainer is the floor's, `validate: false` lets a
@@ -195,7 +203,7 @@ export function towerFloorSpec(pack, run, cfg = CONFIG) {
   return {
     pack, ruleset: s.ruleset, teams: [s.player.recs, s.foe.recs], meta: [s.player.meta, s.foe.meta], seed: s.seed, pick: s.pick, lead: s.lead, names: ['You', s.names[1]],
     sides: [{ kind: 'human' }, { kind: 'cpu', level: s.cpu.level, seed: s.cpu.seed }], cpu: s.cpu.level, format: run.format, trainer: s.names[1], validate: false,
-    tower: { floor: run.floor, boss: s.boss, seed: run.seed, lives: livesLeft(run, cfg), livesUsed: run.livesUsed, buffs: run.held.length, tag: towerTag(run), trainer: s.trainer, effects: s.effects },
+    tower: { floor: run.floor, boss: s.boss, seed: run.seed, lives: livesLeft(run, cfg), livesUsed: run.livesUsed, tries: tryNumber(run), retries: retryInfo(run, cfg), buffs: run.held.length, tag: towerTag(run), trainer: s.trainer, effects: s.effects },
   };
 }
 
@@ -257,15 +265,17 @@ export async function startTowerFloor({ pack, persist, floor, runId, navType = '
   const s = createTowerSession({ pack, persist, now, cfg });
   const b = await s.beginFloor({ floor, seed: runId, navType });
   if (!b || b.status === 'stale') return { ok: false, status: 'stale', why: b ? b.why : 'no answer' };
-  if (b.status === 'abandoned') return { ok: false, status: 'abandoned', applied: b.applied, next: b.next || null, newIds: b.newIds || [], why: 'the earlier fight of this floor was left, which counts as a loss' };
+  if (b.status === 'abandoned') return { ok: false, status: 'abandoned', applied: b.applied, next: b.next || null, newIds: b.newIds || [], retries: b.retries || null, why: 'the earlier fight of this floor was left, which counts as a loss' };
   const tower = await s.read();
   const cur = tower.current;
   if (!cur || cur.seed !== runId || cur.phase !== 'battle' || cur.floor !== floor) return { ok: false, status: 'stale', why: 'the run moved on' };
   let spec;
   try { spec = towerFloorSpec(pack, cur, cfg); } catch (e) { return { ok: false, status: 'error', why: String(e && e.message ? e.message : e).slice(0, 120) }; }
   // THE IDENTITY OF THIS FIGHT: a reload of a fight under way takes over the attempt the run already carries (it IS that fight); any other page makes its own number, which is what lets the run tell two pages apart
-  const lives = cur.livesUsed, attempt = b.status === 'resume' ? (cur.attempt >>> 0) : newAttempt(nonce, now);
-  return { ok: true, status: b.status, run: cur, spec, tag: spec.tower.tag, attempt, lives, markFight: () => s.markFight({ floor, seed: runId, attempt, lives }), finish: (result) => s.finishFloor({ floor, seed: runId, result, attempt, lives }) };
+  // ... and THE TRY IT IS: the try number the run had when this page opened the floor. The mark and the result both name it, so once a loss of this try has been counted (the run is then on the next try)
+  // nothing this page sends again, and nothing a page that opened the same try sends late, can be applied.
+  const tries = tryNumber(cur), attempt = b.status === 'resume' ? (cur.attempt >>> 0) : newAttempt(nonce, now);
+  return { ok: true, status: b.status, run: cur, spec, tag: spec.tower.tag, attempt, tries, markFight: () => s.markFight({ floor, seed: runId, attempt, tries }), finish: (result) => s.finishFloor({ floor, seed: runId, result, attempt, tries }) };
 }
 
 /* ---------------------------------------------------------------------------------------------- what the screens show */
@@ -283,10 +293,14 @@ const achView = (tower) => ACHIEVEMENTS.map((a) => ({ id: a.id, name: a.name, de
 
 /**
  * The Tower record as plain JSON for the screens (hub_data.js builds one per profile; the hub model keeps it and draws from it). Never throws: a run that cannot be read shows as `broken`.
- * { record, run: null | {...}, last, achievements: [51], earned (count), total }
+ * { record, run: null | {...}, last, achievements: [51], earned (count), total, saved }
+ * The RETRIES are in it three times: `record.retries` (over every finished run) and `record.fewestRetries` (per format: the fewest a won climb needed, null until one is won); `run.retry` (retryInfo:
+ * used, onFloor, left, cap, scope), `run.lostTry` ('life' | 'retry' | null: the last try of this floor was lost, so the fight that waits is a try again) and `run.tries`; `last.retries`.
+ * `saved` is false when the caller says the store is not keeping profiles (hub_data.js passes store.status.notSaved): the screens must then not say that the climb is saved.
  */
-export function summarizeTower(tower, pack, { cfg = CONFIG } = {}) {
-  const record = { best: { ...tower.best }, winsByFormat: { ...tower.winsByFormat }, runs: tower.runs, wins: tower.wins, floors: tower.floors, bosses: tower.bosses, buffsSeen: Object.keys(tower.buffsSeen).length };
+export function summarizeTower(tower, pack, { cfg = CONFIG, saved = true } = {}) {
+  const fewest = {}; for (const f of cfg.formats) fewest[f] = fewestRetriesOf(tower, f);
+  const record = { best: { ...tower.best }, winsByFormat: { ...tower.winsByFormat }, runs: tower.runs, wins: tower.wins, floors: tower.floors, bosses: tower.bosses, buffsSeen: Object.keys(tower.buffsSeen).length, retries: Number.isInteger(tower.retries) ? tower.retries : 0, fewestRetries: fewest };
   let run = null;
   const c = tower.current;
   if (c) {
@@ -298,7 +312,7 @@ export function summarizeTower(tower, pack, { cfg = CONFIG } = {}) {
       if (r.phase === 'battle' && pack) { try { const tr = floorTrainer(pack, { seed: r.seed, format: r.format, floor: r.floor }, cfg, foeMods(r.held, { cfg })); trainer = { name: tr.name, boss: tr.boss, cpu: tr.cpu.level, size: tr.recs.length }; } catch (_e) { trainer = null; } }
       run = {
         seed: r.seed, format: r.format, floor: r.floor, floors: cfg.floors, phase: r.phase, fighting: r.fighting, teamName: r.team.name, teamSize: r.team.recs.length,
-        lives: livesLeft(r, cfg), livesUsed: r.livesUsed, skips: r.skips, boss: isBoss(r.floor, cfg), cleared: r.history.filter((h) => h.result === 'w').length,
+        lives: livesLeft(r, cfg), livesUsed: r.livesUsed, retry: retryInfo(r, cfg), lostTry: lostTry(r), tries: tryNumber(r), skips: r.skips, boss: isBoss(r.floor, cfg), cleared: r.history.filter((h) => h.result === 'w').length,
         held: heldView(r, cfg), synergies: syn.active.map((s) => ({ id: s.id, name: s.name, text: s.text, kind: s.kind })), trainer,
         offer: r.phase === 'offer' ? { ...offerView(r, { pack, cfg }), key: offerKey(r) } : null, earned: r.earned.slice(),
       };
@@ -307,9 +321,9 @@ export function summarizeTower(tower, pack, { cfg = CONFIG } = {}) {
   let last = null;
   if (tower.last) {
     const l = tower.last;
-    last = { won: l.won, cleared: l.cleared, format: l.format, livesUsed: l.livesUsed, skips: l.skips, at: l.at,
+    last = { won: l.won, cleared: l.cleared, format: l.format, livesUsed: l.livesUsed, retries: Number.isInteger(l.retries) ? l.retries : 0, skips: l.skips, at: l.at,
       held: heldView({ held: l.held }, cfg), earned: l.earned.filter((id) => ACHIEVEMENT_BY_ID[id]).map((id) => ({ id, name: ACHIEVEMENT_BY_ID[id].name, grade: ACHIEVEMENT_BY_ID[id].grade })) };
   }
   const achievements = achView(tower);
-  return { record, run, last, achievements, earned: achievements.filter((a) => a.at !== null).length, total: achievements.length };
+  return { record, run, last, achievements, earned: achievements.filter((a) => a.at !== null).length, total: achievements.length, saved: saved !== false };
 }

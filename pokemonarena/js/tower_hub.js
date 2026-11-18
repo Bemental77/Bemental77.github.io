@@ -13,7 +13,8 @@
 //   { type: 'tower-giveup', profileId }                              GIVE UP was answered YES
 //   { type: 'screen', path, back? }                                  (hub_model's) a screen change
 //
-// SCREENS   tower          the status of the climb and its menu: FIGHT / CHOOSE A BUFF, MY BUFFS, NEW RUN, LAST RUN, ACHIEVEMENTS, TRAINER, BACK
+// SCREENS   tower          the status of the climb and its menu: FIGHT (RETRY FLOOR n when the last try of the floor was lost) / CHOOSE A BUFF, MY BUFFS, NEW RUN, LAST RUN, ACHIEVEMENTS, TRAINER, BACK.
+//                          The status window names the floor, the retries LEFT and the retries used; the message of RETRY FLOOR says that the climb is saved (tower_session.js summarizeTower: run.retry, run.lostTry, saved)
 //           tower-new      TEAM (a random one, or one of the trainer's saved legal teams), FORMAT, START, BACK
 //           tower-offer    the buff offer: balls in a row (the ROM's own Poke Ball sprites), the highlighted one open and described; A asks "take it?", the SKIP chip (Down, START, or a tap) asks "take nothing?", B steps back to the Tower menu
 //                          (the offer stays: it is in the profile, CHOOSE A BUFF is the menu's first row, and MY BUFFS is the next one)
@@ -113,7 +114,7 @@ export function speakTower(v) {
   const msg = (v.msg || []).filter(Boolean).join(' ');
   if (t.kind === 'tower-last') {
     const l = t.last;
-    parts.push(l ? (l.won ? 'The Tower was cleared.' : 'The climb ended.') + ' ' + l.cleared + ' of 30 floors cleared in ' + l.format + (l.livesUsed ? ', ' + l.livesUsed + (l.livesUsed === 1 ? ' extra life' : ' extra lives') + ' used' : '') + (l.skips ? ', ' + l.skips + ' offers skipped' : '') + '. ' + l.held.length + (l.held.length === 1 ? ' buff' : ' buffs') + ' held' + (l.held.length ? ': ' + l.held.map((b) => b.name).join(', ') : '') + '. ' + (l.earned.length ? l.earned.length + (l.earned.length === 1 ? ' achievement' : ' achievements') + ' earned: ' + l.earned.map((e) => e.name).join(', ') + '.' : 'No new achievement.') : 'No climb yet.');
+    parts.push(l ? (l.won ? 'The Tower was cleared.' : 'The climb ended.') + ' ' + l.cleared + ' of 30 floors cleared in ' + l.format + ', ' + (l.retries ? l.retries + (l.retries === 1 ? ' retry' : ' retries') : 'no retry') + (l.livesUsed ? ', ' + l.livesUsed + (l.livesUsed === 1 ? ' extra life' : ' extra lives') + ' used' : '') + (l.skips ? ', ' + l.skips + ' offers skipped' : '') + '. ' + l.held.length + (l.held.length === 1 ? ' buff' : ' buffs') + ' held' + (l.held.length ? ': ' + l.held.map((b) => b.name).join(', ') : '') + '. ' + (l.earned.length ? l.earned.length + (l.earned.length === 1 ? ' achievement' : ' achievements') + ' earned: ' + l.earned.map((e) => e.name).join(', ') + '.' : 'No new achievement.') : 'No climb yet.');
   } else if (t.kind === 'tower-buffs' && t.rows) {
     const r = t.rows[t.cursor];
     if (r) parts.push((t.tab === 0 ? 'Buff ' : 'Synergy ') + (t.abs + 1) + ' of ' + t.total + ': ' + r.name + (t.tab === 0 ? ', ' + r.rarity + ', power ' + r.power + (r.curse ? ', a curse' : '') : '') + '.');
@@ -122,7 +123,11 @@ export function speakTower(v) {
     const r = t.rows[t.cursor];
     if (r) parts.push('Achievement ' + (t.abs + 1) + ' of ' + t.total + ': ' + r.name + ', ' + ['', 'green', 'blue', 'purple', 'gold'][r.grade] + ', ' + (r.at === null ? 'not earned yet' : 'earned') + '.');
     if (msg) parts.push(msg);
-  } else if (msg) parts.push(msg);
+  } else {
+    // the Tower home: the status window is not text for a screen reader, so the floor and the retries are said here
+    if (t.kind === 'tower' && t.status) parts.push('Floor ' + t.status.floor + ' of ' + t.status.floors + '. ' + (t.status.retry ? retryWords(t.status.retry) : '') + (t.status.lives > 0 ? ' Extra lives: ' + t.status.lives + '.' : ''));
+    if (msg) parts.push(msg);
+  }
   if (t.balls) parts.push('Buffs: ' + t.balls.map((b, i) => (i === t.cursor ? 'selected ' : '') + b.rarity + ' ' + b.name + ': ' + b.effectText).join('; ') + '.');
   if (v.menu) parts.push(v.menu.rows.map((r, i) => (i === v.menu.cursor ? 'selected ' : '') + r.label + (r.value !== undefined ? ' ' + r.value : '')).join(', ') + '.');
   return parts.join(' ');
@@ -132,6 +137,26 @@ export const pitchFor = (n) => (n > 7 ? 12 : n > 6 ? 14 : 16);
 const cycle = (list, cur, dir) => list[(list.indexOf(cur) + dir + list.length) % list.length];
 const inR = (r, x, y) => x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h;
 const FORMATS = ['3v3', '6v6'];
+
+/* ---- the retries, in words (one place: the status window, the messages and the screen reader all read these) ---- */
+const hasRetries = (rt) => !!rt && (rt.scope === 'none' || rt.cap > 0);
+/** The status window's two retry lines for a run: ['RETRIES LEFT 2/3', 'RETRIES USED 5'] (one line, 'NO RETRIES', where the config hands out none). */
+export function retryLines(rt) {
+  if (!rt) return [];
+  if (!hasRetries(rt)) return ['NO RETRIES'];
+  const first = rt.scope === 'none' ? 'RETRIES NO LIMIT' : rt.cap > 9 ? 'RETRIES ' + rt.left + '/' + rt.cap : 'RETRIES LEFT ' + rt.left + '/' + rt.cap;
+  return [first, 'RETRIES USED ' + rt.used];
+}
+/** One message line: how many retries are left where, and how many the climb has used ("2 of 3 retries left here, 4 used."). */
+export function retryWords(rt) {
+  if (!rt) return '';
+  if (!hasRetries(rt)) return 'No retries: a loss ends the climb.';
+  if (rt.scope === 'none') return 'Retries used on this climb: ' + rt.used + '.';
+  if (rt.left === 0) return 'Last try: no retry left, ' + rt.used + ' used.';
+  return rt.left + ' of ' + rt.cap + ' retries left' + (rt.scope === 'floor' ? ' here' : '') + ', ' + rt.used + ' used.';
+}
+/** A number for the status window, held to five digits (a record's total can be large). */
+const short = (n) => (n > 99999 ? '99999+' : String(n));
 
 /** The centres of n balls in a row (shared with the renderer and the hit test). */
 export function ballCentres(n) {
@@ -185,7 +210,7 @@ export function createTowerHub(env) {
     if (!p) { rows.push({ id: 'new', kind: 'item', label: 'NEW RUN', disabled: env.dataState() !== 'ready' }, { id: 'back', kind: 'button', label: 'BACK' }); return rows; }
     if (r && r.broken) rows.push({ id: 'drop', kind: 'item', label: 'DROP THIS RUN' });
     else if (r && r.phase === 'offer') rows.push({ id: 'offer', kind: 'item', label: 'CHOOSE A BUFF' });
-    else if (r) rows.push({ id: 'fight', kind: 'item', label: 'FIGHT: FLOOR ' + r.floor });
+    else if (r) rows.push({ id: 'fight', kind: 'item', label: (r.lostTry ? 'RETRY FLOOR ' : 'FIGHT: FLOOR ') + r.floor });          // (the same row and the same effect: the last try of this floor was lost, so the fight that waits is a try again)
     if (r && !r.broken) rows.push({ id: 'buffs', kind: 'item', label: 'MY BUFFS' });
     rows.push({ id: 'new', kind: 'item', label: 'NEW RUN', disabled: !writable() || !t });
     if (t && t.last) rows.push({ id: 'last', kind: 'item', label: 'LAST RUN' });
@@ -215,11 +240,23 @@ export function createTowerHub(env) {
     if (env.dataState() === 'unavailable') return ['Your profile could not be read here.', 'Storage may be blocked.'];
     if (!p) return ['The Tower keeps your climb in a', 'trainer profile. A run makes one.'];
     switch (row && row.id) {
-      case 'fight': if (r.fighting) return ['You left a fight unfinished.', 'Fighting again counts it as a loss.']; return r.trainer ? ['Next: ' + r.trainer.name + (r.trainer.boss ? ' (BOSS)' : ''), r.trainer.size + ' Pokemon, CPU ' + r.trainer.cpu.toUpperCase() + '. A to fight.'] : ['Floor ' + r.floor + ' is waiting.', 'A to fight.'];
+      case 'fight':
+        // a fight that was begun and left: opening the floor again counts it as a lost try, and the message says what that costs
+        if (r.fighting) return ['You left a fight unfinished.', r.lives > 0 ? 'Coming back spends an Extra Life.' : !hasRetries(r.retry) ? 'Fighting again counts it as a loss.' : r.retry.left > 0 ? (r.retry.scope === 'none' ? 'That costs a retry.' : 'That costs 1 of the ' + r.retry.left + (r.retry.left === 1 ? ' retry' : ' retries') + ' left.') : 'No retry is left: the climb ends.'];
+        // the last try of this floor was lost: the climb is still here (it is in the profile), and the message says so, with the retries left and used
+        if (r.lostTry) return t.saved === false ? ['This climb is NOT being saved:', 'this browser keeps no profiles.'] : ['The climb is saved on floor ' + r.floor + '.', retryWords(r.retry)];
+        return r.trainer ? ['Next: ' + r.trainer.name + (r.trainer.boss ? ' (BOSS)' : ''), r.trainer.size + ' Pokemon, CPU ' + r.trainer.cpu.toUpperCase() + '. A to fight.'] : ['Floor ' + r.floor + ' is waiting.', 'A to fight.'];
       case 'offer': return ['Floor ' + (r.floor - 1) + ' is cleared!', 'Choose one buff to take along.'];
       case 'drop': return ['This run cannot be read.', 'A gives it up so you can start again.'];
       case 'buffs': return ['What you hold, and how the', 'buffs combine with each other.'];
-      case 'new': return !writable() ? ['This profile is from a newer', 'version, so the Tower cannot change it.'] : r ? ['Give up this climb and start', 'another. A asks first.'] : ['Climb ' + (t.run ? t.run.floors : 30) + ' floors of trainers.', 'Take a buff after every floor.'];
+      case 'new': {
+        if (!writable()) return ['This profile is from a newer', 'version, so the Tower cannot change it.'];
+        if (r) return ['Give up this climb and start', 'another. A asks first.'];
+        // a Tower that has been won: the record line, the fewest retries a won climb needed in each format
+        const fw = t.record && t.record.fewestRetries, won = fw ? FORMATS.filter((f) => fw[f] !== null && fw[f] !== undefined) : [];
+        if (won.length) return ['Fewest retries to win:', FORMATS.map((f) => f + ' ' + (fw[f] === null || fw[f] === undefined ? 'not won yet' : short(fw[f]))).join(', ') + '.'];
+        return ['Climb ' + (t.run ? t.run.floors : 30) + ' floors of trainers.', 'Take a buff after every floor.'];
+      }
       case 'last': return ['How your last climb ended', 'and what it earned.'];
       case 'ach': return [t.earned + ' of ' + t.total + ' earned.', 'Only the Tower earns them.'];
       case 'trainer': return ['Whose climb to show.', 'A or the arrows change it.'];
@@ -242,8 +279,10 @@ export function createTowerHub(env) {
     const t = tw(), r = liveRun();
     if (!prof() && env.dataState() === 'ready') return ['THE TOWER', '30 FLOORS', 'A BUFF AFTER', 'EVERY ONE', 'BOSSES 10 20 30'];
     if (!t) return ['THE TOWER', '', 'loading...'];
-    if (r) return ['THE TOWER', 'FLOOR ' + r.floor + '/' + r.floors, r.format + ' ' + (r.lives > 0 || r.livesUsed > 0 ? 'LIVES ' + r.lives : 'NO LIVES'), 'BUFFS ' + r.held.length, 'BEST ' + Math.max(t.record.best['3v3'], t.record.best['6v6'])];
-    return ['THE TOWER', t.run && t.run.broken ? 'BROKEN RUN' : 'NO RUN YET', 'BEST 3v3 ' + t.record.best['3v3'], 'BEST 6v6 ' + t.record.best['6v6'], 'WON ' + t.record.wins + ' OF ' + t.record.runs];
+    // a run: the floor, the format and the best floor, the buffs (and the lives, when there are or were any), then THE RETRIES: how many are left and how many the climb has used
+    if (r) return ['THE TOWER', 'FLOOR ' + r.floor + '/' + r.floors, r.format + ' BEST ' + Math.max(t.record.best['3v3'], t.record.best['6v6']), 'BUFFS ' + r.held.length + (r.lives > 0 || r.livesUsed > 0 ? ' LIVES ' + r.lives : '')].concat(retryLines(r.retry));
+    // no run: the record (and the retries of every finished climb, once there are some)
+    return ['THE TOWER', t.run && t.run.broken ? 'BROKEN RUN' : 'NO RUN YET', 'BEST 3v3 ' + t.record.best['3v3'], 'BEST 6v6 ' + t.record.best['6v6'], 'WON ' + t.record.wins + ' OF ' + t.record.runs].concat(t.record.retries > 0 ? ['RETRIES ' + short(t.record.retries)] : []);
   }
   /** The text the message box shows for the selected row of MY BUFFS / ACHIEVEMENTS, wrapped to the window: { key, lines, pages, page, msg: [two lines] } or null when no row is selected. */
   function textOf(path) {
@@ -287,7 +326,10 @@ export function createTowerHub(env) {
       const rs = menuRows(path), cur = S.cursor[path], row = rs[cur];
       out.menu = { rows: rs.map(({ values, ...r }) => r), cursor: cur };
       out.msg = S.confirm && path === 'tower' ? [S.confirm.kind === 'giveup' ? 'Give up this climb?' : '', S.confirm.kind === 'giveup' ? 'The run counts as over.' : ''] : (path === 'tower' ? helpHome(row) : helpNew(row));
-      out.tower = { kind: path, panel: { lines: path === 'tower' ? panelLines() : panelLines() }, confirm: S.confirm && path === 'tower' ? { cursor: S.confirm.cursor } : null, state: loading ? 'loading' : ready ? 'ready' : 'unavailable' };
+      const lr = liveRun();
+      out.tower = { kind: path, panel: { lines: path === 'tower' ? panelLines() : panelLines() }, confirm: S.confirm && path === 'tower' ? { cursor: S.confirm.cursor } : null, state: loading ? 'loading' : ready ? 'ready' : 'unavailable',
+        // the climb's status in plain values (the status window draws its lines; the screen reader says these)
+        status: path === 'tower' && lr ? { floor: lr.floor, floors: lr.floors, lostTry: lr.lostTry || null, retry: lr.retry ? { ...lr.retry } : null, lives: lr.lives, saved: !tw() || tw().saved !== false } : null };
       return out;
     }
     const r = liveRun();

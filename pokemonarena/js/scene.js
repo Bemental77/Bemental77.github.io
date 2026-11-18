@@ -1487,6 +1487,13 @@ export function createScene(opts) {
     else if (label === 'FORFEIT') { S.menu = null; S.overlay = null; S.mode = back; openConfirm('forfeit', back); }   // always asks (YES / NO), from the action menu, the team preview and the waiting screen alike
     else if (label === quitLabel) { S.menu = null; S.overlay = null; S.mode = back; if (S.ended || ctl.winner !== null) { if (hooks.onQuit) hooks.onQuit(); } else openQuitConfirm(back); }
   }
+  // The page may word the question that LEAVE (the pause menu's last row) and FORFEIT ask: opts.leaveAsk(kind: 'quit' | 'forfeit', where: 'box' | 'title') -> a string, or nothing to keep the scene's own
+  // words. A Tower floor uses it to say what leaving costs (tower_fight.js leaveAsk); every other battle passes no such option and reads exactly as before.
+  function leaveAsk(kind, where) {
+    if (typeof opts.leaveAsk !== 'function') return null;
+    let t = null; try { t = opts.leaveAsk(kind, where); } catch (_e) { t = null; }
+    return typeof t === 'string' && t.length > 0 && t.length <= 120 ? t : null;
+  }
   function openQuitConfirm(back) { S.confirm = { kind: 'quit', cursor: 1, back }; S.overlay = back === 'preview' ? { rows: ['YES', 'NO'], cursor: 1, w: 48, x: 120, y: 60 } : { rows: ['YES', 'NO'], cursor: 1, w: 48, x: 176 }; S.mode = 'confirm'; }
 
   /* ------------------------------------------------------------------------------------------- input */
@@ -1775,8 +1782,9 @@ export function createScene(opts) {
     if (m === 'confirm' && S.confirm && S.confirm.kind === 'free') return S.free && S.free.box ? S.free.box : S.lastBox;          // the typed question stays under the YES / NO box
     if (m === 'confirm' && S.confirm) {
       const k = S.confirm.kind;
-      const s = k === 'forfeit' ? msg('forfeit.ask', roles(viewSide)).split(/(?<=[?!.]) /)[0] : k === 'team' ? 'Send out this team?' : 'Leave this battle?';
-      if (k !== 'forfeit') fallbacks.add('confirm.' + k);
+      const own = k === 'forfeit' || k === 'quit' ? leaveAsk(k, 'box') : null;
+      const s = own || (k === 'forfeit' ? msg('forfeit.ask', roles(viewSide)).split(/(?<=[?!.]) /)[0] : k === 'team' ? 'Send out this team?' : 'Leave this battle?');
+      if (k !== 'forfeit' || own) fallbacks.add('confirm.' + k);
       return staticBox(setBoxText(s).lines(), false);
     }
     if (m === 'wait') return staticBox(setBoxText(rawMsg('wait', 'Waiting for the other player...')).lines(), false);
@@ -1802,7 +1810,7 @@ export function createScene(opts) {
       // The lead preview (6v6) asks "Choose a Pokemon." in the ROM's own party-menu words, and its question ("Send out this one first?": the ROM has no line for it, so it is listed in fallbacks as
       // 'confirm.lead') names no Pokemon so that it always fits the title row beside the foe's name; the whole team is numbered in the order the battle will send it out (the lead, then team order).
       const leadAsk = p.lead && p.picks.length >= p.pick;
-      const left = asking ? (S.confirm.kind === 'quit' ? 'Leave this battle?' : 'Give up this battle?') : p.lead ? (leadAsk ? 'Send out this one first?' : (msg('party.choose', roles(viewSide)) || 'Choose a Pokemon.')) : p.picks.length >= p.pick ? 'Send out this team?' : 'Choose ' + p.pick + ' (' + p.picks.length + '/' + p.pick + ')';
+      const left = asking ? (leaveAsk(S.confirm.kind, 'title') || (S.confirm.kind === 'quit' ? 'Leave this battle?' : 'Give up this battle?')) : p.lead ? (leadAsk ? 'Send out this one first?' : (msg('party.choose', roles(viewSide)) || 'Choose a Pokemon.')) : p.picks.length >= p.pick ? 'Send out this team?' : 'Choose ' + p.pick + ' (' + p.picks.length + '/' + p.pick + ')';
       if (asking || leadAsk || !p.lead) fallbacks.add(asking ? (S.confirm.kind === 'quit' ? 'confirm.quit' : 'confirm.forfeit.preview') : leadAsk ? 'confirm.lead' : 'preview.title');
       return { screen: 'preview', overlay: ov, preview: { mine: p.mine, foe: p.foe, picks: p.lead ? leadOrder(p) : p.picks, cursor: p.cursor, tick: S.tick, title: left, foeTitle: trainer, prompt: [] } };
     }

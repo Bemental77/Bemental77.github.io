@@ -68,7 +68,7 @@ export async function readHubData(store, pack, opts = {}) {
       } catch (_e) { record = { battles: 0, resettable: false, pages: buildRecordNotice('unavailable') }; }
       // the Tower's climb of this profile, summarised for the Tower screens (null while the Tower's code loads, or for a profile of a newer build, whose Tower record this build cannot read)
       let tower = null;
-      if (!r.readOnly && typeof opts.towerSummary === 'function') { try { tower = opts.towerSummary(p.tower, pack); } catch (_e) { tower = null; } }
+      if (!r.readOnly && typeof opts.towerSummary === 'function') { try { tower = opts.towerSummary(p.tower, pack, { saved: !out.notSaved }); } catch (_e) { tower = null; } }          // (saved: false when this browser is not keeping profiles, so the Tower never says a climb is saved when it is not)
       out.profiles.push({ id: p.id, name: p.trainerName, readOnly: !!r.readOnly, teams, record, tower });
     }
     if (st.notSaved && !out.profiles.length) { out.state = 'unavailable'; out.note = 'This browser is not keeping profiles.'; }

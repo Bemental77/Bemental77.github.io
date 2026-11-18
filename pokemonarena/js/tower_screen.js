@@ -53,10 +53,23 @@ export function createTowerScreen(ui, h) {
   function drawConfirm(f, c) { chip(f, TGEOM.yes, 'YES', c.cursor === 0); chip(f, TGEOM.no, 'NO', c.cursor === 1); }
 
   /* ------------------------------------------------------------------------------------------ the status window (home, new run) */
+  // A title and up to FIVE lines: four at the pitch the window always had (12 px), five (a run shows its two retry lines) at 10 px, the line height of the small font.
+  const PANEL_FONTS = ['small', 'smallNarrow'];
+  const panelPitch = (lines) => (lines.length > 5 ? 10 : 12);
   function drawPanel(f, lines) {
-    const P = TGEOM.panel;
+    const P = TGEOM.panel, pitch = panelPitch(lines);
     ui.drawWindow(f, P.x, P.y, P.w, P.h);
-    lines.forEach((ln, i) => { if (!ln) return; if (i === 0) textCentre(f, 'normal', ln, P.x + P.w / 2, P.y + 1, TEXT.dark); else text(f, h.fitFont(ln, P.w - 6, ['small', 'smallNarrow']), ln, P.x + 3, P.y + 19 + (i - 1) * 12); });
+    lines.forEach((ln, i) => { if (!ln) return; if (i === 0) textCentre(f, 'normal', ln, P.x + P.w / 2, P.y + 1, TEXT.dark); else text(f, h.fitFont(ln, P.w - 6, PANEL_FONTS), ln, P.x + 3, P.y + 19 + (i - 1) * pitch); });
+  }
+  /** Every line of a status window as it will be drawn: [{ what, px, max, bottom, floor }] (the tests check that each fits the window's width and height). */
+  function panelWidths(lines) {
+    const P = TGEOM.panel, pitch = panelPitch(lines);
+    return lines.map((ln, i) => (i === 0 ? { what: 'panel title', px: width('normal', ln), max: P.w - 6, bottom: P.y + 1 + 14, floor: P.y + P.h } : { what: 'panel line ' + i, px: ln ? width(h.fitFont(ln, P.w - 6, PANEL_FONTS), ln) : 0, max: P.w - 6, bottom: P.y + 19 + (i - 1) * pitch + 10, floor: P.y + P.h - 2 }));
+  }
+  /** The two lines under the title of the LAST RUN window: how far, in which format and with how many retries; then what it held, the lives and the skips. */
+  function lastLines(l) {
+    return [l.cleared + ' OF 30 FLOORS  ' + l.format + '  ' + (l.retries ? 'RETRIES ' + l.retries : 'NO RETRY'),
+      'BUFFS HELD ' + l.held.length + (l.livesUsed ? '  ' + l.livesUsed + (l.livesUsed === 1 ? ' LIFE USED' : ' LIVES USED') : '') + (l.skips ? '  ' + l.skips + ' SKIPPED' : '')];
   }
 
   /* ------------------------------------------------------------------------------------------ the offer */
@@ -144,8 +157,9 @@ export function createTowerScreen(ui, h) {
     const l = t.last;
     if (!l) { text(f, 'normal', 'NO CLIMB YET', D.x + 2, D.y + 1); return; }
     text(f, 'normal', l.won ? 'THE TOWER IS CLEARED!' : 'THE CLIMB ENDED', D.x + 2, D.y + 1, l.won ? COL.green : TEXT.dark);
-    text(f, 'small', l.cleared + ' OF 30 FLOORS  ' + l.format + (l.livesUsed ? '  ' + l.livesUsed + ' LIFE USED' : '') + (l.skips ? '  ' + l.skips + ' SKIPPED' : ''), D.x + 2, D.y + 16);
-    text(f, 'small', 'BUFFS HELD ' + l.held.length, D.x + 2, D.y + 27);
+    const ll = lastLines(l);
+    text(f, 'small', ll[0], D.x + 2, D.y + 16);
+    text(f, 'small', ll[1], D.x + 2, D.y + 27);
     let x = D.x + 2, y = D.y + 38;
     l.held.slice(0, 12).forEach((b) => { const nm = b.name; const w = width('small', nm) + 6; if (x + w > D.x + D.w - 4) { x = D.x + 2; y += 10; } if (y > D.y + 50) return; text(f, 'small', nm, x, y, ink(b.color)); x += w; });
     y = D.y + 62;
@@ -171,7 +185,9 @@ export function createTowerScreen(ui, h) {
         else if (t.kind === 'tower-last') drawLast(f, tt);
       }
     },
-    /** The widest line any Tower message needs (the tests check every one fits the message window). */
+    /** What the tests measure: the status window's lines (panelWidths) and the LAST RUN window's two lines (lastWidths), each with the room it has. */
+    panelWidths,
+    lastWidths: (l) => lastLines(l).map((ln, i) => ({ what: 'last line ' + (i + 1), px: width('small', ln), max: TGEOM.detail.w - 8 })),
     ball2x, wrap,
   };
 }

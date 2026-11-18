@@ -12,7 +12,7 @@
 //   seed=<u32>                  the battle seed (default: drawn once from crypto and written back into the address bar)
 //   format=6v6 | 3v3            6v6 = every Pokemon of both teams; 3v3 = team preview, each side picks 3 (Quick Battle defaults to 3v3)
 //   cpu=easy | normal | hard    the opponent's skill (default normal)
-//   tower=1&floor=N&run=<run seed>[&life=K][&p=<profile id>]   one FLOOR of a Pokemon Tower run (tower_launch.js has the contract; tower_fight.js is the logic, this page only wires it): the teams, seed, format and CPU
+//   tower=1&floor=N&run=<run seed>[&try=K][&p=<profile id>]   one FLOOR of a Pokemon Tower run (tower_launch.js has the contract; tower_fight.js is the logic, this page only wires it): the teams, seed, format and CPU
 //                               come from the run in the profile, and none of team / foe / seed / format / cpu / the online parameters may be given with it. See TOWER.md.
 // With no parameters the page starts a Quick Battle: two random legal teams under arena-gen3-standard. Anything that is not exactly one
 // of the forms above is refused with an error screen; the offending VALUE IS NEVER ECHOED, executed or put into the DOM.
@@ -529,7 +529,8 @@ async function main() {
         const left = await towerFight.leaveUnrestorable(); resumeStore.clear(); hook.towerRefused = { status: 'abandoned', why: 'the saved fight could not be resumed' };
         towerError(left.message, 'The last fight was left'); return;
       }
-      const sceneOpts = { ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: towerFight ? 'LEAVE TOWER' : 'BACK TO HUB', anim: animCfg, style: styleCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: mkHooks({ onResult: onResult, onMatchEnd: towerFight ? towerMatchEnd : recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); if (towerFight) { towerFight.onQuit(); return; } whenCareerSettled(() => navigate(HUB_PAGE_URL)); } }) };
+      const sceneOpts = { ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: towerFight ? 'LEAVE TOWER' : 'BACK TO HUB', leaveAsk: towerFight ? (kind, where) => towerFight.leaveAsk(kind, where) : undefined, anim: animCfg, style: styleCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: mkHooks({ onResult: onResult, onMatchEnd: towerFight ? towerMatchEnd : recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); if (towerFight) { towerFight.onQuit(); return; } whenCareerSettled(() => navigate(HUB_PAGE_URL)); } }) };
+      // (leaveAsk: LEAVE TOWER and FORFEIT say what leaving this fight costs NOW: nothing before the first choice, an Extra Life or one of the retries left after it, the climb when none is left)
       // the result buttons are read when the result screen comes up (scene.js startResult), so a Tower floor's can follow who won
       if (towerFight) Object.defineProperty(sceneOpts, 'resultOptions', { enumerable: true, get: () => resultOptionsFor() });
       scene = createScene(sceneOpts);
