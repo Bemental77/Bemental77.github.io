@@ -398,7 +398,7 @@ hub.faults()                                      // [] unless something of your
   `tick(n, held)`, `pause(bool)`, `frameHash()`, `canvasHash()`, `dialog` (the layer), `apps` (`ids`, `state()`, `family()`, `loaded()`, `errors()`, `ctl(id)`, `load(id)`, `idle(id)`,
   `effect(eff)`), `appEffects`, `appFaults`, `renderError`, `loopError`, `typed`, `dropped`.
 
-### The stubs (what is there until an app is written)
+### The stubs (what is there until an app is written, and what the shell's suite keeps as fixtures)
 
 | App | Path (parent) | What it does today |
 |---|---|---|
@@ -408,18 +408,20 @@ hub.faults()                                      // [] unless something of your
 
 ### When you replace a placeholder
 
-The three stubs are tested as what they are. These are ALL the places in the suites that know what a placeholder shows or does; everything else uses test-only apps (`fakeApp`,
-`typerApp` in `tools/pokemonarena_apps_test.mjs`), hand-made views, or the hub's own screens, and holds whatever your app becomes:
+**The shell's suite does not change when you do.** The three stubs live on as FIXTURES of `tools/pokemonarena_apps_test.mjs` (`tools/fixtures/pokemonarena/app-stubs/`, nine files): the
+suite lays them over the game's own `online_*`, `center_*` and `builder_*` files in every tree it loads in Node or serves to a browser, so its family X and its browser sessions go on
+testing the SHELL with them whatever your app becomes (it passes with the game's nine files replaced by files that throw). **Do not edit that suite or those fixtures for your app**: write
+your app's checks in a suite of your own. What your files must keep, because the registries and the fixture overlay rely on it: the nine file names, and the ids `online`, `center`,
+`builder` with a path of the same name each. A file of yours beyond the three (`center_net.js`, `builder_views.js`) is yours alone; the stubs do not import it.
+
+These are the places in the OTHER suites that know what a placeholder shows or does:
 
 | Where | What is tied to a placeholder |
 |---|---|
-| `tools/pokemonarena_apps_test.mjs`, family X (`checkStubs`) and the mutants with `fam: 'X'` | every row, effect, parent and ctl of the three stubs, and their pictures. Rewrite the part about your app, or move it to a suite of your own |
-| the same file's browser sessions | `keys`: the rows of PLAY ONLINE, the Center's seconds, the builder's NAME / TEAM CODE entries (the "a real keyboard types" and paste cases run on them), the dialog over the Center, the navigation cases (which walk `online`, `center` and `builder`), the throw / sound / held cases (which replace methods of the Center's model). `touch`, `pad`: the same rows. `broken`: a `builder_ctl.js` with no `createCtl`, a `center_screen.js` that throws, an `online_screen.js` whose `createScreen` throws. `control`: the builder's NAME entry. **What these prove about the shell must be kept**: point them at your screens |
 | `tools/pokemonarena_journey_test.mjs`, step 2 | TEAM BUILDER opens `builder`, then the row with id `editor` leaves for `editor.html` |
 | `tools/pokemonarena_hub_test.mjs` | nothing a stub shows: only that PLAY ONLINE opens `online` and TEAM BUILDER opens `builder` (address `#builder`, a title that contains "Team Builder") and that B returns |
 
-`hub.golden.json` holds no picture of a stub (the text entry and the dialog are drawn there over the main menu). The ids `online`, `center`, `builder`, and a path of the same name for
-each, are what the main menu, the registries and these suites rely on: keep them.
+`hub.golden.json` holds no picture of a stub (the text entry and the dialog are drawn there over the main menu).
 
 ### What the foundation left outside the picture
 
@@ -477,6 +479,7 @@ under `foreignHunks` with the reason, so the merge can be done by hand.
 | `js/center_hub.js`, `js/center_screen.js`, `js/center_ctl.js`, `js/center_net.js`, any new `js/center_*.js`, `js/world_rom.js` (fixes only), `center.html`, `tools/pokemonarena_center_test.mjs`, and the deletion of `center.css`, `js/center_boot.js`, `js/center_draw.js`, `js/center_map.js`, `js/avatar.js`, `dev/avatar_sheet.html` | CENTER |
 | `js/online.js`, `js/battle_boot.js`, `battle.html`, `battle.css`, any new `js/online_view.js` / `js/online_draw.js` / `js/battle_ask.js`, the BATTLE-page sessions of `tools/pokemonarena_online_page_test.mjs`, `ONLINE.md` | BATTLE |
 | `js/builder_hub.js`, `js/builder_screen.js`, `js/builder_ctl.js`, any new `js/builder_*.js`, `editor.html`, the deletion of the DOM editor (`js/editor_app.js`, `js/editor_views.js`, `js/editor_import.js`, `js/osk.js`, `editor.css`), `tools/pokemonarena_builder_*.mjs` (new), `tools/pokemonarena_editor_page_test.mjs`, `tools/pokemonarena_journey_test.mjs` | BUILDER |
+| `tools/pokemonarena_apps_test.mjs`, `tools/fixtures/pokemonarena/app-stubs/` | nobody. The shell's suite runs on its own fixture apps ("When you replace a placeholder"); it must stay green untouched. If it goes red, the cause is a change to the shell, not your app |
 | the shell: `js/boot.js`, `js/hub_model.js`, `js/hub_screen.js`, `js/hub_apps.js`, `js/hub_app_screens.js`, `js/hub_app_ctls.js`, `js/hub_dialog.js`, `js/hub_menu.js`, `js/textentry.js`, `js/textentry_screen.js`, `tools/pokemonarena_hub_test.mjs`, `hub.golden.json` | nobody: smallest hunks only, each reported. `hub.golden.json` is regenerated at the merge, so do not fight over it: run `--update` in your worktree and say which keys you changed |
 | `README.md`, `INAPP.md` | everybody, ADD-ONLY: your test lines next to the related ones in `README.md`; in `INAPP.md` ONE new section at the very end, `## <TRACK>: as built`. Do not reflow or reorder what is there |
 | the pure layers every track reads: `js/netmatch.js`, `js/online_match.js`, `js/openlobby.js`, `js/matchctl.js`, `js/engine*.js`, `lib/netplay.js`, `js/editor_state.js`, `js/editor_data.js`, `js/store.js`, `js/profile.js`, `js/rules.js`, `js/teamcode.js` | nobody edits these (a real bug found in one is reported, with a failing case, and fixed in the smallest hunk) |

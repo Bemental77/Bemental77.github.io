@@ -33,10 +33,10 @@
 //   control  a copy of the game whose keyboard capture is switched off: the "typing does not press buttons" check FAILS there (so it can fail)
 //   control2 a copy of the game whose history wiring takes its own step back for the browser's Back, and which lets a letter through under a question: the navigation check and the
 //            "typing does not answer a question" check FAIL there (so they can fail)
-// WHAT IS TIED TO THE THREE PLACEHOLDER APPS (online / center / builder: the only apps there are today): family X, and the rows the browser sessions press. Families A D E M I S use this
-// suite's own apps (fakeApp, typerApp) and hand-made views, so they hold whatever a product app becomes. When an app replaces its placeholder, its part of X and the browser cases that
-// press its rows are that app's to rewrite; what those cases proved about the SHELL (a real keyboard types, the paste, a dialog over an app screen, a ctl that cannot load) must be kept by
-// pointing them at the new screens. pokemonarena/INAPP.md "When you replace a placeholder" lists every such place in every suite.
+// THE THREE PLACEHOLDER APPS ARE FIXTURES OF THIS SUITE (tools/fixtures/pokemonarena/app-stubs/: online / center / builder as they were when the shell was written). They are laid over
+// the game's own online_* / center_* / builder_* files in EVERY tree this suite loads in Node or serves to a browser (layStubs, below). Family X and the rows the browser sessions press
+// are theirs; families A D E M I S use this suite's own apps (fakeApp, typerApp) and hand-made views. So this suite says what the SHELL does whatever the product apps become, and the
+// work that replaces a placeholder does not edit it: a product app is tested by its own suite.
 // Screenshots go to ARENA_OUT and are meant to be opened. Nothing ROM-derived is written anywhere else.
 import fs from 'node:fs';
 import os from 'node:os';
@@ -48,6 +48,12 @@ import { copyTree, mutateFile, startOverlay } from './pokemonarena_overlay.mjs';
 
 const { root, J, sleep, key, errsOf, tapLogical, clickLogical, logicalToPage, moveMouse, rightClick, padPress, tapSel, clickSel, AUDIO_DOUBLE, PAD_DOUBLE, addInit, BASE, CDP0, loadPct } = L;
 const SRC = path.join(root, 'pokemonarena', 'js');
+const STUB_DIR = path.join(root, 'tools', 'fixtures', 'pokemonarena', 'app-stubs');
+const STUB_FILES = ['online_hub.js', 'online_screen.js', 'online_ctl.js', 'center_hub.js', 'center_screen.js', 'center_ctl.js', 'builder_hub.js', 'builder_screen.js', 'builder_ctl.js'];
+/** Lay the placeholder apps over the nine app files of a js/ directory (a copy, never the game's own). */
+const layStubs = (jsDir) => { if (path.resolve(jsDir) === path.resolve(SRC)) throw new Error('the placeholder apps are never laid over the game itself'); for (const f of STUB_FILES) fs.copyFileSync(path.join(STUB_DIR, f), path.join(jsDir, f)); return jsDir; };
+/** A copy of pokemonarena/ for an overlay server, with the placeholder apps in it. */
+const stubbedCopy = (tmp) => { const d = copyTree(path.join(root, 'pokemonarena'), path.join(tmp, 'pokemonarena')); layStubs(path.join(d, 'js')); return d; };
 const ARGS = process.argv.slice(2);
 const UNIT_ONLY = ARGS.includes('--unit') || process.env.ARENA_SKIP_BROWSER === '1';
 const WANT_MUTANTS = !ARGS.includes('--no-mutants');
@@ -1114,19 +1120,26 @@ const FAMILIES = { A: checkHost, N: checkNav, G: checkGuards, D: checkDialog, E:
 const FAMILY_NAMES = { A: 'the registry and the delegation', N: 'navigation (the trail)', G: 'an app that throws', D: 'the dialog layer', E: 'the text entry model', M: 'the menu helper', X: 'the stubs and their ctls', I: 'the interface as it is written down', S: 'the renderers' };
 
 const tmpDirs = [];
-async function mutantStack(mu) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arena-apps-mut-')); tmpDirs.push(dir);
+// the game's js/ (flat), the placeholder apps laid over it, and the document the I family reads: what every family runs on, mutated or not
+function flatTree(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); tmpDirs.push(dir);
   for (const file of fs.readdirSync(SRC)) { const p = path.join(SRC, file); if (fs.statSync(p).isFile()) fs.copyFileSync(p, path.join(dir, file)); }
+  layStubs(dir);
+  fs.copyFileSync(path.join(root, 'pokemonarena', 'INAPP.md'), path.join(dir, 'INAPP.md'));
+  return dir;
+}
+async function mutantStack(mu) {
+  const dir = flatTree('arena-apps-mut-');
   const target = path.join(dir, mu.file), text = fs.readFileSync(target, 'utf8'), n = text.split(mu.find).length - 1;
   if (n !== 1) throw new Error('the text to replace occurs ' + n + ' times (must be 1)');
   fs.writeFileSync(target, text.replace(mu.find, () => mu.replace));
-  fs.copyFileSync(path.join(root, 'pokemonarena', 'INAPP.md'), path.join(dir, 'INAPP.md'));          // (the document the I family reads)
   return loadStack(dir);
 }
 
 let REAL = null;
 try {
-  REAL = await loadStack(SRC);
+  REAL = await loadStack(flatTree('arena-apps-real-'));
+  ok(STUB_FILES.every((f) => fs.readFileSync(path.join(REAL.dir, f), 'utf8') === fs.readFileSync(path.join(STUB_DIR, f), 'utf8')) && REAL.HA.APPS.map((a) => a.id).join() === 'online,center,builder', 'the tree under test is the game\'s js/ with the nine placeholder files of the fixture laid over it, and the registry still names online, center, builder', REAL.HA.APPS.map((a) => a.id).join());
   for (const [fam, check] of Object.entries(FAMILIES)) {
     let real; try { real = await check(REAL); } catch (err) { real = ['the checks threw: ' + (err && err.stack ? err.stack.split('\n').slice(0, 3).join(' | ') : err)]; }
     ok(real.length === 0, fam + '. ' + FAMILY_NAMES[fam] + ': every check passes', real.slice(0, 6).join(' ;; '));
@@ -1159,7 +1172,8 @@ const shot = async (page, name) => { try { await page.screenshot(path.join(OUT, 
 const rowY = (i, n = 6) => HM.GEOM.menu.y + i * HM.menuPitch(n) + (HM.menuPitch(n) >> 1);
 const mainY = (i) => rowY(i, 8);
 // a FRESH page every time (through about:blank): an address that differs only by its #hash would otherwise be a same-document step, not a boot
-async function boot(page, q = '', base = BASE) {
+let PAGE = BASE;          // where the sessions open the game: the overlay that serves it with the placeholder apps (set when the browser part starts)
+async function boot(page, q = '', base = PAGE) {
   await page.navigate('about:blank');
   await page.navigate(base + '/pokemonarena/' + q);
   await page.waitFor(`window.${HUB} && ${HUB}.state !== 'boot'`, { timeoutMs: 90000 });
@@ -1236,12 +1250,21 @@ async function coveredFacts(page, base) {
 }
 const COVERED_OK = (r) => r.open === true && r.dropped === 1 && r.under === true;
 
-let server = null;
+let server = null, stubOv = null, stubTmp = null;
 try {
   console.log('before the browser: ' + loadPct() + '; reaping leaked browsers');
   L.reapLeaks();
   server = await L.startServer();
   console.log('dev server up on ' + BASE + ' (node tools/devserver.mjs, Range-capable)');
+  stubTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'arena-apps-stubs-'));
+  stubOv = await startOverlay({ dir: stubbedCopy(stubTmp), port: L.PORT + 11, upstream: BASE });
+  PAGE = stubOv.url;
+  console.log('the game with the placeholder apps laid over it is served on ' + PAGE);
+  {
+    const served = await Promise.all(STUB_FILES.map(async (f) => (await (await fetch(PAGE + '/pokemonarena/js/' + f)).text()) === fs.readFileSync(path.join(STUB_DIR, f), 'utf8')));
+    const rest = (await (await fetch(PAGE + '/pokemonarena/js/hub_model.js')).text()) === fs.readFileSync(path.join(SRC, 'hub_model.js'), 'utf8');
+    ok(served.every(Boolean) && rest, 'every session runs the game\'s own shell with the nine placeholder files of the fixture (what the server hands out is byte for byte the fixture, and hub_model.js is the game\'s)', J(served) + ' ' + rest);
+  }
   fs.mkdirSync(OUT, { recursive: true });
   let cdp = CDP0;
 
@@ -1661,7 +1684,7 @@ try {
   if (wants('broken')) await runSession('a ctl that cannot load', { width: 1280, height: 800, port: cdp++ }, async (page) => {
     const tag = 'broken: ';
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'arena-apps-broken-'));
-    const d = copyTree(path.join(root, 'pokemonarena'), path.join(tmp, 'pokemonarena'));
+    const d = stubbedCopy(tmp);
     mutateFile(d, 'js/builder_ctl.js', 'export function createCtl(env) {', 'export function createCtlX(env) {');
     mutateFile(d, 'js/center_screen.js', '      const c = view.center; if (!c) return;', "      throw new Error('boom');");          // ... and whose Center renderer throws
     mutateFile(d, 'js/online_screen.js', "export function createScreen(ui, h) {\n  const TEXT = ui.TEXT;", "export function createScreen(ui, h) {\n  throw new Error('no art');");          // ... and whose PLAY ONLINE renderer cannot even be made
@@ -1738,7 +1761,7 @@ try {
   if (wants('control')) await runSession('typing negative control', { width: 1280, height: 800, port: cdp++ }, async (page) => {
     const tag = 'control: ';
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'arena-apps-ctl-'));
-    const d = copyTree(path.join(root, 'pokemonarena'), path.join(tmp, 'pokemonarena'));
+    const d = stubbedCopy(tmp);
     mutateFile(d, 'js/boot.js', "    if (!typingNow() || e.defaultPrevented) return;\n    if (e.repeat && !heldAsText.has(e.code || e.key)) return;", "    return;");
     const ov = await startOverlay({ dir: d, port: L.PORT + 13, upstream: BASE });
     try {
@@ -1755,7 +1778,7 @@ try {
     const good = { nav: await navFacts(page), covered: await coveredFacts(page) };
     ok(NAV_OK(good.nav) && COVERED_OK(good.covered), tag + 'on the real page: two moves back to back end on the second, with its own history entry; a letter typed while a question covers a text entry is dropped and the question stays', J(good));
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'arena-apps-ctl2-'));
-    const d = copyTree(path.join(root, 'pokemonarena'), path.join(tmp, 'pokemonarena'));
+    const d = stubbedCopy(tmp);
     mutateFile(d, 'js/boot.js', "    if (ours) syncHistory();", "    if (false) syncHistory();");          // the landing of the page's own step back is taken for the browser's Back button
     mutateFile(d, 'js/boot.js', "    if (coveredNow()) { dropCovered(e); return; }\n", '');          // a letter typed under a question goes on to the input layer
     const ov = await startOverlay({ dir: d, port: L.PORT + 14, upstream: BASE });
@@ -1766,6 +1789,8 @@ try {
     } finally { ov.stop(); try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_e) { /* ignore */ } }
   });
 } finally {
+  if (stubOv) stubOv.stop();
+  if (stubTmp) { try { fs.rmSync(stubTmp, { recursive: true, force: true }); } catch (_e) { /* ignore */ } }
   L.stopServer(server);
   L.reapLeaks();
 }
