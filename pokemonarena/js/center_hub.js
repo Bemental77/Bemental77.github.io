@@ -39,7 +39,8 @@ export function createCenterHub(ctx) {
       return { ...base, screen: path, app: ID, mascot: null, menu: menu.view(rows()), msg: ['The Trainer Center is moving', 'into this picture.'],
         center: { title: 'THE CENTER', seconds: secs, lines: ['HERE FOR ' + secs + ' s', a ? 'ANSWER: ' + String(a.value).toUpperCase() : ''] } };
     },
-    speak(v) { return 'Trainer Center. ' + (v.msg || []).join(' ') + ' You have been here ' + v.center.seconds + ' seconds. Back.'; },
+    // (the words do NOT carry the seconds: the page puts them in a polite live region whenever they change, and a text that changes every second would be read out every second)
+    speak(v) { return 'Trainer Center. ' + (v.msg || []).join(' ') + ' Back.'; },
     title: () => 'Pokemon Arena - Trainer Center',
     state: () => ({ ticks: S.ticks, answer: S.answer ? { ...S.answer } : null }),
   };

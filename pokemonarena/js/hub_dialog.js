@@ -7,25 +7,36 @@
 //   d.open({ id: 'challenge', app: 'online', pages: [['RED wants to battle you.', '3v3, standard rules.']], choice: { options: ['YES', 'NO'], cursor: 1 }, ticksLeft: 1800 });   // -> true
 //   d.press('up'); d.press('a');            // -> [{ type: 'dialog', id: 'challenge', value: 0, app: 'online' }]   (the answer is an EFFECT; hub_model.js also tells the app's model: app.onDialog(id, value))
 //
-// A DIALOG   { id, pages, choice, ticksLeft?, app? }
+// A DIALOG   { id, pages, choice, ticksLeft?, armTicks?, app? }
 //   id         a non-empty string (at most 64 characters): names the question in its answer
 //   pages      1..16 pages; a page is one or two lines (a string is a one-line page). A turns the page; the options are shown with the LAST page
 //   choice     null (a notice: A / B / a tap closes it, value 'closed') or { options: 1..4 non-empty strings, cursor: the option highlighted first }
 //   ticksLeft  optional: frames (hub ticks, 59.7275 a second) until the dialog answers 'timeout' by itself. Counted only while the dialog is the one SHOWN (a queued dialog does not age)
+//   armTicks   optional (default 0, at most DIALOG_ARM_MAX): for that many ticks after the dialog becomes the one shown it ANSWERS NOTHING and turns no page: not on A, not on B, not on a click
+//              or a tap. The highlight can be moved meanwhile and the timeout still counts. A QUESTION THE PLAYER DID NOT ASK FOR (a challenge, anything that opens from the network or a timer)
+//              MUST PASS IT (DIALOG_ARM_TICKS, 0.6 s): the A that was already on its way to the menu underneath must not accept a battle. A dialog whose ticksLeft would run out before it is
+//              armed is refused
 //   app        optional: the id of the hub app that asked. The answer effect then carries `app`, so boot.js hands it to that app's ctl and hub_model.js to that app's model
 // THE ANSWER { type: 'dialog', id, value, app? }   value = the index of the option chosen | 'timeout' | 'closed' (a notice was read to its end, or dismissed with B)
 // INPUT      A        the next page; on the last page: the highlighted option (a notice: closes)
 //            B        the LAST option (NO), from any page (a notice: closes)
-//            d-pad    up / left = the option above, down / right = the option below (they wrap); L / R likewise
+//            d-pad    up / left = the option above, down / right = the option below (they wrap); L / R likewise. ONE PRESS, ONE STEP: the repeats of a HELD direction (press(action, { repeat:
+//                     true })) never move the highlight, so a direction held since before the question appeared cannot drift it from NO onto YES
 //            pointer  move / down on an option highlights it, a click on it chooses it; a click on the message box is A while there are pages to turn or when the dialog is a notice
 //                     (it never chooses an option: a stray tap on the text must not answer YES); a click anywhere else does nothing. The wheel moves the highlight
 // A SECOND open() WHILE ONE IS OPEN IS QUEUED (first in, first shown), up to DIALOG_QUEUE_MAX dialogs in all. open() REFUSES (returns false, changes nothing) a malformed dialog, an id that is already
-// open or queued, and a full queue. close(id) removes that dialog whether it is shown or queued and emits NO effect (the caller that closes it knows).
+// open or queued, and a full queue. close(id) removes that dialog whether it is shown or queued and emits NO effect (the caller that closes it knows); closeOwn(id, app) does so only for a
+// dialog that was opened for that app (what an app's ctx.dialog.close is: an app cannot close another's question).
+// TEXT       a line or an option may hold any text: what the ROM font cannot draw (a character it lacks, a {...} that is not one of its tokens) is drawn as "?" by battle_ui.js safeText.
 
 export const DIALOG_MAX_OPTIONS = 4;
 export const DIALOG_MAX_PAGES = 16;
 export const DIALOG_QUEUE_MAX = 8;
 export const DIALOG_FONT = 'normal';
+/** The arm delay for a question the player did not ask for: 36 ticks, 0.6 s (the delay the page's old "wants to battle you" dialog kept its Accept button inert for). */
+export const DIALOG_ARM_TICKS = 36;
+/** The longest arm delay a dialog may ask for (ten seconds). */
+export const DIALOG_ARM_MAX = 600;
 
 // geometry shared with the renderer and the hit test (logical 240x160 pixels)
 export const DGEOM = Object.freeze({
@@ -59,8 +70,14 @@ export function normalizeDialog(spec) {
     if (!Number.isInteger(spec.ticksLeft) || spec.ticksLeft < 1) return null;
     ticksLeft = spec.ticksLeft;
   }
+  let armTicks = 0;
+  if (spec.armTicks !== null && spec.armTicks !== undefined) {
+    if (!Number.isInteger(spec.armTicks) || spec.armTicks < 0 || spec.armTicks > DIALOG_ARM_MAX) return null;
+    armTicks = spec.armTicks;
+  }
+  if (ticksLeft !== null && ticksLeft <= armTicks) return null;          // it would time out before it could be answered
   if (spec.app !== null && spec.app !== undefined && (!isStr(spec.app) || !spec.app)) return null;
-  return { id: spec.id, app: spec.app || null, pages, page: 0, choice, ticksLeft };
+  return { id: spec.id, app: spec.app || null, pages, page: 0, choice, ticksLeft, armTicks, age: 0 };
 }
 
 /**
@@ -94,11 +111,15 @@ export function optionRects(options, measure) {
 
 /** opts: { measure(font, s) -> pixels } (default: 6 px a character, which is the ROM's normal font for capitals and digits). */
 export function createDialogLayer(opts = {}) {
-  const measure = typeof opts.measure === 'function' ? opts.measure : (_font, s) => String(s).length * 6;
+  const sixPx = (_font, s) => String(s).length * 6;
+  const measure0 = typeof opts.measure === 'function' ? opts.measure : sixPx;
+  const measure = (font, s) => { try { const px = measure0(font, s); return Number.isFinite(px) ? px : sixPx(font, s); } catch (_e) { return sixPx(font, s); } };          // (a measure that throws on a text must not take the hit test, the view and the hub with it)
   const Q = [];                                    // Q[0] is the dialog shown; the rest wait their turn
   const cur = () => Q[0] || null;
   const lastPage = (d) => d.page >= d.pages.length - 1;
   const rectsOf = (d) => (d.choice ? optionRects(d.choice.options, measure) : null);
+  // ARMED: has the dialog been the one shown for its armTicks? Until then it answers nothing and turns no page (a press that was already on its way when it appeared is not a decision)
+  const armed = (d) => d.age >= d.armTicks;
 
   function answer(value) {
     const d = Q.shift();
@@ -108,8 +129,11 @@ export function createDialogLayer(opts = {}) {
   }
   function move(d, dir) { const n = d.choice.options.length; d.choice.cursor = (d.choice.cursor + dir + n) % n; return []; }
 
-  function press(action) {
+  /** info: { repeat } (optional): true for the synthesized repeat of a HELD direction, which a dialog ignores (one press, one step). */
+  function press(action, info) {
     const d = cur(); if (!d) return [];
+    if (info && info.repeat) return [];
+    if ((action === 'a' || action === 'b') && !armed(d)) return [];
     if (action === 'a') {
       if (!lastPage(d)) { d.page++; return []; }
       return answer(d.choice ? d.choice.cursor : 'closed');
@@ -139,18 +163,23 @@ export function createDialogLayer(opts = {}) {
     if (!h) return [];
     if (h.kind === 'option') {
       d.choice.cursor = h.index;
+      if (!armed(d)) return [];                                // (the highlight follows the pointer; the answer waits until the dialog is armed)
       return ev.kind === 'click' ? answer(h.index) : [];
     }
-    if (ev.kind !== 'click') return [];
+    if (ev.kind !== 'click' || !armed(d)) return [];
     if (!lastPage(d)) { d.page++; return []; }                 // a tap on the text turns the page ...
     return d.choice ? [] : answer('closed');                    // ... and closes a notice, but never answers a question
   }
 
   function tick() {
-    const d = cur(); if (!d || d.ticksLeft === null) return [];
+    const d = cur(); if (!d) return [];
+    if (d.age < d.armTicks) d.age++;                           // (only the dialog SHOWN ages: one that waits in the queue is armed from the tick it appears)
+    if (d.ticksLeft === null) return [];
     d.ticksLeft--;
     return d.ticksLeft <= 0 ? answer('timeout') : [];
   }
+  /** Remove the dialog with this id (shown or queued). No effect is emitted. -> true when there was one. */
+  function close(id) { const i = Q.findIndex((x) => x.id === id); if (i < 0) return false; Q.splice(i, 1); return true; }
 
   return {
     /** Show the dialog, or queue it behind the one that is open. -> true when it was taken, false when it was refused (malformed, an id already open or queued, a full queue). */
@@ -159,19 +188,23 @@ export function createDialogLayer(opts = {}) {
       if (!d || Q.length >= DIALOG_QUEUE_MAX || Q.some((x) => x.id === d.id)) return false;
       Q.push(d); return true;
     },
-    /** Remove the dialog with this id (shown or queued). No effect is emitted. -> true when there was one. */
-    close(id) { const i = Q.findIndex((x) => x.id === id); if (i < 0) return false; Q.splice(i, 1); return true; },
-    /** The dialog shown, as plain JSON, or null: { id, app, page, pages, choice: { options, cursor } | null, ticksLeft }. */
-    current() { const d = cur(); return d ? { id: d.id, app: d.app, page: d.page, pages: d.pages.length, choice: d.choice ? { options: d.choice.options.slice(), cursor: d.choice.cursor } : null, ticksLeft: d.ticksLeft } : null; },
+    close,
+    /** close(id), but only when that dialog was opened for `app` (an app closes its own questions, never another's, nor the page's). -> true when it was closed. */
+    closeOwn(id, app) { const d = Q.find((x) => x.id === id); return !!d && d.app === app && close(id); },
+    /** The dialog shown, as plain JSON, or null: { id, app, page, pages, choice: { options, cursor } | null, ticksLeft, armed }. */
+    current() { const d = cur(); return d ? { id: d.id, app: d.app, page: d.page, pages: d.pages.length, choice: d.choice ? { options: d.choice.options.slice(), cursor: d.choice.cursor } : null, ticksLeft: d.ticksLeft, armed: armed(d) } : null; },
     isOpen: () => Q.length > 0,
     press, hit, pointer, tick,
     /** The rows of the options shown (logical pixels), [] when none are. */
     rects() { const d = cur(); return d && d.choice && lastPage(d) ? rectsOf(d).rows : []; },
-    /** What hub_screen.js draws, or null: { id, app, page, pages, lines: [a, b], more, choice: { options, cursor, x, y, w, h, pitch } | null, queued }. The options come with the LAST page. */
+    /**
+     * What hub_screen.js draws, or null: { id, app, page, pages, lines: [a, b], more, armed, choice: { options, cursor, x, y, w, h, pitch } | null, queued }. The options come with the LAST page.
+     * armed: false while the dialog still answers nothing (its armTicks): the renderer then leaves the cursor and the "more" arrow out, so the player can see when it starts listening.
+     */
     view() {
       const d = cur(); if (!d) return null;
       const last = lastPage(d), r = d.choice && last ? rectsOf(d) : null;
-      return { id: d.id, app: d.app, page: d.page, pages: d.pages.length, lines: d.pages[d.page].slice(), more: !last, choice: r ? { options: d.choice.options.slice(), cursor: d.choice.cursor, x: r.x, y: r.y, w: r.w, h: r.h, pitch: r.pitch } : null, queued: Q.length - 1 };
+      return { id: d.id, app: d.app, page: d.page, pages: d.pages.length, lines: d.pages[d.page].slice(), more: !last, armed: armed(d), choice: r ? { options: d.choice.options.slice(), cursor: d.choice.cursor, x: r.x, y: r.y, w: r.w, h: r.h, pitch: r.pitch } : null, queued: Q.length - 1 };
     },
     state: () => ({ open: Q.length ? Q[0].id : null, page: Q.length ? Q[0].page : 0, cursor: Q.length && Q[0].choice ? Q[0].choice.cursor : null, queued: Q.slice(1).map((x) => x.id) }),
   };

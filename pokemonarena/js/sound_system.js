@@ -450,16 +450,31 @@ export function createSoundSystem(opts = {}) {
   /**
    * A menu sound for an input that just ran. changed = did the screen's cursor / mode move because of it. effects = the effects the screen's model returned for it (hub_model.js):
    * a refused START ({ type: 'blocked' }) answers with the error buzz (se_error) instead of the select sound, as the game's menus do (SE_FAILURE).
+   * A SCREEN MAY NAME ITS OWN SOUND: when the effects hold { type: 'sfx', key } (the hub's: hub_model.js; one with a string `app` is that app's own business and does not count) nothing is
+   * played here. The page plays those keys as it carries the effects out (sfx(key), below); key null plays none, so [{ type: 'sfx', key: null }] is a silent press.
    */
   function menuSfx(action, changed, inMenu, effects) {
     if (!inMenu) return;
+    if (namesOwnSfx(effects)) return;
     const refused = Array.isArray(effects) && effects.some((e) => e && ERROR_EFFECTS.includes(e.type));
     const key = refused ? 'se_error' : action === 'a' ? 'se_select' : action === 'b' ? (changed ? 'se_back' : null) : (action === 'up' || action === 'down' || action === 'left' || action === 'right') ? (changed ? 'se_cursor' : null) : null;
     if (!key) return;
     S.menuSfx.push(key); if (S.menuSfx.length > 100) S.menuSfx.shift();
     director.playSfx(key);
   }
-  const sceneSig = (scene) => { try { const s = scene.state(); const o = scene.S && scene.S.overlay; return JSON.stringify([s.mode, s.cursor, s.moveCursor, s.partyCursor, s.picks, s.resultCursor, s.recapPage, o ? o.cursor : null]); } catch (_e) { return ''; } };
+  const namesOwnSfx = (effects) => Array.isArray(effects) && effects.some((e) => e && e.type === 'sfx' && typeof e.app !== 'string');
+  /**
+   * Play ONE sound effect by its music_map.js key ('se_success', 'se_menu_open' ...: SFX_KEYS there): what an { type: 'sfx', key } effect and a hub app's ctl (env.sound.sfx) ask for. Only a
+   * key shaped like a sound effect's ('se_...') is taken (-> true; anything else -> false: a song is not started this way); it is logged with the menu sounds (state().menuSfx). Like every
+   * effect it is silent while nothing can play, and a key the soundtrack in use has no sound for is silent too.
+   */
+  function sfx(key) {
+    if (typeof key !== 'string' || !/^se_[a-z0-9_]{1,28}$/.test(key)) return false;
+    S.menuSfx.push(key); if (S.menuSfx.length > 100) S.menuSfx.shift();
+    director.playSfx(key);
+    return true;
+  }
+  const sceneSig =(scene) => { try { const s = scene.state(); const o = scene.S && scene.S.overlay; return JSON.stringify([s.mode, s.cursor, s.moveCursor, s.partyCursor, s.picks, s.resultCursor, s.recapPage, o ? o.cursor : null]); } catch (_e) { return ''; } };
   // (the sound part of these three is wrapped: whatever happens in it, the scene still gets its press / click and the frame still runs)
   function pressWithSfx(scene, action) {
     let m0 = null, s0 = '';
@@ -537,7 +552,7 @@ export function createSoundSystem(opts = {}) {
     /** Is the sound switched on (not muted)? The hub's SOUND row and the pause menu show this. */
     audible: () => !mixer.muted(),
     setMuted: (m) => { mixer.setMuted(m); paintButton(); },
-    hookScene, battleFrame, menuSfx, pressWithSfx, clickWithSfx, sceneSig,
+    hookScene, battleFrame, menuSfx, sfx, pressWithSfx, clickWithSfx, sceneSig,
     sig: (x) => { try { return JSON.stringify(x); } catch (_e) { return ''; } },
     get plays() { return S.plays; }, get testPlays() { return S.testPlays; },
     ctx: () => mixer.ctx(),

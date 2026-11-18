@@ -222,7 +222,7 @@ function checkModel(M) {
 const MUTANTS = [
   { name: 'START ignores the legality of the team', find: 'if (!t.legal) { S.flash', replace: 'if (false) { S.flash', expect: 'START on an illegal team is blocked' },
   { name: 'a 2-Pokemon team may pick 3v3', find: "return size >= 3 ? ['3v3', '6v6'] : ['6v6'];", replace: "return ['3v3', '6v6'];", expect: 'allowedFormats(2) has no 3v3' },
-  { name: 'B on the main menu leaves the game', find: "if (S.path === 'main') return [];\n    const up", replace: "if (S.path === 'main') return [{ type: 'navigate', url: '/' }];\n    const up", expect: 'B on the main menu does nothing' },
+  { name: 'B on the main menu leaves the game', find: "if (S.path === 'main') return [];\n    return stepBack(1);", replace: "if (S.path === 'main') return [{ type: 'navigate', url: '/' }];\n    return stepBack(1);", expect: 'B on the main menu does nothing' },          // (back() is now one step down the TRAIL: hub_model.js stepBack)
   { name: 'up does not wrap', find: 'S.cursor[S.path] = (cur + rs.length - 1) % rs.length;', replace: 'S.cursor[S.path] = Math.max(0, cur - 1);', expect: 'up from the first row wraps' },
   { name: 'SOUND toggles without telling the page', find: "S.sound = !S.sound; return [{ type: 'sound', on: S.sound }];", replace: 'S.sound = !S.sound; return [];', expect: 'SOUND toggles on and tells the page' },
   { name: 'the row hit test is half a row low', find: 'const index = (win ? win.off : 0) + Math.floor((y - m.y) / pitch);', replace: 'const index = (win ? win.off : 0) + Math.floor((y - m.y + 6) / pitch);', expect: 'the middle, top edge and bottom edge' },
@@ -235,7 +235,7 @@ const MUTANTS = [
   { name: 'the TEAM BUILDER row of the main menu still leaves for the page', find: "        case 'builder': return go('builder');", replace: "        case 'builder': return [{ type: 'navigate', url: BUILDER_URL }];", expect: 'TEAM BUILDER opens the builder screen in the picture' },
   { name: 'the PLAY ONLINE row opens nothing', find: "        case 'online': return go('online');\n", replace: '', expect: 'PLAY ONLINE opens the online screen' },
   { name: 'the PLAY ONLINE row is dropped from the main menu', find: "  { id: 'online', label: 'PLAY ONLINE',", replace: "  { id: 'onlineX', label: 'PLAY ONLINE',", expect: 'PLAY ONLINE opens the online screen' },
-  { name: 'B from an app screen does not come back', find: "    const up = parentOf(S.path, appList);", replace: "    const up = parentOf(S.path, appList); if (apps.of(S.path)) return [];", expect: 'B on the online screen comes back' },
+  { name: 'B from an app screen does not come back', find: "    return stepBack(1);", replace: "    if (apps.of(S.path)) return []; return stepBack(1);", expect: 'B on the online screen comes back' },
   { name: 'the left half of a choice row cannot step back', find: "h.zone === 'prev') return change(row, -1);", replace: "h.zone === 'never') return change(row, -1);", expect: 'clicking the left half of a choice row steps BACK' },
   { name: 'A on the last ABOUT page does not go back', find: "return action === 'a' ? back() : [];", replace: 'return [];', expect: 'A on the last page goes back' },
   { name: 'the active profile is not preselected', find: 'S.team.profileId = d.activeId;', replace: 'void 0;', expect: 'the active profile is preselected' },
@@ -632,7 +632,8 @@ try {
     const L1 = await page.eval('history.length');
     ok(L1 - L0 <= 1 && (await page.eval('location.hash')) === '' && (await where(page)) === 'main', tag + 'three ABOUT / B round trips add at most one history entry in total, not six (' + L0 + ' -> ' + L1 + ')', L0 + ' -> ' + L1);
     // control: make the page's "step back" push a NEW entry instead (the old behaviour) and the same round trips must pile the history up
-    await page.eval(`history.back = () => history.pushState({}, '', location.pathname)`);
+    // (the page steps back with history.go(-n) and then waits for the browser to land: the stand-in pushes an entry and reports a landing on the menu's)
+    await page.eval(`history.go = () => { history.pushState({ arenaHub: 'main', trail: [] }, '', location.pathname); window.dispatchEvent(new PopStateEvent('popstate', { state: { arenaHub: 'main', trail: [] } })); }`);
     const L2 = await page.eval('history.length');
     for (let i = 0; i < 3; i++) { await reachAbout(page, 'key'); await clickLogical(page, `${HUB}.canvas`, 60, mainY(7)); await sleep(120); await key(page, 'b'); await sleep(250); }
     const L3 = await page.eval('history.length');

@@ -15,6 +15,11 @@
 //   * parent(path): a pure function of the path alone (the browser history is seeded from it before any state exists). It names 'main' or any OTHER hub path, and following it from any of the
 //     app's paths reaches 'main' (no loop)
 // AND WHAT checkApp ENFORCES of the object create(ctx) returns: its id and paths are the descriptor's, and every method of APP_METHODS is a function.
+//
+// AN APP THAT THROWS DOES NOT TAKE THE HUB DOWN. The hub never calls an app's model directly: createAppHost hands it a GUARD of each model, whose methods call the model's (looked up at the
+// moment of the call) inside a try. A throw is reported to onFault(id, method, error, args), and what THAT returns stands in for the answer (hub_model.js records the fault for the page and
+// answers "nothing": no effects, no hit, no text wanted, a view that says the screen hit a problem; and it goes back by itself when it was the B press that threw). So one bad tick, one bad
+// view, or a closed app's bad onData costs that one call, not the hub's clock or every data refresh.
 
 import { APP as ONLINE } from './online_hub.js';
 import { APP as CENTER } from './center_hub.js';
@@ -84,27 +89,43 @@ export function checkApp(desc, app) {
   return bad;
 }
 
+/** The methods of an app's model the hub calls through the guard (APP_METHODS without parent, which is read off the descriptor, plus the optional onDialog). */
+export const GUARDED_METHODS = Object.freeze([...APP_METHODS.filter((m) => m !== 'parent'), 'onDialog']);
+
 /**
- * Make every app of `list` and answer the hub model's questions about them. makeCtx(desc) -> the ctx that app's factory gets. Throws an Error that names the app when one is malformed.
- *   of(path)   the model of the app that owns the path, or null          byId(id)   the model of that app, or null
+ * Make every app of `list` and answer the hub model's questions about them. makeCtx(desc) -> the ctx that app's factory gets. Throws an Error that names the app when one is malformed
+ * (a programming error every test sees). After that NOTHING an app's model throws leaves this host: see the header.
+ *   onFault(id, method, error, args) -> the value that stands in for the call that threw (default: undefined)
+ *   of(path)   the GUARD of the app that owns the path, or null          byId(id)   the GUARD of that app, or null       (what hub_model.js delegates through)
+ *   raw(id)    the app's own model, or null                              rawOf(path) likewise, by path                   (what a ctl and the tests are handed: the app's own methods are on it)
  *   handles()  { id: model, ... }                                       ids        the ids, in registry order
  *   onData()   every app's onData(), concatenated                       state()    { id: app.state(), ... }
  */
-export function createAppHost(list, makeCtx) {
-  const models = new Map();
+export function createAppHost(list, makeCtx, onFault) {
+  const models = new Map(), guards = new Map();
+  const failed = typeof onFault === 'function' ? onFault : () => undefined;
   for (const desc of list) {
     const app = desc.create(makeCtx(desc));
     const bad = checkApp(desc, app);
     if (bad.length) throw new Error('hub app "' + desc.id + '" is malformed: ' + bad.join('; '));
     models.set(desc.id, app);
+    // (the model's method is looked up when it is called, not now: a ctl or a test may replace one)
+    const g = { id: desc.id, paths: desc.paths };
+    for (const m of GUARDED_METHODS) {
+      if (m === 'onDialog' && typeof app.onDialog !== 'function') continue;
+      g[m] = (...args) => { try { return app[m](...args); } catch (err) { return failed(desc.id, m, err, args); } };
+    }
+    guards.set(desc.id, Object.freeze(g));
   }
   const fx = (r) => (Array.isArray(r) ? r : []);
   return {
     ids: list.map((a) => a.id),
-    of(path) { const d = appOfPath(path, list); return d ? models.get(d.id) : null; },
-    byId: (id) => models.get(id) || null,
+    of(path) { const d = appOfPath(path, list); return d ? guards.get(d.id) : null; },
+    byId: (id) => guards.get(id) || null,
+    raw: (id) => models.get(id) || null,
+    rawOf(path) { const d = appOfPath(path, list); return d ? models.get(d.id) : null; },
     handles: () => Object.fromEntries(models),
-    onData() { let out = []; for (const a of models.values()) out = out.concat(fx(a.onData())); return out; },
-    state() { const o = {}; for (const [id, a] of models) o[id] = a.state(); return o; },
+    onData() { let out = []; for (const a of guards.values()) out = out.concat(fx(a.onData())); return out; },
+    state() { const o = {}; for (const [id, a] of guards) o[id] = a.state(); return o; },
   };
 }

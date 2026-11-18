@@ -273,13 +273,22 @@ const FRAME_COLORS = Object.freeze({ backdrop: [0, 0, 0] });
 
 /* ================================================================================================= renderer */
 
-// A string safe for the ROM charset: characters the font map does not know become '?'.
-const okChar = new Map();
+// A string safe for the ROM charset: characters the font map does not know become '?'. A {TOKEN} is kept only when it IS one of the font's tokens ({CURSOR}, {LV} ...): any other
+// balanced braces ("RED{NOPE}", "{}" -- a remote trainer's name can hold them) used to pass through whole and then THROW in the text encoder, which froze whatever screen drew or even
+// measured that text. Their braces are now two "?" like any other character the font lacks.
+const okChar = new Map(), okToken = new Map();
+const TOKEN_MAX = 12;                                          // (no token of the font is longer; nothing longer is ever looked up or remembered)
+function isToken(tok) {
+  if (tok.length > TOKEN_MAX) return false;
+  let ok = okToken.get(tok);
+  if (ok === undefined) { try { encodeText(tok); ok = true; } catch (_e) { ok = false; } if (okToken.size < 512) okToken.set(tok, ok); }
+  return ok;
+}
 export function safeText(str) {
   let out = '';
   for (let i = 0; i < str.length; i++) {
     const ch = str[i];
-    if (ch === '{') { const j = str.indexOf('}', i); if (j > i) { out += str.slice(i, j + 1); i = j; continue; } }
+    if (ch === '{') { const j = str.indexOf('}', i); if (j > i && j - i < TOKEN_MAX && isToken(str.slice(i, j + 1))) { out += str.slice(i, j + 1); i = j; continue; } }
     let ok = okChar.get(ch);
     if (ok === undefined) { try { encodeText(ch); ok = true; } catch (_e) { ok = false; } okChar.set(ch, ok); }
     out += ok ? ch : '?';
