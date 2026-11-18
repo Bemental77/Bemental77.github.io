@@ -773,23 +773,26 @@ presence_boot.js by hand with no dialogs handed in, so the DOM dialogs keep thei
 ## CENTER: as built
 
 The Trainer Center is the hub app `center` (2026-11-18): the ROM's own Pokemon Center in the 240x160 picture, the players as the ROM's overworld trainer sprites, the ROM's emote icons over their heads,
-every word in the ROM's windows and fonts. The page with the hand-drawn room and avatars is deleted. Every name below is the name in the code. Nothing in the protocol moved: `js/netmatch.js`,
-`js/online_match.js`, `js/openlobby.js`, `js/matchctl.js`, `js/engine*.js` and `lib/netplay.js` are untouched, and so are `PROTO`, `MSG`, `BEACON_V` / `TOPIC`, `SEAL_INFO`, `ACCEPT_KEY`, `MEET_KEY`, `resumeKey`, `GAME_KEY`.
+every word in the ROM's windows and fonts, every name on the ROM's party-menu chip. The page with the hand-drawn room and avatars is deleted. Every name below is the name in the code. Nothing in the
+protocol moved: `js/netmatch.js`, `js/online_match.js`, `js/openlobby.js`, `js/matchctl.js`, `js/engine*.js` and `lib/netplay.js` are untouched, and so are `PROTO`, `MSG`, `BEACON_V` / `TOPIC`, `SEAL_INFO`,
+`ACCEPT_KEY`, `MEET_KEY`, `resumeKey`, `GAME_KEY`.
+
+This section is the state AFTER the review of the first build (its three blocking findings and the cheap minor ones are fixed here; what was left, and why, is under "Known limits").
 
 ### What exists
 
 | File | What |
 |---|---|
-| `js/center_hub.js` | the app's pure model (`APP`, `createCenterHub`, `WALK`, `CGEOM`, `DLG`, `MENU_ROWS`, `WORDS`, `ANSWER_WORDS`, `DOING`, `stepOf`). One path, `center`, parent `online` |
-| `js/center_screen.js` | the pure renderer (`createScreen(ui, h)`, `TAG`, `BUBBLE_UP`): the map's lower layers, the nurse and her Pokemon and every trainer top to bottom, the map's top layer, the bubbles, the names (last: a name always reads), the mode's window |
-| `js/center_ctl.js` | the side effects (`createCtl(env)`, `ROOM_SOUNDS`, `ROOM_SOUNDTRACK`, `BEAT_MS`): the room read from the ROM, the presence service, the room's network, a challenge, the sounds |
+| `js/center_hub.js` | the app's pure model (`APP`, `createCenterHub`, `WALK`, `NOTE_TICKS`, `CGEOM`, `DLG`, `MENU_ROWS`, `WORDS`, `ANSWER_WORDS`, `DOING`, `stepOf`). One path, `center`, parent `online` |
+| `js/center_screen.js` | the pure renderer (`createScreen(ui, h)`, `TAG`, `BUBBLE_UP`, `layoutTags`): the map's lower layers, the nurse and her Pokemon and every trainer top to bottom, the map's top layer, the bubbles, the names (last: a name always reads), the mode's window |
+| `js/center_ctl.js` | the side effects (`createCtl(env)`, `CENTER_SEEN_KEY`, `ROOM_SOUNDS`, `ROOM_SOUNDTRACK`, `BEAT_MS`): the room read from the ROM, who is asked before walking in, the presence service, the room's network, a challenge, somebody asking this player, the sounds |
 | `js/center_room.js` | THE ROOM as plain data (pure, no import): `roomFromWorld(world, { GFX, MB })`, `createGrid(room)`, `SPOTS`, `SPAWNS`, `STATUS_EMOTE`, `ahead`, `VEC`, `DIRS`, `OPPOSITE`, `CELL`, `ROOM_W`, `ROOM_H`, `TRAINER_ELEVATION`, `roomNpcs` |
 | `js/center_world.js` | `centerWorld(romBytes) -> { world, room }`: `world_rom.js loadWorld` and `roomFromWorld`, once per ROM image, shared by the renderer and the ctl |
 | `js/center_look.js` | THE LOOK CODE (Contract 4; replaces `js/avatar.js`) |
 | `js/center_net.js` | the room's messages and roster, VERSION 2, the room handed in as rules |
 | `center.html` | a redirect to `/pokemonarena/#center` that carries the test seams (`net anim arenaturn arenagrace openquick openchal openjoin openhold opendisc ctrname ctrav`) and nothing else of the address. No UI |
 | `center.golden.json` | hashes (FNV-1a) of nine pictures rendered from the ROM. Hashes only |
-| `tools/pokemonarena_center_test.mjs` | the suite, rebuilt (below) |
+| `tools/pokemonarena_center_test.mjs` | the suite (below) |
 
 `js/world_rom.js` was not changed. The three registries (`hub_apps.js`, `hub_app_screens.js`, `hub_app_ctls.js`) were not changed: they already named `center`.
 
@@ -802,26 +805,63 @@ every word in the ROM's windows and fonts. The page with the hand-drawn room and
   (`grid.findPath`: never across the door mat unless the mat is where it goes). People do not block people.
 * **Who is in it**: every player with the Center open walks as their look. Players who are open elsewhere stand at `SPOTS` (ten cells; no two near each other, none under a plant) with a ROM icon saying what
   they are doing (`STATUS_EMOTE`: `...` in the Arena's menu or a battle against the computer, `!!` looking for anyone, `!` hosting a listed game, the cross for another version). Players beyond the tenth
-  are in WHO'S HERE only. **Names**: a plate at each trainer's feet in the ROM's small narrow font, as tall as the letters: dark on white for the others, white on dark for the player.
-* **A** (facing it, or a tap on it): another player -> `<NAME>   W-L online` and **ASK TO BATTLE / CANCEL** (**JOIN THEIR BATTLE / CANCEL** when they host a listed game; a plain line when their listing has not
-  arrived or they are on another version); the nurse, from the cell across the counter, facing up -> a welcome and **PLAY ONLINE / STAY HERE** (`ctx.go('online')`); the PC, from the cell below it ->
-  `ctx.go('builder')`; the wall map -> WHO'S HERE; a sign -> what the Center shares, in pages (`DISCLOSURE_WORDS` of the seam plus `WORDS.also`). Standing on the door mat and stepping down leaves (`ctx.back()`);
-  a tap on the mat walks onto it and out.
+  are in WHO'S HERE only.
+* **Names**: at each trainer's feet, in the ROM's small narrow font ON THE ROM'S PARTY-MENU CHIP (`ui.panel`: the plain chip for the others, the selected chip for the player; nothing in the room is a
+  rectangle this site filled). **No name lies on another** (`layoutTags`): the plates of one row stand side by side, each still under its own trainer (at least `TAG.hold` = 6 of its pixels across lie under
+  the trainer's cell), so two trainers side by side, or on one cell, read as two names; where a row is too crowded for that, the trainers farthest from the player go without a plate (the player's own is
+  never left out; the names are in WHO'S HERE and in the question A opens). A plate never lies on the line that says what B does.
+* **A** (facing it, or a tap on it): another player -> `<NAME>   W-L online` and where they are, then WHAT ASKING DOES ("If they accept, a 3 v 3 battle opens on both screens." / "You join their 3 v 3 battle at
+  once.") with **ASK TO BATTLE / CANCEL** (**JOIN THEIR BATTLE / CANCEL** when they host a listed game; a plain line when their listing has not arrived or they are on another version); the nurse, from the
+  cell across the counter, facing up -> a welcome and **PLAY ONLINE / STAY HERE** (`ctx.go('online')`); the PC, from the cell below it -> `ctx.go('builder')`; the wall map -> WHO'S HERE; a sign -> what the
+  Center shares. WHAT IS FACED COMES FIRST: a trainer standing on the player's own cell is talked to only when nothing is faced (they cannot take the PC away by standing in front of it). Standing on the
+  door mat and stepping down leaves (`ctx.back()`); a tap on the mat walks onto it and out.
 * **The menu** (B, START, a tap on `B: MENU` in the bottom right corner; B or START closes it): **LOOK** (the 138 ROM trainer sprites, sixteen to a page, the highlighted one walking in place; L / R, the
   arrows in the title row or the wheel turn the page), **EMOTE** (the sixteen ROM icons), **TEAM** (`ctx.go('builder')`), **WHO'S HERE** (name, record, what they are doing; A on a row is A in front of that
   player, which is how a player who is not in the picture is battled), **EXIT**. X is the emotes and Y the looks.
 * **Asking**: "Asked <NAME> to battle. Waiting for an answer..." with CANCEL (which listens after 0.6 s: the A that asked is not the A that cancels); then "<NAME> accepted! Opening the battle...",
-  "<NAME> said not now.", "<NAME> is answering another challenge. Try again in a moment.", "<NAME> did not answer.", "Challenge cancelled.", or why this browser cannot ask (`ANSWER_WORDS`).
+  "<NAME> said not now.", "<NAME> is answering another challenge. Try again in a moment.", "<NAME> did not answer.", "Challenge cancelled.", "Your challenge to <NAME> was withdrawn.", or why this browser
+  cannot ask (`ANSWER_WORDS`). **CANCEL, leaving the Center and a page that goes away WITHDRAW the challenge** (`presence.js` `can`): the question closes on the other screen, and no YES can open a battle
+  with somebody who is gone. A notice that only reports something goes by itself after `NOTE_TICKS` (six seconds a page); "accepted! Opening the battle..." stays.
+
+### Who is asked before walking in (nothing is published before YES)
+
+Walking in switches Open to battles on, for this page only (`svc.turnOn({ persist: false })`), and lists two things the hub's switch does not: THE LOOK and THE CELL. So "the player has been told" is kept
+per thing told: `localStorage['arena.open.seen']` (presence_boot.js: what Open to battles lists) and **`localStorage['arena.center.seen']`** (`CENTER_SEEN_KEY`, center_ctl.js: what the Center lists).
+
+| The browser | What is asked, in the picture, before anything is switched on |
+|---|---|
+| was never told what Open to battles lists (`mount.needsDisclosure()`) | the service's disclosure, with one more sentence (`WORDS.also`: "The Trainer Center is the one exception: there your look and where you stand are listed too."). YES sets both keys |
+| was told that, never what the Center lists (`arena.center.seen` not set), switch OFF or ON | **THE CENTER'S OWN QUESTION** (`app.askIn()`, dialog `center:enter`): `WORDS.shares` a page a thought, how it ends (`WORDS.sharesEnd`; `WORDS.sharesStay` for a player whose stored switch is on: their listing stays when they leave), then **"Walk in?" YES / NO**, NO highlighted, B = NO, armed after 0.6 s. YES sets `arena.center.seen` |
+| said YES to the Center once | nothing: they walk in |
+| cannot remember (storage blocked) | the question, at every visit |
+
+NO leaves the Center (`ctx.back()`), without a word: nothing was switched on, nothing was published, nothing is remembered. The same-browser test transport (`?net=local`) publishes nothing anywhere and asks
+nothing unless the address says `opendisc=1` (presence_boot.js's own seam). **Decision made here, to revisit if wanted:** the question is asked ONCE per browser (like the hub's disclosure); the first
+Trainer Center asked a player whose switch was off in every new tab. One line changes it (`told()` in center_ctl.js).
+
+### Somebody asks this player (the service's question and the Center's own dialogs)
+
+"<NAME> wants to battle you" is the presence service's question, in the hub's dialog layer, which shows ONE dialog at a time, first in first shown, and the question is a NO by itself after 25 s. So nothing
+of the Center's may stand in front of it. The ctl listens to the service from the moment the Center is the open screen (`onAsked`, also before the player has walked in):
+
+* the Center's own dialogs MAKE WAY at once (`app.makeWay()`): a notice, a sign, the nurse, the question about a trainer are closed (they are over; the player can open them again); the Center's own question
+  is put away and asked again from its first page when the challenge is gone (`app.resume()`);
+* **one question at a time**: a player who is waiting for an answer to a challenge of their own has that challenge withdrawn (`app.askWithdrawn(true)`: the player they asked stops seeing it, and after the
+  question a line says "Your challenge to <NAME> was withdrawn.");
+* **two players who ask EACH OTHER at once**: both pages see the same two board ids, so both know which gives way. The page with the SMALLER board id withdraws its challenge and sees the other's question;
+  the other keeps waiting (the question it was sent closes when the withdrawal arrives). One battle: never two rooms, never two automatic NOs.
 
 ### What the Center calls of the other tracks, and what they can rely on
 
-* **SEAM** (`hubPresence(env)`): `ready`, `isOn()`, `mount.needsDisclosure()`, `turnOn({ persist: false, also: WORDS.also })`, `turnOff({ persist: false })`, `stored()`, `status()`, `onChange(fn)`,
-  `watchPlayers(bool)`, `players()`, `boardId()`, `trainer()`, `canChallenge()`, `challenge(player, { state, accepted, failed })`, `relist()`, `goBattle('join', room)` (the default `back`: the Center).
-  The Center asks nothing itself about being open: the disclosure and "<name> wants to battle you" are the service's questions.
-* **ONLINE**: the Center is opened with `ctx.go('center')`; `parent('center')` is `'online'`, so B, NO to the disclosure, the door mat and EXIT all come back to PLAY ONLINE when it was opened from there.
+* **SEAM** (`hubPresence(env)`): `ready`, `isOn()`, `mount.needsDisclosure()`, `mount.pending()` (who asks: `{ s, r }`), `state().challenge`, `turnOn({ persist: false, also: WORDS.also })`,
+  `turnOff({ persist: false })`, `stored()`, `status()`, `onChange(fn)`, `watchPlayers(bool)`, `players()`, `boardId()`, `trainer()`, `canChallenge()`, `challenge(player, { state, accepted, failed })`,
+  `relist()`, `goBattle('join', room)` (the default `back`: the Center). "<name> wants to battle you" and the first-time disclosure are the service's questions; the Center asks only its own
+  (`center:enter`), through `ctx.dialog`.
+* **ONLINE**: the Center is opened with `ctx.go('center')`; `parent('center')` is `'online'`, so B, NO to either question, the door mat and EXIT all come back to PLAY ONLINE when it was opened from there.
   The nurse's PLAY ONLINE is `ctx.go('online')`. The HTML link `#trainerCenter` in `index.html` still points at `center.html`, which forwards to `#center`: remove it with the row.
-* **BUILDER**: the PC and TEAM are `ctx.go('builder')` (the builder opens on top of the Center). B on the builder's first screen must be `ctx.back()`: the Center then walks the player in again WHERE THEY STOOD
-  (`walkIn` keeps the cell when the player left through the PC or TEAM). While the builder is open the player is not in the room and, unless the stored switch is on, not open.
+* **BUILDER**: the PC and TEAM are `ctx.go('builder')` (the builder opens on top of the Center). B on the builder's first screen must be `ctx.back()`: the Center then walks the player in again WHERE THEY STOOD.
+  That cell is kept only for the way back: a player who goes on from the builder to anywhere the Center is not on the way back from (Home) walks in at the door the next time (the ctl looks at
+  `env.model.trail()` every `BEAT_MS` while the player is away; the shell has no event for it). While the builder is open the player is not in the room and, unless the stored switch is on, not open.
 * **BATTLE**: a battle that started in the Center has `sessionStorage['arena.back'] === 'center'` on both sides (the asker through `goBattle`, the one who accepted through the service). Coming back to
   `/pokemonarena/#center` (with the test seams) walks the player in again. `tools/pokemonarena_center_test.mjs` CB7 reads the battle page through `window.__arenaOnline.state.stage`, `.state.role` and
   `.nm().status().phase`, and its page mutant BM2 breaks the meet token's line in `js/online.js` (`else if (meetTok && state.role === 'guest' && state.room) { meetTok = false; startAs('guest'); }`): when
@@ -845,7 +885,7 @@ where one of the ROM's is picked and kept. A player who lists no look is drawn a
 ### The room's network : `js/center_net.js`, VERSION 2
 
 `CENTER_TOPIC = 'bemental/arena/center/2'`, `CENTER_CHANNEL = 'bemental-arena-center-2'`, `VERSION = 2`: a page of the first Trainer Center and this one never hear each other. The messages are what they
-were (`ask`, `here`, `mv`, `emo`, `bye`); so are `TIMING` (an emote now shows 2000 ms), `createRoster` and the caps. What changed:
+were (`ask`, `here`, `mv`, `emo`, `bye`); so are `TIMING` (an emote now shows 2000 ms) and `createRoster`.
 
 ```js
 roomRules({ walkable(x, y), look(code), emotes }) -> rules     // from the ROM at run time; a rule that throws or does not answer `true` refuses
@@ -854,27 +894,42 @@ checkCenterMsg(m, rules = NO_ROOM)                              // a position th
 createCenter({ bus, me, rules, now, timers, random, timing })   // + isIn(); the name goes out through cleanName
 ```
 
+* **What a trainer publishes** is only the fields the room defines: `t, v, s, k`, and in a `here` `name, av, x, y, d` plus `b` (the board id) and `rec` when there are any. Nothing else the page knows (no
+  team, no room) can ride along: `hereMsg` names each field, and N7a2 / K1g pin it.
+* **Two caps, in this order** (the order changed after the review): one sender is heard at most `perSenderMax` (14) times a second, by the id the message claims, and what it sends beyond that is dropped
+  BEFORE the room's own count; then the whole room is cut off above `totalMax` (260) messages a second. So one page that floods is cut off by itself and the others are still heard (it used to deafen the
+  room); a flood under many sender ids still does, for the rest of that second.
+* **What a stranger can still do** (the header of the file used to say otherwise): a sender id is only a claim, so anybody who has heard a trainer's id can send a step in their name, and the room shows
+  that trainer on the forged cell until their own next `here` or step (at most 3 s). A forged cell is still a cell of the room, and talking to a trainer always goes through the board.
+
 `EMOTES` and `EMOTE_NAMES` are gone (an emote is the number of a ROM icon), and the module imports neither a map nor a look table.
 
 ### The model's own methods (what the ctl drives) and effects
 
-`setRoom(room)`, `room()`, `setMe({ name, rec, look })`, `setShares(text)`, `walkIn(n) -> boolean`, `isIn()`, `me() -> { name, rec, look, x, y, d }`, `setRoster({ walkers, players })`, `people()`,
-`setNet('off' | 'connecting' | 'up' | 'down')`, `myEmote(e)`, `askAccepted()`, `askFailed(why)`, `say(text)`, `kick('off' | 'noStart') -> effects`, `out() -> effects`.
-Effects `{ app: 'center', type }`: `moved`, `look { code }`, `emote { e }`, `ask { id, name }`, `join { id, room }`, `cancel-ask`, `sound { what: 'bump' | 'door' | 'pc' }`.
-Dialog ids: `center:talk`, `center:asking`, `center:note`, `center:nurse`, `center:sign` (closed in `leave`); the line that says why the player was walked out is `ctx.notify` and stays.
-Test hook: `window.__arenaHub.center = { state(), people(), me(), sid(), wire }`; the model's state is `window.__arenaHub.apps.state().center`.
-Test seams, honoured only with `?net=local`: `ctrname=<name>` (the name in the room) and `ctrav=<look code>`, so two tabs of one browser profile can be two trainers.
+`setRoom(room)`, `room()`, `setMe({ name, rec, look })`, `setShares(list | string)` (what the signs and the Center's own question say: a page a thought), `askIn() -> boolean` (the Center's own question),
+`walkIn(n) -> boolean`, `isIn()`, `me() -> { name, rec, look, x, y, d }`, `setRoster({ walkers, players })`, `people()`, `setNet('off' | 'connecting' | 'up' | 'down')`, `myEmote(e)`, `askAccepted()`,
+`askFailed(why)`, `askWithdrawn(say) -> name | null`, `makeWay()`, `resume()`, `keepsPlace()`, `forgetPlace()`, `say(text)`, `kick('off' | 'noStart') -> effects`, `out() -> effects`.
+Effects `{ app: 'center', type }`: `moved`, `look { code }`, `emote { e }`, `ask { id, name }`, `join { id, room }`, `cancel-ask`, `sound { what: 'bump' | 'door' | 'pc' }`; the ctl also hears the answer of
+the Center's own question (`{ type: 'dialog', id: 'center:enter', value, app: 'center' }`, YES = 0).
+Dialog ids: `center:enter`, `center:talk`, `center:asking`, `center:note`, `center:nurse`, `center:sign` (closed in `leave`); the line that says why the player was walked out is `ctx.notify` and stays.
+`state()` gained `entering` (the Center's own question is waiting for its answer).
+Test hook: `window.__arenaHub.center = { state(), people(), me(), sid(), wire }` (`state()`: `inside, mine, leaving, seam, net, sid, board, asking, entering, told, roomError`); the model's state is
+`window.__arenaHub.apps.state().center`.
+Test seams, honoured only with `?net=local`: `ctrname=<name>` (the name in the room) and `ctrav=<look code>`, so two tabs of one browser profile can be two trainers; `opendisc=1` makes that transport ask
+first, as the public one does.
 
 ### Storage, topics, addresses
 
 | Where | Key | Value |
 |---|---|---|
 | localStorage | `arena.avatar` | a look code, `w` + six base-36 digits (was: seven base-36 digits of the hand-drawn avatar; such a value reads as none) |
+| localStorage | `arena.center.seen` (new) | `'1'` once the player has said YES to a question that said what the Center lists |
 | sessionStorage | `arena.center.in` | no longer written or read (the page that used it is gone) |
 | MQTT / BroadcastChannel | `bemental/arena/center/2` / `bemental-arena-center-2` | the room |
 | address | `/pokemonarena/#center` | the Center; `/pokemonarena/center.html` forwards to it |
 
-Nothing else is stored. `arena.open` is never written by the Center (it is on for the page only); `arena.meet` and `arena.back` are written by the seam's `goBattle`.
+Nothing else is stored. `arena.open` is never written by the Center (it is on for the page only); `arena.open.seen` is written by presence_boot.js when the service's disclosure is answered YES;
+`arena.meet` and `arena.back` are written by the seam's `goBattle`.
 
 ### Sound
 
@@ -894,25 +949,45 @@ Still naming them, in files that are not CENTER's: a comment in `js/openlobby.js
 
 ### Known limits
 
-* A name plate laps over the trainer in the next row when two trainers stand in one column (the plates are drawn last, over the sprites and the bubbles, so the NAME always reads; a bubble can lose its top rows to the name of the trainer above). The spots are placed so that a plate never lies on a trainer
-  between players who stand still.
+* **Names, up and down**: a plate laps over the trainer in the next row when two trainers stand in one column (the plates are drawn last, so the NAME always reads; a bubble can lose its top rows to the
+  name of the trainer above). Side by side they no longer lie on each other. In a crowded row some trainers have no plate (see "Names").
+* **A sprite on a sprite**: a trainer standing on the player's own cell is hidden behind the player's sprite (both names are written under the cell, which is how one knows).
+* **The question before walking in is asked once per browser**, not once per tab as the first Trainer Center did for a player whose switch was off ("Who is asked before walking in").
+* **One question at a time costs a challenge**: a player who is asked while waiting for an answer loses their own challenge (a line says so). A stranger who keeps asking can keep doing that; the service's
+  own limits apply (six questions a minute, 20 s of quiet for a sender who was told no).
+* **A player who is asked and then leaves or closes the page** leaves the asker waiting the whole answer time (27 s; CANCEL works meanwhile). Not shortened on purpose: the listing also goes when they say
+  YES, and their `ok` can be lost on a public broker while the room (`acc`) still arrives, so "the listing is gone" must not end a challenge that was accepted.
+* **An emote chosen within 900 ms of the last one** is not sent and not shown (the bubble shows only what the room was told).
+* **The door mat**: a trainer standing on it takes a tap aimed at the mat (they are talked to; the d-pad and EXIT still leave), and stepping off it leaves without a question.
+* **Touch sizes** (measured by the review on a 390 px phone): a floor cell and a WHO'S HERE row are 26 css px, a look-page arrow 33 x 26. Everything is reachable with the d-pad, A and B alone.
 * The picture's clock stops in a hidden tab: a walker in a hidden tab stands still for the others (they stay in the room: the heartbeat, the board id and the roster run on timers) and cannot be seen
-  walking until the tab is shown.
+  walking until the tab is shown. A question that arrives there is in the dialog layer at once (the Center's dialogs make way on the service's event, not on a frame).
 * Leaving for the Team Builder leaves the room (the others see the player go and come back) and, for a player whose stored switch is off, takes the listing down for that time.
 * `ROOM_SOUNDS` are SoulGold song-table indexes: correct only for that soundtrack, which is why another soundtrack gets the mapped keys.
 * The roster is pushed to the model every 500 ms and on every room or board event; an emote on another trainer ends up to 500 ms late.
+* The hub's first paint loads `world_rom.js`, `center_hub.js` and `center_room.js` through `center_screen.js` (this file's app table allows it for the Center). Not measured.
 
 ### Tests (2026-11-18, this tree)
 
 ```bash
-node tools/pokemonarena_center_test.mjs node             # the Node checks: L (looks), R (the room from the ROM), G (the grid), M1-M13 (the model), S (the renderer, the hashes), N (the room's messages),
-                                                         # T (the MEET token), K1-K6 (the ctl on two and three pages over Node's BroadcastChannel): 213 checks
-node tools/pokemonarena_center_test.mjs node --mutants   # ... and 65 defects, one at a time, each in a process of its own; each must fail the case it names (CENTER_MUT=<id> runs one)
-node tools/pokemonarena_center_test.mjs                  # the Node checks, then real Chrome: CB0 the redirect; CB1 the disclosure, NO, YES; CB2 two tabs; CB3 real keys and a click; CB4 a look and an emote;
-                                                         # CB5 a hub player at a spot; CB6 a challenge declined; CB7 one accepted: a battle on both screens, the MEET token; CB8 the door mat; CB9 the PC and back;
-                                                         # CB10 Open switched off elsewhere; CB11 a background tab; CB12 a phone (touch only) and a controller
-node tools/pokemonarena_center_test.mjs --mutants page-mutants   # five defects in the page, served over the real files; each must fail its session
+node tools/pokemonarena_center_test.mjs node             # the Node checks (274): L (looks), R (the room from the ROM), G (the grid), M1-M14 (the model; M14: the Center's own question, making way, notices,
+                                                         # the guards the review's mutants walked through), S (the renderer, the hashes, the name plates), N (the room's messages, what a here carries,
+                                                         # the two caps), T (the MEET token), K1-K10 (the ctl on two and three pages over Node's BroadcastChannel; K7 the Center's own question,
+                                                         # K8 somebody asks over the Center's dialogs and two who ask each other, K9 CANCEL and leaving withdraw, K10 the public transport on a double
+                                                         # of the MQTT library)
+node tools/pokemonarena_center_test.mjs node --mutants   # ... and 113 defects, one at a time, each in a process of its own; each must fail the case it names (CENTER_MUT=<id> runs one; a ctl mutant
+                                                         # runs only the block of the case it names)
+node tools/pokemonarena_center_test.mjs                  # the Node checks, then real Chrome (54 cases): CB0 the redirect; CB1 the disclosure, NO, YES; CB2 two tabs; CB3 real keys and a click; CB4 a look
+                                                         # and an emote; CB5 a hub player at a spot; CB6 a challenge declined; CB7 one accepted: a battle on both screens, the MEET token; CB8 the door mat;
+                                                         # CB9 the PC and back; CB10 Open switched off elsewhere; CB11 a background tab; CB12 a phone (touch only) and a controller; CB13 the Center's own
+                                                         # question (asked, NO, YES, remembered); CB14 "wants to battle you" over a sign and over an answer left on the screen
+node tools/pokemonarena_center_test.mjs --mutants page-mutants   # seven defects in the page, served over the real files; each must fail its session
 node tools/pokemonarena_center_test.mjs --update         # rewrite center.golden.json from what the ROM gives now (then LOOK at the pictures)
 ```
 
-Ports: `ARENA_PORT` / `ARENA_CDP` (or `CENTER_PORT` / `CENTER_CDP`; defaults 8241 / 9441; the sessions use CDP+0..+2, the page mutants port+20.. and CDP+10..). Pictures: `CENTER_OUT`.
+Ports: `ARENA_PORT` / `ARENA_CDP` (or `CENTER_PORT` / `CENTER_CDP`; defaults 8241 / 9441; the sessions use CDP+0..+4, the page mutants port+20.. and CDP+10..+50). Pictures: `CENTER_OUT`.
+
+What the review found and where each fix is pinned: (1) a player whose switch was off and who had once answered the hub's disclosure was listed with no question, and never told about the look and the
+cell: K7a-K7k, CB13a-CB13f, mutants NC20-NC26, NC40, NC41, BM6; (2) a challenge that arrived while a dialog of the Center was open was never shown, and two players who asked each other were both told
+"said not now": K8a-K8f, M14h-M14k, CB14a-CB14d, mutants NC27-NC31, NC39, NM22-NM25, BM7; (3) three guards had no check: what a walker publishes (N7a2, K1g; NN18, NC38), CANCEL withdrawing a
+challenge (K9a; NC32), leaving withdrawing it (K9b, K9c; NC33).

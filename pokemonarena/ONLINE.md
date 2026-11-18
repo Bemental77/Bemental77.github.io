@@ -136,12 +136,20 @@ its tests are is in `INAPP.md`, section **"CENTER: as built"**. What is unchange
 * **Who is in it.** Trainers *walking* there (the room's own messages, below) walk as the ROM sprite they chose. Trainers who are open *somewhere else* (the hub's switch, a battle against the computer, a
   listed game) stand at fixed spots with a ROM icon saying what they are doing; the ones beyond the last spot are in WHO'S HERE (the wall map, or the menu). A walker's `here` names their board listing
   (`b`), so a trainer who is both is drawn once, walking; each listing is claimed by the first walker who names it.
-* **Walking in means being open**, for that page only (the hub's presence service, `turnOn({ persist: false })`): the first time, the disclosure is asked in the picture with one more sentence (the look
-  and where you stand are listed too); NO leaves the Center and nothing is published before YES. Leaving puts the switch back. Open to battles switched off in another tab walks the player out, with a
-  line saying why.
-* **Battling.** A in front of a trainer (or a tap on them): **ASK TO BATTLE** is `presence.js createChallenge` on the page's own board connection, so the room reaches the asker SEALED to a one-time key;
+* **Walking in means being open**, for that page only (the hub's presence service, `turnOn({ persist: false })`), and the Center lists two things the switch does not: the look and the cell. So a
+  player is asked, in the picture, before anything is switched on: one who was never told what Open to battles lists gets the service's disclosure with one more sentence (the look and where you stand
+  are listed too); one who was told that but never what the CENTER lists (they once answered the hub's switch) gets **the Center's own question** ("While you are in the TRAINER CENTER you are open to
+  battles. On public servers: your trainer name, record, look and where you stand. ..." then **Walk in? YES / NO**, NO highlighted), whether their switch is off or on. NO leaves the Center; nothing is
+  published before YES; YES is remembered (`localStorage` `arena.center.seen`), so it is asked once per browser. Leaving puts the switch back. Open to battles switched off in another tab walks
+  the player out, with a line saying why.
+* **Battling.** A in front of a trainer (or a tap on them) says who they are, then what asking does (a 3 v 3 battle on both screens if they accept): **ASK TO BATTLE** is `presence.js createChallenge` on the page's own board connection, so the room reaches the asker SEALED to a one-time key;
   **JOIN THEIR BATTLE** is a listed game. Either way the hub leaves a one-time MEET token in the tab (`presence.js writeMeetToken`) and opens `battle.html?np=ROOM&join=1&meet=1`, which presses Join by itself
-  only against that token (`online.js`); an address alone joins nothing. The battle comes back to `/pokemonarena/#center` (`INAPP.md` "Contract 6").
+  only against that token (`online.js`); an address alone joins nothing. The battle comes back to `/pokemonarena/#center` (`INAPP.md` "Contract 6"). CANCEL, leaving the Center and a
+  page that goes away withdraw a challenge that is waiting for its answer (`can`): nobody can say YES to a player who is gone.
+* **Being asked.** "<name> wants to battle you" is the presence service's question in the hub's dialog layer, which shows one dialog at a time: whatever the Center has on the screen (a notice, a sign,
+  the nurse, a question about a trainer, its own question before walking in) makes way at once, so the question is never behind something nobody is reading (it is a NO by itself after 25 s). One
+  question at a time: a player who is waiting for an answer to a challenge of their own has it withdrawn. Two players who ask EACH OTHER at once: the page with the smaller board id withdraws and sees
+  the other's question, the other keeps waiting, and YES ends in one battle.
 * **A look** is one of the ROM's overworld trainer sprites, as seven characters: `w` and the ROM graphics id in base 36 (`js/center_look.js`; `localStorage` `arena.avatar`). It rides on the board
   listing as `av`. A code of the first Trainer Center (first character 0-5) is never listed again and draws the first avatar.
 * **Emotes** are the ROM's sixteen icons, by number, shown for two seconds. There is no free text anywhere in the room.
@@ -150,7 +158,9 @@ its tests are is in `INAPP.md`, section **"CENTER: as built"**. What is unchange
 mix with this one): `ask` (who is here?); `here` { name, av, x, y, d, b (the id of my board listing), rec }, every 3 s and after an ask (a trainer is gone 10 s after the last one); `mv` { x, y, d } at each
 step (at most every 60 ms; a step that comes sooner goes out, as the latest position, when the gap is over); `emo` { e }; `bye`. Every message is shape-checked against THE ROM'S ROOM, which is handed to
 the module at run time (`roomRules`): a position that is not a cell of the ROM's map a trainer can stand on, a look that is not a ROM trainer sprite, an emote the ROM does not have and a name that is
-not already safe text are refused; with no room handed in, everything is. One sender cannot send more than 14 messages a second, the room is cut off above 260 a second, and it holds at most 30 trainers.
+not already safe text are refused; with no room handed in, everything is. One sender is heard at most 14 times a second, and what it sends beyond that is dropped before the room's own count (one
+page that floods does not deafen the others); the room is cut off above 260 a second from everybody together, and it holds at most 30 trainers. What a trainer publishes is only the fields above. A sender id
+is only a claim: a stranger who has heard one can send a step in that trainer's name, and the room shows them there until their own next message (at most 3 s).
 
 ## What it guarantees, and what it cannot
 
@@ -185,7 +195,7 @@ node tools/pokemonarena_netmatch_test.mjs             # the protocol on the real
 node tools/pokemonarena_netmatch_test.mjs --mutants   # ... and prove it is not vacuous: break netmatch.js / online_match.js / matchctl.js / engine.js / career_stats.js 39 ways, each must fail a named case
 node tools/pokemonarena_online_page_test.mjs          # two real Chrome tabs; groups: profile hub lobby match leaving rejoin resume timeout refusals teams lead layout open openlayout presence presenceui onlineux (name them to run a subset; `lead --mutants` serves a copy of the game with one defect at a time too, 6 of them, cases LD2 to LD9; `presenceui --mutants` and `onlineux --mutants` also serve a copy of the game with one defect at a time and each must fail a named case: 36 and 22 of them; `profile --mutants` does the same for the write of a match the end-of-match comparison stopped, 2 of them; `open --mutants` does the same for the open games (the cooldown after a failed defection against a forger that rotates its code, the host told a player is joining, a re-knocking player not relisted over, the record of a player the library re-admits by itself, Cancel's address), 10 of them, cases OP0 to OP4; every case id belongs to one group, and the run checks that)
 node tools/pokemonarena_openlobby_test.mjs --mutants  # the notice board in Node: shape, ttl, caps, rate limits, ask/answer, tie-break, confirmed rivals, sealed directed messages, both buses, the cooldown after a failed defection; breaks it 56 ways
-node tools/pokemonarena_center_test.mjs [node] [--mutants]   # THE TRAINER CENTER in the picture: the look code, the ROM's room and its collision, GBA walking, every interaction, the room's messages (version 2) and their guards, the MEET token, the ctl on two and three pages in Node, then real Chrome (CB0-CB12); `INAPP.md` "CENTER: as built"
+node tools/pokemonarena_center_test.mjs [node] [--mutants]   # THE TRAINER CENTER in the picture: the look code, the ROM's room and its collision, GBA walking, every interaction, the room's messages (version 2) and their guards, the MEET token, the ctl on two and three pages in Node (who is asked before walking in, a challenge arriving over the Center's own dialogs, two who ask each other, CANCEL and leaving withdraw, the public transport on a double of the MQTT library), then real Chrome (CB0-CB14); `INAPP.md` "CENTER: as built"
 node tools/pokemonarena_presence_test.mjs --mutants   # the challenge protocol across three boards, the sealed room (real WebCrypto), the accept token, who an open game admits, the address of an accepted-challenge page and the plain address a cancelled join goes back to; breaks presence.js and the pure parts of online.js 50 ways
 node tools/multiplayer_page_test.mjs                  # the lobby catalogue and hand-off, Arena included
 node tools/no_streaming_test.mjs                      # online pages are lockstep-only; this module is one of them

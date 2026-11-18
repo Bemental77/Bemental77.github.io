@@ -7,7 +7,8 @@
 // under "FOR THE CTL" and hears its effects ({ app: 'center', type }).
 //
 // SCREEN    center   (parent: 'online', where it is opened from). One path; what is on it is the MODE:
-//   wait    the screen is open but the player has not walked in: Open to battles is starting, or the first-time disclosure is being asked (hub_presence.js). Nothing is published. B goes back
+//   wait    the screen is open but the player has not walked in: Open to battles is starting, or the player is being asked first (the service's first-time disclosure, hub_presence.js, or THE
+//           CENTER'S OWN QUESTION, askIn(): what walking in lists, YES / NO with NO highlighted). Nothing is published. B goes back
 //   room    walking. GBA walking: one cell at a time on the 16 px grid, 16 frames a cell, the ROM's three-picture walk; a held direction keeps walking (tick(path, held)); a direction pressed
 //           while standing turns at once and walks if it is still held 8 frames later; walls and the counter stop you (the ROM's collision). A is whatever you face; B / START open the menu;
 //           a tap on a floor cell walks there by the shortest way, a tap on a trainer or a thing walks up to it and does what A does. People do not block people
@@ -15,10 +16,14 @@
 //   look    the picker over the ROM's trainer sprites (room.looks), sixteen to a page, the highlighted one walking in place
 //   emote   the picker over the ROM's emote icons
 //   who     WHO'S HERE: everyone who is open, in the room or not; A on a row is what A is in front of them
-// WHAT A DOES in front of: another player -> "<NAME>   W-L online" and ASK TO BATTLE / CANCEL (JOIN THEIR BATTLE when they host a listed game; a plain line when they cannot be battled);
+// WHAT A DOES in front of: another player -> "<NAME>   W-L online", what asking does, and ASK TO BATTLE / CANCEL (JOIN THEIR BATTLE when they host a listed game; a plain line when they cannot
+//   be battled);
 //   the nurse (across the counter) -> a welcome and the way to PLAY ONLINE; the PC -> the Team Builder (B there comes back here, to where you stood); the wall map -> WHO'S HERE;
-//   a sign -> what the Center shares about you. Standing on the door mat and stepping down leaves.
-// THE QUESTIONS are the hub's dialog layer (ROM message box and window): ids 'center:talk', 'center:asking', 'center:note', 'center:nurse', 'center:sign'.
+//   a sign -> what the Center shares about you. What is FACED comes first; a trainer standing on the player's own cell is talked to only when nothing is faced. Standing on the door mat and
+//   stepping down leaves.
+// THE QUESTIONS are the hub's dialog layer (ROM message box and window): ids 'center:enter', 'center:talk', 'center:asking', 'center:note', 'center:nurse', 'center:sign'. The layer shows ONE dialog
+//   at a time, first in first shown, so the Center's own must never stand in front of "<name> wants to battle you" (the service's question, which is a NO by itself after 25 s): makeWay() takes
+//   them off the screen the moment somebody asks, and a notice that only reports something (an answer, a cancel) goes by itself after NOTE_TICKS a page.
 //
 // EFFECTS for the ctl: { app: 'center', type: 'moved' } (I stepped or turned: tell the room) | 'look' { code } | 'emote' { e } | 'ask' { id, name } | 'join' { id, room } | 'cancel-ask' |
 //   'sound' { what: 'bump' | 'door' | 'pc' }. A press in the room names its own sound ({ type: 'sfx', key: null }: a step is silent; the menu opens with the ROM's window sound).
@@ -34,6 +39,9 @@ const parent = () => 'online';
 
 /** Frames (the hub's clock, 59.7275 Hz): a cell, the turn before a walk, between two bump sounds, an emote over a head; and how far (px) a trainer may lag before they are simply put where they are. */
 export const WALK = Object.freeze({ step: 16, turn: 8, bump: 32, emote: 120, snap: 40 });
+/** How long a notice that only REPORTS something ("Bob said not now.", "Challenge cancelled.") stays when nobody presses A: frames a page (six seconds). It then goes by itself, so a player who
+ *  walked away from one is not left standing behind it. */
+export const NOTE_TICKS = 360;
 /** The walk cycle within one cell: the first half shows a walk picture (alternating the ROM's two), the second half the standing one. */
 export const stepOf = (t, foot) => (t < WALK.step / 2 ? foot : 0);
 /** The room's rectangles besides the map itself (logical pixels). A window's numbers are its INTERIOR (the ROM ring is outside it). */
@@ -44,18 +52,28 @@ export const CGEOM = Object.freeze({
   emote: Object.freeze({ x: 24, y: 32, w: 192, h: 64, top: 16, cols: 8, rows: 2, cw: 24, ch: 24 }),  // a title row, then 8 x 2 icons of 16 x 16
   who: Object.freeze({ x: 12, y: 8, w: 216, h: 96, top: 16, rows: 5, pitch: 16 }),                   // a title row, then five trainers
 });
-export const DLG = Object.freeze({ talk: 'center:talk', asking: 'center:asking', note: 'center:note', nurse: 'center:nurse', sign: 'center:sign' });
+export const DLG = Object.freeze({ enter: 'center:enter', talk: 'center:talk', asking: 'center:asking', note: 'center:note', nurse: 'center:nurse', sign: 'center:sign' });
 export const MENU_ROWS = Object.freeze([['look', 'LOOK'], ['emote', 'EMOTE'], ['team', 'TEAM'], ['who', "WHO'S HERE"], ['exit', 'EXIT']].map(([id, label]) => Object.freeze({ id, kind: 'item', label })));
 /** Every sentence of the room that this site wrote (the ROM has no line for them); each is set in the ROM font and measured against its window by the tests. */
 export const WORDS = Object.freeze({
-  also: 'In the Trainer Center your look and where you stand are listed too.',
-  shares: 'While you are in the Trainer Center you are open to battles. Your trainer name, your look, where you stand and your online record are on public servers. Leaving takes it all down.',
+  // one more sentence for the service's first-time disclosure (hub_presence.js turnOn({ also })), which has just said "Nothing else is shared": so it is said as the exception it is
+  also: 'The Trainer Center is the one exception: there your look and where you stand are listed too.',
+  // WHAT THE CENTER SHARES (the Center's own question before walking in, and the signs), A PAGE A THOUGHT: each entry of `shares` is one page of the message box, then how it ends
+  // (`sharesEnd`; `sharesStay` for a player whose OPEN TO BATTLES switch is on: their listing does not go when they leave)
+  shares: Object.freeze(['While you are in the TRAINER CENTER you are open to battles.', 'On public servers: your trainer name, record, look and where you stand.', 'Anyone can see them and challenge you. Nothing else is shared.']),
+  sharesEnd: 'Leaving the TRAINER CENTER takes it all down.',
+  sharesStay: 'When you leave you stay listed, because OPEN TO BATTLES is on.',
+  enterAsk: 'Walk in?',
   nurse: 'Welcome to the TRAINER CENTER! Everyone here is open to battles. Walk up to a trainer and press A.',
   nurseAsk: 'To battle a friend, or anyone who is looking, use PLAY ONLINE. Go there now?',
   getting: 'is still getting ready to battle.',
   version: 'is on another version of the Arena. Reloading the page on both sides fixes it.',
   here: 'is here in the TRAINER CENTER.',
   menu: "is open from the Arena's menu.",
+  askDoes: 'If they accept, a 3 v 3 battle opens on both screens.',
+  joinDoes: (fmt) => 'You join their ' + fmt + ' battle at once.',
+  withdrawn: (n) => 'Your challenge to ' + n + ' was withdrawn.',
+  someone: 'That trainer',
   cancelled: 'Challenge cancelled.',
   off: 'OPEN TO BATTLES was switched off, so you left the TRAINER CENTER.',
   noStart: 'OPEN TO BATTLES could not start, so the TRAINER CENTER is closed for now.',
@@ -85,19 +103,26 @@ export function createCenterHub(ctx) {
   const menu = createMenu(CGEOM.menu);
   const me = { x: 0, y: 0, d: 'up', mv: null, turn: 0, bump: 0, foot: 1, look: null, name: 'Player', rec: null, emote: null, placed: false };
   const S = {
-    room: null, grid: null, phase: 'closed', mode: 'room', net: 'off', why: '',
+    room: null, grid: null, phase: 'closed', mode: 'room', net: 'off', why: null,
     walk: null,               // a tapped walk: { steps, face, after }
     lastDir: null,            // the direction pressed last (of several held, it is the one that counts)
     people: [], disp: new Map(), spotOf: new Map(),
     talk: null, asking: null, keep: false,
+    entering: false,          // the Center's own question (DLG.enter) is waiting for its answer
+    enterHeld: false,         // ... and was taken off the screen to make way for "<name> wants to battle you" (resume() puts it back)
     lookCur: 0, emoCur: 0, whoCur: 0, whoFrom: 'menu', tick: 0,
   };
   const looks = () => (S.room ? S.room.looks : []);
   const eff = (type, o) => ({ app: ID, type, ...(o || {}) });
   const px = ctx.msgPx - 14;                                           // (a page that is followed by another leaves room for the "more" arrow)
   const pagesOf = (text) => wrapDialog(text, ctx.measure, px);
-  const closeAll = () => { for (const id of [DLG.talk, DLG.asking, DLG.nurse, DLG.sign, DLG.note]) ctx.dialog.close(id); };
-  const note = (text) => { ctx.dialog.close(DLG.note); ctx.dialog.open({ id: DLG.note, pages: pagesOf(text), choice: null }); };
+  const closeAll = () => { for (const id of [DLG.enter, DLG.talk, DLG.asking, DLG.nurse, DLG.sign, DLG.note]) ctx.dialog.close(id); S.entering = false; S.enterHeld = false; };
+  // a notice. It goes by itself after NOTE_TICKS a page unless `stay` (a state the player waits in: "accepted! Opening the battle...")
+  const note = (text, stay) => { const pages = pagesOf(text); ctx.dialog.close(DLG.note); ctx.dialog.open({ id: DLG.note, pages, choice: null, ...(stay ? {} : { ticksLeft: NOTE_TICKS * pages.length }) }); };
+  const sharePages = () => (S.why || [...WORDS.shares, WORDS.sharesEnd]).flatMap((c) => pagesOf(c));
+  // THE CENTER'S OWN QUESTION: what walking in lists, then "Walk in?" YES / NO. NO is highlighted and is the last option (B is NO from any page); it listens after the arm delay, because it
+  // appears by itself a moment after the screen opened (the A that opened the Center must not be the A that turns its first page)
+  const openEnter = () => ctx.dialog.open({ id: DLG.enter, pages: [...sharePages(), [WORDS.enterAsk, '']], choice: { options: ['YES', 'NO'], cursor: 1 }, armTicks: DIALOG_ARM_TICKS });
   const inRoom = () => S.phase === 'in' && !!S.grid;
 
   /* ---------------------------------------------------------------- who is in the room */
@@ -147,24 +172,29 @@ export function createCenterHub(ctx) {
     const join = g.doing === 'looking' || g.doing === 'waiting';
     const where = join ? 'is waiting for an opponent (' + fmtText(g.fmt) + ').' : p.kind === 'walker' ? WORDS.here : WORDS.menu;
     S.talk = { id: g.id, name: p.name, join, room: join ? g.room : null };
-    ctx.dialog.open({ id: DLG.talk, pages: [[who, where]], choice: { options: [join ? 'JOIN THEIR BATTLE' : 'ASK TO BATTLE', 'CANCEL'], cursor: 0 } });
+    ctx.dialog.open({ id: DLG.talk, pages: [[who, where], ...pagesOf(join ? WORDS.joinDoes(fmtText(g.fmt)) : WORDS.askDoes)], choice: { options: [join ? 'JOIN THEIR BATTLE' : 'ASK TO BATTLE', 'CANCEL'], cursor: 0 } });
     return fx;
   }
   function use(kind) {
     if (kind === 'nurse') { ctx.dialog.close(DLG.nurse); ctx.dialog.open({ id: DLG.nurse, pages: [...pagesOf(WORDS.nurse), ...pagesOf(WORDS.nurseAsk)], choice: { options: ['PLAY ONLINE', 'STAY HERE'], cursor: 1 } }); return []; }
     if (kind === 'pc') { S.keep = true; return [SILENT, eff('sound', { what: 'pc' }), ...ctx.go('builder')]; }
     if (kind === 'map') { openWho('room'); return []; }
-    if (kind === 'sign') { ctx.dialog.close(DLG.sign); ctx.dialog.open({ id: DLG.sign, pages: pagesOf(S.why || WORDS.shares), choice: null }); return []; }
+    if (kind === 'sign') { ctx.dialog.close(DLG.sign); ctx.dialog.open({ id: DLG.sign, pages: sharePages(), choice: null }); return []; }
     return [];
   }
-  /** A: whatever is in front of me (a trainer on my own cell counts: people do not block people). */
+  /**
+   * A: whatever is in front of me: a trainer on the cell ahead, else the thing I face (the PC, the nurse, a sign, the wall map). Only when nothing is faced: a trainer standing on my own cell
+   * (people do not block people, so somebody can stand where I stand; they must not take the PC away from me by standing in front of it).
+   */
   function act() {
     if (me.mv) return [SILENT];
     const f = ahead(me.x, me.y, me.d);
-    const p = personAt(f.x, f.y) || personAt(me.x, me.y);
+    const p = personAt(f.x, f.y);
     if (p) return talk(p);
     const kind = S.grid.facing(me.x, me.y, me.d);
-    return kind ? use(kind) : [SILENT];
+    if (kind) return use(kind);
+    const under = personAt(me.x, me.y);
+    return under ? talk(under) : [SILENT];
   }
 
   /* ---------------------------------------------------------------- walking */
@@ -402,6 +432,8 @@ export function createCenterHub(ctx) {
       }
       if (id === DLG.asking) { if (!S.asking) return []; S.asking = null; note(WORDS.cancelled); return [eff('cancel-ask')]; }
       if (id === DLG.nurse) return value === 0 ? ctx.go('online') : [];
+      // the Center's own question: YES is heard by the ctl (it is the dialog's answer), which switches Open to battles on and walks in; anything else leaves, without a word
+      if (id === DLG.enter) { S.entering = false; S.enterHeld = false; return value === 0 || S.phase !== 'wait' ? [] : ctx.back(); }
       return [];
     },
     wantsText: () => false,
@@ -436,7 +468,7 @@ export function createCenterHub(ctx) {
       return 'Trainer Center. ' + (others.length ? others.length + (others.length === 1 ? ' other trainer is here: ' : ' other trainers are here: ') + others.join(', ') + '.' : WORDS.whoNone) + front + ' The arrows walk, A talks, B opens the menu.';
     },
     title: () => 'Pokemon Arena - Trainer Center',
-    state: () => ({ phase: S.phase, mode: S.mode, x: me.x, y: me.y, d: me.d, moving: !!me.mv, walking: S.walk ? S.walk.steps.length + 1 : 0, look: me.look, emote: me.emote ? me.emote.e : null, people: S.people.length, cursor: S.mode === 'menu' ? menu.cursor() : S.mode === 'look' ? S.lookCur : S.mode === 'emote' ? S.emoCur : S.mode === 'who' ? S.whoCur : null, asking: S.asking ? S.asking.id : null, net: S.net }),
+    state: () => ({ phase: S.phase, mode: S.mode, x: me.x, y: me.y, d: me.d, moving: !!me.mv, walking: S.walk ? S.walk.steps.length + 1 : 0, look: me.look, emote: me.emote ? me.emote.e : null, people: S.people.length, cursor: S.mode === 'menu' ? menu.cursor() : S.mode === 'look' ? S.lookCur : S.mode === 'emote' ? S.emoCur : S.mode === 'who' ? S.whoCur : null, asking: S.asking ? S.asking.id : null, entering: S.entering, net: S.net }),
 
     /* ================================================================ FOR THE CTL (center_ctl.js) and the tests ================================================================ */
     /** The ROM's room (center_room.js roomFromWorld). Until it is handed in there is nothing to walk on. */
@@ -444,8 +476,8 @@ export function createCenterHub(ctx) {
     room: () => S.room,
     /** Who I am: { name, rec, look } (each optional; look: a look code). */
     setMe(o) { if (!o) return; if (typeof o.name === 'string' && o.name) me.name = o.name.slice(0, 12); if ('rec' in o) me.rec = recOf(o.rec); if ('look' in o && (o.look === null || lookId(o.look) !== null)) me.look = o.look; },
-    /** What the signs say (the disclosure's words and what the Center adds), from the ctl. */
-    setShares(text) { S.why = typeof text === 'string' ? text : ''; },
+    /** What the signs and the Center's own question say, from the ctl: a list of thoughts, a page each (or one string). Nothing: the words above. */
+    setShares(text) { const list = Array.isArray(text) ? text.filter((c) => typeof c === 'string' && c) : typeof text === 'string' && text ? [text] : []; S.why = list.length ? list : null; },
     /**
      * WALK IN (the player is open to battles and has been told what that publishes): n picks the spawn cell (any unsigned integer: the ctl's random number). A player who left through the PC
      * or TEAM comes back to where they stood. -> false when there is no room or the screen is not open.
@@ -475,9 +507,37 @@ export function createCenterHub(ctx) {
     /** My own emote went out: show it over my head. */
     myEmote(e) { if (Number.isInteger(e) && S.room && e >= 0 && e < S.room.emotes) me.emote = { e, t: 0 }; },
     /** The player I asked said yes: the battle is opening. */
-    askAccepted() { const a = S.asking; S.asking = null; ctx.dialog.close(DLG.asking); note((a ? a.name : 'They') + ' accepted! Opening the battle...'); },
+    askAccepted() { const a = S.asking; S.asking = null; ctx.dialog.close(DLG.asking); note((a ? a.name : WORDS.someone) + ' accepted! Opening the battle...', true); },
     /** The challenge ended without a battle: why = 'declined' | 'busy' | 'timeout' | 'unsupported' | 'gone' | 'off' | 'storage'. */
-    askFailed(why) { const a = S.asking; S.asking = null; ctx.dialog.close(DLG.asking); note((ANSWER_WORDS[why] || ANSWER_WORDS.timeout)(a ? a.name : 'They')); },
+    askFailed(why) { const a = S.asking; S.asking = null; ctx.dialog.close(DLG.asking); note((ANSWER_WORDS[why] || ANSWER_WORDS.timeout)(a ? a.name : WORDS.someone)); },
+    /**
+     * THE CTL WITHDREW MY CHALLENGE because somebody asked ME meanwhile (one question at a time: the one I am asked is the one on the screen). The waiting line goes without "Challenge
+     * cancelled."; say: true leaves a line behind the question, for when it has been answered ("Your challenge to <NAME> was withdrawn."). -> the name of the player I was asking, or null.
+     */
+    askWithdrawn(say) { const a = S.asking; if (!a) return null; S.asking = null; ctx.dialog.close(DLG.asking); if (say) note(WORDS.withdrawn(a.name)); return a.name; },
+    /**
+     * THE CENTER'S OWN QUESTION, asked before anything is switched on or published (the ctl decides when: a player who has not yet said YES to what the Center lists). The answer is the
+     * dialog's: YES (0) goes to the ctl, anything else leaves the Center. -> false when it could not be asked (the screen is not waiting to be walked into, or the dialog layer is full).
+     */
+    askIn() { if (S.phase !== 'wait') return false; ctx.dialog.close(DLG.enter); S.enterHeld = false; S.entering = !!openEnter(); return S.entering; },
+    /**
+     * SOMEBODY ASKS ME TO BATTLE: the service's question is in the dialog layer, which shows one dialog at a time, first in first shown. Everything of the Center's own that stands in front of
+     * it goes: a notice, a sign, the nurse, the question about a trainer (they are over: the player can open them again), and the Center's own question (put away: resume() asks it again).
+     * The line that waits for an answer to MY challenge is the ctl's to settle (askWithdrawn).
+     */
+    makeWay() {
+      for (const id of [DLG.note, DLG.sign, DLG.nurse, DLG.talk]) ctx.dialog.close(id);
+      S.talk = null;
+      if (S.entering && !S.enterHeld) { ctx.dialog.close(DLG.enter); S.enterHeld = true; }
+    },
+    /**
+     * That question is gone (answered NO, withdrawn, timed out): the Center's own question, if it was put away for it, is asked again from its first page.
+     * -> false only when it had to be asked again and could not be (the dialog layer is full): the ctl then takes that for a NO.
+     */
+    resume() { if (!S.enterHeld) return true; S.enterHeld = false; if (S.entering && S.phase === 'wait') S.entering = !!openEnter(); return S.entering || S.phase !== 'wait'; },
+    /** Does the next walk-in keep the cell the player stood on (they left through the PC or TEAM)? forgetPlace(): no more (they went somewhere the Center is not on the way back from). */
+    keepsPlace: () => S.keep,
+    forgetPlace() { S.keep = false; },
     /** A plain line over the room. */
     say(text) { note(text); },
     /** OUT, with a line saying why ('off': Open to battles went off elsewhere; 'noStart': it could not start). -> the effects that leave the screen. */

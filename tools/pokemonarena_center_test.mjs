@@ -8,21 +8,25 @@
 //                                                           pokemonarena/js, browser mutants are served over the real files by a small overlay server). CENTER_MUT=<id> runs one.
 //   node tools/pokemonarena_center_test.mjs --update        write pokemonarena/center.golden.json (hashes of the pictures only, never pixels) from what the ROM gives now
 //   node tools/pokemonarena_center_test.mjs CB3 CB7         only those browser sessions (after the Node checks)
-//   ARENA_PORT / ARENA_CDP (or CENTER_PORT / CENTER_CDP; defaults 8241 / 9441); CENTER_OUT=<dir> for the pictures it writes (default: the system's temp folder)
+//   ARENA_PORT / ARENA_CDP (or CENTER_PORT / CENTER_CDP; defaults 8241 / 9441; the sessions use CDP+0..+4, the page mutants port+20.. and CDP+10..+50);
+//   CENTER_OUT=<dir> for the pictures it writes (default: the system's temp folder)
 //
 // NODE (nothing is faked below the page: the real hub model, the real renderer and ROM font, the real presence service, presence_boot.js, presence.js and the board over Node's
 // BroadcastChannel, which is the transport ?net=local uses in a browser; doubled: window, document, navigation, the sound door):
 //   L  looks: the seven-character code of a ROM trainer sprite, old codes, the stored look
 //   R  the room read from the ROM: the collision, the door, the nurse, the PC, the wall map, the signs, the spots; the pictures against hashes
 //   G  the grid: what is faced from where, the shortest walk, the door mat
-//   M  the model: walking in, GBA walking, the ROM's collision, taps, every interaction from the right cell and facing only, the menu, the pickers, WHO'S HERE, the people, the words
-//   S  the renderer: the layers, the depth order, feet on the cell, every text against its window, no art in the source
-//   N  the room's messages and roster: version 2, the guards (a position, a look, an emote, a name), the caps
+//   M  the model: walking in, GBA walking, the ROM's collision, taps, every interaction from the right cell and facing only (what is faced before a trainer underfoot), the menu, the
+//      pickers, WHO'S HERE, the people, the words; M14: the Center's own question, its dialogs making way for "wants to battle you", notices that go by themselves
+//   S  the renderer: the layers, the depth order, feet on the cell, every text against its window, no art in the source; S5: the name plates (the ROM's chip, none on another)
+//   N  the room's messages and roster: version 2, the guards (a position, a look, an emote, a name), what a `here` carries, the two caps
 //   T  the one-time MEET token and the battle page's address
 //   K  the ctl on two and three pages: nothing published before YES, seeing each other, a step, a look, an emote, a hub player at a spot, a challenge declined and one accepted,
-//      the switch going off elsewhere, the switch put back, the sounds
+//      the switch going off elsewhere, the switch put back, the sounds (K1-K6); K7 THE CENTER'S OWN QUESTION (a player who once answered the hub's disclosure is still asked before
+//      anything is switched on); K8 a challenge that arrives over a notice, a sign, the nurse, a question, the waiting line; two players who ask each other; K9 CANCEL and leaving
+//      withdraw a challenge; K10 the public transport, on a double of the MQTT library (the room's own topic; not even a connection before YES)
 // BROWSER (real Chrome through tools/headless_cdp.mjs: headless, a throwaway profile, muted; the tabs share one profile, which is what lets ?net=local pair them; everything is read and
-// driven through window.__arenaHub, real keys, real taps and a scripted controller): CB0-CB12, listed where they are.
+// driven through window.__arenaHub, real keys, real taps and a scripted controller): CB0-CB14, listed where they are.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -55,7 +59,7 @@ const S16 = (c) => String(c).repeat(16).slice(0, 16);
 
 /* ================================================================================================ Node checks */
 // runNode(jsDir, log, parts) -> the names of the failed cases. jsDir is pokemonarena/js or a copy of it with one defect. parts: { pure, ctl }.
-async function runNode(jsDir, log, parts = { pure: true, ctl: true }) {
+async function runNode(jsDir, log, parts = { pure: true, ctl: true, block: null }) {
   const failed = [];
   failed.checks = 0;
   const ok = (c, name, detail) => { failed.checks++; if (!c) { failed.push(name); if (log) console.log('FAIL', name, detail === undefined ? '' : String(detail).slice(0, 400)); } else if (log && process.env.CENTER_VERBOSE) console.log('ok  ', name); };
@@ -153,6 +157,9 @@ async function runNode(jsDir, log, parts = { pure: true, ctl: true }) {
         dlg: () => hub.view().dialog || null,
         text: () => { const d = hub.view().dialog; return d ? d.lines.filter(Boolean).join(' ') : null; },
         allText: () => { const out = []; for (let i = 0; i < 20; i++) { const d = hub.view().dialog; if (!d) break; out.push(d.lines.filter(Boolean).join(' ')); if (!d.more) break; hub.press('a'); } return out.join(' '); },
+        // to the last page of the dialog that is open (where its options are); and: close whatever is open (bounded: a dialog that will not close must fail a check, not hang the run)
+        last: () => { for (let i = 0; i < 20 && hub.view().dialog && hub.view().dialog.more; i++) w.press('a'); return hub.view().dialog || null; },
+        clear: () => { for (let i = 0; i < 30 && hub.view().dialog; i++) w.press('b'); return !hub.view().dialog; },
         sounds: () => log.filter((e) => e.app === 'center' && e.type === 'sound').map((e) => e.what),
         of: (type) => log.filter((e) => e.app === 'center' && e.type === type),
         // walk one cell with the d-pad: press, hold through the turn and the step, let go
@@ -330,7 +337,7 @@ async function runNode(jsDir, log, parts = { pure: true, ctl: true }) {
       ok(m.st().mode === 'room', 'M6o ... and B is back in the room', m.st().mode);
       m.cell(room.signs[0].x, room.signs[0].y); m.tick(400);
       const sign = m.dlg(), words = m.allText();
-      ok(sign && sign.id === 'center:sign' && /trainer name/.test(words) && /your look/.test(words) && /where you stand/.test(words) && /online record/.test(words) && /public servers/.test(words) && /takes it all down/.test(words), 'M6p a sign says what the Center shares about you: name, look, where you stand, record, where, and how it ends', words);
+      ok(sign && sign.id === 'center:sign' && /trainer name, record, look and where you stand/.test(words) && /public servers/.test(words) && /challenge you/.test(words) && /takes it all down/.test(words), 'M6p a sign says what the Center shares about you: name, record, look, where you stand, where, that anyone can challenge, and how it ends', words);
       m.app.setShares('ONE TWO THREE'); m.press('a'); m.press('a');
       ok(/ONE TWO THREE/.test(m.allText()), 'M6q ... in the words the ctl hands in (the disclosure\'s)', '');
       ok([w, p, t, n, m].every((x) => x.hub.faults().length === 0), 'M6r nothing threw', J(m.hub.faults()));
@@ -367,13 +374,13 @@ async function runNode(jsDir, log, parts = { pure: true, ctl: true }) {
       w.app.setRoster({ walkers, players });
       // a tap on a trainer walks up to them and talks
       w.click(6 * CELL + 8, 5 * CELL + 4); w.tick(400);
-      const d = w.dlg();
-      ok(d && d.id === 'center:talk' && d.lines[0] === 'RED   3-1 online' && d.lines[1] === CH.WORDS.here && d.choice.options.join() === 'ASK TO BATTLE,CANCEL' && Math.abs(w.st().x - 6) + Math.abs(w.st().y - 5) === 1,
-        'M8a a tap on a trainer walks up to them: "<NAME>   W-L online", where they are, ASK TO BATTLE / CANCEL', J([d, w.st()]));
+      const d = w.dlg(), d2 = w.last();
+      ok(d && d.id === 'center:talk' && d.lines[0] === 'RED   3-1 online' && d.lines[1] === CH.WORDS.here && d.more && !d.choice && d2 && d2.lines.filter(Boolean).join(' ') === CH.WORDS.askDoes && /3 v 3 battle opens on both screens/.test(CH.WORDS.askDoes) && d2.choice && d2.choice.options.join() === 'ASK TO BATTLE,CANCEL' && d2.choice.cursor === 0 && Math.abs(w.st().x - 6) + Math.abs(w.st().y - 5) === 1,
+        'M8a a tap on a trainer walks up to them: "<NAME>   W-L online" and where they are, then what asking does (a 3 v 3 battle on both screens if they accept) with ASK TO BATTLE / CANCEL', J([d, d2, w.st()]));
       w.press('b');
       ok(w.dlg() === null && w.of('ask').length === 0, 'M8b B is CANCEL: nothing is asked', '');
       // A facing them
-      w.press('a'); w.press('a');
+      w.press('a'); w.last(); w.press('a');
       const asking = w.dlg(), ask = w.of('ask');
       ok(ask.length === 1 && ask[0].id === S16('a') && ask[0].name === 'RED' && asking && asking.id === 'center:asking' && /Asked RED to battle/.test(asking.lines[0]) && /Waiting/.test(asking.lines[1]) && asking.choice.options.join() === 'CANCEL' && w.st().asking === S16('a'),
         'M8c ASK TO BATTLE asks that player\'s listing and says so: "Asked RED to battle. Waiting for an answer..." with CANCEL', J([ask, asking]));
@@ -383,19 +390,19 @@ async function runNode(jsDir, log, parts = { pure: true, ctl: true }) {
       ok(w.of('cancel-ask').length === 1 && w.text() === CH.WORDS.cancelled && w.st().asking === null, 'M8e CANCEL withdraws the challenge and says "Challenge cancelled."', w.text());
       w.press('a');
       // accepted, and every way it can end without a battle
-      const reask = () => { while (w.dlg()) w.press('b'); w.press('a'); w.press('a'); };
+      const reask = () => { w.clear(); w.press('a'); w.last(); w.press('a'); };
       reask(); w.app.askAccepted();
       ok(w.text() === 'RED accepted! Opening the battle...' && w.st().asking === null, 'M8f accepted: "RED accepted! Opening the battle..."', w.text());
       const said = {};
       for (const why of ['declined', 'busy', 'timeout', 'unsupported', 'gone', 'off', 'storage']) { reask(); w.app.askFailed(why); said[why] = w.allText(); }
       ok(said.declined === 'RED said not now.' && /answering another challenge/.test(said.busy) && said.timeout === 'RED did not answer.' && /cannot send a private challenge/.test(said.unsupported) && /not open to battles any more/.test(said.gone) && /not open to battles yet/.test(said.off) && /storage/.test(said.storage),
         'M8g declined, busy, no answer, a browser that cannot ask, a player who left: each is said in words', J(said));
-      while (w.dlg()) w.press('b');
+      w.clear();
       // a listed game: JOIN THEIR BATTLE
       const sp = w.app.people().find((p) => p.name === 'SILVER');
       w.click(sp.x * CELL + 8, sp.y * CELL + 2); w.tick(600);
-      const jd = w.dlg();
-      ok(jd && jd.choice && jd.choice.options.join() === 'JOIN THEIR BATTLE,CANCEL' && /waiting for an opponent \(3 v 3\)/.test(jd.lines[1]), 'M8h a player who hosts a listed game: JOIN THEIR BATTLE / CANCEL', J(jd));
+      const jd0 = w.dlg(), jd = w.last();
+      ok(jd0 && /waiting for an opponent \(3 v 3\)/.test(jd0.lines[1]) && jd && jd.choice && jd.choice.options.join() === 'JOIN THEIR BATTLE,CANCEL' && jd.lines.filter(Boolean).join(' ') === 'You join their 3 v 3 battle at once.', 'M8h a player who hosts a listed game: what joining does, JOIN THEIR BATTLE / CANCEL', J([jd0, jd]));
       w.press('a');
       const join = w.of('join');
       ok(join.length === 1 && join[0].room === 'ABCDE' && join[0].id === S16('e') && w.of('ask').length === 9, 'M8i ... which joins their room (nothing is asked)', J(join));
@@ -485,8 +492,8 @@ async function runNode(jsDir, log, parts = { pure: true, ctl: true }) {
       const v2 = w.hub.view().center.who;
       ok(v2.top > 0 && v2.up && v2.rows[v2.cursor].name === 'P5', 'M10b the list scrolls with the cursor', J(v2));
       w.press('a');
-      const d = w.dlg();
-      ok(d && d.id === 'center:talk' && /^P5/.test(d.lines[0]) && d.choice.options[0] === 'JOIN THEIR BATTLE', 'M10c A on a row is what A is in front of that trainer (a player who is not in the picture can be battled from here)', J(d));
+      const d = w.dlg(), dl = w.last();
+      ok(d && d.id === 'center:talk' && /^P5/.test(d.lines[0]) && dl && dl.choice && dl.choice.options[0] === 'JOIN THEIR BATTLE', 'M10c A on a row is what A is in front of that trainer (a player who is not in the picture can be battled from here)', J([d, dl]));
       w.press('b'); w.press('b');
       ok(w.st().mode === 'menu', 'M10d B goes back to the menu it was opened from', w.st().mode);
       w.press('a'); w.press('up');
@@ -519,6 +526,17 @@ async function runNode(jsDir, log, parts = { pure: true, ctl: true }) {
       w.press('b');
       w.walk('up'); w.walk('left');
       ok(w.st().x === 6 && w.st().y === 6 && w.app.people().some((p) => p.name === 'BLUE' && p.x === 6 && p.y === 6), 'M11e ... and a cell somebody stands on can be walked onto', J(w.st()));
+      // what is FACED comes first: somebody standing on the player's own cell does not take the PC, the nurse, a sign or the wall map away
+      const taken = [];
+      for (const [kind, c] of [['nurse', room.nurse.talk], ['pc', room.pc[0].use], ['map', room.map[0].use], ['sign', room.signs[0].use]]) {
+        const x = mk();
+        x.cell(c.x, c.y); x.idle(); x.press('up'); x.tick(2);
+        x.app.setRoster({ walkers: [walker('1', 'RED', 1, c.x, c.y, { b: S16('a') })], players: [player('a', 'RED', 'menu')] });
+        x.press('a');
+        const got = kind === 'pc' ? x.hub.path() === 'builder' : kind === 'map' ? x.st().mode === 'who' : !!x.dlg() && x.dlg().id === 'center:' + kind;
+        if (!got || x.st().x !== c.x || x.st().y !== c.y) taken.push(kind + ' ' + J([x.hub.path(), x.st().mode, x.dlg() && x.dlg().id]));
+      }
+      ok(!taken.length, 'M11g what is FACED comes before a trainer who stands on the player\'s own cell: A at the PC, the nurse, a sign and the wall map is still the PC, the nurse, the sign, the map', J(taken));
       ok(w.hub.faults().length === 0, 'M11f nothing threw', J(w.hub.faults()));
     });
 
@@ -531,11 +549,11 @@ async function runNode(jsDir, log, parts = { pure: true, ctl: true }) {
       w.app.setRoster({ walkers, players });
       const over = [];
       const check = (where) => { const v = w.hub.view(); for (const m of screen.widths(v).concat(cs.widths(v))) if (m.px > m.max) over.push(where + ': ' + m.what + ' ' + m.px + ' > ' + m.max); const fr = screen.render(v); if (fr.fault) over.push(where + ' fault ' + J(fr.fault)); };
-      const pages = (where) => { for (let i = 0; i < 20 && w.dlg(); i++) { check(where + ' p' + i); if (!w.dlg().more) break; w.hub.press('a'); } while (w.dlg()) w.hub.press('b'); };
+      const pages = (where) => { for (let i = 0; i < 20 && w.dlg(); i++) { check(where + ' p' + i); if (!w.dlg().more) break; w.hub.press('a'); } if (!w.clear()) over.push(where + ': a dialog that B does not close'); };
       check('room');
       for (const p of w.app.people()) { w.press('b'); w.press('down'); w.press('down'); w.press('down'); w.press('a'); const rows = w.hub.view().center.who.total; for (let i = 0; i < rows; i++) { check('who'); if (w.hub.view().center.who.rows[w.hub.view().center.who.cursor].name === p.name) break; w.press('down'); } w.press('a'); pages('talk ' + p.name); w.press('b'); w.press('b'); }
       // asking and every answer
-      w.press('b'); w.press('down'); w.press('down'); w.press('down'); w.press('a'); w.press('a'); w.press('a'); check('asking');
+      w.press('b'); w.press('down'); w.press('down'); w.press('down'); w.press('a'); w.press('a'); w.last(); w.press('a'); check('asking');
       w.app.askAccepted(); pages('accepted');
       for (const why of Object.keys(CH.ANSWER_WORDS)) { w.app.askFailed(why); pages('answer ' + why); }
       w.app.say(CH.WORDS.cancelled); pages('cancelled');
@@ -577,9 +595,112 @@ async function runNode(jsDir, log, parts = { pure: true, ctl: true }) {
       const o = mk(); o.app.out();
       ok(o.hub.path() === 'online' && !o.hub.view().dialog, 'M13c out after NO to the disclosure: back, without a word', o.hub.path());
       const st = mk().st();
-      ok(J(Object.keys(st).sort()) === J(['asking', 'cursor', 'd', 'emote', 'look', 'mode', 'moving', 'net', 'people', 'phase', 'walking', 'x', 'y']) && J(st).length < 200, 'M13d state() is small plain JSON', J(st));
+      ok(J(Object.keys(st).sort()) === J(['asking', 'cursor', 'd', 'emote', 'entering', 'look', 'mode', 'moving', 'net', 'people', 'phase', 'walking', 'x', 'y']) && J(st).length < 220, 'M13d state() is small plain JSON', J(st));
       const reg = HM.createHubModel({});
       ok(reg.apps.center.id === 'center' && reg.apps.center.paths.join() === 'center' && reg.apps.center.parent('center') === 'online' && HM.arrivalTrail('center').join() === 'online,center', 'M13e the app is the registry\'s `center`, one path, opened from PLAY ONLINE', '');
+    });
+
+    await guard('M14', () => {
+      const challenge = { id: 'presence:challenge', pages: [['RED wants to battle you.', '']], choice: { options: ['YES', 'NO'], cursor: 1 }, armTicks: 36 };          // (what the presence service puts in the dialog layer)
+      // THE CENTER'S OWN QUESTION
+      const w = mk({ outside: true }); w.hub.goto('center');
+      const put = w.app.askIn(), q0 = w.dlg();
+      ok(put === true && q0 && q0.id === 'center:enter' && q0.armed === false && q0.pages === CH.WORDS.shares.length + 2 && w.st().phase === 'wait' && w.st().entering === true, 'M14a the Center\'s own question is put while the screen waits to be walked into, a page a thought (no sentence is cut in two by a page), and does not listen at once', J([put, q0, w.st()]));
+      w.press('a'); w.press('b');
+      ok(w.dlg() && w.dlg().id === 'center:enter' && w.dlg().page === 0 && w.hub.path() === 'center', 'M14b ... for 0.6 s neither A nor B does anything (the A that opened the Center turns no page and answers nothing)', J(w.dlg()));
+      w.tick(40);
+      let words = ''; for (let i = 0; i < 20 && w.dlg() && w.dlg().more; i++) { words += ' ' + w.text(); w.press('a'); }
+      const lastQ = w.dlg();
+      ok(/open to battles/.test(words) && /trainer name, record, look and where you stand/.test(words) && /public servers/.test(words) && /challenge you/.test(words) && /Nothing else is shared/.test(words) && /takes it all down/.test(words)
+        && lastQ && lastQ.lines[0] === CH.WORDS.enterAsk && lastQ.choice && lastQ.choice.options.join() === 'YES,NO' && lastQ.choice.cursor === 1,
+        'M14c it says what walking in lists (the name, the record, the look, where you stand), where, that anyone can challenge, that nothing else is shared, and how it ends; then "Walk in?" YES / NO with NO highlighted', words + ' | ' + J(lastQ));
+      const n0 = w.log.length; w.press('a');
+      const ans = w.log.slice(n0);
+      ok(w.hub.path() === 'online' && w.st().phase === 'closed' && w.st().entering === false && !w.dlg() && ans.some((e) => e.type === 'dialog' && e.id === 'center:enter' && e.value === 1 && e.app === 'center') && ans.some((e) => e.type === 'screen'),
+        'M14d NO leaves the Center without a word, and the ctl is told the answer', J(ans));
+      const b = mk({ outside: true }); b.hub.goto('center'); b.app.askIn(); b.tick(40); b.press('b');
+      const y = mk({ outside: true }); y.hub.goto('center'); y.app.askIn(); y.tick(40); y.last(); y.press('up');
+      const n1 = y.log.length; y.press('a');
+      ok(b.hub.path() === 'online' && y.hub.path() === 'center' && y.st().phase === 'wait' && y.st().entering === false && !y.dlg() && y.log.slice(n1).some((e) => e.type === 'dialog' && e.id === 'center:enter' && e.value === 0 && e.app === 'center') && !y.log.slice(n1).some((e) => e.type === 'screen'),
+        'M14e B is NO from the first page; YES stays on the screen and is told to the ctl (which then switches Open to battles on and walks in)', J([b.hub.path(), y.st(), y.log.slice(n1)]));
+      const inn = mk(), shut = mk({ outside: true });
+      ok(inn.app.askIn() === false && !inn.dlg() && shut.app.askIn() === false && !shut.dlg(), 'M14f the question is only put on a screen that waits to be walked into (not in the room, not on a closed screen)', '');
+      const l = mk({ outside: true }); l.hub.goto('center'); l.app.askIn(); l.hub.goto('main');
+      ok(!l.hub.view().dialog && l.st().entering === false, 'M14g leaving the screen takes the question with it', J(l.hub.view().dialog));
+      // SOMEBODY ASKS ME: what the Center has in the dialog layer makes way
+      const openers = {
+        note: (x) => x.app.askFailed('timeout'),
+        sign: (x) => { x.cell(room.signs[0].x, room.signs[0].y); x.tick(400); },
+        nurse: (x) => { x.cell(room.nurse.x, room.nurse.y); x.tick(400); },
+        talk: (x) => { x.app.setRoster({ walkers: [walker('1', 'RED', 1, 7, 6, { b: S16('a') })], players: [player('a', 'RED', 'menu')] }); x.press('a'); },
+      };
+      const stuck = [];
+      for (const [kind, open] of Object.entries(openers)) {
+        const x = mk(); open(x);
+        const before = x.dlg() && x.dlg().id;
+        x.hub.dialog.open(challenge);
+        const hidden = x.dlg() && x.dlg().id;
+        x.app.makeWay();
+        const now = x.dlg();
+        if (before !== 'center:' + kind || hidden !== before || !now || now.id !== 'presence:challenge' || now.armed !== false || now.queued !== 0) stuck.push(kind + ': ' + before + ' > ' + (now && now.id));
+      }
+      ok(!stuck.length, 'M14h somebody asks me: a notice, a sign, the nurse and the question about a trainer make way, so that "wants to battle you" is the one on the screen (it listens only after its own arm delay)', J(stuck));
+      // my own waiting line is the ctl's to settle
+      const k = mk(); openers.talk(k); k.last(); k.press('a');
+      k.hub.dialog.open(challenge); k.app.makeWay();
+      const kept = k.dlg() && k.dlg().id, name = k.app.askWithdrawn(true), top = k.dlg() && k.dlg().id;
+      k.tick(40); k.press('a');                                                // NO to that question (the highlighted answer)
+      const line = k.text();
+      const k2 = mk(); openers.talk(k2); k2.last(); k2.press('a'); k2.hub.dialog.open(challenge); const name2 = k2.app.askWithdrawn(false); k2.tick(40); k2.press('a');
+      ok(kept === 'center:asking' && name === 'RED' && top === 'presence:challenge' && k.st().asking === null && line === 'Your challenge to RED was withdrawn.' && k.of('cancel-ask').length === 0 && name2 === 'RED' && !k2.dlg() && mk().app.askWithdrawn(true) === null,
+        'M14i the line that waits for an answer to MY challenge is the ctl\'s to settle: askWithdrawn takes it off (no "Challenge cancelled.", no second cancel) and, when asked to, leaves a line behind the question', J([kept, name, top, line, name2, k2.dlg()]));
+      // the Center's own question makes way too, and comes back
+      const e = mk({ outside: true }); e.hub.goto('center'); e.app.askIn(); e.tick(40); e.press('a');
+      const onPage = e.dlg().page;
+      e.hub.dialog.open(challenge); e.app.makeWay();
+      const over = e.dlg() && e.dlg().id;
+      e.hub.dialog.close('presence:challenge'); e.app.resume(); e.app.resume();
+      const back = e.dlg();
+      const full = mk({ outside: true }); full.hub.goto('center'); full.app.askIn(); full.app.makeWay();
+      for (let i = 0; i < 8; i++) full.hub.dialog.open({ id: 'x' + i, pages: [['.', '']], choice: null });
+      const cannot = full.app.resume();
+      ok(cannot === false && full.st().entering === false && mk().app.resume() === true, 'M14t a question that had to be asked again and cannot be (the dialog layer is full) is reported, so that the ctl takes it for a NO (nobody is walked in unasked)', J([cannot, full.st()]));
+      ok(onPage === 1 && over === 'presence:challenge' && back && back.id === 'center:enter' && back.page === 0 && back.armed === false && back.queued === 0 && e.st().entering === true,
+        'M14j the Center\'s own question makes way as well, and is asked again from its first page (listening after the arm delay) when that question is gone', J([onPage, over, back]));
+      // a notice that only reports goes by itself
+      const t = mk(); t.app.askFailed('declined');
+      const d0 = t.hub.dialog.current();
+      t.tick(CH.NOTE_TICKS - 1); const still = !!t.dlg(); t.tick(1);
+      const t2 = mk(); t2.app.askAccepted(); t2.tick(CH.NOTE_TICKS * 3);
+      ok(CH.NOTE_TICKS === 360 && d0 && d0.id === 'center:note' && d0.ticksLeft === CH.NOTE_TICKS && still && !t.dlg() && t2.dlg() && t2.dlg().id === 'center:note',
+        'M14k a notice that reports an answer goes by itself after six seconds (nobody is left standing behind it); "accepted! Opening the battle..." stays until the battle opens', J([d0, still, t.dlg(), t2.dlg()]));
+      const g = mk(), said = {};
+      for (const why of ['declined', 'gone', 'timeout', 'busy']) { g.app.askFailed(why); said[why] = g.allText(); }
+      g.app.askAccepted();
+      ok(!/\bThey\b/.test(J(said)) && said.gone === 'That trainer is not open to battles any more.' && /^That trainer accepted!/.test(g.text()), 'M14l with nobody asked the words still read ("That trainer is not open to battles any more.")', J(said));
+      // guards a reviewer's mutants walked through
+      const s = mk();
+      s.app.setRoster({ walkers: [walker('1', 'RED', 1, 7, 5, { b: S16('a') })], players: [player('a', 'RED', 'menu')] });
+      s.tick(1, ['up']);
+      const mid = s.st().moving; s.press('a');
+      ok(mid === true && !s.dlg(), 'M14m A in the middle of a step does nothing (the trainer ahead is talked to when the step is over)', J([mid, s.dlg()]));
+      const c = mk({ outside: true });
+      const kfx = c.app.kick('off'), ofx = c.app.out(), win = c.app.walkIn(0);
+      ok(kfx.length === 0 && ofx.length === 0 && win === false && !c.hub.view().dialog && c.hub.path() === 'main' && c.st().phase === 'closed', 'M14n a screen that is not open is not walked into, walked out of or left: kick, out and walkIn do nothing there', J([kfx, ofx, win]));
+      const far = mk();
+      far.app.setRoster({ walkers: [walker('1', 'RED', 1, 2, 5, { b: S16('a') })], players: [player('a', 'RED', 'menu')] });
+      far.click(2 * CELL + 8, 5 * CELL + 4); far.tick(20);
+      far.app.setRoster({ walkers: [walker('1', 'RED', 1, 12, 8, { b: S16('a') })], players: [player('a', 'RED', 'menu')] });
+      far.tick(600);
+      ok(!far.dlg() && !far.st().walking && !far.st().moving, 'M14o a trainer who walked away while the player was walking up to them is not talked to from across the room', J([far.dlg(), far.st()]));
+      const lookWas = mk(); lookWas.app.setMe({ look: 'junk' }); lookWas.app.setMe({ look: '0371a52' }); lookWas.app.setMe({ look: 7 });
+      ok(lookWas.app.me().look === lk(0), 'M14p the model takes a look only when it is a look code (junk and a code of the hand-drawn Center change nothing)', lookWas.app.me().look);
+      const rp = mk(); const rfx = rp.press('left', { repeat: true });
+      ok(rp.st().d === 'up' && !rfx.some((x) => x.app === 'center') && rp.of('moved').length === 0, 'M14q the synthesized repeat of a held direction neither turns nor walks (holding is read from the frame, once)', J([rp.st().d, rfx]));
+      const mw = mk(); mw.cell(2, 5); mw.tick(5); mw.press('b');
+      const walkingUnderMenu = mw.st().walking; mw.tick(200);
+      ok(mw.st().mode === 'menu' && walkingUnderMenu === 0 && Math.abs(mw.st().x - 7) + Math.abs(mw.st().y - 7) <= 1 && !mw.st().moving, 'M14r opening the menu ends a tapped walk (nobody walks on behind an open menu)', J(mw.st()));
+      ok([w, b, y, k, e, t, s, far, mw].every((x) => x.hub.faults().length === 0), 'M14s nothing threw', '');
     });
 
     /* ---------------------------------------------------------------- S the renderer */
@@ -628,8 +749,35 @@ async function runNode(jsDir, log, parts = { pure: true, ctl: true }) {
       ok(lowTotal > 10 && lowShown === lowTotal, 'S4 people are drawn in depth order: the head of the trainer in front covers the trainer behind', J([lowShown, lowTotal]));
       // names and bubbles
       const tg = cs.tags(w.hub.view()), ppl = w.hub.view().center.people;
-      ok(tg.length === ppl.length && tg.every((t) => t.x >= 0 && t.y >= 0 && t.x + t.w <= 240 && t.y + t.h <= 160 && t.h <= 11 && t.w <= CS.TAG.maxPx + 2 * CS.TAG.padX) && tg.every((t, i) => t.y >= ppl[i].py + 8 && t.y <= ppl[i].py + 16),
+      ok(tg.length === ppl.length && tg.every((t) => t.shown && t.x >= 0 && t.y >= 0 && t.x + t.w <= 240 && t.y + t.h <= 160 && t.h <= 11 && t.w <= CS.TAG.maxPx + 2 * CS.TAG.padX) && tg.every((t, i) => t.y >= ppl[i].py + 8 && t.y <= ppl[i].py + 16),
         'S5 every trainer has a name plate at their feet, inside the picture, no taller than the letters', J(tg.slice(0, 3)));
+      // NO NAME LIES ON ANOTHER NAME, wherever the trainers stand
+      const lapping = (t) => { const s = t.filter((q) => q.shown), bad = []; for (let i = 0; i < s.length; i++) for (let j = i + 1; j < s.length; j++) { const a = s[i], b = s[j]; if (a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h) bad.push(a.id + '+' + b.id); } return bad; };
+      const scene = (list, name) => { const x = mk(); if (name) x.app.setMe({ name }); x.app.setRoster({ walkers: list, players: [] }); x.tick(2); const v = x.hub.view(); return { t: cs.tags(v), ppl: v.center.people, fr: screen.render(v) }; };
+      // (a plate that was moved aside is still under its own trainer: at least TAG.hold of its pixels across lie under the trainer's cell)
+      const held = (sc) => sc.t.every((q, i) => !q.shown || (q.x >= 0 && q.x + q.w <= 240 && Math.min(q.x + q.w, sc.ppl[i].px + 16) - Math.max(q.x, sc.ppl[i].px) >= Math.min(CS.TAG.hold, q.w)));
+      const by = (sc, id) => sc.t.find((q) => q.id === id);
+      const side = scene([walker('1', 'RED', 1, 6, 7), walker('2', 'Bob', 2, 8, 7)]);
+      const pm = by(side, 'me'), pr = by(side, 'w:' + S16('1')), pb = by(side, 'w:' + S16('2'));
+      ok(side.t.length === 3 && side.t.every((q) => q.shown) && !lapping(side.t).length && held(side) && pr.x + pr.w <= pm.x && pm.x + pm.w <= pb.x,
+        'S5b a trainer on each side of the player (which is how one walks up to somebody): the three names stand side by side, none on another, each under its own trainer', J(side.t));
+      const onOne = scene([walker('1', 'RED', 1, 7, 7)]);
+      ok(onOne.t.every((q) => q.shown) && !lapping(onOne.t).length && held(onOne), 'S5c a trainer on the player\'s own cell: both names are written, side by side under the one cell', J(onOne.t));
+      const long = scene([walker('1', 'MMMMMMMMMM', 1, 6, 7), walker('2', 'Wwwwwwwwww', 2, 8, 7)], 'CASEYCASEY');
+      ok(by(long, 'me').shown && long.t.filter((q) => !q.shown).length === 1 && !lapping(long.t).length && held(long), 'S5d three names too long for three cells: one of the other two goes without a plate (never the player\'s own), none lies on another, and none is pushed away from its trainer', J(long.t));
+      const cells = grid.cells().filter((c) => !grid.isDoor(c.x, c.y));
+      const crowd = scene(cells.filter((c) => c.y >= 5 && c.y <= 7).slice(0, 29).map((c, i) => walker('0123456789abcdefghijklmnopqrstuv'[i], ['MMMMMMMMMM', 'Bob', 'Alexandria', 'RED', 'Lyra'][i % 5], 10 + i, c.x, c.y)));
+      ok(crowd.t.length === 30 && by(crowd, 'me').shown && crowd.t.filter((q) => q.shown).length >= 8 && crowd.t.some((q) => !q.shown) && !lapping(crowd.t).length && held(crowd) && !crowd.fr.fault,
+        'S5e a crowd (29 trainers shoulder to shoulder in three rows, long names among them): still no name on another name; some go without a plate, the player never does', J([crowd.t.length, crowd.t.filter((q) => q.shown).length, lapping(crowd.t).slice(0, 3), held(crowd), crowd.fr.fault]));
+      const corner = scene([walker('1', 'RED', 1, 13, 8), walker('2', 'Wwwwwwwwww', 2, 11, 8)]);
+      const hint = CH.CGEOM.hint, onHint = corner.t.filter((q) => q.shown && q.x < hint.x + hint.w && q.x + q.w > hint.x && q.y < hint.y + hint.h && q.y + q.h > hint.y);
+      ok(corner.t.every((q) => q.shown) && !onHint.length && !lapping(corner.t).length && held(corner), 'S5f a name in the bottom right corner does not lie on the line that says what B does', J(corner.t));
+      // the plate is the ROM's party-menu chip (the selected chip for the player), not a rectangle this site filled
+      const chipOf = (variant, cw, chh) => { let got = null; ui.panel({ blit: (_w, _h, rgba) => { got = rgba; } }, 0, 0, cw, chh, variant, true); return got; };
+      const romPlate = (fr, p, variant) => { const chip = chipOf(variant, p.w, p.h); let same2 = 0, ink = 0, other = 0; for (let yy = 0; yy < p.h; yy++) for (let xx = 0; xx < p.w; xx++) { const o = ((p.y + yy) * 240 + p.x + xx) * 4, c4 = (yy * p.w + xx) * 4; if (!chip[c4 + 3]) continue; if (fr.rgba[o] === chip[c4] && fr.rgba[o + 1] === chip[c4 + 1] && fr.rgba[o + 2] === chip[c4 + 2]) same2++; else if (fr.rgba[o] === ui.TEXT.dark[0] && fr.rgba[o + 1] === ui.TEXT.dark[1] && fr.rgba[o + 2] === ui.TEXT.dark[2]) ink++; else other++; } return { same: same2, ink, other }; };
+      const mineP = romPlate(side.fr, pm, 'sel'), redP = romPlate(side.fr, pr, 'normal'), swapped = romPlate(side.fr, pm, 'normal');
+      ok(mineP.other === 0 && redP.other === 0 && mineP.ink > 20 && redP.ink > 10 && mineP.same > mineP.ink && redP.same > redP.ink && swapped.other > 0,
+        'S5g a name plate is the ROM\'s own party-menu chip with the name in the ROM font: the plain chip for the others, the selected chip for the player', J([mineP, redP, swapped]));
       const red = ppl.find((p) => p.name === 'RED'), icon = world.emotes[14].frames[0];
       let im = 0, it = 0; for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) { const s = (y * 16 + x) * 4; if (!icon[s + 3]) continue; it++; if (same(px(eight.rgba, red.px + x, red.py - 16 - CS.BUBBLE_UP + y), [icon[s], icon[s + 1], icon[s + 2]])) im++; }
       ok(it > 60 && im === it, 'S6 an emote is the ROM\'s icon, over the trainer\'s head', J([im, it]));
@@ -642,12 +790,13 @@ async function runNode(jsDir, log, parts = { pure: true, ctl: true }) {
         if (/getContext|fillStyle|strokeStyle|createImageData|#[0-9a-fA-F]{6}\b|rgba?\(/.test(src)) bad.push(f + ': canvas drawing or a colour');
         if (/\[\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*\]/.test(src)) bad.push(f + ': a colour triple');
         if (/avatar\.js|center_map\.js|center_draw\.js|center_boot\.js/.test(src)) bad.push(f + ': names a deleted file');
+        if (/\.rect\(/.test(src)) bad.push(f + ': fills a rectangle of its own');
       }
       const gone = ['js/avatar.js', 'js/center_map.js', 'js/center_draw.js', 'js/center_boot.js', 'center.css', 'dev/avatar_sheet.html'].filter((f) => fs.existsSync(path.join(root, 'pokemonarena', f)));
       const importers = fs.readdirSync(SRC).filter((f) => f.endsWith('.js') && /from '\.\/(avatar|center_map|center_draw|center_boot)\.js'/.test(fs.readFileSync(path.join(SRC, f), 'utf8')));
       const html = fs.readFileSync(path.join(root, 'pokemonarena', 'center.html'), 'utf8');
       ok(!bad.length && !gone.length && !importers.length && !/<canvas|<button|<link[^>]+stylesheet|center_boot/.test(html) && /location\.replace\('\/pokemonarena\/' \+/.test(html) && /#center/.test(html),
-        'S7 no art in the source (no canvas drawing, no colour, no character outside ASCII); the hand-drawn Trainer Center is gone and nothing imports it; center.html is a redirect with no UI', J([bad, gone, importers]));
+        'S7 no art in the source (no canvas drawing, no colour, no rectangle filled by this site, no character outside ASCII); the hand-drawn Trainer Center is gone and nothing imports it; center.html is a redirect with no UI', J([bad, gone, importers]));
       ok(w.hub.faults().length === 0, 'S8 nothing threw', J(w.hub.faults()));
     });
 
@@ -711,8 +860,12 @@ async function runNode(jsDir, log, parts = { pure: true, ctl: true }) {
       const C = N.createCenter({ bus, me: () => mine, rules, now: () => t, timers: tm.T, random: (n) => Uint8Array.from({ length: n }, () => (rbyte = (rbyte + 77) & 255)) });
       C.start();
       ok(sent.length === 2 && sent[0].k === 'here' && sent[1].k === 'ask' && sent.every((m) => m.s === C.sid && m.t === N.KIND && m.v === 2) && c(sent[0]).ok && sent[0].name === 'Bob b', 'N7a walking in says who we are and asks who is here; the name goes out as safe text (a page never sends what the others would refuse)', J(sent));
+      mine.b = S2; mine.rec = [3, 1]; mine.team = 'SECRET'; mine.room = 'ABCDE'; C.update(); mine.b = null; mine.rec = null;
+      const full = sent[sent.length - 1];
+      ok(Object.keys(sent[0]).sort().join() === 'av,d,k,name,s,t,v,x,y' && full.k === 'here' && Object.keys(full).sort().join() === 'av,b,d,k,name,rec,s,t,v,x,y' && Object.keys(sent[1]).sort().join() === 'k,s,t,v',
+        'N7a2 what a trainer publishes in the room is ONLY the fields the room defines: who (name, look), where (x, y, d), and the board id and the record when there are any. No team, no room, nothing else the page knows', J([Object.keys(sent[0]), Object.keys(full)]));
       tm.run(3000);
-      ok(sent.filter((m) => m.k === 'here').length === 2, 'N7b ... and says it again every few seconds', sent.length);
+      ok(sent.filter((m) => m.k === 'here').length === 3, 'N7b ... and says it again every few seconds', sent.length);
       sent.length = 0;
       mine.x = 6; C.moved(); mine.x = 5; C.moved(); mine.x = 4; C.moved();
       const mv1 = sent.filter((m) => m.k === 'mv').length;
@@ -741,6 +894,18 @@ async function runNode(jsDir, log, parts = { pure: true, ctl: true }) {
       const fx = C.roster.get(S3).x;
       t += 1001; bus.cb({ ...base, s: S3, k: 'mv', x: 10, y: 5, d: 'up' });
       ok(fx === 3 + ((N.TIMING.perSenderMax - 2) % 2) && C.roster.get(S3).x === 10, 'N7i one sender cannot send more than its share in a second; the next second they are heard again', J([fx, C.roster.get(S3).x]));
+      // one page that floods is cut off BY ITSELF: what it sends beyond its share does not count against the room
+      t += 1001;
+      for (let i = 0; i < 400; i++) bus.cb({ ...base, s: S3, k: 'mv', x: 3 + (i % 2), y: 5, d: 'up' });
+      bus.cb({ ...base, s: S2, k: 'mv', x: 6, y: 7, d: 'left' });
+      ok(C.roster.get(S2).x === 6 && C.roster.get(S2).d === 'left', 'N7l one sender that floods (400 messages in a second) does not deafen the room: another trainer\'s step is still heard in that second', J(C.roster.get(S2)));
+      // the whole room: forty senders, each within its own share, 400 messages in a second
+      t += 1001;
+      for (let i = 0; i < 40; i++) { const sx = (i + 16).toString(16).padStart(2, '0').repeat(8); for (let j = 0; j < 10; j++) bus.cb({ ...base, s: sx, k: 'bye' }); }
+      bus.cb({ ...base, s: S2, k: 'mv', x: 5, y: 7, d: 'left' });
+      const deaf = C.roster.get(S2).x;
+      t += 1001; bus.cb({ ...base, s: S2, k: 'mv', x: 5, y: 7, d: 'left' });
+      ok(deaf === 6 && C.roster.get(S2).x === 5 && N.TIMING.totalMax === 260 && N.TIMING.perSenderMax === 14, 'N7m above the cap of the whole room (260 messages a second from everybody together) the rest of that second is dropped unread, whoever sends it; the next second the room hears again', J([deaf, C.roster.get(S2).x]));
       sent.length = 0; C.close();
       ok(sent.length === 1 && sent[0].k === 'bye' && bus.closed, 'N7j leaving says bye and lets go of the connection', J(sent));
       C.moved(); C.emote(1); C.update();
@@ -774,7 +939,7 @@ async function runNode(jsDir, log, parts = { pure: true, ctl: true }) {
     });
   }
 
-  if (parts.ctl) await runCtl(jsDir, ok, guard, { ui, screen, room, looks, lk, CH, K, P, OL, N });
+  if (parts.ctl) await runCtl(jsDir, ok, guard, { ui, screen, room, looks, lk, CH, K, P, OL, N, only: parts.block || null });
   return failed;
 }
 
@@ -783,7 +948,7 @@ const memStorage = (init = {}) => { const store = { ...init }; return { store, g
 async function runCtl(jsDir, ok, guard, M) {
   const imp = (f) => import(pathToFileURL(path.join(jsDir, f)).href);
   const [HM, T, CC, HP] = await Promise.all(['hub_model.js', 'tables.js', 'center_ctl.js', 'hub_presence.js'].map(imp));
-  const { ui, screen, room, looks, lk, CH, K, P, OL, N } = M;
+  const { ui, screen, room, looks, lk, CH, K, P, OL, N, only } = M;
   const pack = T.loadPack(romBytes, { verify: 'header', dexText: false });
   const settle = async (cond, ms = 4000) => { const t0 = Date.now(); while (!cond() && Date.now() - t0 < ms) await sleep(10); return !!cond(); };
   const pages = [];
@@ -795,6 +960,7 @@ async function runCtl(jsDir, ok, guard, M) {
       setTimeout: (...a) => setTimeout(...a), clearTimeout: (...a) => clearTimeout(...a), setInterval: (...a) => setInterval(...a), clearInterval: (...a) => clearInterval(...a), console: { warn() {}, error() {}, log() {} },
       addEventListener(t, f) { if (!ls.has(t)) ls.set(t, new Set()); ls.get(t).add(f); }, removeEventListener(t, f) { if (ls.has(t)) ls.get(t).delete(f); }, fire(t, e = {}) { for (const f of [...(ls.get(t) || [])]) f(e); },
     };
+    if (o.mqtt) win.mqtt = o.mqtt;                              // (a double of the MQTT library: openlobby.js loadMqttLib takes window.mqtt when it is there)
     const doc = { hidden: false, getElementById: () => null, addEventListener() {}, removeEventListener() {} };
     const hub = HM.createHubModel({ mascot: 25, env: 0, measure: screen.measure, msgPx: screen.msgPx, measureFont: screen.measureFont });
     hub.setData({ state: 'ready', activeId: null, profiles: [] });
@@ -803,7 +969,7 @@ async function runCtl(jsDir, ok, guard, M) {
     const sync = () => { const now = hub.path() === 'center'; if (now && !w.fam) { w.fam = true; if (w.ctl) w.ctl.enter('center'); } else if (!now && w.fam) { w.fam = false; if (w.ctl) w.ctl.leave('center'); } };
     const run = (fx) => { for (const e of fx || []) { if (!e) continue; if (typeof e.app === 'string') { if (e.app === 'center' && w.ctl) w.ctl.effect(e); } else if (e.type === 'dialog' && hook.presence) hook.presence.answer(e); else if (e.type === 'sfx' && e.key) w.sound.push(e.key); } sync(); return fx; };
     const snap = (url) => { const ss = win.sessionStorage; return { url, back: HP.readBack(ss), accept: ss.getItem(P.ACCEPT_KEY), meet: ss.getItem(P.MEET_KEY) }; };
-    w.env = { win, doc, hook, model: hub, app: hub.apps.center, pack, rom: ui.rom, ui, navigate: (u) => w.nav.push(snap(u)), input: null, storage: win.localStorage, session: win.sessionStorage, refreshData() {}, redraw() {}, run, freshSeed: () => (o.seed === undefined ? 0 : o.seed), store: () => null, whenStore: () => Promise.resolve(null),
+    w.env = { win, doc, hook, model: hub, app: hub.apps.center, pack, rom: ui.rom, ui, navigate: (u) => w.nav.push(snap(u)), input: null, storage: o.blocked ? null : win.localStorage, session: win.sessionStorage, refreshData() {}, redraw() {}, run, freshSeed: () => (o.seed === undefined ? 0 : o.seed), store: () => null, whenStore: () => Promise.resolve(null),
       sound: { sfx: (k) => { w.sound.push(k); return true; }, music: (k) => { w.sound.push('music:' + k); return true; }, system: () => o.system || null } };
     w.svc = HP.hubPresence({ ...w.env, button: null });
     w.ctl = o.noCtl ? null : CC.createCtl(w.env);
@@ -815,6 +981,10 @@ async function runCtl(jsDir, ok, guard, M) {
     w.go = (p) => run(hub.goto(p));
     w.dlg = () => hub.view().dialog || null;
     w.text = () => { const d = hub.view().dialog; return d ? d.lines.filter(Boolean).join(' ') : null; };
+    w.last = () => { for (let i = 0; i < 20 && w.dlg() && w.dlg().more; i++) w.press('a'); return w.dlg(); };
+    w.clear = () => { for (let i = 0; i < 30 && w.dlg(); i++) w.press('b'); return !w.dlg(); };
+    // A PLAYER IN FRONT OF THE PICTURE: frames go by while they read (a question that appears by itself listens only after its arm delay)
+    w.read = (n = 40) => w.tick(n);
     w.people = () => w.app.people();
     w.end = () => { try { if (w.ctl) w.ctl.dispose(); } catch (_e) { /* ignore */ } try { w.svc.dispose(); } catch (_e) { /* ignore */ } };
     pages.push(w);
@@ -825,7 +995,7 @@ async function runCtl(jsDir, ok, guard, M) {
   const sees = (w, name) => settle(() => w.people().some((p) => p.name === name));
   // everything said on the room's channel and on the board, as any other browser hears it
   const spy = [], chans = [N.CENTER_CHANNEL, 'bemental-arena-open-1'].map((n) => { const c = new globalThis.BroadcastChannel(n); c.onmessage = (e) => spy.push({ ch: n, m: e.data }); return c; });
-  const block = async (name, fn) => { try { await fn(); } catch (e) { ok(false, name + ' (threw)', e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : e); } await endAll(); };
+  const block = async (name, fn) => { if (only && only !== name) return; try { await fn(); } catch (e) { ok(false, name + ' (threw)', e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : e); } await endAll(); };
 
   await block('K1', async () => {
     spy.length = 0;
@@ -854,6 +1024,15 @@ async function runCtl(jsDir, ok, guard, M) {
     ok(went && a.svc.isOn() && here && here.m.name === 'Alice' && here.m.av === lk(6) && here.m.v === 2 && open && a.win.localStorage.getItem('arena.open') === null,
       'K1e YES walks in: Open to battles is on FOR THIS PAGE ONLY (the stored switch is untouched), the room hears who walked in and the board lists them', J([went, here && here.m, a.win.localStorage.store]));
     ok(a.sound.includes('music:pokecenter') && a.hub.faults().length === 0, 'K1f the hub is told the screen is the Pokemon Center (for its music); nothing threw', J([a.sound, a.hub.faults()]));
+    const heres = spy.filter((s) => s.ch === N.CENTER_CHANNEL && s.m.k === 'here'), want = ['av', 'b', 'd', 'k', 'name', 's', 't', 'v', 'x', 'y'];
+    const extra = heres.map((s) => Object.keys(s.m).filter((k) => !want.includes(k) && k !== 'rec')).flat();
+    ok(heres.length > 0 && !extra.length && heres.every((s) => want.every((k) => k === 'b' || k in s.m)) && spy.filter((s) => s.ch === N.CENTER_CHANNEL).every((s) => !('team' in s.m) && !('room' in s.m)),
+      'K1g what a walker publishes in the room is ONLY its defined fields (t, v, s, k, name, av, x, y, d, and b / rec when there are any): no team, no room, nothing else the page knows', J([extra, heres[0] && Object.keys(heres[0].m)]));
+    ok(a.win.localStorage.getItem(CC.CENTER_SEEN_KEY) === '1' && a.win.localStorage.getItem('arena.open.seen') === '1', 'K1h that YES is remembered for the Center too (the disclosure carried what the Center lists)', J(a.win.localStorage.store));
+    a.go('main'); await sleep(150); spy.length = 0;
+    a.go('center');
+    const again = await inRoom(a);
+    ok(again && !a.dlg() && a.hook.center.state().entering === false, 'K1i ... so the next visit walks straight in', J([a.st().phase, a.dlg()]));
   });
 
   await block('K2', async () => {
@@ -902,7 +1081,8 @@ async function runCtl(jsDir, ok, guard, M) {
       'K3a players who are open from the hub (not in the Center) stand at the spots, as the look they list; a stored look of the hand-drawn Center is never listed, and its player is still one of the ROM trainers', J([ps, listed]));
     // talk to one of them through WHO'S HERE and ask
     a.press('b'); a.press('down'); a.press('down'); a.press('down'); a.press('a'); a.press('a');
-    ok(a.dlg() && a.dlg().id === 'center:talk' && a.dlg().lines[1] === CH.WORDS.menu && a.dlg().choice.options[0] === 'ASK TO BATTLE', 'K3b a player at a spot can be asked: they are "open from the Arena menu"', J(a.dlg()));
+    const k3 = a.dlg(), k3l = a.last();
+    ok(k3 && k3.id === 'center:talk' && k3.lines[1] === CH.WORDS.menu && k3l && k3l.choice && k3l.choice.options[0] === 'ASK TO BATTLE', 'K3b a player at a spot can be asked: they are "open from the Arena menu"', J([k3, k3l]));
     a.press('a');
     const target = a.st().asking, hw = [h, g].find((x) => x.svc.boardId() === target);
     await settle(() => hw.dlg() && hw.dlg().id === 'presence:challenge');
@@ -922,7 +1102,7 @@ async function runCtl(jsDir, ok, guard, M) {
     const bx = b.app.me().x, dir = bx < a.app.me().x ? 'left' : 'right';
     a.press(dir); a.tick(2); a.press('a');
     ok(a.dlg() && a.dlg().id === 'center:talk' && /^Bob/.test(a.dlg().lines[0]) && a.dlg().lines[1] === CH.WORDS.here, 'K4a A in front of another walker: "Bob", "is here in the TRAINER CENTER.", ASK TO BATTLE', J(a.dlg()));
-    a.press('a');
+    a.last(); a.press('a');
     await settle(() => b.dlg() && b.dlg().id === 'presence:challenge');
     b.tick(40); for (let i = 0; i < 6 && b.dlg() && b.dlg().more; i++) b.press('a'); b.press('up'); b.press('a');
     await settle(() => b.nav.length === 1);
@@ -945,13 +1125,13 @@ async function runCtl(jsDir, ok, guard, M) {
     const c = page('?net=local&ctrname=Cara&ctrav=' + lk(8), { seed: 3 });
     c.go('center'); await inRoom(c);
     c.app.setRoster({ walkers: [], players: [{ id: S16('e'), name: 'Host', rec: null, look: null, doing: 'waiting', room: 'ZXCVB', fmt: '3v3', compatible: true }] });
-    c.press('b'); c.press('down'); c.press('down'); c.press('down'); c.press('a'); c.press('a'); c.press('a');
+    c.press('b'); c.press('down'); c.press('down'); c.press('down'); c.press('a'); c.press('a'); c.last(); c.press('a');
     const cn = c.nav[0] || {};
     ok(/\?np=ZXCVB&join=1&meet=1&net=local/.test(cn.url || '') && cn.back === 'center' && cn.meet, 'K4f JOIN THEIR BATTLE opens that room with the MEET token, and comes back to the Center', J(cn));
     const bad = page('?net=local&ctrname=Dan&ctrav=' + lk(9), { seed: 4 });
     bad.go('center'); await inRoom(bad);
     bad.app.setRoster({ walkers: [], players: [{ id: S16('f'), name: 'Odd', rec: null, look: null, doing: 'waiting', room: 'not a room!', fmt: '3v3', compatible: true }] });
-    bad.press('b'); bad.press('down'); bad.press('down'); bad.press('down'); bad.press('a'); bad.press('a'); bad.press('a');
+    bad.press('b'); bad.press('down'); bad.press('down'); bad.press('down'); bad.press('a'); bad.press('a'); bad.last(); bad.press('a');
     ok(bad.nav.length === 0 && /not open any more/.test(bad.text() || '') && bad.hook.center.state().leaving === false, 'K4g a room that is not a room code opens nothing, and says so', J([bad.nav, bad.text()]));
     ok([a, b, c, bad].every((x) => x.hub.faults().length === 0), 'K4h nothing threw', J(a.hub.faults()));
   });
@@ -974,6 +1154,7 @@ async function runCtl(jsDir, ok, guard, M) {
     s.go('center'); await inRoom(s);
     s.go('main'); await sleep(150);
     ok(s.svc.isOn() && s.win.localStorage.getItem('arena.open') === '1' && s.hook.center.state().mine === false, 'K5c a player who was already open stays open after leaving the Center', J([s.svc.status(), s.hook.center.state()]));
+    ok(s.svc.mount.lobbies.isWatching() === false, 'K5m ... and their page stops asking the board who is open (the list is the Center\'s to watch, only while the player is in it)', '');
     // on for this page only: leaving puts it back, and the stored switch was never written
     b.go('main'); await sleep(150);
     ok(!b.svc.isOn() && b.win.localStorage.getItem('arena.open') === null, 'K5d a player who was not open is not open after leaving, and the stored switch was never touched', J([b.svc.status(), b.win.localStorage.store]));
@@ -1001,6 +1182,9 @@ async function runCtl(jsDir, ok, guard, M) {
     p.win.fire('pagehide', {});
     await settle(() => !o.people().some((x) => x.kind === 'walker'), 2000); await sleep(50);
     ok(!o.people().some((x) => x.kind === 'walker') && p.hub.path() === 'center' && !p.hub.view().dialog, 'K5f a page that goes away says bye at once, and is not walked out with a line', J([o.people(), p.hub.path()]));
+    p.win.fire('pageshow', { persisted: true });               // ... and the browser brings it back from the back / forward cache
+    const backIn = await inRoom(p), seenAgain = await sees(o, 'Pat');
+    ok(backIn && seenAgain && p.hub.path() === 'center' && !p.hub.view().dialog, 'K5l a page that comes back from the back / forward cache walks in again, and the others see the trainer again', J([backIn, seenAgain, p.hook.center.state()]));
     ok([a, b, s, q, r, t2, p, o].every((x) => x.hub.faults().length === 0), 'K5g nothing threw', J(a.hub.faults()));
   });
 
@@ -1033,7 +1217,268 @@ async function runCtl(jsDir, ok, guard, M) {
     ok(nl.hook.center.state().seam === null && a.hook.center.state().seam === 'Alice', 'K6f the name and look seams are for the same-browser test transport only', J(nl.hook.center.state()));
     const src = fs.readFileSync(path.join(jsDir, 'center_ctl.js'), 'utf8');
     ok(!/requestAnimationFrame/.test(src) && /win\.setInterval\(beat, BEAT_MS\)/.test(src), 'K6g what the room must learn or publish runs on a timer, never on the frames of the picture', '');
-    ok([a, u, none, o].every((x) => x.hub.faults().length === 0), 'K6h nothing threw', J(a.hub.faults()));
+    // the cell is kept ONLY for the way back from the Team Builder
+    const kp = page('?net=local&ctrname=Kay&ctrav=' + lk(9));
+    kp.go('center'); await inRoom(kp);
+    const use = room.pc[0].use;
+    kp.click(use.x * 16 + 8, use.y * 16 + 8); kp.tick(600); kp.press('up'); kp.tick(2); kp.press('a');
+    const inBuilder = kp.hub.path();
+    kp.press('b'); await inRoom(kp);
+    const backAt = kp.app.me();
+    kp.press('a');                                              // the PC again, and this time HOME from the Team Builder
+    const inBuilder2 = kp.hub.path();
+    kp.go('main'); await sleep(CC.BEAT_MS * 2 + 200);
+    kp.go('center'); await inRoom(kp);
+    const freshAt = kp.app.me();
+    ok(inBuilder === 'builder' && backAt.x === use.x && backAt.y === use.y && inBuilder2 === 'builder' && freshAt.x === room.spawns[0].x && freshAt.y === room.spawns[0].y && kp.hook.center.state().inside,
+      'K6i B in the Team Builder comes back to the cell the player stood on; a player who went on from the Team Builder to the main menu walks in at the door the next time', J([inBuilder, backAt, inBuilder2, freshAt]));
+    ok([a, u, none, o, kp].every((x) => x.hub.faults().length === 0), 'K6h nothing threw', J(a.hub.faults()));
+  });
+
+  await block('K7', async () => {
+    // a visit that was given up before the presence service was even ready publishes nothing, not for a moment
+    spy.length = 0;
+    const z = page('?net=local&ctrname=Zed&ctrav=' + lk(9));
+    z.go('center'); z.go('main');
+    await z.svc.ready; await sleep(600);
+    ok(spy.length === 0 && !z.svc.isOn() && z.st().phase === 'closed' && z.hook.center.state().inside === false, 'K7j a player who left before the presence service was ready is never listed, not even for a moment', J([spy.slice(0, 2), z.svc.status()]));
+    z.end();
+    // THE CENTER'S OWN QUESTION: a player whose switch is OFF and who once answered the hub's disclosure (they were told about the name and the record, never about the look and the cell)
+    spy.length = 0;
+    const a = page('?net=local&opendisc=1&ctrname=Alice&ctrav=' + lk(6), { local: { 'arena.open.seen': '1' } });
+    a.go('center');
+    await settle(() => a.dlg() && a.dlg().id === 'center:enter');
+    await sleep(300);
+    const q = a.dlg();
+    ok(q && q.id === 'center:enter' && a.st().phase === 'wait' && a.hub.view().center.people.length === 0 && a.svc.isOn() === false && a.svc.stored() === false,
+      'K7a a player who is NOT open to battles but once answered the hub\'s disclosure is still asked first, in the picture, by the Center itself', J([q && q.id, a.st().phase, a.svc.status()]));
+    ok(spy.length === 0 && a.hook.center.wire.sent === 0, 'K7b nothing at all is published before YES (not on the room channel, not on the board)', J(spy.slice(0, 2)));
+    a.read();
+    let words = ''; for (let i = 0; i < 20 && a.dlg() && a.dlg().more; i++) { words += ' ' + a.text(); a.press('a'); }
+    const last = a.dlg();
+    ok(/trainer name, record, look and where you stand/.test(words) && /public servers/.test(words) && /takes it all down/.test(words) && last && last.lines[0] === CH.WORDS.enterAsk && last.choice && last.choice.options.join() === 'YES,NO' && last.choice.cursor === 1,
+      'K7c it says what walking in lists: the name, the record, THE LOOK and WHERE YOU STAND, on public servers, and how it ends; NO is highlighted', words.slice(0, 400));
+    a.press('a');                                               // A on the highlighted NO
+    await settle(() => a.hub.path() !== 'center'); await sleep(200);
+    ok(a.hub.path() === 'online' && a.st().phase === 'closed' && spy.length === 0 && !a.svc.isOn() && a.win.localStorage.getItem(CC.CENTER_SEEN_KEY) === null && a.win.localStorage.getItem('arena.open') === null && !a.dlg(),
+      'K7d NO leaves the Center without a word: nothing was published, nothing is remembered', J([a.hub.path(), spy.length, a.win.localStorage.store]));
+    a.go('center');
+    await settle(() => a.dlg() && a.dlg().id === 'center:enter'); a.read(); a.last(); a.press('up'); a.press('a');
+    const went = await inRoom(a);
+    await settle(() => spy.some((s) => s.ch === N.CENTER_CHANNEL && s.m.k === 'here'));
+    ok(went && a.svc.isOn() && a.win.localStorage.getItem(CC.CENTER_SEEN_KEY) === '1' && a.win.localStorage.getItem('arena.open') === null && spy.some((s) => s.ch === N.CENTER_CHANNEL && s.m.k === 'here' && s.m.name === 'Alice'),
+      'K7e YES walks in (open for this page only: the stored switch stays off), and is remembered', J([went, a.win.localStorage.store]));
+    a.go('main'); await sleep(150);
+    a.go('center');
+    const again = await inRoom(a);
+    ok(again && !a.dlg() && a.hook.center.state().entering === false, 'K7f the next visit asks nothing: what the Center lists was said once, and YES was the answer', J([a.st().phase, a.dlg()]));
+    // a player whose switch is ON: they are listed already, but the look and the cell are news to them too. NO leaves them as they were
+    const s = page('?net=local&opendisc=1&ctrname=Sam&ctrav=' + lk(9), { local: { 'arena.open': '1', 'arena.open.seen': '1' } });
+    await s.svc.ready; await settle(() => s.svc.isOn());
+    s.go('center');
+    await settle(() => s.dlg() && s.dlg().id === 'center:enter'); await sleep(200);
+    const sq = s.dlg();
+    s.read();
+    let sw = ''; for (let i = 0; i < 20 && s.dlg() && s.dlg().more; i++) { sw += ' ' + s.text(); s.press('a'); }
+    s.press('b');                                               // B is NO
+    await settle(() => s.hub.path() !== 'center'); await sleep(200);
+    ok(sq && sq.id === 'center:enter' && s.hub.path() === 'online' && s.svc.isOn() && !spy.some((x) => x.ch === N.CENTER_CHANNEL && x.m.name === 'Sam') && s.win.localStorage.getItem(CC.CENTER_SEEN_KEY) === null && s.hook.center.state().inside === false,
+      'K7g a player whose switch is ON is asked too (the look and the cell are news to them); NO leaves them listed as they were and puts nothing of them in the room', J([sq && sq.id, s.hub.path(), s.svc.status()]));
+    ok(/stay listed/.test(sw) && /OPEN TO BATTLES is on/.test(sw) && !/takes it all down/.test(sw) && /look and where you stand/.test(sw), 'K7h ... and their question says how it ends for THEM: leaving takes them out of the room, the listing stays', sw.slice(-260));
+    s.go('center'); await settle(() => s.dlg() && s.dlg().id === 'center:enter'); s.read(); s.last(); s.press('up'); s.press('a');
+    const sin = await inRoom(s);
+    s.go('main'); await sleep(150);
+    ok(sin && s.svc.isOn() && s.win.localStorage.getItem('arena.open') === '1' && s.win.localStorage.getItem(CC.CENTER_SEEN_KEY) === '1', 'K7i YES walks them in; leaving leaves their switch on', J([sin, s.svc.status()]));
+    // a browser that cannot remember (storage blocked) is asked at every visit
+    const nb = page('?net=local&opendisc=1&ctrname=Nob&ctrav=' + lk(10), { local: { 'arena.open.seen': '1' }, blocked: true });
+    nb.go('center'); await settle(() => nb.dlg() && nb.dlg().id === 'center:enter'); nb.read(); nb.last(); nb.press('up'); nb.press('a');
+    const nb1 = await inRoom(nb);
+    nb.go('main'); await sleep(150); nb.go('center');
+    const nb2 = await settle(() => nb.dlg() && nb.dlg().id === 'center:enter');
+    ok(nb1 && nb2 && nb.st().phase === 'wait', 'K7k a browser that cannot remember the answer asks at every visit (it never walks anybody in unasked)', J([nb1, nb2]));
+    ok([a, s, nb].every((x) => x.hub.faults().length === 0), 'K7l nothing threw', J(a.hub.faults()));
+  });
+
+  // two players in the room who can ask each other (a short answer time: 3 s in place of 25)
+  const QC = '?net=local&openchal=3000';
+  const two = async () => {
+    const a = page(QC + '&ctrname=Alice&ctrav=' + lk(6), { seed: 0 }), b = page(QC + '&ctrname=Bob&ctrav=' + lk(7), { seed: 1 });
+    a.go('center'); b.go('center'); await inRoom(a); await inRoom(b);
+    await settle(() => a.people().some((p) => p.name === 'Bob' && p.doing === 'here') && b.people().some((p) => p.name === 'Alice' && p.doing === 'here'));
+    return [a, b];
+  };
+  // ask a trainer by name through WHO'S HERE (it works from anywhere in the room)
+  const askName = (w, name) => { w.press('b'); w.press('down'); w.press('down'); w.press('down'); w.press('a'); const i = w.hub.view().center.who.rows.findIndex((r) => r.name === name); for (let k = 0; k < i; k++) w.press('down'); w.press('a'); w.last(); w.press('a'); };
+  const questioned = (w, ms = 1000) => settle(() => w.dlg() && w.dlg().id === 'presence:challenge', ms);
+
+  await block('K8', async () => {
+    const openers = [
+      ['a notice nobody pressed A on', (b) => { b.app.askFailed('timeout'); }, 'center:note'],
+      ['a sign', (b) => { b.click(room.signs[0].x * 16 + 8, room.signs[0].y * 16 + 8); b.tick(400); }, 'center:sign'],
+      ['the nurse', (b) => { b.click(room.nurse.x * 16 + 8, room.nurse.y * 16 + 8); b.tick(400); }, 'center:nurse'],
+      ['the question about a trainer', (b) => { b.press('b'); b.press('down'); b.press('down'); b.press('down'); b.press('a'); b.press('a'); }, 'center:talk'],
+    ];
+    const hidden = [];
+    for (const [what, open, id] of openers) {
+      const [a, b] = await two();
+      open(b);
+      const under = b.dlg() && b.dlg().id;
+      askName(a, 'Bob');
+      const seen = await questioned(b);
+      const d = b.dlg();
+      if (under !== id || !seen || !d || !/wants to battle you/.test(d.lines[1]) || d.armed !== false || d.queued !== 0) hidden.push(what + ': ' + under + ' > ' + (d && d.id));
+      b.read(); b.last(); b.press('up'); b.press('a');          // and it can be answered: YES
+      await settle(() => b.nav.length === 1, 1500);
+      if (b.nav.length !== 1) hidden.push(what + ': YES did not open the battle');
+      await endAll();
+    }
+    ok(!hidden.length, 'K8a somebody asks a player who has a notice, a sign, the nurse or the question about a trainer on the screen: "wants to battle you" is the one shown within a second (nothing of the Center stands in front of it), and YES opens the battle', J(hidden));
+
+    // ONE QUESTION AT A TIME: Cara is waiting for Bob's answer when Alice asks Cara
+    {
+      const [a, b] = await two();
+      const c = page(QC + '&ctrname=Cara&ctrav=' + lk(8), { seed: 2 });
+      c.go('center'); await inRoom(c);
+      await settle(() => c.people().filter((p) => p.doing === 'here').length === 2 && a.people().some((p) => p.name === 'Cara' && p.doing === 'here'));
+      askName(c, 'Bob');
+      const bobAsked = await questioned(b);
+      askName(a, 'Cara');
+      const caraSees = await questioned(c);
+      await settle(() => !b.dlg(), 1500);
+      const cd = c.dlg();
+      ok(bobAsked && caraSees && cd && /wants to battle you/.test(cd.lines[1]) && cd.queued <= 1 && !b.dlg() && c.st().asking === null && c.hook.center.state().asking === false,
+        'K8b ONE QUESTION AT A TIME: somebody asks a player who is waiting for an answer to a challenge of their own: the question is on their screen within a second, and their own challenge is withdrawn (the player they had asked stops seeing it)', J([bobAsked, caraSees, cd, b.dlg()]));
+      c.read(); c.last(); c.press('a');                         // NO (the highlighted answer)
+      await settle(() => c.dlg() && c.dlg().id === 'center:note');
+      await settle(() => a.dlg() && a.dlg().id === 'center:note');
+      ok(c.text() === 'Your challenge to Bob was withdrawn.' && /said not now/.test(a.text() || '') && [a, b, c].every((x) => x.nav.length === 0), 'K8c after their NO a line says that their own challenge was withdrawn; the one who asked them is told "said not now"; nobody goes anywhere', J([c.text(), a.text()]));
+      await endAll();
+    }
+
+    // TWO WHO ASK EACH OTHER AT ONCE
+    {
+      const [a, b] = await two();
+      askName(a, 'Bob'); askName(b, 'Alice');                   // (in one turn: neither has heard the other)
+      const small = String(a.svc.boardId()) < String(b.svc.boardId()) ? a : b, big = small === a ? b : a;
+      const seen = await questioned(small);
+      await sleep(400);
+      const sd = small.dlg(), bd = big.dlg();
+      ok(seen && sd && sd.id === 'presence:challenge' && small.st().asking === null && small.hook.center.state().asking === false && bd && bd.id === 'center:asking' && bd.queued === 0 && big.hook.center.state().asking === true,
+        'K8d two players who ask EACH OTHER at once: exactly one of them (the smaller board id) withdraws and sees the question; the other keeps waiting, with nothing hidden behind the waiting line', J([seen, sd && sd.id, bd && [bd.id, bd.queued]]));
+      small.read(); small.last(); small.press('up'); small.press('a');          // YES
+      await settle(() => small.nav.length === 1);
+      await settle(() => big.dlg() && big.dlg().id === 'center:note');
+      const told = big.text();
+      const sn = small.nav[0] || {}, tok = sn.accept ? JSON.parse(sn.accept) : {};
+      const lob = OL.createOpenLobbies({ bus: OL.createLocalBus({ BroadcastChannel: globalThis.BroadcastChannel }), now: () => performance.now(), mine: { rom: 'x', fp: 'y' } });
+      const acc = P.createAcceptor({ lobbies: lob, to: tok.for, r: tok.rq, room: 'QWERT', ck: tok.ck });          // (what the battle page of the one who said YES does)
+      await settle(() => big.nav.length === 1);
+      acc.stop(); lob.close();
+      ok(/auto=host/.test(sn.url || '') && /accepted! Opening the battle/.test(told || '') && small.nav.length === 1 && big.nav.length === 1 && /np=QWERT&join=1&meet=1/.test((big.nav[0] || {}).url || ''),
+        'K8e ... and YES ends in ONE battle: the one who answered hosts, the one who kept waiting joins (never two rooms, never two automatic NOs)', J([sn.url, told, big.nav]));
+      await endAll();
+    }
+
+    // the Center's own question makes way for a challenge too (a player whose switch is on can be asked before they have walked in), and comes back
+    {
+      const h = page('?net=local&opendisc=1&openchal=3000&ctrname=Hal&ctrav=' + lk(9), { local: { 'arena.open': '1', 'arena.open.seen': '1' } });
+      await h.svc.ready; await settle(() => h.svc.isOn());
+      const [a] = await two();
+      await settle(() => a.people().some((p) => p.kind === 'spot' && p.doing === 'menu'));
+      h.go('center');
+      await settle(() => h.dlg() && h.dlg().id === 'center:enter');
+      h.read(); h.press('a');                                   // reading its second page
+      // Alice asks the player who is open from the menu (Hal is at a spot in her room)
+      a.press('b'); a.press('down'); a.press('down'); a.press('down'); a.press('a');
+      const hi = a.hub.view().center.who.rows.findIndex((r) => r.doing === 'IN THE MENU');
+      for (let k = 0; k < hi; k++) a.press('down');
+      a.press('a'); a.last(); a.press('a');
+      const seen = await questioned(h);
+      const top = h.dlg() && h.dlg().id;
+      h.read(); h.last(); h.press('a');                         // NO
+      await settle(() => h.dlg() && h.dlg().id === 'center:enter', 1500);
+      const back = h.dlg();
+      ok(hi >= 0 && seen && top === 'presence:challenge' && back && back.id === 'center:enter' && back.page === 0 && h.st().phase === 'wait' && h.hook.center.state().entering === true,
+        'K8f the Center\'s own question makes way too (a player whose switch is on can be asked before they walk in); after NO it is asked again from its first page', J([hi, seen, top, back && [back.id, back.page]]));
+      await endAll();
+    }
+  });
+
+  await block('K9', async () => {
+    // CANCEL
+    {
+      const [a, b] = await two();
+      askName(a, 'Bob');
+      const asked = await questioned(b);
+      a.read(); a.press('a');                                   // CANCEL (it listens after 0.6 s)
+      const gone = await settle(() => !b.dlg(), 1500);
+      const late = b.svc.mount.accept();                        // even a YES that was on its way opens nothing
+      await sleep(400);
+      ok(asked && gone && a.text() === CH.WORDS.cancelled && a.hook.center.state().asking === false && late === false && a.nav.length === 0 && b.nav.length === 0,
+        'K9a CANCEL withdraws the challenge: the question closes on the screen of the player who was asked, and no YES can open a battle any more', J([asked, gone, a.text(), late, a.nav, b.nav]));
+      await endAll();
+    }
+    // leaving the Center
+    {
+      const [a, b] = await two();
+      askName(a, 'Bob');
+      const asked = await questioned(b);
+      a.go('online');
+      const gone = await settle(() => !b.dlg(), 1500);
+      const late = b.svc.mount.accept();
+      await sleep(400);
+      ok(asked && gone && late === false && a.nav.length === 0 && b.nav.length === 0 && a.hook.center.state().asking === false && !a.dlg(),
+        'K9b leaving the Center withdraws a challenge that was waiting for its answer: the player who was asked cannot say YES to somebody who has gone', J([asked, gone, late, b.nav]));
+      await endAll();
+    }
+    // the page goes away
+    {
+      const [a, b] = await two();
+      askName(a, 'Bob');
+      const asked = await questioned(b);
+      a.win.fire('pagehide', {});
+      const gone = await settle(() => !b.dlg(), 1500);
+      ok(asked && gone && b.nav.length === 0, 'K9c ... and so does a page that goes away', J([asked, gone]));
+      await endAll();
+    }
+  });
+
+  await block('K10', async () => {
+    // THE PUBLIC TRANSPORT (no ?net=local): a double of the MQTT library stands for the brokers; everything above it is the page's own code (openlobby.js createMqttBus, presence_boot.js, the ctl)
+    const world = { clients: [], published: [] };
+    const mq = {
+      connect(url, opts) {
+        const c = { url, opts, connected: false, subs: new Set(), h: {}, ended: false };
+        c.on = (ev, fn) => { (c.h[ev] = c.h[ev] || []).push(fn); return c; };
+        c.emit = (ev, ...args) => (c.h[ev] || []).forEach((f) => f(...args));
+        c.subscribe = (t, _o, cb) => { c.subs.add(t); if (cb) cb(null); };
+        c.publish = (t, p) => { world.published.push({ t, m: JSON.parse(p) }); for (const x of world.clients) if (x.url === url && x.connected && !x.ended && x.subs.has(t)) setTimeout(() => { if (!x.ended) x.emit('message', t, Buffer.from(p)); }, 0); };
+        c.end = () => { c.ended = true; c.connected = false; };
+        world.clients.push(c);
+        setTimeout(() => { if (!c.ended) { c.connected = true; c.emit('connect'); } }, 0);
+        return c;
+      },
+    };
+    const QM = '?wsbroker=' + encodeURIComponent('wss://double:1/mqtt');
+    const a = page(QM, { mqtt: mq, seed: 0 });
+    a.go('center');
+    await settle(() => a.dlg() && a.dlg().id === 'presence:disclosure'); await sleep(300);
+    ok(a.dlg() && a.dlg().id === 'presence:disclosure' && world.clients.length === 0 && world.published.length === 0 && a.hook.center.state().seam === null,
+      'K10a on the public transport the first visit asks first, and before YES not even a connection to a broker is made', J([a.dlg() && a.dlg().id, world.clients.length, world.published.length]));
+    a.last(); a.press('up'); a.press('a');
+    const ain = await inRoom(a);
+    await settle(() => world.published.some((r) => r.m.k === 'here') && world.published.some((r) => r.m.k === 'open'), 12000);
+    const roomMsgs = world.published.filter((r) => r.m.t === N.KIND), boardMsgs = world.published.filter((r) => r.m.t !== N.KIND);
+    ok(ain && roomMsgs.length > 0 && roomMsgs.every((r) => r.t === N.CENTER_TOPIC) && boardMsgs.length > 0 && boardMsgs.every((r) => r.t === 'bemental/arena/open/1') && N.CENTER_TOPIC === 'bemental/arena/center/2' && world.clients.every((c) => c.url === 'wss://double:1/mqtt'),
+      'K10b after YES the room speaks on ITS OWN topic (bemental/arena/center/2) and the board on the board\'s: nothing of the room is ever published on the board\'s topic', J([roomMsgs.slice(0, 1), [...new Set(world.published.map((r) => r.t))]]));
+    const b = page(QM, { mqtt: mq, seed: 1, local: { 'arena.open.seen': '1', [CC.CENTER_SEEN_KEY]: '1' } });
+    b.go('center');
+    const bin = await inRoom(b);
+    await settle(() => a.people().some((p) => p.kind === 'walker' && p.doing === 'here') && b.people().some((p) => p.kind === 'walker' && p.doing === 'here'), 15000);
+    const ap = a.people(), bp = b.people();
+    ok(bin && ap.length === 1 && ap[0].kind === 'walker' && ap[0].doing === 'here' && bp.length === 1 && bp[0].doing === 'here' && bp[0].x === a.app.me().x && bp[0].y === a.app.me().y && a.hook.center.state().net === 'up',
+      'K10c two players on the public transport meet in the room, each linked to their own listing on the board', J([ap, bp]));
+    ok([a, b].every((x) => x.hub.faults().length === 0), 'K10d nothing threw', J(a.hub.faults()));
   });
   for (const c of chans) c.close();
 }
@@ -1106,6 +1551,61 @@ const NODE_MUTANTS = [
   { id: 'NC14', part: 'ctl', file: 'center_ctl.js', from: "  const seamName = local && query.get('ctrname') ?", to: "  const seamName = query.get('ctrname') ?", fails: 'K6f' },
   { id: 'NC15', part: 'ctl', file: 'center_ctl.js', from: "    if (byIndex) { safe(() => sys.director.playEffectIndex(s.index, 0)); return; }", to: "    if (sys) { safe(() => sys.director.playEffectIndex(s.index, 0)); return; }", fails: 'K6c' },
   { id: 'NC16', part: 'ctl', file: 'center_ctl.js', from: "    if (!look || !isLook(look, room.looks)) { look = pickLook(room.looks, env.freshSeed()); saveLook(env.storage, look); }", to: "    if (!look || !isLook(look, room.looks)) { look = pickLook(room.looks, env.freshSeed()); }", fails: 'K6e' },
+  // ---- what is faced before a trainer underfoot; the Center's own question; making way; notices; guards a review's mutants walked through
+  { id: 'NM18', part: 'pure', file: 'center_hub.js', from: "    const p = personAt(f.x, f.y);\n    if (p) return talk(p);\n    const kind = S.grid.facing(me.x, me.y, me.d);\n    if (kind) return use(kind);\n    const under = personAt(me.x, me.y);\n    return under ? talk(under) : [SILENT];", to: "    const p = personAt(f.x, f.y) || personAt(me.x, me.y);\n    if (p) return talk(p);\n    const kind = S.grid.facing(me.x, me.y, me.d);\n    return kind ? use(kind) : [SILENT];", fails: 'M11g' },
+  { id: 'NM19', part: 'pure', file: 'center_hub.js', from: "[WORDS.enterAsk, '']], choice: { options: ['YES', 'NO'], cursor: 1 },", to: "[WORDS.enterAsk, '']], choice: { options: ['YES', 'NO'], cursor: 0 },", fails: 'M14c' },
+  { id: 'NM20', part: 'pure', file: 'center_hub.js', from: "choice: { options: ['YES', 'NO'], cursor: 1 }, armTicks: DIALOG_ARM_TICKS });", to: "choice: { options: ['YES', 'NO'], cursor: 1 } });", fails: 'M14b' },
+  { id: 'NM21', part: 'pure', file: 'center_hub.js', from: "return value === 0 || S.phase !== 'wait' ? [] : ctx.back(); }", to: "return []; }", fails: 'M14d' },
+  { id: 'NM22', part: 'pure', file: 'center_hub.js', from: "      for (const id of [DLG.note, DLG.sign, DLG.nurse, DLG.talk]) ctx.dialog.close(id);\n      S.talk = null;", to: "      for (const id of [DLG.sign, DLG.nurse, DLG.talk]) ctx.dialog.close(id);\n      S.talk = null;", fails: 'M14h' },
+  { id: 'NM23', part: 'pure', file: 'center_hub.js', from: "choice: null, ...(stay ? {} : { ticksLeft: NOTE_TICKS * pages.length }) }); };", to: "choice: null }); };", fails: 'M14k' },
+  { id: 'NM24', part: 'pure', file: 'center_hub.js', from: "if (S.entering && S.phase === 'wait') S.entering = !!openEnter(); return S.entering || S.phase !== 'wait'; },", to: "return true; },", fails: 'M14j' },
+  { id: 'NM25', part: 'pure', file: 'center_hub.js', from: "if (!a) return null; S.asking = null; ctx.dialog.close(DLG.asking); if (say) note(WORDS.withdrawn(a.name)); return a.name; },", to: "if (!a) return null; S.asking = null; if (say) note(WORDS.withdrawn(a.name)); return a.name; },", fails: 'M14i' },
+  { id: 'NM26', part: 'pure', file: 'center_hub.js', from: "    if (me.mv) return [SILENT];\n    const f = ahead(me.x, me.y, me.d);", to: "    const f = ahead(me.x, me.y, me.d);", fails: 'M14m' },
+  { id: 'NM27', part: 'pure', file: 'center_hub.js', from: "    kick(why) { if (S.phase === 'closed') return []; ctx.notify(", to: "    kick(why) { ctx.notify(", fails: 'M14n' },
+  { id: 'NM28', part: 'pure', file: 'center_hub.js', from: "      if (!S.grid || S.phase === 'closed') return false;", to: "      if (!S.grid) return false;", fails: 'M14n' },
+  { id: 'NM29', part: 'pure', file: 'center_hub.js', from: "if (p && inPicture(p) && Math.abs(p.x - me.x) + Math.abs(p.y - me.y) <= 1) fx.push(...talk(p)); }", to: "if (p) fx.push(...talk(p)); }", fails: 'M14o' },
+  { id: 'NM30', part: 'pure', file: 'center_hub.js', from: "if ('look' in o && (o.look === null || lookId(o.look) !== null)) me.look = o.look; },", to: "if ('look' in o) me.look = o.look; },", fails: 'M14p' },
+  { id: 'NM31', part: 'pure', file: 'center_hub.js', from: "          if (repeat) return [SILENT];\n          S.lastDir = action; S.walk = null;", to: "          S.lastDir = action; S.walk = null;", fails: 'M14q' },
+  { id: 'NM32', part: 'pure', file: 'center_hub.js', from: "  function openMenu() { S.mode = 'menu'; S.walk = null; menu.setCursor(0);", to: "  function openMenu() { S.mode = 'menu'; menu.setCursor(0);", fails: 'M14r' },
+  { id: 'NM33', part: 'pure', file: 'center_hub.js', from: "        if (value !== 0 || !t) return [];", to: "        if (!t) return [];", fails: 'M8b' },
+  { id: 'NM34', part: 'pure', file: 'center_hub.js', from: "pages: [[who, where], ...pagesOf(join ? WORDS.joinDoes(fmtText(g.fmt)) : WORDS.askDoes)],", to: "pages: [[who, where]],", fails: 'M8a' },
+  // ---- the name plates
+  { id: 'NS4', part: 'pure', file: 'center_screen.js', from: "    return layoutTags(raw, h.SCREEN_W).map((t) =>", to: "    return raw.map((t) => ({ ...t, shown: true })).map((t) =>", fails: 'S5b' },
+  { id: 'NS5', part: 'pure', file: 'center_screen.js', from: "{ const hold = Math.min(TAG.hold, t.w); lo.push(", to: "{ const hold = -200; lo.push(", fails: 'S5d' },
+  { id: 'NS6', part: 'pure', file: 'center_screen.js', from: "    if (y + hh > CGEOM.hint.y && cx + CELL / 2 - Math.min(TAG.hold, w) + w > CGEOM.hint.x) y = CGEOM.hint.y - hh;\n", to: "", fails: 'S5f' },
+  { id: 'NS7', part: 'pure', file: 'center_screen.js', from: "      ui.panel(f, t.x, t.y, t.w, t.h, t.mine ? 'sel' : 'normal', true);", to: "      f.rect(t.x, t.y, t.w, t.h, t.mine ? TEXT.dark : TEXT.white);", fails: 'S5g' },
+  { id: 'NS8', part: 'pure', file: 'center_screen.js', from: "      ui.panel(f, t.x, t.y, t.w, t.h, t.mine ? 'sel' : 'normal', true);", to: "      ui.panel(f, t.x, t.y, t.w, t.h, 'normal', true);", fails: 'S5g' },
+  { id: 'NS9', part: 'pure', file: 'center_screen.js', from: "if (live[i].pri > worst.pri) worst = live[i];", to: "if (live[i].pri < worst.pri) worst = live[i];", fails: 'S5d' },
+  // ---- the room's two caps, and what a here carries
+  { id: 'NN16', part: 'pure', file: 'center_net.js', from: "    if (++p.n > timing.perSenderMax) return;\n    if (++winCount > timing.totalMax) return;\n", to: "    if (++winCount > timing.totalMax) return;\n    if (++p.n > timing.perSenderMax) return;\n", fails: 'N7l' },
+  { id: 'NN17', part: 'pure', file: 'center_net.js', from: "    if (++winCount > timing.totalMax) return;\n", to: "", fails: 'N7m' },
+  { id: 'NN18', part: 'pure', file: 'center_net.js', from: "    if (m.rec) o.rec = m.rec;\n    return o;", to: "    if (m.rec) o.rec = m.rec;\n    if (m.team) o.team = m.team;\n    return o;", fails: 'N7a2' },
+  { id: 'NC38', part: 'ctl', file: 'center_net.js', from: "    if (m.rec) o.rec = m.rec;\n    return o;", to: "    if (m.rec) o.rec = m.rec;\n    o.team = 'SECRET';\n    return o;", fails: 'K1g' },
+  // ---- nothing is published before the player has said YES to what the CENTER lists
+  { id: 'NC20', part: 'ctl', file: 'center_ctl.js', from: "    if (!generic && asksFirst && !told()) {", to: "    if (false) {", fails: 'K7a' },
+  { id: 'NC21', part: 'ctl', file: 'center_ctl.js', from: "      const yes = await askIn();\n", to: "      svc.turnOn({ persist: false }); const yes = await askIn();\n", fails: 'K7b' },
+  { id: 'NC22', part: 'ctl', file: 'center_ctl.js', from: "      const yes = await askIn();\n", to: "      const yes = await askIn(); markTold();\n", fails: 'K7d' },
+  { id: 'NC23', part: 'ctl', file: 'center_ctl.js', from: "      markTold();\n    }\n", to: "    }\n", fails: 'K7f' },
+  { id: 'NC24', part: 'ctl', file: 'center_ctl.js', from: "    if (!generic && asksFirst && !told()) {", to: "    if (!generic && asksFirst && !told() && !wasOn) {", fails: 'K7g' },
+  { id: 'NC25', part: 'ctl', file: 'center_ctl.js', from: "    if (generic) markTold();", to: "    if (generic && false) markTold();", fails: 'K1h' },
+  { id: 'NC26', part: 'ctl', file: 'center_ctl.js', from: "    await svc.ready;\n    if (g !== gen) return;\n", to: "    await svc.ready;\n", fails: 'K7j' },
+  { id: 'NC40', part: 'ctl', file: 'center_ctl.js', from: "(safe(() => svc.stored(), false) ? WORDS.sharesStay : WORDS.sharesEnd)", to: "WORDS.sharesEnd", fails: 'K7h' },
+  { id: 'NC41', part: 'ctl', file: 'center_ctl.js', from: "safe(() => !!env.storage && env.storage.getItem(CENTER_SEEN_KEY) === '1', false);", to: "safe(() => !env.storage || env.storage.getItem(CENTER_SEEN_KEY) === '1', false);", fails: 'K7k' },
+  // ---- somebody asks: the Center's dialogs make way; one question at a time; two who ask each other
+  { id: 'NC27', part: 'ctl', file: 'center_ctl.js', from: "    app.makeWay();\n", to: "", fails: 'K8a' },
+  { id: 'NC28', part: 'ctl', file: 'center_ctl.js', from: "      const waits = mutual && String(svc.boardId()) > String(p.s);", to: "      const waits = mutual;", fails: 'K8d' },
+  { id: 'NC29', part: 'ctl', file: 'center_ctl.js', from: "      const waits = mutual && String(svc.boardId()) > String(p.s);", to: "      const waits = false;", fails: 'K8d' },
+  { id: 'NC30', part: 'ctl', file: 'center_ctl.js', from: "      if (!waits) { dropChal(); app.askWithdrawn(!mutual); }", to: "      if (!waits && mutual) { dropChal(); app.askWithdrawn(!mutual); }", fails: 'K8b' },
+  { id: 'NC31', part: 'ctl', file: 'center_ctl.js', from: "      if (!waits) { dropChal(); app.askWithdrawn(!mutual); }", to: "      if (!waits) { chal = null; chalTo = null; app.askWithdrawn(!mutual); }", fails: 'K8b' },
+  { id: 'NC39', part: 'ctl', file: 'center_ctl.js', from: "    if (!p) { if (asked !== null) { asked = null; if (app.resume() === false) { settleEntry(false); run(app.out()); } redraw(); } return; }", to: "    if (!p) { asked = null; return; }", fails: 'K8f' },
+  // ---- CANCEL and leaving withdraw a challenge
+  { id: 'NC32', part: 'ctl', file: 'center_ctl.js', from: "      else if (eff.type === 'cancel-ask') dropChal();", to: "      else if (eff.type === 'cancel-ask') { chal = null; chalTo = null; }", fails: 'K9a' },
+  { id: 'NC33', part: 'ctl', file: 'center_ctl.js', from: "    dropChal();                                                          // a challenge in flight is withdrawn: nobody may say YES to a player who has left\n", to: "", fails: 'K9b' },
+  // ---- the rest of the ctl
+  { id: 'NC34', part: 'ctl', file: 'center_ctl.js', from: "  const onShow = (e) => { if (e && e.persisted && safe(() => env.model.path(), '') === 'center') enter(); };", to: "  const onShow = () => {};", fails: 'K5l' },
+  { id: 'NC35', part: 'ctl', file: 'center_ctl.js', from: "    safe(() => svc.watchPlayers(false));\n", to: "", fails: 'K5m' },
+  { id: 'NC36', part: 'ctl', file: 'center_ctl.js', from: "    if (!app.keepsPlace()) return;\n", to: "    return;\n", fails: 'K6i' },
+  { id: 'NC37', part: 'ctl', file: 'center_ctl.js', from: "brokers: brokersFor(win), topic: CENTER_TOPIC,", to: "brokers: brokersFor(win), topic: 'bemental/arena/open/1',", fails: 'K10b' },
 ];
 async function runNodeMutants() {
   let killed = 0, ran = 0;
@@ -1121,7 +1621,8 @@ async function runNodeMutants() {
     fs.writeFileSync(fp, body.replace(m.from, () => m.to));
     // (in a process of its own: a defect that leaves a page in the room, saying "here" for ever, must not be heard by the next mutant's pages)
     let failed = [];
-    const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), '__child', dir, m.part], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 180000, windowsHide: true });
+    const blockOf = m.part === 'ctl' ? (m.fails.match(/^K\d+/) || [''])[0] : '';
+    const r = spawnSync(process.execPath, [fileURLToPath(import.meta.url), '__child', dir, m.part, blockOf], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 180000, windowsHide: true });
     const line = String(r.stdout || '').split('\n').find((l) => l.startsWith('CHILD_FAILED '));
     try { failed = line ? JSON.parse(line.slice('CHILD_FAILED '.length)) : ['threw: the run did not finish (' + String(r.stderr || r.error || '').slice(0, 200) + ')']; } catch (_e) { failed = ['threw: unreadable result']; }
     const hit = failed.some((f) => f.startsWith(m.fails));
@@ -1285,8 +1786,10 @@ async function browserCases(origin, cdp, only) {
     const bob = (await people(a)).find((p) => p.name === 'Bob');
     await L.clickLogical(a, canvas, bob.x * CELL + 8, bob.y * CELL + 2);
     await a.waitFor(`!!${H}.view().dialog && ${H}.view().dialog.id === "center:talk"`, { timeoutMs: 15000 }).catch(() => {});
-    const talk = await dlg(a), near = await me(a);
-    ok(talk && talk.id === 'center:talk' && /^Bob/.test(talk.lines[0]) && talk.choice && talk.choice.options.join() === 'ASK TO BATTLE,CANCEL' && Math.abs(near.x - bob.x) + Math.abs(near.y - bob.y) === 1, 'CB6a a click on a trainer walks up to them and asks: ASK TO BATTLE / CANCEL', J([talk, near]));
+    const talk0 = await dlg(a), near = await me(a);
+    await L.key(a, 'a'); await sleep(200);                                                           // (its second page: what asking does, with the options)
+    const talk = await dlg(a);
+    ok(talk0 && talk0.id === 'center:talk' && /^Bob/.test(talk0.lines[0]) && talk && talk.id === 'center:talk' && /3 v 3 battle/.test(talk.lines.join(' ')) && talk.choice && talk.choice.options.join() === 'ASK TO BATTLE,CANCEL' && Math.abs(near.x - bob.x) + Math.abs(near.y - bob.y) === 1, 'CB6a a click on a trainer walks up to them and asks: who they are, what asking does, ASK TO BATTLE / CANCEL', J([talk0, talk, near]));
     await shot(a, 'cb6_talk');
     await L.key(a, 'a');
     await a.waitFor(`!!${H}.view().dialog && ${H}.view().dialog.id === "center:asking"`, { timeoutMs: 5000 }).catch(() => {});
@@ -1355,6 +1858,7 @@ async function browserCases(origin, cdp, only) {
     const alice = (await people(b)).find((p) => p.name === 'Alice');
     await L.clickLogical(b, canvas, alice.x * CELL + 8, alice.y * CELL + 2);
     await b.waitFor(`!!${H}.view().dialog && ${H}.view().dialog.id === "center:talk"`, { timeoutMs: 15000 }).catch(() => {});
+    await lastPage(b);
     await L.key(b, 'a');
     const got = await until(() => a.eval(`${H}.presence.state().challenge`), 20000);
     await sleep(Math.max(0, 4000 - (Date.now() - t0)));
@@ -1447,6 +1951,97 @@ async function browserCases(origin, cdp, only) {
     await L.padPress(g, PADIDX.b); const gb = (await st(g)).mode; await L.padPress(g, PADIDX.b);
     ok(gb === 'menu' && (await st(g)).mode === 'room' && !errs(g).length, 'CB12j B opens the menu and B closes it; no page errors', J([gb, errs(g)]));
   });
+
+  /* ---- CB13: THE CENTER'S OWN QUESTION: a player whose switch is off and who once answered the hub's disclosure is asked before anything is switched on ---- */
+  if (want('CB13')) await withBrowser({ port: cdp + 3, width: 1000, height: 900, lock: false, args: NO_THROTTLE }, async (a) => {
+    const spy = await a.openTab({ width: 600, height: 400 });
+    await spy.navigate(origin + '/pokemonarena/text_manifest.json');
+    await spy.eval('window.__room = []; window.__ch = new BroadcastChannel("bemental-arena-center-2"); window.__ch.onmessage = (e) => window.__room.push(e.data); window.__board = []; window.__bc = new BroadcastChannel("bemental-arena-open-1"); window.__bc.onmessage = (e) => window.__board.push(e.data); true');
+    const said = () => spy.eval('window.__room.length + window.__board.length');
+    // this browser once answered the hub's disclosure (what Open to battles lists), and its switch is off
+    await a.navigate(origin + '/pokemonarena/text_manifest.json');
+    await a.eval('localStorage.setItem("arena.open.seen", "1"); localStorage.removeItem("arena.open"); localStorage.removeItem("arena.center.seen"); true');
+    await front(a);
+    await a.navigate(HUB('Alice', lk(6), '&opendisc=1'));
+    await a.waitFor(ready, { timeoutMs: 90000 }).catch(() => {});
+    await a.waitFor(`(!!${H}.view().dialog && ${H}.view().dialog.id === "center:enter") || ${inside}`, { timeoutMs: 30000 }).catch(() => {});
+    await sleep(1200);
+    const pre = { d: await dlg(a), st: await st(a), n: await said(), on: await a.eval(`${H}.presence.isOn()`), stored: await a.eval('localStorage.getItem("arena.open")'), drawn: await a.eval(`${H}.view().center.people.length`) };
+    ok(pre.d && pre.d.id === 'center:enter' && pre.st.phase === 'wait' && pre.on === false && pre.stored === null && pre.drawn === 0, 'CB13a a player who is NOT open to battles (but once answered the hub\'s disclosure) is asked first by the Center itself, in the picture, before they walk in', J(pre));
+    ok(pre.n === 0, 'CB13b nothing at all is published before YES', pre.n);
+    await shot(a, 'cb13_question');
+    let words = '';
+    for (let i = 0; i < 12; i++) { const d = await dlg(a); if (!d) break; words += ' ' + d.lines.join(' '); if (!d.more) break; await press(a, 'a'); }
+    const last = await dlg(a);
+    ok(/trainer name, record, look and where you stand/.test(words.replace(/\s+/g, ' ')) && /public servers/.test(words) && last && last.choice && last.choice.options.join() === 'YES,NO' && last.choice.cursor === 1, 'CB13c it says what the Center lists (the name, the record, the look, where you stand, on public servers) and asks "Walk in?" with NO highlighted', words);
+    await shot(a, 'cb13_walk_in');
+    await L.key(a, 'b');                                                                              // B is NO
+    await a.waitFor('location.hash !== "#center"', { timeoutMs: 10000 }).catch(() => {});
+    await sleep(500);
+    const no = { hash: await a.eval('location.hash'), n: await said(), told: await a.eval('localStorage.getItem("arena.center.seen")'), on: await a.eval(`${H}.presence.isOn()`), d: await dlg(a) };
+    ok(no.hash === '#online' && no.n === 0 && no.told === null && no.on === false && !no.d, 'CB13d NO (the B key) leaves the Center: nothing was published, nothing is remembered', J(no));
+    await a.eval(`${H}.goto("center")`);
+    await a.waitFor(`!!${H}.view().dialog && ${H}.view().dialog.id === "center:enter" && ${H}.view().dialog.armed`, { timeoutMs: 15000 }).catch(() => {});
+    await lastPage(a); await press(a, 'up');
+    await L.key(a, 'a');                                                                              // YES, with a real key
+    await walkIn(a).catch(() => {});
+    const heard = await until(() => spy.eval('window.__room.some((m) => m.k === "here" && m.name === "Alice") && window.__board.some((m) => m.k === "open")'), 8000);
+    const yes = { st: await st(a), told: await a.eval('localStorage.getItem("arena.center.seen")'), stored: await a.eval('localStorage.getItem("arena.open")') };
+    ok(yes.st.phase === 'in' && !!heard && yes.told === '1' && yes.stored === null, 'CB13e YES walks in: the room and the board hear it, the answer is remembered, and the stored switch stays off (open for this page only)', J(yes));
+    await a.eval(`${H}.goto("main")`); await sleep(500);
+    await a.eval(`${H}.goto("center")`);
+    await walkIn(a).catch(() => {});
+    ok((await st(a)).phase === 'in' && !(await dlg(a)), 'CB13f the next visit walks straight in: what the Center lists was said once', J(await st(a)));
+    await shot(a, 'cb13_in');
+    ok(!errs(a).length, 'CB13g no page errors', J(errs(a)).slice(0, 300));
+  });
+
+  /* ---- CB14: SOMEBODY ASKS A PLAYER WHO HAS SOMETHING OF THE CENTER'S ON THE SCREEN: the question is the one shown ---- */
+  if (want('CB14')) await withBrowser({ port: cdp + 4, width: 1000, height: 900, lock: false, args: NO_THROTTLE }, async (a) => {
+    await a.navigate(HUB('Alice', lk(6), '&openchal=8000'));
+    await walkIn(a).catch(() => {});
+    const b = await a.openTab({ width: 1000, height: 900 });
+    await b.navigate(HUB('Bob', lk(7), '&openchal=8000'));
+    await walkIn(b).catch(() => {});
+    await until(async () => (await people(a)).some((p) => p.name === 'Bob' && p.doing === 'here') && (await people(b)).some((p) => p.name === 'Alice' && p.doing === 'here'), 30000);
+    // ask a trainer by name through WHO'S HERE, with the hook alone (the tab need not be in front)
+    const askName = async (p, name) => {
+      await press(p, 'b'); await press(p, 'down'); await press(p, 'down'); await press(p, 'down'); await press(p, 'a');
+      const i = await p.eval(`${H}.view().center.who.rows.findIndex((r) => r.name === ${J(name)})`);
+      for (let k = 0; k < i; k++) await press(p, 'down');
+      await press(p, 'a'); await lastPage(p); await press(p, 'a');
+      return i;
+    };
+    const shownId = (p) => p.eval(`(${H}.view().dialog || {}).id || null`);
+    // Bob reads a sign (and leaves it on the screen)
+    await front(b);
+    await L.clickLogical(b, canvas, room.signs[0].x * CELL + 8, room.signs[0].y * CELL + 8);
+    await b.waitFor(`!!${H}.view().dialog && ${H}.view().dialog.id === "center:sign"`, { timeoutMs: 15000 }).catch(() => {});
+    const under = await shownId(b);
+    const t0 = Date.now();
+    const row = await askName(a, 'Bob');
+    await b.waitFor(`!!${H}.view().dialog && ${H}.view().dialog.id === "presence:challenge"`, { timeoutMs: 5000 }).catch(() => {});
+    const took = Date.now() - t0, q = await dlg(b);
+    ok(under === 'center:sign' && row >= 0 && q && q.id === 'presence:challenge' && /wants to battle you/.test(q.lines[1]) && took < 3000, 'CB14a somebody asks a player who is reading a sign: "wants to battle you" is on their screen at once (' + took + ' ms), not behind the sign', J([under, row, q]));
+    await b.waitFor(`!!${H}.view().dialog && ${H}.view().dialog.armed`, { timeoutMs: 5000 }).catch(() => {});
+    await shot(b, 'cb14_question_over_sign');
+    await L.key(b, 'b');                                                                              // NO
+    await a.waitFor(`!!${H}.view().dialog && ${H}.view().dialog.id === "center:note"`, { timeoutMs: 15000 }).catch(() => {});
+    const note = await dlg(a);
+    ok(note && note.lines.join(' ').trim() === 'Bob said not now.' && !(await dlg(b)), 'CB14b NO: the asker reads "Bob said not now." (and the sign Bob was reading is gone with the question)', J([note, await dlg(b)]));
+    // Alice leaves that answer on her screen, and Bob asks HER: the answer nobody pressed A on does not hide the question
+    const row2 = await askName(b, 'Alice');
+    await a.waitFor(`!!${H}.view().dialog && ${H}.view().dialog.id === "presence:challenge"`, { timeoutMs: 5000 }).catch(() => {});
+    const q2 = await dlg(a);
+    ok(row2 >= 0 && q2 && q2.id === 'presence:challenge' && /wants to battle you/.test(q2.lines[1]), 'CB14c a player with an answer left on the screen ("Bob said not now.") can be asked: the question takes its place', J([row2, q2]));
+    await front(a);
+    await a.waitFor(`!!${H}.view().dialog && ${H}.view().dialog.armed`, { timeoutMs: 5000 }).catch(() => {});
+    await shot(a, 'cb14_question_over_note');
+    await L.key(a, 'b');                                                                              // NO
+    await b.waitFor(`!!${H}.view().dialog && ${H}.view().dialog.id === "center:note"`, { timeoutMs: 15000 }).catch(() => {});
+    ok(/said not now/.test(((await dlg(b)) || { lines: [] }).lines.join(' ')) && (await a.eval('location.pathname')) === '/pokemonarena/' && (await b.eval('location.pathname')) === '/pokemonarena/', 'CB14d ... and their NO is told to the one who asked; both stay in the Center', J(await dlg(b)));
+    ok(!errs(a).length && !errs(b).length, 'CB14e no page errors', J(errs(a).concat(errs(b))).slice(0, 400));
+  });
 }
 
 // Browser mutants: one defect in the page at a time, served over the real files; each must fail its case.
@@ -1456,6 +2051,8 @@ const BROWSER_MUTANTS = [
   { id: 'BM3', file: '/pokemonarena/center.html', from: "      for (var i = 0; i < keep.length; i++) if (from.get(keep[i]) !== null) to.set(keep[i], from.get(keep[i]));", to: "      to = from;", fails: 'CB0a' },
   { id: 'BM4', file: '/pokemonarena/js/center_hub.js', from: "    else if (a.kind === 'thing') { if (S.grid.facing(me.x, me.y, me.d) === a.thing) fx.push(...use(a.thing)); }", to: "    else if (a.kind === 'thing') { /* nothing */ }", fails: 'CB9a' },
   { id: 'BM5', file: '/pokemonarena/js/center_ctl.js', from: "      win.setTimeout(() => { if (inside && !leaving && !svc.isOn()) { stopRoom(); run(app.kick('off')); } }, 0);", to: "", fails: 'CB10a' },
+  { id: 'BM6', file: '/pokemonarena/js/center_ctl.js', from: "    if (!generic && asksFirst && !told()) {", to: "    if (false) {", fails: 'CB13a' },
+  { id: 'BM7', file: '/pokemonarena/js/center_ctl.js', from: "    app.makeWay();\n", to: "", fails: 'CB14a' },
 ];
 async function runBrowserMutants() {
   let killed = 0, ran = 0;
@@ -1469,7 +2066,7 @@ async function runBrowserMutants() {
     const port = PORT + 20 + i;
     const srv = await overlay(port, PORT, { [m.file]: body });
     const before = failures.length;
-    try { await browserCases(`http://localhost:${port}`, CDP0 + 10 + i * 4, [m.fails]); } catch (e) { failures.push(m.fails + ' threw ' + e.message); }
+    try { await browserCases(`http://localhost:${port}`, CDP0 + 10 + i * 6, [m.fails]); } catch (e) { failures.push(m.fails + ' threw ' + e.message); }
     const hit = failures.slice(before).some((f) => f.startsWith(m.fails));
     failures.length = before;
     srv.close();
@@ -1482,7 +2079,7 @@ async function runBrowserMutants() {
 /* ================================================================================================ main */
 if (args[0] === '__child') {          // one mutant's run (runNodeMutants): the names of the failed cases, as one line
   let failed = [];
-  try { failed = await runNode(args[1], false, { pure: args[2] === 'pure', ctl: args[2] === 'ctl' }); } catch (e) { failed = ['threw: ' + e.message]; }
+  try { failed = await runNode(args[1], false, { pure: args[2] === 'pure', ctl: args[2] === 'ctl', block: args[3] || null }); } catch (e) { failed = ['threw: ' + e.message]; }
   console.log('CHILD_FAILED ' + JSON.stringify(failed));
   process.exit(0);
 }
