@@ -1,43 +1,57 @@
 // pokemonarena/js/builder_mon.js -- THE TEAM BUILDER, the POKEMON family: one Pokemon of a team, in tabs.
 //
-//   builder-mon   the Pokemon's ROM front sprite, its Pokedex number, level and type badges on the left; a strip of tabs (BUILD, MOVES, STATS: L / R, or a tap on a tab); the open tab on the right.
-//     BUILD       SPECIES (the species picker), NICKNAME (the text entry), LEVEL, GENDER, SHINY, NATURE, ABILITY (left / right change them at once; A on LEVEL or FRIENDSHIP opens "type a
-//                 number"), ITEM (the held-item picker), FRIENDSHIP, and a last row that says whether the Pokemon passes its team's rules (A opens the CHECK screen on it). The message box says
-//                 what the highlighted row is: what a nature does, the ability's line from the ROM, why something is refused (the reducer's own words)
-//     MOVES, STATS  arrive with the next stage: until a family registers them (X.ext('mon.tabs')), each is a plain note that says so
+//   builder-mon   a strip of tabs (BUILD, MOVES, STATS: L / R, or a tap on a tab) over the open tab.
+//     BUILD       the Pokemon's ROM front sprite, its Pokedex number, level and type badges on the left; on the right SPECIES (the species picker), NICKNAME (the text entry), LEVEL, GENDER,
+//                 SHINY, NATURE, ABILITY (left / right change them at once; A on LEVEL or FRIENDSHIP opens "type a number"), ITEM (the held-item picker), FRIENDSHIP, a row that says whether
+//                 the Pokemon passes its team's rules (A opens the CHECK screen on it), then UNDO and REDO. The message box says what the highlighted row is: what a nature does, the ability's
+//                 line from the ROM, why something is refused (the reducer's own words)
+//     MOVES       builder_moves.js;   STATS   builder_stats.js   (each registers its tab: X.ext('mon.tabs'))
 //
 // Pure ES module (browser + Node): no DOM, no ROM, no clock, no storage, no randomness. A screen of builder_hub.js (its header has the screen interface and what X is). Every edit is X.dispatch
 // with the action the old DOM editor sent (monSet with its `coalesce` key, so a held direction is ONE undo step).
 //
 // A TAB (the entries of X.ext('mon.tabs'), and BUILD below): { id, label, create(X) -> { view(), press(action, info), pointer(ev), hit(x, y), rects(), state(), enter?() } }
-//   view() -> { layout, help, say, ... }: `layout` names the painter builder_screen.js draws the tab with ('build' and 'note' exist; a new tab registers its own painter)
-//   A tab registered with the id of a placeholder ('moves', 'stats') REPLACES it. L, R and the tab chips belong to the Pokemon screen; every other input goes to the open tab.
-// numberMenu(X, spec) is the shared "numbers without sliders" pop-up (TYPE A NUMBER / the largest / the smallest): the STATS tab of the next stage uses it for EVs and IVs.
+//   view() -> { layout, help, say, ... }: `layout` names the painter builder_screen.js draws the tab with ('tab:<layout>': 'build', 'moves', 'stats'; 'note' is a plain window of lines)
+//   A tab registered with the id of an existing one REPLACES it; a new id is added after them. L, R and the tab chips belong to the Pokemon screen; every other input goes to the open tab
+//   (a press the tab answers with null falls to the screen: B goes back).
+// numberMenu(X, spec) is the shared "numbers without sliders" pop-up (TYPE A NUMBER / the largest / bigger jumps / the smallest): LEVEL and FRIENDSHIP here, EVs, stat points and IVs on STATS.
 
 import { createList, plural, sentence } from './builder_parts.js';
 import { BG, inR, tabRects } from './builder_geom.js';
+import { undoRows, undoHelp, undoAct, isUndoRow } from './builder_undo.js';
 
-export const TAB_IDS = Object.freeze(['build', 'moves', 'stats']);
-const TAB_LABEL = Object.freeze({ build: 'BUILD', moves: 'MOVES', stats: 'STATS' });
 const STAT_WORD = Object.freeze({ hp: 'HP', atk: 'Attack', def: 'Defense', spa: 'Sp. Atk', spd: 'Sp. Def', spe: 'Speed' });
 
 /**
- * "Type a number, or take the largest / the smallest": the pop-up a number row opens on A. spec: { id, label, value, min, max, set(n) } (set dispatches; the reducer clamps and says so).
+ * "Type a number, take the largest or the smallest, or jump": the pop-up a number row opens on A.
+ * spec: { id, label, value | get() (the number now), min, max, set(n) (dispatches; the reducer clamps and says so), jumps?: [40] (a "+40" and a "-40" row each; the menu stays open on them),
+ *         name? (how the field is called in "<name>: enter a whole number."), what? (how it is called in "Type <what> as a number") }
  * What is typed must be a whole number (the text entry's 'code' keys: digits, and letters that are refused here with the DOM editor's words).
  */
 export function numberMenu(X, spec) {
   const digits = String(spec.max).length;
+  const now = () => (typeof spec.get === 'function' ? spec.get() : spec.value);
+  const name = spec.name || spec.label.charAt(0) + spec.label.slice(1).toLowerCase();
+  const jumps = (spec.jumps || []).filter((j) => Number.isInteger(j) && j > 0);
   X.popup.open({
     id: 'number:' + spec.id, title: spec.label,
-    rows: () => [{ id: 'type', label: 'TYPE A NUMBER' }, { id: 'max', label: 'MAX', value: String(spec.max) }, { id: 'min', label: 'MIN', value: String(spec.min) }],
-    help: (r) => (r.id === 'type' ? ['Type ' + spec.label.toLowerCase() + ' as a number', '(' + spec.min + ' to ' + spec.max + ').'] : r.id === 'max' ? ['The largest: ' + spec.max + '.', ''] : ['The smallest: ' + spec.min + '.', '']),
+    rows: () => [{ id: 'type', label: 'TYPE A NUMBER' }, { id: 'max', label: 'MAX', value: String(spec.max) }]
+      .concat(...jumps.map((j) => [{ id: 'up:' + j, label: '+' + j, stay: true }, { id: 'down:' + j, label: '-' + j, stay: true }]), [{ id: 'min', label: 'MIN', value: String(spec.min) }]),
+    help(r) {
+      if (r.id === 'type') return ['Type ' + (spec.what || spec.label.toLowerCase()) + ' as a number', '(' + spec.min + ' to ' + spec.max + ').'];
+      if (r.id === 'max') return ['The largest: ' + spec.max + '.', ''];
+      if (r.id === 'min') return ['The smallest: ' + spec.min + '.', ''];
+      return [name + ' is ' + now() + '.', 'A: ' + r.label + ' (as far as the rules allow).'];
+    },
     pick(res) {
       if (res.kind !== 'choose') return [];
       if (res.row.id === 'max') { spec.set(spec.max); return []; }
       if (res.row.id === 'min') { spec.set(spec.min); return []; }
-      X.entry.open({ id: 'number', title: spec.label + '? (' + spec.min + '-' + spec.max + ')', value: String(spec.value), max: Math.max(digits, 3), charset: 'code' }, (r) => {
+      if (res.row.id.startsWith('up:')) { spec.set(now() + Number(res.row.id.slice(3))); return []; }
+      if (res.row.id.startsWith('down:')) { spec.set(Math.max(spec.min, now() - Number(res.row.id.slice(5)))); return []; }
+      X.entry.open({ id: 'number', title: spec.label + '? (' + spec.min + '-' + spec.max + ')', value: String(now()), max: Math.max(digits, 3), charset: 'code' }, (r) => {
         if (!r.ok) return [];
-        if (!/^\d{1,6}$/.test(r.value)) { X.flash(spec.label.charAt(0) + spec.label.slice(1).toLowerCase() + ': enter a whole number.', true); return []; }
+        if (!/^\d{1,6}$/.test(r.value)) { X.flash(name + ': enter a whole number.', true); return []; }
         spec.set(Number(r.value)); return [];
       });
       return [];
@@ -66,7 +80,7 @@ function buildTab(X) {
   function rows() {
     const m = mon(), sp = species(m), n = problems(m).length;
     const last = { id: 'problems', kind: 'item', label: n ? 'PROBLEMS' : 'RULES', value: n ? String(n) : 'OK', bad: n > 0 };
-    if (!sp) return [{ id: 'species', kind: 'item', label: 'SPECIES', value: 'Unknown ' + m.species }, { id: 'remove', kind: 'button', label: 'REMOVE FROM TEAM' }, last];
+    if (!sp) return [{ id: 'species', kind: 'item', label: 'SPECIES', value: 'Unknown ' + m.species }, { id: 'remove', kind: 'button', label: 'REMOVE FROM TEAM' }, last, ...undoRows(X)];
     const nat = natures()[m.nature], ab = abilities(m).find((s) => s.slot === m.abilitySlot);
     return [
       { id: 'species', kind: 'item', label: 'SPECIES', value: kit().text(sp.name) },
@@ -79,6 +93,7 @@ function buildTab(X) {
       { id: 'item', kind: 'item', label: 'ITEM', value: itemName(m) },
       { id: 'friendship', kind: 'choice', label: 'FRIENDSHIP', value: String(m.friendship) },
       last,
+      ...undoRows(X),
     ];
   }
   /** Left / right (or A) on a choice row: one step, through the reducer. */
@@ -122,6 +137,7 @@ function buildTab(X) {
   function act(r) {
     if (!r) return [];
     if (r.kind === 'back') return X.back();
+    if ((r.kind === 'choose' || r.kind === 'refused') && isUndoRow(r.row.id)) return undoAct(X, r.row.id);          // (a grey one says there is nothing to undo)
     if (r.kind === 'choose') return choose(r.row);
     if (r.kind !== 'change') return [];
     return change(r.row, r.dir);
@@ -135,6 +151,7 @@ function buildTab(X) {
   }
   function helpOf(row) {
     const m = mon(), sp = species(m);
+    if (row && isUndoRow(row.id)) return undoHelp(X, row.id);
     if (!sp) return row && row.id === 'remove' ? ['Take this record out of the team.', ''] : 'This ROM has no Pok{E}mon with that number, so this record cannot be edited or used in a battle. Pick another species or remove it.';
     switch (row && row.id) {
       case 'species': return [kit().text(sp.name) + ': ' + kit().ED.uniqueTypes(sp).map((t) => kit().pack.types[t].name).join(' / ') + '.', 'A chooses another species.'];
@@ -165,24 +182,15 @@ function buildTab(X) {
     state: () => list.state(),
     view() {
       const m = mon(), rs = rows(), lv = list.view(rs), row = rs[list.cursor(rs.length)], ps = problems(m);
-      return { layout: 'build', list: lv, menu: { rows: lv.rows.map((r) => ({ id: r.id, kind: r.kind, label: r.label, ...(r.value === undefined ? {} : { value: r.value }) })), cursor: lv.cursor }, help: helpOf(row), pagesFirst: false, say: (row ? row.label + ' ' + String(row.value === undefined ? '' : row.value).replace('{MALE}', 'male').replace('{FEMALE}', 'female') + '. ' : '') + (ps.length ? plural(ps.length, 'problem') + '.' : '') };
+      return { layout: 'build', list: lv, menu: { rows: lv.rows.map((r) => ({ id: r.id, kind: r.kind, label: r.label, ...(r.value === undefined ? {} : { value: r.value }), ...(r.disabled ? { disabled: true } : {}) })), cursor: lv.cursor }, help: helpOf(row), pagesFirst: false, say: (row ? row.label + ' ' + String(row.value === undefined ? '' : row.value).replace('{MALE}', 'male').replace('{FEMALE}', 'female') + '. ' : '') + (ps.length ? plural(ps.length, 'problem') + '.' : '') };
     },
   };
 }
 
-/** A tab that is not built yet: it says so, plainly. (The next stage registers the real one under the same id.) */
-function noteTab(id) {
-  return () => ({
-    press: (action) => (action === 'b' ? null : []),
-    pointer: () => [], hit: () => null, rects: () => [], state: () => ({}),
-    view: () => ({ layout: 'note', lines: [TAB_LABEL[id], 'This screen arrives with', 'the next stage of the', 'Team Builder.'], help: ['Nothing to edit here yet.', 'L, R or a tap on a tab changes it.'], say: TAB_LABEL[id] + ' is not built yet.' }),
-  });
-}
-
 /* ================================================================================================ the Pokemon screen */
 function monScreen(X) {
-  // the tabs: BUILD and the two placeholders, each replaced by a registered tab of the same id; a registered tab with a new id is added after them
-  const defs = [{ id: 'build', label: TAB_LABEL.build, create: buildTab }, { id: 'moves', label: TAB_LABEL.moves, create: noteTab('moves') }, { id: 'stats', label: TAB_LABEL.stats, create: noteTab('stats') }];
+  // the tabs: BUILD, then the registered ones (MOVES, STATS) in registration order; one registered under an id that is already there REPLACES that tab
+  const defs = [{ id: 'build', label: 'BUILD', create: buildTab }];
   for (const e of X.ext('mon.tabs')) { const i = defs.findIndex((d) => d.id === e.id); if (i >= 0) defs[i] = e; else defs.push(e); }
   const tabs = defs.map((d) => ({ id: d.id, label: d.label, api: d.create(X) }));
   const index = () => Math.max(0, tabs.findIndex((t) => t.id === X.at().tab));

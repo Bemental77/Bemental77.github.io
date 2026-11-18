@@ -1,22 +1,19 @@
 // pokemonarena/js/builder_home.js -- THE TEAM BUILDER, the HOME family: the two lists a player starts from.
 //
 //   builder         TRAINERS   every profile in this browser (the one being edited is marked ACTIVE), NEW TRAINER, BACK. A opens a trainer (switches to it and shows its teams); MENU
-//                              (the chip, RIGHT, START or X) opens the trainer's menu: OPEN, RENAME, DELETE
-//   builder-teams   TEAMS      the trainer's teams (16 at most), NEW TEAM, REMOVE UNUSED (only when the box holds Pokemon that are on no team), BACK. A opens a team; MENU opens the team's
-//                              menu: OPEN, RENAME, DUPLICATE, MOVE UP, MOVE DOWN, DELETE
+//                              (the chip, RIGHT, START or X) opens the trainer's menu: OPEN, RENAME, DELETE, and for the trainer being edited PORTRAIT, UNDO, REDO
+//   builder-teams   TEAMS      the trainer's teams (16 at most), NEW TEAM, IMPORT A CODE, UNDO, REDO, REMOVE UNUSED (only when the box holds Pokemon that are on no team), BACK. A opens a
+//                              team; MENU opens the team's menu: OPEN, RENAME, DUPLICATE, MOVE UP, MOVE DOWN, DELETE
 //
 // Pure ES module (browser + Node): no DOM, no ROM, no clock, no storage, no randomness. A screen of builder_hub.js (its header has the screen interface and what X is).
 // Team edits go through X.dispatch (the reducer); what touches the STORE (make, open, rename another, delete a profile) is an effect for builder_ctl.js.
-// REGISTRATION POINTS for later stages (X.ext): 'trainers.rows' (IMPORT PROFILE, IMPORT SAVE, DATA), 'trainers.menu' (PORTRAIT, EXPORT, IDENTITY KEY), 'teams.rows' (IMPORT A CODE),
-// 'teams.menu'. An entry is { id, label, help: [line, line] | text, run(X, target) -> effects, when?(X) }; `target` is the trainer or the team the menu was opened on.
+// REGISTRATION POINTS (X.ext): 'trainers.rows' (IMPORT PROFILE, IMPORT SAVE, DATA), 'trainers.menu' (PORTRAIT, UNDO, REDO; later EXPORT, IDENTITY KEY), 'teams.rows' (IMPORT A CODE, UNDO, REDO),
+// 'teams.menu'. An entry: builder_parts.js "AN EXTENSION ENTRY"; `target` is the trainer or the team the menu was opened on (null for a list's rows).
 
-import { createList, plural } from './builder_parts.js';
+import { createList, plural, extRows, extRun, extHelp } from './builder_parts.js';
 import { BG, inR } from './builder_geom.js';
 
 const CHIP = BG.strip.chip;
-const extRows = (X, slot) => X.ext(slot).map((e) => ({ id: 'x:' + e.id, kind: 'button', label: e.label, ext: e.id }));
-const extRun = (X, slot, id, target) => { const e = X.ext(slot).find((x) => 'x:' + x.id === id || x.id === id); return e && typeof e.run === 'function' ? e.run(X, target) || [] : []; };
-const extHelp = (X, slot, id) => { const e = X.ext(slot).find((x) => 'x:' + x.id === id || x.id === id); return e ? e.help || ['', ''] : null; };
 const menuRow = (lv) => ({ rows: lv.rows.map((r) => ({ id: r.id, kind: r.kind, label: r.label, ...(r.disabled ? { disabled: true } : {}) })), cursor: lv.cursor });
 
 /* ================================================================================================ TRAINERS */
@@ -26,7 +23,7 @@ function trainersScreen(X) {
   function rows() {
     const active = X.activeId();
     const out = X.trainers().map((t) => ({ id: 'p:' + t.id, kind: 'item', label: t.unreadable ? '(unreadable)' : t.name, pid: t.id, tag: t.id === active ? 'ACTIVE' : t.readOnly ? 'LOCKED' : '', ...(t.unreadable ? { disabled: true } : {}) }));
-    return out.concat(extRows(X, 'trainers.rows'), [{ id: 'new', kind: 'button', label: 'NEW TRAINER' }, { id: 'back', kind: 'button', label: 'BACK' }]);
+    return out.concat(extRows(X, 'trainers.rows', null, 'button'), [{ id: 'new', kind: 'button', label: 'NEW TRAINER' }, { id: 'back', kind: 'button', label: 'BACK' }]);
   }
   const rowNow = () => { const rs = rows(); return rs[list.cursor(rs.length)] || null; };
   const open = (id) => (id === X.activeId() ? X.go('builder-teams') : [X.eff('profile-open', { id })]);
@@ -55,9 +52,10 @@ function trainersScreen(X) {
     if (!t || t.unreadable) return [];
     X.popup.open({
       id: 'trainer', title: t.name,
-      rows: () => [{ id: 'open', label: 'OPEN' }, { id: 'rename', label: 'RENAME' }].concat(X.ext('trainers.menu').map((e) => ({ id: 'x:' + e.id, label: e.label })), [{ id: 'delete', label: 'DELETE' }]),
-      help: (r) => MENU_HELP[r.id] || extHelp(X, 'trainers.menu', r.id),
+      rows: () => [{ id: 'open', label: 'OPEN' }, { id: 'rename', label: 'RENAME' }].concat(extRows(X, 'trainers.menu', t), [{ id: 'delete', label: 'DELETE' }]),
+      help: (r) => MENU_HELP[r.id] || extHelp(X, 'trainers.menu', r.id, t),
       pick(res) {
+        if (res.kind === 'refused') return extRun(X, 'trainers.menu', res.row.id, t);          // (a grey row: its reason goes to the message box)
         if (res.kind !== 'choose') return [];
         switch (res.row.id) {
           case 'open': return open(t.id);
@@ -72,6 +70,7 @@ function trainersScreen(X) {
   function act(r) {
     if (!r) return [];
     if (r.kind === 'back') return X.back();
+    if (r.kind === 'refused' && r.row.ext) return extRun(X, 'trainers.rows', r.row.id, null);
     if (r.kind !== 'choose') return [];
     if (r.row.pid) return open(r.row.pid);
     if (r.row.id === 'new') return newTrainer();
@@ -124,7 +123,7 @@ function teamsScreen(X) {
   function rows() {
     const out = teams().map((t) => { const c = X.teamCheck(t.id); return { id: 't:' + t.id, kind: 'item', label: t.name, tid: t.id, tag: tagOf(c), bad: c.status === 'bad' }; });
     out.push({ id: 'new', kind: 'button', label: full() ? 'TEAM LIMIT REACHED' : 'NEW TEAM', ...(full() ? { disabled: true } : {}) });
-    out.push(...extRows(X, 'teams.rows'));
+    out.push(...extRows(X, 'teams.rows', null, 'button'));
     if (unused() > 0) out.push({ id: 'unused', kind: 'button', label: 'REMOVE UNUSED' });
     out.push({ id: 'back', kind: 'button', label: 'BACK' });
     return out;
@@ -158,10 +157,11 @@ function teamsScreen(X) {
     X.popup.open({
       id: 'teams', title: row.label,
       rows: () => [{ id: 'open', label: 'OPEN' }, { id: 'rename', label: 'RENAME' }, { id: 'duplicate', label: 'DUPLICATE' }, { id: 'up', label: 'MOVE UP', stay: true }, { id: 'down', label: 'MOVE DOWN', stay: true }]
-        .concat(X.ext('teams.menu').map((e) => ({ id: 'x:' + e.id, label: e.label })), [{ id: 'delete', label: 'DELETE' }]),
-      help: (r) => MENU_HELP[r.id] || extHelp(X, 'teams.menu', r.id),
+        .concat(extRows(X, 'teams.menu', find()), [{ id: 'delete', label: 'DELETE' }]),
+      help: (r) => MENU_HELP[r.id] || extHelp(X, 'teams.menu', r.id, find()),
       pick(res) {
         const t = find();
+        if (res.kind === 'refused' && t) return extRun(X, 'teams.menu', res.row.id, t);
         if (res.kind !== 'choose' || !t) return [];
         const i = teams().indexOf(t);
         switch (res.row.id) {
@@ -177,17 +177,19 @@ function teamsScreen(X) {
     });
     return [];
   }
+  // a row another family put on the list (IMPORT A CODE, UNDO, REDO): it is run, and the cursor stays on it though the rows above it may have changed (an undo brought a team back)
+  const extra = (row) => { const fx = extRun(X, 'teams.rows', row.id, null); list.seek(rows(), (x) => x.id === row.id); return fx; };
   function act(r) {
     if (!r) return [];
     if (r.kind === 'back') return X.back();
-    if (r.kind === 'refused') { if (r.row.id === 'new') X.flash('A profile holds at most ' + ES().EDITOR_LIMITS.teamsMax + ' teams.', true); return []; }
+    if (r.kind === 'refused') { if (r.row.id === 'new') X.flash('A profile holds at most ' + ES().EDITOR_LIMITS.teamsMax + ' teams.', true); else if (r.row.ext) return extra(r.row); return []; }
     if (r.kind !== 'choose') return [];
     if (r.row.tid) return openTeam(r.row.tid);
     switch (r.row.id) {
       case 'new': return newTeam();
       case 'unused': X.dispatch({ type: 'boxCleanup' }); return [];
       case 'back': return X.back();
-      default: return extRun(X, 'teams.rows', r.row.id, null);
+      default: return extra(r.row);
     }
   }
   function helpOf(row) {

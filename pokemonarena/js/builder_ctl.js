@@ -16,10 +16,17 @@
 //   LEAVE      (the path moved out of the builder's screens) flush, then DROP the editor state. The hub page also writes profiles outside the reducer (the Tower, RESET RECORD), each
 //              bumping the store's rev: a state kept across a leave would save over them, or be refused. Every ENTER loads again
 //   FLUSH      on leave, on pagehide, when the tab is hidden, before another profile is opened or made, and on dispose
+//   UNDO       Ctrl+Z, and Ctrl+Y or Ctrl+Shift+Z, anywhere in the builder: the model's undo() / redo() (the reducer's stack). Never while a text entry is open (a word being typed), a
+//              question is asked, a DOM panel (Controls, Sound) is up, or the key is going to a real text field of the page. The picture has UNDO and REDO rows for everyone else
+//   THE CODE   (builder_io.js) the ctl makes a team's ARENA1 code (kit.encodeTeam), says how long it is, COPIES it (navigator.clipboard.writeText) and READS the clipboard on the press of
+//              PASTE A CODE (readText); a browser that refuses either is said in the picture. BOTH ARE ASKED IN THE CALL THAT CARRIES THE PRESS (a copy: whenever the code is already made,
+//              which it is once the screen has said its length): some browsers allow the clipboard only there. What was pasted or entered is decoded and judged (kit.decodeCode) and
+//              handed to the screen
+//   THE TEST   the test battle: flush, the codes of the team (and of the other team when one was chosen), then the battle page at editor_links.js battleUrl with a fresh seed
 // The trainer list's actions (make, open, rename another, delete a profile) are the store's, so they arrive here as effects. The tab's focus (which team / Pokemon / tab) is kept in
-// sessionStorage so a reload comes back to it; the species picker's sort is kept in localStorage under the DOM editor's key.
+// sessionStorage so a reload comes back to it; the species picker's sort and the STATS tab's EVs / points view are kept in localStorage under the DOM editor's keys.
 //
-// Test hook: env.hook.builder = { flush(), idle(), state(), kit() }.
+// Test hook: env.hook.builder = { flush(), idle(), state(), kit() }. env.clipboard (tests) stands in for navigator.clipboard.
 
 import { createBuilderKit } from './builder_kit.js';
 import { ConflictError, ReadOnlyError, ValidationError } from './store.js';
@@ -31,6 +38,10 @@ export const SAVE_DEBOUNCE_MS = 250;
 export const FLUSH_ROUNDS = 6;
 export const FOCUS_KEY = 'arena.builder.at';
 export const SORT_KEY = 'arena.editor.speciesSort';          // (the DOM editor's key: the remembered sort carries over)
+export const VIEW_KEY = 'arena.editor.statsView';            // (the DOM editor's key: 'ev' | 'points')
+const PREF_KEYS = Object.freeze({ speciesSort: SORT_KEY, statsView: VIEW_KEY });
+/** The longest pasted text that is looked at (a team code is at most 1024 characters; white space is dropped by the decoder). */
+export const PASTE_MAX = 8192;
 export const CONFLICT_ID = 'builder:conflict', FAILED_ID = 'builder:save-failed', UNSAVED_ID = 'builder:not-kept';
 export const CONFLICT_OPTIONS = Object.freeze(['USE THE OTHER', 'KEEP MINE', 'LATER']);
 const CONFLICT_TEXT = 'This profile was changed in another tab. Saving here would overwrite that. Choose which version to keep.';
@@ -45,6 +56,9 @@ export function createCtl(env) {
   // one thing at a time: an ENTER's load, a profile opened, a LEAVE's flush never overlap (the hub starts a ctl's calls in order but does not wait for them)
   let chain = Promise.resolve();
   const serial = (fn) => { const p = chain.then(fn); chain = p.catch((e) => { console.warn('[builder] ' + msgOf(e)); }); return p; };
+  // ... and what runs BESIDE that queue (a team code being made, copied, read, decoded: none of it touches the store): started at once, so a copy is close to the press that asked for it
+  let beside = Promise.resolve();
+  const aside = (p) => { beside = Promise.all([beside, Promise.resolve(p).catch(() => {})]).then(() => undefined); return p; };
 
   const measure = (font, s) => { try { return env.ui && typeof env.ui.measure === 'function' ? env.ui.measure(font, s) : String(s).length * 6; } catch (_e) { return String(s).length * 6; } };
   const pagesOf = (text) => wrapDialog(text, measure, (env.ui && env.ui.R ? env.ui.R.msg.w - 4 : 204) - 12);          // (less the room the dialog's "more" arrow takes)
@@ -62,8 +76,12 @@ export function createCtl(env) {
   }
 
   /* ------------------------------------------------------------------------------------------ per-tab conveniences */
-  function readSort() { try { const v = env.storage ? env.storage.getItem(SORT_KEY) : null; return typeof v === 'string' && v.length < 16 ? v : null; } catch (_e) { return null; } }
-  function writePref(key, value) { if (key !== 'speciesSort') return; try { if (env.storage) env.storage.setItem(SORT_KEY, String(value)); } catch (_e) { /* a convenience */ } }
+  function readPrefs() {
+    const out = {};
+    for (const [key, name] of Object.entries(PREF_KEYS)) { try { const v = env.storage ? env.storage.getItem(name) : null; if (typeof v === 'string' && v.length < 16) out[key] = v; } catch (_e) { /* a convenience */ } }
+    return out;
+  }
+  function writePref(key, value) { if (!Object.prototype.hasOwnProperty.call(PREF_KEYS, key)) return; try { if (env.storage) env.storage.setItem(PREF_KEYS[key], String(value)); } catch (_e) { /* a convenience */ } }
   function readFocus() {
     try { const raw = env.session ? env.session.getItem(FOCUS_KEY) : null; if (!raw || raw.length > 400) return null; const j = JSON.parse(raw); return j && typeof j === 'object' && typeof j.profileId === 'string' ? j : null; } catch (_e) { return null; }
   }
@@ -224,6 +242,73 @@ export function createCtl(env) {
     sync();
   }
 
+  /* ------------------------------------------------------------------------------------------ the team code and the test battle (builder_io.js) */
+  const clip = () => env.clipboard || (win && win.navigator && win.navigator.clipboard) || null;
+  const tell = (path, msg) => { run(app.tell(path, msg)); redraw(); };
+  // (the code of a team is kept while the profile is the same object: the length is said when the screen opens, and COPY then writes at once, close to the press that asked)
+  let made = { profile: null, teamId: null, code: null };
+  async function codeOf(teamId) {
+    const S = app.editor();
+    if (!S) return { ok: false, message: 'No trainer is open.', of: null };
+    const profile = S.profile;
+    if (made.profile === profile && made.teamId === teamId) return { ok: true, code: made.code, of: profile };
+    const r = await kit.encodeTeam(profile, teamId);
+    if (r.ok) made = { profile, teamId, code: r.code };
+    return { ...r, of: profile };
+  }
+  async function codeLength(teamId) {
+    const r = await codeOf(teamId);
+    tell('builder-code', r.ok ? { type: 'length', teamId, chars: r.code.length, of: r.of } : { type: 'length', teamId, error: r.message, of: r.of });
+  }
+  /** The code already made for this team AS IT IS NOW, or null. */
+  const madeFor = (teamId) => { const S = app.editor(); return S && made.profile === S.profile && made.teamId === teamId ? made.code : null; };
+  async function codeCopy(teamId) {
+    // THE WRITE STARTS IN THE VERY CALL THAT ASKED whenever the code is already made (it is, once the screen has said its length): some browsers let a page copy only from inside the key
+    // press or the tap that asked, and refuse a write that starts after an await
+    let code = madeFor(teamId);
+    if (code === null) { const r = await codeOf(teamId); if (!r.ok) { tell('builder-code', { type: 'copy-refused', message: r.message }); return; } code = r.code; }
+    try { const c = clip(); if (!c || typeof c.writeText !== 'function') throw new Error('no clipboard'); await c.writeText(code); }
+    catch (_e) { tell('builder-code', { type: 'copy-refused' }); return; }
+    tell('builder-code', { type: 'copied', chars: code.length });
+  }
+  async function codeDecode(text) { tell('builder-code', { type: 'decoded', ...(await kit.decodeCode(String(text).slice(0, PASTE_MAX))) }); }
+  async function codePaste() {
+    let text = null;
+    try { const c = clip(); if (!c || typeof c.readText !== 'function') throw new Error('no clipboard'); text = await c.readText(); }
+    catch (_e) { tell('builder-code', { type: 'paste-refused' }); return; }
+    if (typeof text !== 'string' || !text.trim()) { tell('builder-code', { type: 'paste-empty' }); return; }
+    await codeDecode(text);
+  }
+  async function testStart(eff) {
+    if (!app.editor()) return;
+    await flush();
+    if (conflict || saveError) return;                                 // (the question about the save is on the screen: the battle waits for its answer)
+    const S = app.editor(); if (!S) return;
+    const say = (text) => { app.note(text, true); redraw(); };
+    const mine = await kit.encodeTeam(S.profile, eff.teamId);
+    if (!mine.ok) { say(mine.message); return; }
+    let foe = 'random';
+    if (eff.foeId) { const f = await kit.encodeTeam(S.profile, eff.foeId); if (!f.ok) { say(f.message); return; } foe = f.code; }
+    let url;
+    try { url = kit.LINKS.battleUrl({ team: mine.code, foe, seed: env.freshSeed() >>> 0, format: eff.format, cpu: eff.cpu }); } catch (e) { say('The test battle could not be opened: ' + msgOf(e)); return; }
+    env.navigate(url);
+  }
+
+  /* ------------------------------------------------------------------------------------------ Ctrl+Z / Ctrl+Y */
+  function onKey(e) {
+    if (!inside || !e || e.defaultPrevented || !(e.ctrlKey || e.metaKey) || e.altKey) return;
+    const k = String(e.key || '').toLowerCase();
+    const type = k === 'z' ? (e.shiftKey ? 'redo' : 'undo') : k === 'y' && !e.shiftKey ? 'redo' : null;
+    if (!type) return;
+    const m = env.model, hk = env.hook, t = e.target;
+    if (m && ((typeof m.wantsText === 'function' && m.wantsText()) || (typeof m.textUnder === 'function' && m.textUnder()) || (m.dialog && m.dialog.isOpen()))) return;          // a word being typed, a question
+    if (hk && typeof hk.dialogOpen === 'function' && hk.dialogOpen()) return;                                                                                        // a DOM panel (Controls, Sound)
+    if (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(String(t.tagName || '')) || t.isContentEditable)) return;                                                            // a real text field keeps its own undo
+    if (typeof e.preventDefault === 'function') e.preventDefault();
+    run(type === 'undo' ? app.undo() : app.redo());
+    redraw();
+  }
+
   /* ------------------------------------------------------------------------------------------ the page's lifecycle */
   function wire() {
     if (wired || !store) return;
@@ -237,10 +322,11 @@ export function createCtl(env) {
   const onVisibility = () => { if (doc && doc.hidden) flush(); };
   if (win && typeof win.addEventListener === 'function') win.addEventListener('pagehide', onHide);
   if (doc && typeof doc.addEventListener === 'function') doc.addEventListener('visibilitychange', onVisibility);
+  if (win && typeof win.addEventListener === 'function') win.addEventListener('keydown', onKey);
 
   async function begin() {
     inside = true;
-    if (!kit) { kit = createBuilderKit({ pack: env.pack, deps: env.deps }); app.attach(kit); const sort = readSort(); if (sort) app.setPrefs({ speciesSort: sort }); }
+    if (!kit) { kit = createBuilderKit({ pack: env.pack, deps: env.deps }); app.attach(kit); app.setPrefs(readPrefs()); }
     app.setPhase('loading'); redraw();
     store = typeof env.whenStore === 'function' ? await env.whenStore() : env.store();
     if (!store) { app.setEditor(null); app.setPhase('nostore'); redraw(); return; }
@@ -267,7 +353,7 @@ export function createCtl(env) {
     sync();
   }
 
-  const api = { flush, idle: () => chain, kit: () => kit, state: () => ({ inside, saving: !!saving, conflict: !!conflict, stale, saveError, timer: saveTimer !== null, dirty: kit ? dirty() : false }) };
+  const api = { flush, idle: () => Promise.all([chain, beside]).then(() => undefined), kit: () => kit, state: () => ({ inside, saving: !!saving, conflict: !!conflict, stale, saveError, timer: saveTimer !== null, dirty: kit ? dirty() : false }) };
   if (env.hook && typeof env.hook === 'object') env.hook.builder = api;
 
   return {
@@ -283,6 +369,11 @@ export function createCtl(env) {
         case 'profile-open': return serial(() => openProfile(eff.id));
         case 'profile-rename': return serial(() => renameProfile(eff.id, eff.name));
         case 'profile-delete': return serial(() => deleteProfile(eff.id));
+        case 'code-length': return aside(codeLength(eff.teamId));
+        case 'code-copy': return aside(codeCopy(eff.teamId));
+        case 'code-paste': return aside(codePaste());
+        case 'code-decode': return aside(codeDecode(eff.text));
+        case 'test-start': return serial(() => testStart(eff));
         case 'dialog':
           if (eff.id === CONFLICT_ID && eff.value === 0) return serial(reloadActive);
           if (eff.id === CONFLICT_ID && eff.value === 1) return serial(keepMine);
@@ -295,6 +386,7 @@ export function createCtl(env) {
       flush();
       if (win && typeof win.removeEventListener === 'function') win.removeEventListener('pagehide', onHide);
       if (doc && typeof doc.removeEventListener === 'function') doc.removeEventListener('visibilitychange', onVisibility);
+      if (win && typeof win.removeEventListener === 'function') win.removeEventListener('keydown', onKey);
     },
   };
 }

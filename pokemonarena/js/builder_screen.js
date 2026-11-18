@@ -1,12 +1,14 @@
 // pokemonarena/js/builder_screen.js -- draws THE TEAM BUILDER (builder_hub.js view -> pixels) from the ROM: the shared FURNITURE every builder screen is drawn with, and the registry of the
-// screens' painters (one module per screen family: builder_screen_home.js, builder_screen_team.js, builder_screen_mon.js, builder_screen_pick.js).
+// screens' painters (one module per screen family: builder_screen_home.js, builder_screen_team.js, builder_screen_mon.js, builder_screen_pick.js, builder_screen_moves.js,
+// builder_screen_stats.js, builder_screen_io.js).
 //
 // Pure ES module (browser + Node): no DOM, no timers. hub_screen.js gives this module the frame `f` (the terrain picture already on it) and its drawing helpers `h`
 // (pokemonarena/INAPP.md "The app interface"); the text entry and the dialog layer are drawn by hub_screen.js over what is drawn here.
 //
 // EVERY PIXEL IS THE ROM'S: the party-menu teal behind every builder screen, the ROM's 6 px window ring, the ROM's party slot panel (slots, chips), the ROM fonts and their cursor / arrow
-// glyphs, the ROM message box, the ROM's party icons, front sprites, trainer heads and type badges (editor_art.js createArtKit, decoded lazily: only what a frame shows). The only things that
-// are not ROM art are the plain white interiors the ROM's windows have. No picture is made in code, nothing is recoloured, and a sprite is never scaled.
+// glyphs, the ROM message box, the ROM's party icons, front sprites, trainer heads, type badges, category icons and the HP-bar tiles a stat bar is built from (editor_art.js createArtKit,
+// decoded lazily: only what a frame shows). The only things that are not ROM art are the plain white interiors the ROM's windows have. No picture is made in code, nothing is recoloured,
+// and a sprite is never scaled.
 //
 // THE FURNITURE (K, handed to every painter)
 //   K.t(f, { s, x, y, max, font | fonts, align, fg, sh, what })   ONE TEXT: the first font of `fonts` that fits `max` pixels (cut to fit only as the last resort), drawn left / right / centre
@@ -14,7 +16,7 @@
 //                              checked at the extremes (the longest species, ability and item names of this ROM, a 10-character trainer, a 16-character team)
 //   K.bg / K.strip / K.chip   the teal, the title strip (title, chips, the autosave tag), one chip (the ROM party panel: normal, selected, or grey when it has nothing to do)
 //   K.list / K.box / K.popup / K.message   a list window with its rows (label, value between the arrows, a small tag), a plain ROM window, the pop-up menu, the message box and its "more" arrow
-//   K.icon / K.sprite / K.badge / K.head       ROM art by id, drawn where asked; an id the ROM has no picture for draws nothing (and says so to the caller)
+//   K.icon / K.sprite / K.badge / K.head / K.cat / K.bar   ROM art by id, drawn where asked; an id the ROM has no picture for draws nothing (and says so to the caller)
 // A PAINTER   (K) => { kind: (f, b, view) => void }: `b` is view.builder. To add a screen family: write its painters and add them to PAINTER_SETS below. A tab of the Pokemon screen registers
 //   under 'tab:<layout>'.
 
@@ -24,9 +26,12 @@ import { PAINTERS as HOME } from './builder_screen_home.js';
 import { PAINTERS as TEAM } from './builder_screen_team.js';
 import { PAINTERS as MON } from './builder_screen_mon.js';
 import { PAINTERS as PICK } from './builder_screen_pick.js';
+import { PAINTERS as MOVES } from './builder_screen_moves.js';
+import { PAINTERS as STATS } from './builder_screen_stats.js';
+import { PAINTERS as IO } from './builder_screen_io.js';
 
 /** The painters of every screen family. A LATER STAGE ADDS ITS SET HERE (and its family in builder_hub.js). */
-export const PAINTER_SETS = Object.freeze([HOME, TEAM, MON, PICK]);
+export const PAINTER_SETS = Object.freeze([HOME, TEAM, MON, PICK, MOVES, STATS, IO]);
 export const FONTS = Object.freeze(['normal', 'narrow', 'smallNarrow']);
 
 export function createScreen(ui, h, sets = PAINTER_SETS) {
@@ -77,16 +82,19 @@ export function createScreen(ui, h, sets = PAINTER_SETS) {
     const v = t(f, { s: val, x: vr, y, align: 'right', font: vf, max: room - lw - 4 - reserve, fg: row.bad ? COL.red : fg, what: 'row value' });
     if (arrows) { t(f, { s: '{RIGHT}', x: right - 9, y, what: 'arrow' }); t(f, { s: '{LEFT}', x: vr - v.px - 10, y, what: 'arrow' }); }
   }
-  /** A list window (g: builder_geom.js BG.list / BG.wide / BG.mon.list) with the rows of a list view (builder_parts.js createList view()). */
-  function list(f, g, lv) {
-    ui.drawWindow(f, g.x, g.y, g.w, listH(g));
+  /**
+   * A list window (g: builder_geom.js BG.list / BG.wide / BG.mon.list) with the rows of a list view (builder_parts.js createList view()). o.h: the window's height when it holds more than the
+   * rows (the move picker's foot line); o.tagMax: the room a row's small tag may take (default 40).
+   */
+  function list(f, g, lv, o = {}) {
+    ui.drawWindow(f, g.x, g.y, g.w, o.h || listH(g));
     const left = g.x + 11, right = g.x + g.w - 12;                    // (the last 10 px are the lane of the "more above / below" arrows)
     lv.rows.forEach((row, i) => {
       const y = g.y + i * g.pitch, on = i === lv.cursor, fg = row.disabled || row.dim ? COL.line : TEXT.dark;
       if (row.value !== undefined) pair(f, row, left, right, y, on, fg);
       else {
         let room = right - left;
-        if (row.tag) { const w = t(f, { s: row.tag, x: right, y, align: 'right', font: 'small', max: 40, fg: row.bad ? COL.red : COL.line, what: 'row tag' }).px; room -= w + 4; }
+        if (row.tag) { const w = t(f, { s: row.tag, x: right, y, align: 'right', font: 'small', max: o.tagMax || 40, fg: row.bad ? COL.red : COL.line, what: 'row tag' }).px; room -= w + 4; }
         t(f, { s: row.label, x: left, y, max: room, fonts: FONTS, fg, what: 'row' });
       }
       if (on) t(f, { s: '{CURSOR}', x: g.x + 2, y, what: 'cursor' });
@@ -96,10 +104,10 @@ export function createScreen(ui, h, sets = PAINTER_SETS) {
     if (lv.up && !busy(0)) t(f, { s: '{UP}', x: g.x + g.w - 10, y: g.y, what: 'arrow' });
     if (lv.down && !busy(g.rows - 1)) t(f, { s: '{DOWN}', x: g.x + g.w - 10, y: g.y + (g.rows - 1) * g.pitch, what: 'arrow' });
   }
-  /** The pop-up menu (builder_parts.js createPopupSlot view()): a ROM window, an optional title line, the rows and the cursor. */
+  /** The pop-up menu (builder_parts.js createPopupSlot view()): a ROM window, an optional title line, the rows that are shown and the cursor; a menu that scrolls has the ROM's arrows in a lane at its right. */
   function popup(f, p) {
     ui.drawWindow(f, p.x, p.y, p.w, p.h);
-    const left = p.x + BG.popup.lead, right = p.x + p.w - 4, k = p.title ? 1 : 0;
+    const left = p.x + BG.popup.lead, right = p.x + p.w - 4 - (p.lane ? BG.popup.lane : 0), k = p.title ? 1 : 0;
     if (p.title) t(f, { s: p.title, x: p.x + 4, y: p.y, max: p.w - 8, fonts: FONTS, fg: COL.blue, what: 'popup title' });
     p.rows.forEach((row, i) => {
       const y = p.y + (i + k) * p.pitch, on = i === p.cursor, fg = row.disabled ? COL.line : TEXT.dark;
@@ -107,6 +115,8 @@ export function createScreen(ui, h, sets = PAINTER_SETS) {
       else t(f, { s: row.label, x: left, y, max: right - left, fonts: FONTS, fg, what: 'popup row' });
       if (on) t(f, { s: '{CURSOR}', x: p.x + 2, y, what: 'cursor' });
     });
+    if (p.up) t(f, { s: '{UP}', x: p.x + p.w - 10, y: p.y + k * p.pitch, what: 'arrow' });
+    if (p.down) t(f, { s: '{DOWN}', x: p.x + p.w - 10, y: p.y + (k + p.rows.length - 1) * p.pitch, what: 'arrow' });
   }
   /** The ROM message box with the view's two lines, and the ROM's down arrow at its foot while the text goes on over the page. */
   function message(f, view) {
@@ -140,10 +150,14 @@ export function createScreen(ui, h, sets = PAINTER_SETS) {
     if (avatar.kind === 'mon') return sprite(f, avatar.id, {}, x, y);
     blit(f, kit().trainerHead(avatar.id | 0), x, y); return true;
   }
+  /** The ROM's 16x16 category icon of a move (0 physical, 1 special, 2 status). */
+  function cat(f, category, x, y) { blit(f, kit().categoryIcon(category | 0), x, y); }
+  /** A stat bar built from the ROM's HP-bar tiles (editor_art.js statBar: green, yellow or red by how full it is), `tiles` tiles of 8 px wide. */
+  function bar(f, value, max, x, y, tiles) { blit(f, kit().statBar(value, max, tiles || 8), x, y); }
   /** `s` as lines no wider than `px` in `font` (h.wrap: words kept whole). */
   const wrap = (font, s, px, maxLines) => h.wrap(font, ui.safeText(String(s)), px, maxLines);
 
-  const K = { ui, h, TEXT, COL, G: BG, FONTS, onTeal, t, bg, box, chip, strip, pair, list, popup, message, blit, icon, sprite, badge, badges, head, wrap, art: kit };
+  const K = { ui, h, TEXT, COL, G: BG, FONTS, onTeal, t, bg, box, chip, strip, pair, list, popup, message, blit, icon, sprite, badge, badges, head, cat, bar, wrap, art: kit };
   const painters = {};
   for (const set of sets) Object.assign(painters, set(K));
   K.painters = painters;

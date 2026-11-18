@@ -4,9 +4,10 @@
 //   mon         the strip: the Pokemon's name, the tab chips (the open tab is the ROM's selected panel), the autosave tag. Then the open tab's painter: K.painters['tab:' + b.layout]
 //   tab:build   on the left, straight on the teal as in the ROM's own summary: the ROM front sprite (its two frames alternate: b.frame), the type badges, "No. / Lv" in the small font;
 //               on the right the list of fields
-//   tab:note    the same left column, and a window with a few plain lines (a tab that is not built yet)
-// A NEW TAB (the next stage's MOVES and STATS) registers its painter as 'tab:<its layout>' (here, or in a painter set of its own) and draws what it likes below the strip; K.painters.monLeft
-// draws the left column for a tab that wants it.
+//   tab:note    the same left column, and a window with a few plain lines (a tab that only has something to say)
+//   tab:moves   builder_screen_moves.js;   tab:stats   builder_screen_stats.js   (each as wide as the picture: no left column)
+// A NEW TAB registers its painter as 'tab:<its layout>' (here, or in a painter set of its own) and draws what it likes below the strip; K.painters.monLeft draws the left column for a tab
+// that wants it.
 
 export const PAINTERS = (K) => {
   const { G, t, TEXT } = K;

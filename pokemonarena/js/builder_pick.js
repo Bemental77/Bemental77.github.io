@@ -23,6 +23,8 @@ const CHIPS = BG.strip.pick;
 const CHIP_LABEL = Object.freeze({ filter: 'FILTER', pgup: '{UP}', pgdn: '{DOWN}' });
 const SORT_SHOWN = Object.freeze({ dex: 'POK{E}DEX', name: 'NAME', type: 'TYPE' });
 export const FIND_MAX = 16;
+/** The room a picker's title has left of its chips, and the narrowest font the strip sets it in (builder_screen.js strip): what a title must fit. */
+export const TITLE_PX = CHIPS[0].x - 4 - BG.strip.title.x, TITLE_FONT = 'smallNarrow';
 const chipsView = (lv) => CHIPS.map((c) => ({ id: c.id, label: CHIP_LABEL[c.id], x: c.x, y: c.y, w: c.w, h: c.h, off: c.id === 'pgup' ? !lv.up : c.id === 'pgdn' ? !lv.down : false }));
 const menuOf = (lv) => ({ rows: lv.rows.map((r) => ({ id: r.id, kind: r.kind, label: r.label, ...(r.dim ? { disabled: true } : {}) })), cursor: lv.cursor });
 const widest = (X, list) => list.reduce((a, s) => (X.measure('normal', s) > X.measure('normal', a) ? s : a), '');
@@ -152,11 +154,14 @@ function speciesScreen(X) {
     state: () => ({ ...list.state(), purpose: P.purpose, q: P.q, type: P.type, excluded: P.excluded, sort: X.kit() ? sort() : 'dex' }),
     view() {
       const f = ids(), lv = list.view(source(f)), n = f.ids.length, id = n ? f.ids[list.cursor(n)] : null, row = id === null ? null : info(id);
-      const what = [P.type !== null ? pack().types[P.type].name.toUpperCase() : '', P.q ? '"' + P.q + '"' : ''].filter(Boolean).join(' ') || 'POK{E}MON';
+      // the strip says what is listed: the type and the word looked for. BOTH only while they fit the room left of the chips (a long word with a long type name does not: the word stays,
+      // the type is in the FILTER panel and in the screen reader's words)
+      const type = P.type !== null ? pack().types[P.type].name.toUpperCase() : '', word = P.q ? '"' + P.q + '"' : '', both = [type, word].filter(Boolean).join(' ');
+      const what = !both ? 'POK{E}MON' : X.measure(TITLE_FONT, both + ': ' + n) <= TITLE_PX ? both : word || type;
       return {
         kind: 'species', noTag: true, title: what + ': ' + n, chips: chipsView(lv), list: lv, menu: menuOf(lv), side: row ? { species: id, types: row.types.slice(), dim: !row.available } : null,
         help: helpOf(f, row),
-        say: 'Choose a Pok{E}mon, ' + n + ' listed, sorted by ' + (sort() === 'dex' ? 'Pok{E}dex number' : sort()) + '. ' + (row ? kit().text(row.name) + (row.natDex ? ', number ' + row.natDex : '') + (row.available ? '' : ', cannot be picked') + '.' : ''),
+        say: 'Choose a Pok{E}mon, ' + n + ' listed' + (type ? ', type ' + pack().types[P.type].name : '') + (P.q ? ', matching "' + P.q + '"' : '') + ', sorted by ' + (sort() === 'dex' ? 'Pok{E}dex number' : sort()) + '. ' + (row ? kit().text(row.name) + (row.natDex ? ', number ' + row.natDex : '') + (row.available ? '' : ', cannot be picked') + '.' : ''),
       };
     },
   };

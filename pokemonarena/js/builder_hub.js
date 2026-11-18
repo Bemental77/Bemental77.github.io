@@ -14,6 +14,11 @@
 //   builder_team.js    builder-team (the six slots), builder-rules, builder-check
 //   builder_mon.js     builder-mon (the Pokemon screen: its tabs; the BUILD tab)
 //   builder_pick.js    builder-species, builder-item (the pickers and their filter panels)
+//   builder_moves.js   the Pokemon screen's MOVES tab, and builder-move (the move picker and its filter panel)
+//   builder_stats.js   the Pokemon screen's STATS tab (EVs or stat points, IVs, Hidden Power, the quick actions)
+//   builder_portrait.js  builder-portrait (the ROM's 52 trainer heads), wired to the active trainer's menu
+//   builder_io.js      builder-code (COPY / PASTE / ENTER a team code, the preview, ADD AS A NEW TEAM) and builder-test (the test battle); the team screen's CODE and TEST chips
+//   builder_undo.js    UNDO and REDO: the rows they have on every editing screen
 //   builder_parts.js   the furniture the screens are made of (list, pop-up, pages); builder_geom.js the rectangles
 //
 // A FAMILY   { id, screens: { path: { parent, title, need, create(X) } }, ext: { '<slot>': [entry, ...] } }
@@ -21,14 +26,20 @@
 //            nearest screen that can be shown (settle)
 //   create   (X) -> { view(), press(action, info), pointer(ev), hit(x, y), rects(), state(), enter?(), leave?(), tick?(held), ready?(), onEditor?() }
 //   view()   -> { kind, title, help: text | [line, line], say, ...what builder_screen.js draws for that kind }   (pagesFirst: true = A turns the pages of a long help before it acts)
-//   ext      rows other screens show for this family (X.ext(slot)): 'trainers.rows', 'trainers.menu', 'teams.rows', 'teams.menu', 'team.chips', 'team.menu', 'mon.tabs'
+//   ext      rows other screens show for this family (X.ext(slot, target)): 'trainers.rows', 'trainers.menu', 'teams.rows', 'teams.menu', 'team.chips', 'team.menu', 'mon.tabs'
+//            (an entry: builder_parts.js "AN EXTENSION ENTRY")
+//   tell     OPTIONAL screen method tell(msg) -> effects: what the ctl answers a screen with (the model's tell(path, msg)): a decoded team code, a copy the browser refused
 //
 // EFFECTS (app: 'builder', carried out by builder_ctl.js)
 //   { type: 'opened', path, at, profileId }     a nested builder screen opened, or the Pokemon screen's tab changed (the ctl keeps the focus for this tab, so a reload comes back to the same team)
 //   { type: 'edited' }                           the reducer committed an edit: schedule the autosave
 //   { type: 'profile-create', name } / 'profile-open', id / 'profile-rename', id, name / 'profile-delete', id     the trainer list's actions (the store's, so the ctl's)
-//   { type: 'pref', key, value }                 a per-viewer preference changed (the species picker's sort)
-// THE CTL'S DOOR (methods of the model beyond the hub's): attach, setPhase, setPrefs, setTrainers, setEditor, editor, apply, mapEditor, edit, setFlags, note, setFocus, focus, settle, showTeams
+//   { type: 'pref', key, value }                 a per-viewer preference changed (the species picker's sort, the STATS tab's EVs / points view)
+//   { type: 'code-length', teamId } / 'code-copy', teamId / 'code-paste' / 'code-decode', text     the team code (builder_io.js): the ctl makes it, copies it, reads the clipboard, decodes, and
+//                                                answers with tell('builder-code', ...)
+//   { type: 'test-start', teamId, foeId, format, cpu }     the test battle: the ctl saves, makes the codes and leaves for the battle page
+// THE CTL'S DOOR (methods of the model beyond the hub's): attach, setPhase, setPrefs, setTrainers, setEditor, editor, apply, mapEditor, edit, setFlags, note, setFocus, focus, settle, showTeams,
+//   tell(path, msg), undo(), redo() (Ctrl+Z / Ctrl+Y)
 
 import { createEntrySlot } from './textentry.js';
 import { wrapDialog } from './hub_dialog.js';
@@ -38,10 +49,15 @@ import { FAMILY as HOME } from './builder_home.js';
 import { FAMILY as TEAM } from './builder_team.js';
 import { FAMILY as MON } from './builder_mon.js';
 import { FAMILY as PICK } from './builder_pick.js';
+import { FAMILY as MOVES } from './builder_moves.js';
+import { FAMILY as STATS } from './builder_stats.js';
+import { FAMILY as PORTRAIT } from './builder_portrait.js';
+import { FAMILY as IO } from './builder_io.js';
+import { FAMILY as UNDO } from './builder_undo.js';
 
 const ID = 'builder';
 /** The screen families of the builder, in the order their paths are listed. A LATER STAGE ADDS ITS FAMILY HERE (and its painters in builder_screen.js). */
-export const FAMILIES = Object.freeze([HOME, TEAM, MON, PICK]);
+export const FAMILIES = Object.freeze([HOME, TEAM, MON, PICK, MOVES, STATS, PORTRAIT, IO, UNDO]);          // (the order is the order their rows take on a shared screen: PORTRAIT before UNDO in a trainer's menu)
 export const NEEDS = Object.freeze(['none', 'profile', 'team', 'mon']);
 export const PHASES = Object.freeze(['boot', 'loading', 'ready', 'nostore']);
 const TITLE = 'Pokemon Arena - ';
@@ -74,7 +90,7 @@ function createBuilderHub(ctx, reg) {
   const S = {
     kit: null, ed: null, phase: 'boot', trainers: null,
     flags: { saving: false, conflict: false, notSaved: false, failed: false },
-    prefs: { speciesSort: 'dex' },
+    prefs: { speciesSort: 'dex', statsView: 'ev' },
     at: { teamId: null, monId: null, tab: 'build' },
     flash: null,                           // { text, pages, seq, bad }: a note in the message box until the next input
     pager: { key: '', page: 0 },           // which page of a long message is shown
@@ -153,12 +169,16 @@ function createBuilderHub(ctx, reg) {
     prefs: () => S.prefs,
     setPref(key, value) { if (S.prefs[key] === value) return; S.prefs[key] = value; pending.push({ app: ID, type: 'pref', key, value }); },
     dispatch, flash, ask,
+    /** Ask something of the ctl from where no effects are returned (a screen's enter()): it leaves with the effects of the input that caused it. */
+    emit(effect) { pending.push(effect); },
+    /** The open screen may have lost what it shows (an undo took the team away): -> the move to the nearest screen that can be shown, or []. */
+    settle: () => settle(),
     go: (path, o) => ctx.go(path, o), back: () => ctx.back(),
     entry, popup,
     measure: ctx.measure, msgPx: ctx.msgPx,
     eff: (type, more) => ({ app: ID, type, ...(more || {}) }),
-    /** The rows other families registered for a slot of this screen ('team.chips', 'mon.tabs' ...), in registration order; an entry with when(X) is left out while that is false. */
-    ext: (slot) => (EXT[slot] || []).filter((e) => typeof e.when !== 'function' || e.when(X)),
+    /** The rows other families registered for a slot of this screen ('team.chips', 'mon.tabs' ...), in registration order; an entry with when(X, target) is left out while that is false (target: the trainer or the team a menu was opened on). */
+    ext: (slot, target) => (EXT[slot] || []).filter((e) => typeof e.when !== 'function' || e.when(X, target === undefined ? null : target)),
     /** Another screen's own object (a picker is told what it picks for before it is opened). */
     screen: (path) => screens[path] || null,
   };
@@ -191,12 +211,15 @@ function createBuilderHub(ctx, reg) {
     if (S.phase === 'ready' && !target(path)) return screens[path].view();
     return { kind: 'wait', title: 'TEAM BUILDER', lines: S.phase === 'nostore' ? ['NO STORAGE'] : ['LOADING...'], help: WAIT[S.phase] || WAIT.loading, say: 'Team Builder.' };
   }
-  /** The text in the message box: a pop-up's help, else a note, else the screen's own help. -> { key, pages, page, first } (first: A turns its pages before it does anything else). */
+  /**
+   * The text in the message box: a note (what the last input was answered with: it stands over an open pop-up's help too, so "Undid: change move." is read while the menu stays open), else
+   * the open pop-up's help, else the screen's own help. -> { key, pages, page, first } (first: A turns its pages before it does anything else).
+   */
   function messageOf(sv) {
     let pages, key, first = false;
-    const ph = popup.isOpen() ? popup.help() : null;
-    if (ph) { pages = pagesOf(ph, ctx.measure, PX, ctx.msgPx); key = 'p:' + JSON.stringify(ph); }
-    else if (S.flash) { pages = S.flash.pages; key = 'f:' + S.flash.seq + ':' + S.flash.text; first = true; }
+    const ph = !S.flash && popup.isOpen() ? popup.help() : null;
+    if (S.flash) { pages = S.flash.pages; key = 'f:' + S.flash.seq + ':' + S.flash.text; first = true; }
+    else if (ph) { pages = pagesOf(ph, ctx.measure, PX, ctx.msgPx); key = 'p:' + JSON.stringify(ph); }
     else { const hp = sv.help || ['', '']; pages = pagesOf(hp, ctx.measure, PX, ctx.msgPx); key = 'h:' + JSON.stringify(hp); first = !!sv.pagesFirst; }
     return { key, pages, first, page: S.pager.key === key ? clamp(S.pager.page, 0, pages.length - 1) : 0 };
   }
@@ -216,7 +239,15 @@ function createBuilderHub(ctx, reg) {
     return { text: 'SAVED', bad: false };
   }
   const TAG_SAYS = Object.freeze({ 'READ-ONLY': 'This profile is read-only.', CHANGED: 'Changed in another tab.', 'NOT SAVED': 'Not saved.' });
+  /** A note lives until the next input: one that an EARLIER input left (under a pop-up that stayed open) goes now. */
+  const dropStale = () => { if (S.flash && S.flash.seq !== S.input) S.flash = null; };
 
+  function history(type) {
+    if (S.phase !== 'ready' || !S.ed || entry.isOpen()) return [];
+    S.input++;
+    dispatch({ type });
+    return out(settle());
+  }
   /** What a handler returned, plus what the reducer and the screens asked of the ctl meanwhile (one 'edited' however many edits the input made). */
   function out(fx) {
     const list = Array.isArray(fx) ? fx.slice() : [];
@@ -251,7 +282,7 @@ function createBuilderHub(ctx, reg) {
     press(path, action, info) {
       S.input++;
       const efx = entry.press(action); if (efx) return out(efx);
-      const pfx = popup.press(action); if (pfx) return out(pfx);
+      const pfx = popup.press(action); if (pfx) { dropStale(); return out(pfx); }
       if (action === 'select') { turnPage(path, true); return out([]); }
       if (action === 'a' && S.phase === 'ready') { const m = messageOf(screenView(path)); if (m.first && m.page < m.pages.length - 1) { S.pager = { key: m.key, page: m.page + 1 }; return out([]); } }          // a note is read to its end first
       S.flash = null;
@@ -269,7 +300,7 @@ function createBuilderHub(ctx, reg) {
       const acts = ev.kind === 'click' || ev.kind === 'wheel';
       if (acts) S.input++;
       const efx = entry.pointer(ev); if (efx) return out(efx);
-      const pfx = popup.pointer(ev); if (pfx) return out(pfx);
+      const pfx = popup.pointer(ev); if (pfx) { if (acts) dropStale(); return out(pfx); }
       if (ev.kind === 'click' && inR(BG.msg, ev.x, ev.y)) { turnPage(path, true); return out([]); }          // a tap on the message box turns the page of a long text
       if (S.phase !== 'ready' || target(path)) return out([]);
       const s = screens[path];
@@ -291,7 +322,7 @@ function createBuilderHub(ctx, reg) {
       const tag = tagNow();
       return {
         ...base, screen: path, app: ID, mascot: null, menu: menu || null, msg: m.pages[m.page].slice(),
-        builder: { ...rest, tag: rest.noTag ? null : tag, note: !!S.flash && !popup.isOpen(), more: m.page < m.pages.length - 1, page: m.page + 1, pages: m.pages.length, popup: popup.view(),
+        builder: { ...rest, tag: rest.noTag ? null : tag, note: !!S.flash, more: m.page < m.pages.length - 1, page: m.page + 1, pages: m.pages.length, popup: popup.view(),
           say: String(say || ''), text: m.pages.flat().filter(Boolean).join(' '), warn: tag && tag.bad ? TAG_SAYS[tag.text] || '' : '' },
         entry: entry.view(),
       };
@@ -306,7 +337,7 @@ function createBuilderHub(ctx, reg) {
     state() {
       const tag = tagNow(), scr = {};
       for (const p of reg.paths) scr[p] = screens[p].state();
-      return { phase: S.phase, profile: S.ed ? S.ed.profile.id : null, seq: S.ed ? S.ed.seq : 0, at: { ...S.at }, tag: tag ? tag.text : null, note: S.flash ? S.flash.text.slice(0, 80) : null, page: S.pager.page,
+      return { phase: S.phase, profile: S.ed ? S.ed.profile.id : null, seq: S.ed ? S.ed.seq : 0, undo: S.ed ? S.ed.undo.length : 0, redo: S.ed ? S.ed.redo.length : 0, at: { ...S.at }, tag: tag ? tag.text : null, note: S.flash ? S.flash.text.slice(0, 80) : null, page: S.pager.page,
         popup: popup.state(), entry: entry.isOpen() ? entry.entry().state() : null, screens: scr };
     },
 
@@ -317,7 +348,7 @@ function createBuilderHub(ctx, reg) {
     /** 'loading' (the store is being read) | 'ready' | 'nostore' (storage could not be opened at all). */
     setPhase(p) { if (PHASES.includes(p) && (p === 'boot' || S.kit)) S.phase = p; },
     phase: () => S.phase,
-    setPrefs(p) { if (p && typeof p === 'object' && typeof p.speciesSort === 'string') S.prefs.speciesSort = p.speciesSort; },
+    setPrefs(p) { if (p && typeof p === 'object') for (const k of Object.keys(S.prefs)) if (typeof p[k] === 'string') S.prefs[k] = p[k]; },
     /** The trainer list as the store has it: [{ id, name, readOnly, teams, mons, avatar: { kind, id } | null, unreadable }] (null: fall back to what the hub knows). */
     setTrainers(list) { S.trainers = Array.isArray(list) ? list.map((t) => ({ id: String(t.id), name: typeof t.name === 'string' ? t.name : '', readOnly: !!t.readOnly, teams: t.teams | 0, mons: t.mons | 0, avatar: t.avatar && typeof t.avatar === 'object' ? { kind: String(t.avatar.kind), id: t.avatar.id | 0 } : null, unreadable: !!t.unreadable })) : null; },
     /** The profile being edited, as an editor_state.js state (kit.initialState(profile, { readOnly })), or null: none is open. */
@@ -339,6 +370,11 @@ function createBuilderHub(ctx, reg) {
     settle,
     /** A trainer was opened or made: show its teams (from the trainer list), or put the open screen right. -> effects for env.run. */
     showTeams() { if (S.phase !== 'ready' || !S.ed) return settle(); return ctx.path() === ID ? ctx.go('builder-teams') : settle(); },
+    /** The ctl answers a screen (a decoded team code, a copy the browser refused): the screen's own tell(msg). -> effects for env.run. */
+    tell(path, msg) { const s = screens[path]; if (!s || typeof s.tell !== 'function' || S.phase !== 'ready') return []; S.input++; return out(s.tell(msg) || []); },
+    /** Ctrl+Z / Ctrl+Y: one step back or forward through the reducer's stack, from any builder screen (not under a text entry: a word being typed is not an edit yet). -> effects for env.run. */
+    undo() { return history('undo'); },
+    redo() { return history('redo'); },
     /** (tests) the screens' own objects, and the registry this model was made from. */
     screens, registry: reg,
   };

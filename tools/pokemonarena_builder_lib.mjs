@@ -5,6 +5,7 @@
 //   await W.open();                              // the main menu's TEAM BUILDER: the ctl enters, loads, the model is ready
 //   await W.press('a', 'down');                  // presses, carried out; awaits the ctl (not its debounce: W.fire() runs the pending timers, W.saved() waits for the write)
 //   W.view(), W.b() (view.builder), W.app (the builder's model), W.ctl, W.store, W.hub, W.frame() (the 240x160 picture), W.texts() (every text drawn, with its room)
+//   W.key({ ctrlKey: true, key: 'z' })           // a keydown the page's window hears (the ctl's Ctrl+Z / Ctrl+Y); W.clip: the clipboard double ({ text, refuse: { read, write }, reads, writes })
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -39,7 +40,7 @@ export function fakeStorage(init = {}) {
 
 /**
  * opts: { dir (a js/ directory to load the hub, the builder and the kit from: a mutant), store (reuse one: a "second tab", a "reload"), session, storage, deps, noStore: true (storage could
- * not be opened), durable (false: a store that keeps nothing), data: false (do not give the hub its first data) }
+ * not be opened), durable (false: a store that keeps nothing), data: false (do not give the hub its first data), clipboard: false (a browser with no clipboard at all) }
  */
 export async function makeWorld(opts = {}) {
   const S0 = await base();
@@ -57,10 +58,17 @@ export async function makeWorld(opts = {}) {
   let tid = 0, family = null, familyPath = null, ctl = null;
   const session = opts.session || fakeStorage(), storage = opts.storage || fakeStorage();
   const isMine = (p) => app.paths.includes(p);
+  // the page's window as the ctl uses it: listeners (keydown, pagehide) a test can fire, and a clipboard that can be told to refuse (as a browser without permission does)
+  const handlers = {}, clip = { text: '', refuse: { read: false, write: false }, reads: 0, writes: 0 };
+  const clipboard = opts.clipboard === false ? null : {
+    writeText: async (s) => { clip.writes++; if (clip.refuse.write) throw new Error('NotAllowedError'); clip.text = String(s); },
+    readText: async () => { clip.reads++; if (clip.refuse.read) throw new Error('NotAllowedError'); return clip.text; },
+  };
+  const win = { addEventListener: (type, fn) => { (handlers[type] = handlers[type] || []).push(fn); }, removeEventListener: (type, fn) => { handlers[type] = (handlers[type] || []).filter((x) => x !== fn); }, navigator: { clipboard } };
   async function refreshData() { if (!store) return; log.refreshes++; run(hub.setData(await HD.readHubData(store, pack, { tzMinutes: 0 }))); }
   const env = {
-    win: null, doc: null, hook: {}, model: hub, app, store: () => store, whenStore: async () => store, pack, rom, ui, navigate: (u) => log.navigated.push(u), input: null, storage, session, deps,
-    refreshData, redraw: () => { log.redraws++; }, run: (fx) => run(fx), freshSeed: () => 1, sound: { sfx: (k) => { log.sfx.push(k); return true; }, music: () => true, system: () => null },
+    win, doc: null, hook: { dialogOpen: () => !!log.domPanel }, model: hub, app, store: () => store, whenStore: async () => store, pack, rom, ui, navigate: (u) => log.navigated.push(u), input: null, storage, session, deps,
+    refreshData, redraw: () => { log.redraws++; }, run: (fx) => run(fx), freshSeed: () => (opts.seedOf ? opts.seedOf() : 0x12345678), sound: { sfx: (k) => { log.sfx.push(k); return true; }, music: () => true, system: () => null },
     timers: { set: (fn, ms) => { const t = { id: ++tid, fn, ms }; timers.push(t); return t.id; }, clear: (id) => { const i = timers.findIndex((t) => t.id === id); if (i >= 0) timers.splice(i, 1); } },
   };
   ctl = BC.createCtl(env);
@@ -88,8 +96,10 @@ export async function makeWorld(opts = {}) {
   /** The debounce, the write, and the hub's refresh after it. */
   async function saved() { await idle(); for (let i = 0; i < 8 && timers.length; i++) await fire(); await idle(); }
   const W = {
-    hub, app, ctl, store, env, log, screen, ui, pack, timers, session, storage, deps, M: S0.M,
+    hub, app, ctl, store, env, log, screen, ui, pack, timers, session, storage, deps, M: S0.M, clip,
     run, idle, fire, saved, refreshData,
+    /** A keydown on the page's window (what Ctrl+Z is to the ctl). -> whether a listener prevented its default (took the key). */
+    async key(e) { let took = false; const ev = { key: '', ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, target: null, defaultPrevented: false, ...e, preventDefault() { took = true; } }; for (const fn of (handlers.keydown || []).slice()) fn(ev); await idle(); return took; },
     /** Presses, each carried out; then the ctl is awaited. -> the effects of the LAST press. */
     async press(...actions) { let fx = []; for (const a of actions) { fx = hub.press(a); run(fx); } await idle(); return fx; },
     /** One press with the repeat flag of a held direction. */
@@ -108,7 +118,9 @@ export async function makeWorld(opts = {}) {
     /** Walk the open list's cursor to the row with this id (the list wraps, so it is found within its length). -> whether it was. */
     async toRow(id, max = 1200) { for (let i = 0; i < max; i++) { const r = W.row(); if (r && r.id === id) return true; run(hub.press('down')); } return false; },
     /** The pop-up's row with this id: put the cursor on it. */
-    async toPop(id) { for (let i = 0; i < 12; i++) { const p = W.b().popup; if (!p) return false; if (p.rows[p.cursor].id === id) return true; run(hub.press('down')); } return false; },
+    async toPop(id) { for (let i = 0; i < 40; i++) { const p = W.b().popup; if (!p) return false; if (p.rows[p.cursor].id === id) return true; run(hub.press('down')); } return false; },
+    /** Every row of the open pop-up, also the ones a long menu has scrolled out of sight (the model's own rows, walked with the cursor). -> [{ id, label, value? }] */
+    popRows() { const p0 = W.b().popup; if (!p0) return []; const out = []; for (let i = 0; i < p0.total; i++) { const p = W.b().popup; out.push(p.rows[p.cursor]); hub.press('down'); } return out; },
     profile: () => (app.editor() ? app.editor().profile : null),
     /** The 240x160 frame of the view now. */
     frame: (v) => screen.render(v || hub.view()),

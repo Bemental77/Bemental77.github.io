@@ -1,19 +1,20 @@
 // pokemonarena/js/builder_team.js -- THE TEAM BUILDER, the TEAM family: one team, its rules and what the rules say about it.
 //
-//   builder-team    the team's six SLOTS (the ROM's party panels, two across) and a row of chips: RULES, CHECK, [a later stage's], MENU. A on a Pokemon opens its slot menu (EDIT, EARLIER, LATER,
-//                   COPY, REMOVE); A on an empty slot opens the species picker to add one; MENU (the chip, START or X) opens the team menu (RENAME, SORT BY TYPE, CONVERT TO RULES, DUPLICATE, DELETE)
-//   builder-rules   MODE (Standard / Level 5 / Level 100 / Champions), ITEM CLAUSE, DUPLICATES: left / right change the team's ruleset AT ONCE (teamRuleset: only the id changes, no Pokemon is edited)
-//   builder-check   every problem the rules module finds, one row each; the message box has the reason, word-wrapped and paged (A turns its pages, then opens that Pokemon); CONVERT TO RULES
+//   builder-team    the team's six SLOTS (the ROM's party panels, two across) and a row of chips: RULES, CHECK, CODE, TEST (builder_io.js), MENU. A on a Pokemon opens its slot menu (EDIT, EARLIER,
+//                   LATER, COPY, REMOVE); A on an empty slot opens the species picker to add one; MENU (the chip, START or X) opens the team menu (RENAME, SORT BY TYPE, CONVERT TO RULES, DUPLICATE,
+//                   UNDO, REDO, DELETE)
+//   builder-rules   MODE (Standard / Level 5 / Level 100 / Champions), ITEM CLAUSE, DUPLICATES: left / right change the team's ruleset AT ONCE (teamRuleset: only the id changes, no Pokemon is edited);
+//                   UNDO, REDO
+//   builder-check   every problem the rules module finds, one row each; the message box has the reason, word-wrapped and paged (A turns its pages, then opens that Pokemon); CONVERT TO RULES; UNDO, REDO
 //
 // Pure ES module (browser + Node): no DOM, no ROM, no clock, no storage, no randomness. Screens of builder_hub.js (its header has the screen interface and what X is). Every edit is X.dispatch.
-// REGISTRATION POINTS for later stages (X.ext): 'team.chips' (CODE, TEST: { id, label, help, run(X, team) -> effects }) and 'team.menu' (UNDO, REDO).
+// REGISTRATION POINTS (X.ext; an entry: builder_parts.js "AN EXTENSION ENTRY", its target the team): 'team.chips' (CODE, TEST) and 'team.menu' (UNDO, REDO).
 
-import { createList, plural, sentence } from './builder_parts.js';
+import { createList, plural, sentence, extRows, extRun, extHelp } from './builder_parts.js';
 import { BG, inR, clamp, slotRects, chipRects } from './builder_geom.js';
+import { undoRows, undoHelp, undoAct, isUndoRow } from './builder_undo.js';
 
 const SLOTS = 6, COLS = 2;
-const extHelp = (X, slot, id) => { const e = X.ext(slot).find((x) => x.id === id); return e ? e.help || ['', ''] : null; };
-const extRun = (X, slot, id, target) => { const e = X.ext(slot).find((x) => x.id === id); return e && typeof e.run === 'function' ? e.run(X, target) || [] : []; };
 
 /* ================================================================================================ the team */
 function teamScreen(X) {
@@ -22,7 +23,7 @@ function teamScreen(X) {
   const team = () => X.team();
   const check = () => X.teamCheck(team().id);
   const maxMons = () => Math.min(X.rules(team().ruleset).team.max, SLOTS);
-  const chips = () => [{ id: 'rules', label: 'RULES' }, { id: 'check', label: 'CHECK' }].concat(X.ext('team.chips').map((e) => ({ id: 'x:' + e.id, label: e.label })), [{ id: 'menu', label: 'MENU' }]);
+  const chips = () => [{ id: 'rules', label: 'RULES' }, { id: 'check', label: 'CHECK' }].concat(X.ext('team.chips', team()).map((e) => ({ id: 'x:' + e.id, label: e.label })), [{ id: 'menu', label: 'MENU' }]);
   const count = () => SLOTS + chips().length;
   const fit = () => { cur = clamp(cur, 0, count() - 1); return cur; };
   const monAt = (i) => check().mons[i] || null;
@@ -64,10 +65,11 @@ function teamScreen(X) {
     X.popup.open({
       id: 'team', title: team().name,
       rows: () => [{ id: 'rename', label: 'RENAME' }, { id: 'sort', label: 'SORT BY TYPE' }, { id: 'conform', label: 'CONVERT TO RULES' }, { id: 'duplicate', label: 'DUPLICATE' }]
-        .concat(X.ext('team.menu').map((e) => ({ id: 'x:' + e.id, label: e.label })), [{ id: 'delete', label: 'DELETE' }]),
-      help: (r) => MENU_HELP[r.id] || extHelp(X, 'team.menu', r.id.slice(2)),
+        .concat(extRows(X, 'team.menu', team()), [{ id: 'delete', label: 'DELETE' }]),
+      help: (r) => MENU_HELP[r.id] || extHelp(X, 'team.menu', r.id, team()),
       pick(res) {
         const t = team();
+        if (res.kind === 'refused' && t) return extRun(X, 'team.menu', res.row.id, t);          // (a grey row: its reason goes to the message box)
         if (res.kind !== 'choose' || !t) return [];
         switch (res.row.id) {
           case 'rename':
@@ -79,7 +81,7 @@ function teamScreen(X) {
           case 'delete':
             X.ask({ id: 'del-team', text: 'Delete "' + t.name + '"' + (t.monIds.length ? ' and its ' + t.monIds.length + ' Pok{E}mon?' : '?') }, (v) => { if (v !== 0) return []; const r = X.dispatch({ type: 'teamDelete', teamId: tid }); return r && !r.error ? X.go('builder-teams') : []; });
             return [];
-          default: return extRun(X, 'team.menu', res.row.id.slice(2), t);
+          default: return extRun(X, 'team.menu', res.row.id, t);
         }
       },
     });
@@ -90,7 +92,7 @@ function teamScreen(X) {
       case 'rules': return X.go('builder-rules');
       case 'check': X.screen('builder-check').begin(null); return X.go('builder-check');
       case 'menu': return teamMenu();
-      default: return extRun(X, 'team.chips', id.slice(2), team());
+      default: return extRun(X, 'team.chips', id, team());
     }
   }
   function activate() {
@@ -137,8 +139,8 @@ function teamScreen(X) {
     const id = chips()[cur - SLOTS].id;
     if (id === 'rules') return ES().rulesetLabel(t.ruleset) + '. A changes the rules.';
     if (id === 'check') return c.status === 'empty' ? ['Add a Pok{E}mon to check the team.', ''] : c.status === 'legal' ? ['Every Pok{E}mon passes the rules.', 'A lists what was checked.'] : [plural(c.count, 'problem') + ' under these rules.', 'A lists them.'];
-    if (id === 'menu') return ['Rename, sort, convert to the', 'rules, duplicate or delete the team.'];
-    return extHelp(X, 'team.chips', id.slice(2)) || ['', ''];
+    if (id === 'menu') return ['Rename, sort, convert, duplicate,', 'undo, redo or delete the team.'];
+    return extHelp(X, 'team.chips', id, t) || ['', ''];
   }
   return {
     // (back from a Pokemon, or from the picker that added one: the cursor is on its slot. Back from RULES or CHECK it stays on the chip it left from)
@@ -189,6 +191,7 @@ function rulesScreen(X) {
       { id: 'mode', kind: 'choice', label: 'MODE', value: MODE_SHOWN[p.mode] },
       { id: 'item', kind: 'choice', label: 'ITEM CLAUSE', value: p.itemClause ? 'ON' : 'OFF' },
       { id: 'dupes', kind: 'choice', label: 'DUPLICATES', value: p.noSpeciesClause ? 'ON' : 'OFF' },
+      ...undoRows(X),
       { id: 'back', kind: 'button', label: 'BACK' },
     ];
   }
@@ -206,6 +209,7 @@ function rulesScreen(X) {
     if (!r) return [];
     if (r.kind === 'back' || (r.kind === 'choose' && r.row.id === 'back')) return X.back();
     if (r.kind === 'change') return change(r.row, r.dir);
+    if ((r.kind === 'choose' || r.kind === 'refused') && isUndoRow(r.row.id)) return undoAct(X, r.row.id);          // (a grey one says there is nothing to undo)
     return [];
   }
   function helpOf(row) {
@@ -214,6 +218,7 @@ function rulesScreen(X) {
       case 'mode': return MODE_HELP[p.mode];
       case 'item': return ['Item clause: no two Pok{E}mon', 'hold the same item.'];
       case 'dupes': return ['Allow two of the same', 'Pok{E}dex number.'];
+      case 'undo': case 'redo': return undoHelp(X, row.id);
       default: return ['Back to the team.', ''];
     }
   }
@@ -240,25 +245,31 @@ function checkScreen(X) {
   let wantMon = null;                                               // the Pokemon whose first problem the cursor starts on (the Pokemon screen's PROBLEMS row)
   function rows() {
     const c = X.teamCheck(X.team().id), out = [];
-    if (c.status === 'empty') return [{ id: 'back', kind: 'button', label: 'BACK' }];          // (nothing to judge yet: the screen says to add a Pokemon)
-    c.v.team.forEach((p, i) => out.push({ id: 'tp:' + i, kind: 'item', label: 'TEAM', value: p.label, text: sentence(p.text) }));
-    c.v.mons.forEach((ps, mi) => ps.forEach((p, pi) => out.push({ id: 'mp:' + mi + ':' + pi, kind: 'item', label: (mi + 1) + ' ' + X.monName(c.mons[mi]), value: p.label, text: sentence(p.text), monId: c.mons[mi].id })));
+    if (c.status !== 'empty') {                                     // (an empty team has nothing to judge yet: the screen says to add a Pokemon)
+      c.v.team.forEach((p, i) => out.push({ id: 'tp:' + i, kind: 'item', label: 'TEAM', value: p.label, text: sentence(p.text) }));
+      c.v.mons.forEach((ps, mi) => ps.forEach((p, pi) => out.push({ id: 'mp:' + mi + ':' + pi, kind: 'item', label: (mi + 1) + ' ' + X.monName(c.mons[mi]), value: p.label, text: sentence(p.text), monId: c.mons[mi].id })));
+    }
     if (out.length) out.push({ id: 'conform', kind: 'button', label: 'CONVERT TO RULES' });
-    out.push({ id: 'back', kind: 'button', label: 'BACK' });
+    out.push(...undoRows(X), { id: 'back', kind: 'button', label: 'BACK' });
     return out;
   }
+  // (the rows change under the cursor when a conversion or an undo removes or brings back problems: the cursor is put on the row that can take the next step)
+  const keep = (id) => { list.seek(rows(), (x) => x.id === id); };
   function act(r) {
     if (!r) return [];
     if (r.kind === 'back') return X.back();
+    // (a grey one says there is nothing to undo. An undo can take the TEAM away, "new team" undone: the screen is then already left, and there are no rows to keep a cursor on)
+    if ((r.kind === 'choose' || r.kind === 'refused') && isUndoRow(r.row.id)) { const fx = undoAct(X, r.row.id); if (X.team()) keep(r.row.id); return fx; }
     if (r.kind !== 'choose') return [];
     if (r.row.monId) { X.setAt({ monId: r.row.monId, tab: 'build' }); return X.go('builder-mon'); }
-    if (r.row.id === 'conform') { X.dispatch({ type: 'teamConform', teamId: X.team().id }); return []; }
+    if (r.row.id === 'conform') { const s = X.dispatch({ type: 'teamConform', teamId: X.team().id }); if (s && !s.error) keep('undo'); return []; }
     if (r.row.id === 'back') return X.back();
     return [];
   }
   function helpOf(row, c) {
     if (row && row.text) return row.text;
     if (row && row.id === 'conform') return ['Fix levels, IVs, EVs, abilities, items', 'and illegal moves to fit the rules.'];
+    if (row && isUndoRow(row.id)) return undoHelp(X, row.id);
     if (c.status === 'empty') return ['Add a Pok{E}mon to check it.', ''];
     if (c.status === 'legal') return 'Yes. Every Pok{E}mon passes ' + X.kit().ES.rulesetLabel(X.team().ruleset) + '.';
     return ['Back to the team.', ''];
@@ -266,7 +277,8 @@ function checkScreen(X) {
   return {
     /** Say where the cursor starts: on the first problem of this Pokemon (null: at the top). */
     begin(monId) { wantMon = monId || null; },
-    enter() { const rs = rows(); if (!(wantMon && list.seek(rs, (r) => r.monId === wantMon))) list.set(0, rs.length); wantMon = null; },
+    // (the cursor starts on that Pokemon's first problem, else on the first problem; with nothing to list, on BACK)
+    enter() { const rs = rows(); if (!(wantMon && list.seek(rs, (r) => r.monId === wantMon))) { if (rs[0] && rs[0].text) list.set(0, rs.length); else list.seek(rs, (r) => r.id === 'back'); } wantMon = null; },
     press: (action, info) => act(list.press(action, rows(), info)),
     pointer: (ev) => act(list.pointer(ev, rows())),
     hit: (x, y) => list.hit(x, y, rows()),
