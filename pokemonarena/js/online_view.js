@@ -40,10 +40,12 @@ export const WORDS = Object.freeze({
   quick: 'BATTLE ANYONE', askQuick: 'FIND AN OPPONENT?',
   ignored: 'PLAY ONLINE',
   hostLede: 'You get a link and a room code to send your friend. They open it, press Join, and the battle starts.',
-  quickLede: 'Get matched with whoever is looking now. Other players see your trainer name and your online record.',
+  quickLede: 'Get matched with whoever is looking now, through public servers. Other players see your trainer name and your online record.',
   ROWS: Object.freeze({ go: 'JOIN THE BATTLE', open: 'OPEN THE ROOM', yes: 'YES', team: 'CHANGE TEAM', back: 'BACK', copyLink: 'COPY LINK', share: 'SHARE', copyCode: 'COPY CODE', copied: 'COPIED' }),
   codeFriend: 'ROOM CODE', codeAnyone: 'CODE FOR A FRIEND',
   starting: 'Getting ready...',
+  // what a token of the hub is starting, said in the message window while the teams are read (the window was empty)
+  startingSays: Object.freeze({ host: 'Your room opens in a moment.', quick: 'The search for an opponent starts in a moment.', guest: 'You join your friend\'s room in a moment.' }),
 });
 
 /** Who the player is in what is under way (`role`), what is happening now (`title`), and the numbered steps with the one it is at. s: the snapshot (stage, role, room, open, quick, invite, admitted, defecting, listedName). */
@@ -93,11 +95,11 @@ export function onlineView(s) {
     v.kind = s.ignored ? 'ignored' : board || (s.role === 'host' && !room) ? (s.ask === 'quick' ? 'ask-quick' : 'ask-host') : s.role === 'guest' ? 'invited' : 'room';
     if (v.kind === 'invited') {
       v.heading = WORDS.invited; v.lede = 'Check your team, then press JOIN THE BATTLE.';
-      v.info = [{ label: 'ROOM', value: room, right: v.name ? 'AS ' + v.name : '' }, team];
+      v.info = [{ label: 'ROOM', value: room, rightLabel: v.name ? 'AS' : '', right: v.name }, team];
       v.rows = [{ id: 'go', label: R.go, disabled: !v.canGo }, { id: 'team', label: R.team }, { id: 'back', label: R.back }];
     } else if (v.kind === 'room') {
       v.heading = WORDS.room + ' ' + room; v.lede = 'Check your team and the battle size, then press OPEN THE ROOM. Your friend joins with the code ' + room + '.';
-      v.info = [{ label: 'ROOM', value: room, right: v.name ? 'AS ' + v.name : '' }, { ...team, right: fmtWords(v.fmt) }];
+      v.info = [{ label: 'ROOM', value: room, rightLabel: v.name ? 'AS' : '', right: v.name }, { ...team, right: fmtWords(v.fmt) }];
       v.rows = [{ id: 'go', label: R.open, disabled: !v.canGo }, { id: 'team', label: R.team }, { id: 'back', label: R.back }];
     } else if (v.kind === 'ask-host') {
       v.heading = WORDS.host; v.ask = WORDS.askHost; v.lede = WORDS.hostLede;
@@ -114,11 +116,12 @@ export function onlineView(s) {
   } else if (starting) {
     v.who = s.role === 'guest' ? 'You\'re joining' + (s.room ? ', room ' + s.room : '') : s.ask === 'quick' ? 'Battle anyone' : 'You\'re hosting';
     v.title = WORDS.starting;
+    v.lede = s.role === 'guest' ? WORDS.startingSays.guest : s.ask === 'quick' ? WORDS.startingSays.quick : WORDS.startingSays.host;
   } else if (going) {
     const n = stepsNow(s);
     v.who = n.role; v.title = n.title; v.steps = n.steps.slice(); v.at = n.at;
     // A JOIN BY CODE THAT IS TAKING A WHILE says what to check. A code nobody has opened is not refused by the network at once (lib/netplay.js keeps trying), so the player is told what usually causes it.
-    if (ms !== null && ms >= SLOW_JOIN_MS && st === 'waiting' && s.role === 'guest' && !s.listedName) v.hint = 'Taking a while? Check the code ' + (s.room || '') + ' with your friend, and that their screen still says "Waiting for your friend".';
+    if (ms !== null && ms >= SLOW_JOIN_MS && st === 'waiting' && s.role === 'guest' && !s.listedName) v.hint = 'Taking a while? Check the code ' + (s.room || '') + ' with your friend, and that their screen still says WAITING FOR YOUR FRIEND.';
     // WHAT CAN BE PRESSED. The way out is there until the other player is connected (cancel.shown); the copies are there while a room's code is on the screen. Once connected: nothing.
     if (st !== 'handshake' && st !== 'resuming') {
       if (v.code && friendRoom) { v.rows.push({ id: 'copy-link', label: v.copied === 'link' ? R.copied : R.copyLink }); if (v.canShare) v.rows.push({ id: 'share', label: R.share }); }
@@ -138,7 +141,7 @@ export const OGEOM = Object.freeze({
   first: 20,                                                      // the first window's top
   info: Object.freeze({ line: 15 }),                              // a confirm screen's lines (the room, the team): normal font
   head: Object.freeze({ title: 15, steps: 11 }),                  // a wait screen's first window: what is happening now, then the numbered steps
-  rows: Object.freeze({ pitch: 12, w: 120, wNarrow: 104, x2: 128 }),
+  rows: Object.freeze({ pitch: 12, w: 120, wNarrow: 108, x2: 124 }),          // (beside the code: x2 - ring = the code window's right edge + its ring, so the two rings meet as every stacked pair does)
   code: Object.freeze({ w: 104, h: 38, label: 10 }),              // the room code LARGE (the normal font at 2x) under its label
   status: Object.freeze({ bottom: 154 }),
 });
@@ -159,7 +162,7 @@ export function layoutOf(v) {
     if (v.code) {
       const h = Math.max(G.code.h, n * G.rows.pitch);
       out.code = { x: G.x, y, w: G.code.w, h, label: G.code.label };
-      if (n) out.rows = { x: G.rows.x2, y, w: G.rows.wNarrow, h: n * G.rows.pitch, pitch: G.rows.pitch, n };
+      if (n) out.rows = { x: G.rows.x2, y, w: G.rows.wNarrow, h, pitch: G.rows.pitch, n };          // (as tall as the code window: the two stand side by side as one band)
       y += h + G.gap;
     } else if (n) { out.rows = { x: G.x, y, w: G.rows.w, h: n * G.rows.pitch, pitch: G.rows.pitch, n }; y += out.rows.h + G.gap; }
   } else return out;
@@ -223,10 +226,21 @@ export function sentenceLayout(measure, v, L = layoutOf(v)) {
  * B ON A WAIT SCREEN NEVER CLOSES ANYTHING: it only moves the cursor onto the way out (CLOSE THE ROOM / STOP LOOKING / CANCEL), which A then presses. A room is not closed by the B that was meant
  * for the screen before.
  */
-export function createOnlinePanel() {
-  let cursor = 0, sig = '', onId = null, moved = false;          // moved: the PLAYER put the cursor where it is (a button, the pointer), on this screen
+/** How long a screen that REPLACED another one answers no A and no click (ms): the second A of a double press (a double tap, a double click, a held Enter's twin) was taking the only row of the
+ *  screen its first A opened (JOIN THE BATTLE, then CANCEL; YES, then STOP LOOKING). The hub's dialogs wait DIALOG_ARM_TICKS (0.6 s) for the same reason. The cursor can be moved meanwhile. */
+export const PANEL_ARM_MS = 600;
+
+/**
+ * The cursor over a screen's rows. opts: { now() -> ms (a monotonic clock), armMs (default 0: a panel made without a clock answers at once, as the Node tests' does) }.
+ * A screen that takes the place of ANOTHER screen (confirm -> wait, wait -> confirm; not the first one shown, and not new rows on the same screen) is armed armMs later.
+ */
+export function createOnlinePanel(opts = {}) {
+  const now = typeof opts.now === 'function' ? opts.now : () => 0, armMs = Number.isFinite(opts.armMs) && opts.armMs > 0 ? opts.armMs : 0;
+  let cursor = 0, sig = '', onId = null, moved = false, armAt = -Infinity;          // moved: the PLAYER put the cursor where it is (a button, the pointer), on this screen. armAt: when A and a click count again
+  const armed = () => now() >= armAt;
   function sync(v) {
     const s = v.screen + '|' + (v.kind || '') + '|' + v.rows.map((r) => r.id).join(',');
+    if (s !== sig && sig && sig.split('|')[0] !== v.screen) armAt = now() + armMs;          // (another SCREEN: what the last A opened. Not the first screen of the page, not a row that came or went)
     // ANOTHER SCREEN, OR OTHER ROWS. The cursor stays on the row it was on only if the player put it there and that row is still there (SHARE appearing does not move it off COPY CODE). A cursor
     // nobody moved starts at the top: when a room opens it stands on COPY LINK, not on the way out it stood on while CLOSE THE ROOM was the only row (an A meant for nothing would close the room).
     if (s !== sig) {
@@ -251,7 +265,7 @@ export function createOnlinePanel() {
       if (!n || v.screen === 'hidden') return null;
       if (action === 'up') return setCursor(v, (cursor + n - 1) % n);
       if (action === 'down') return setCursor(v, (cursor + 1) % n);
-      if (action === 'a') return activate(v);
+      if (action === 'a') return armed() ? activate(v) : null;
       if (action === 'b') {
         const i = v.rows.findIndex((r) => r.id === (v.screen === 'confirm' ? 'back' : 'cancel'));
         if (i < 0) return null;
@@ -267,9 +281,11 @@ export function createOnlinePanel() {
       if (!h) return null;
       const moved = h.index !== cursor;
       setCursor(v, h.index);
-      if (ev.kind === 'click') return activate(v);
+      if (ev.kind === 'click') return armed() ? activate(v) : null;
       return moved ? { kind: 'move', index: h.index } : null;
     },
+    /** Does A (a click) count on this screen now? (false for PANEL_ARM_MS after it took the place of another screen.) */
+    armed: (v) => { sync(v); return armed(); },
     hit, rects: (v) => rowRects(v),
   };
 }
@@ -279,6 +295,6 @@ export function speakOnline(v, cursor = 0) {
   if (v.screen === 'hidden') return '';
   const row = v.rows[cursor] ? ' ' + v.rows[cursor].label + ', ' + (cursor + 1) + ' of ' + v.rows.length + '.' : '';
   const says = sentencesOf(v).map((p) => p.text).join(' ');
-  if (v.screen === 'confirm') return [v.heading + '.', v.info.map((l) => [l.label, l.value, l.right].filter(Boolean).join(' ')).join('. ') + (v.info.length ? '.' : ''), says].filter(Boolean).join(' ') + row;
+  if (v.screen === 'confirm') return [v.heading + '.', v.info.map((l) => [l.label, l.value, l.rightLabel, l.right].filter(Boolean).join(' ')).join('. ') + (v.info.length ? '.' : ''), says].filter(Boolean).join(' ') + row;
   return [v.who + '.', v.title, v.steps.length ? 'Step ' + (v.at + 1) + ' of ' + v.steps.length + ': ' + (v.steps[v.at] || '') + '.' : '', v.code ? v.codeLabel + ' ' + v.code.split('').join(' ') + '.' : '', says].filter(Boolean).join(' ') + row;
 }

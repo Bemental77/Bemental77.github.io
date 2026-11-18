@@ -164,6 +164,8 @@ export function createOnline(cfg) {
   // another kind of address. The same address from anywhere else starts nothing and is the page it always was. (cfg.query: the address as it was read, before an unbacked auto= was struck out above.)
   let startTok = null;
   { let ss = null; try { ss = win.sessionStorage; } catch (_e) { ss = null; } startTok = startPlan(takeStartToken(ss, Date.now()), cfg.query); }
+  // ... and the address's own question wins: a token for the OTHER question (INVITE A FRIEND's on ?ask=quick, BATTLE ANYONE's on ?ask=host) starts nothing. It was taken all the same (one use).
+  if (startTok && cfg.query.ask && startTok !== cfg.query.ask) startTok = null;
   // every use of the clock here is a DURATION (a turn's allowance, a link's grace), so it is the monotonic one: a wall-clock step (NTP, a changed timezone) must not time anyone out
   const now = cfg.now || (() => (win.performance && typeof win.performance.now === 'function' ? win.performance.now() : Date.now()));
   const state = { stage: 'setup', role: query.role, room: query.room, transport: query.transport, nm: null, session: null, mine: null, name: null, fmt: null, error: null, info: null, matches: 0, open: false, quick: false, listed: null, openWanted: false, admitted: false, admittedId: null, defecting: false, invite: null, profileId: null, rec: null };
@@ -236,13 +238,21 @@ export function createOnline(cfg) {
   const inviteLink = () => win.location.origin + '/pokemonarena/battle.html?np=' + encodeURIComponent(state.room) + '&join=1' + (state.transport === 'local' ? '&net=local' : '');
   /** Copy, and say so WHERE THE PRESS WAS for two seconds (view().copied: 'link' | 'code'): the sentence says what is happening, and a "Copied." there used to replace "Waiting for your friend...".
    *  clipboard.writeText is called in the same task as the press that asked for it (nothing is awaited before it): a browser may refuse a copy that no user gesture stands behind. */
-  let copiedTimer = 0;
+  let copiedTimer = 0, refusedTimer = 0;
+  /** How long the refusal is said (ms) before the sentence that says what is happening comes back (it used to stay, in red, for the rest of the wait). */
+  const REFUSED_MS = 6000;
   const COPY_REFUSED = (room) => 'Copy was refused. Tell your friend the room code ' + room + ' on this screen.';
   async function copy(text, what) {
     let ok = false;
     try { await win.navigator.clipboard.writeText(text); ok = true; } catch (_e) { ok = false; }
     // REFUSED (no clipboard here, or a press the browser does not count as a user gesture: a controller's): say so, and point at what always works. The room code is on the screen.
-    if (!ok) { say(COPY_REFUSED(state.room), true); return false; }
+    if (!ok) {
+      const prev = { ...state.status }, said = COPY_REFUSED(state.room);
+      say(said, true);
+      win.clearTimeout(refusedTimer);
+      refusedTimer = win.setTimeout(() => { if (state.status.text === said) { state.status = prev; paint(); } }, REFUSED_MS);          // (unless something else has been said since)
+      return false;
+    }
     state.copied = what; paint();
     win.clearTimeout(copiedTimer);
     copiedTimer = win.setTimeout(() => { state.copied = null; paint(); }, 2000);
@@ -403,8 +413,10 @@ export function createOnline(cfg) {
     return lobbies;
   }
   function closeLobbies() { if (acceptor) { acceptor.stop(); acceptor = null; } if (lobbies) { const l = lobbies; lobbies = null; try { l.close(); } catch (_e) { /* ignore */ } } }
-  /** The board is watched while the page rests at the question that may go on it: the plain address asking FIND AN OPPONENT? (a private room has no business on the board). */
-  const boardWatched = () => state.stage === 'setup' && supportedHere() && boardPage() && state.ask === 'quick';
+  // NOTHING IS DIALLED BEFORE YES. The board is a topic on third-party public brokers, read with a script from a CDN: dialling it shows them this browser's IP address. A question screen (FIND AN OPPONENT?)
+  // that anyone may link to has told the player nothing yet, so the board is dialled by what needs it and nothing else: YES (quick), an accepted challenge's open room, a challenge sent from here.
+  // watchBoard() is the same first step quick() takes, for a caller that only wants the list (the page test's challengers; no row of the picture calls it).
+  function watchBoard() { if (closed || !supportedHere()) return false; ensureLobbies(); lobbies.startWatching(); return true; }
   /* ---------------------------------------------------------------------------------------------- the view: ONE pure function of a snapshot of the state (online_view.js) */
   function snapshot() {
     const c = choiceNow();
@@ -611,7 +623,9 @@ export function createOnline(cfg) {
 
   async function startSession(role, room, teamCode) {
     const N = Netplay();
-    const session = new N.Session({ game: role === 'host' ? GAME_KEY : null, host: role === 'host', code: room, portCount: 2, transport: state.transport });
+    // ui: false: lib/netplay.js draws NOTHING on this page (its 'waiting for the host' card and its relay chip are DOM in the system font, outside the picture: INAPP.md 'everything in the app'). Its Allow
+    // prompt was never drawn here either (the join-request handler below is registered for every host). What the player needs to know is in the picture (online_view.js) and on #netbar.
+    const session = new N.Session({ game: role === 'host' ? GAME_KEY : null, host: role === 'host', code: room, portCount: 2, transport: state.transport, ui: false });
     state.session = session;
     // EVERY ROOM LETS THE FIRST PLAYER IN BY ITSELF. The room code (or the invite link) is what lets somebody in; there is no Allow prompt to answer (the library's own dialog is never shown: this handler
     // is registered for every host). An open (listed) game is the same, for whoever finds it on the board. The player who was let in is remembered by the id they knocked with (req.id, stable across their
@@ -778,7 +792,6 @@ export function createOnline(cfg) {
     win.clearTimeout(copiedTimer); state.copied = null;          // (a COPIED that was said for the room that is gone is not said for the next one)
     viaToken = false; state.starting = false;          // (the page is at a question again: whatever is started from it now was started HERE)
     paint();
-    if (boardWatched()) { ensureLobbies(); lobbies.startWatching(); }
   }
 
   function createMatch(role, room, teamCode, resume) {
@@ -974,7 +987,7 @@ export function createOnline(cfg) {
     return true;
   }
 
-  /** The page is at its question (or starts what a token of the hub asked for): the teams it can play are read, the form is filled from the preferences, and the board is dialled if this page may go on it. */
+  /** The page is at its question (or starts what a token of the hub asked for): the teams it can play are read, the form is filled from the preferences. Nothing is dialled here: the board waits for YES. */
   async function setupForm() {
     const { choices, name } = await gatherTeams();
     state.choices = choices;
@@ -996,7 +1009,6 @@ export function createOnline(cfg) {
     state.quickOff = false;
     setStage('setup');
     say('');
-    if (boardWatched()) { ensureLobbies(); lobbies.startWatching(); }
     // (the Trainer Center's hand-off is honoured two lines down, in a line a test of the Center pins word for word: a join it starts is the hub's too)
     if (!query.auto && !autoNotice && meetTok && state.role === 'guest' && state.room) viaToken = true;
     if (query.auto) { viaToken = true; autoStart(name); } else if (autoNotice) say(autoNotice);
@@ -1037,7 +1049,7 @@ export function createOnline(cfg) {
   /** The open games this page can play (the board's list without the ones on another build), as plain data: [{ room, who, fmt, rec, h }]. [] when the page is not on the board. */
   const board = () => (lobbies ? lobbies.list().filter((g) => g.compatible).map((g) => ({ room: g.room, who: g.name, fmt: g.fmt, rec: g.rec || null, h: !!g.h })) : []);
   // (flashNow: the one-line notice the bar would show this instant, '' when there is none; the page test reads it)
-  const api = { begin, onResult, leaveToHub, state, nm: () => state.nm, session: () => state.session, flash, flashNow: () => (flashText && now() < flashUntil ? flashText : ''), renderBar, lobbies: () => lobbies, board,
+  const api = { begin, onResult, leaveToHub, state, nm: () => state.nm, session: () => state.session, flash, flashNow: () => (flashText && now() < flashUntil ? flashText : ''), renderBar, lobbies: () => lobbies, board, watchBoard,
     view, act, setForm, startAs, go, quick, cancel: cancelAsk, copyLink, copyCode, share, changeTeam, back,
     joinListed: (x) => { const g = gameOf(x); return g ? joinListed(g) : undefined; }, challengeResident: (x) => { const g = gameOf(x); return g ? challengeResident(g) : undefined; },
     /** A game of the board, by its room: join it, or ask its owner when it is a resident (a player who is open from the hub). */

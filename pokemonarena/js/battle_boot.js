@@ -39,7 +39,7 @@ import { matchFromSummary, onlineMatchId } from './career_stats.js';  // ST1: th
 import { cleanName } from './netmatch.js';                              // an online opponent's name as the career keeps it (the same reduction the match used)
 import { createResumeStore, resumeKey, resumeKeyOfTag, adoptRecord, navigationType } from './battle_resume.js';       // W1 fix D11: a reload mid-battle resumes it
 import { parseOnlineQuery, createOnline } from './online.js';                         // two players, one battle (netmatch.js + lib/netplay.js); see ONLINE.md
-import { createOnlinePanel, speakOnline } from './online_view.js';                    // the online screens before a battle: which row the cursor is on, what a press means, the screen reader's words (pure)
+import { createOnlinePanel, speakOnline, PANEL_ARM_MS } from './online_view.js';                    // the online screens before a battle: which row the cursor is on, what a press means, the screen reader's words (pure)
 import { readBack, passThrough } from './hub_presence.js';                            // INAPP.md "Contract 6": the hub screen a battle comes back to; the test seams a hop to the hub carries (pure, strings only)
 import { engineFingerprint } from './online_match.js';
 import { fitScale, fitPicture, createFullscreen, PROMPT_ROOM } from './screenfit.js';
@@ -149,7 +149,10 @@ async function main() {
   // confirm screen, a wait that is given up, the error screen, the header's link.
   const hubUrl = () => { let ss = null; try { ss = window.sessionStorage; } catch (_e) { ss = null; } const p = readBack(ss); return p ? HUB_PAGE_URL + '#' + p : HUB_PAGE_URL; };
   hook.hubUrl = hubUrl;
-  { const h = $('homeLink'); if (h) h.addEventListener('click', () => { try { h.setAttribute('href', hubUrl()); } catch (_e) { /* the link keeps its own address */ } }, true); }
+  // the header's link says it too, from the moment the address has been read (homeTo, below) and again on every way a link is followed: a click, a middle click, a press that opens a menu. A Tower fight's
+  // link is the plain hub, as it always was (a leftover arena.back is not its way home)
+  const homeTo = () => { const h = $('homeLink'); if (h) { try { h.setAttribute('href', hook.params && hook.params.tower ? HUB_PAGE_URL : hubUrl()); } catch (_e) { /* the link keeps its own address */ } } };
+  { const h = $('homeLink'); if (h) for (const t of ['click', 'auxclick', 'pointerdown', 'focus', 'contextmenu']) h.addEventListener(t, homeTo, true); }
   const mbs = (n) => (n / 1048576).toFixed(1);
   const input = createInput();
   let nav = null, scene = null, ctl = null, ui = null, packRef = null, romBytes = null, last = null;
@@ -161,7 +164,16 @@ async function main() {
   // WHO holds the pause (the clock stops and the scene hears nothing while it is true): the Controls dialog, the Sound panel and the Open-to-battles dialogs can be up TOGETHER (a challenge
   // arrives while Controls is open), so it is a SET of owners, not one boolean: closing one dialog never un-pauses the battle behind another that is still open
   const pauseOwners = new Set();
-  const setPaused = (who, v) => { if (v) pauseOwners.add(who); else pauseOwners.delete(who); controlsOpen = pauseOwners.size > 0; hook.controlsOpen = controlsOpen; };
+  const setPaused = (who, v) => {
+    const had = pauseOwners.has(who);
+    if (v) pauseOwners.add(who); else pauseOwners.delete(who); controlsOpen = pauseOwners.size > 0; hook.controlsOpen = controlsOpen;
+    // a question of OPEN TO BATTLES (battle_ask.js) WAITS while the Controls dialog or the Sound panel is up (INAPP.md decision 4), and appears when the last of them closes
+    if (had !== !!v && (who === 'controls' || who === 'sound') && ask) ask.panels();
+  };
+  const panelUp = () => pauseOwners.has('controls') || pauseOwners.has('sound');
+  // THE QUESTIONS OF OPEN TO BATTLES, IN THE PICTURE (battle_ask.js): made when a battle against the CPU is up (never in a Tower fight, never on an online page); paintAsk draws them over the battle's frame
+  let ask = null, paintAsk = null, askAcc = 0, askSpoken = '';
+  const askUp = () => !!ask && ask.isOpen() && !panelUp();
   const ctlDlg = createControlsDialog({
     input, enableDomNav,
     onOpen: () => { setPaused('controls', true); },
@@ -235,7 +247,7 @@ async function main() {
   if ($('controlsBtn')) $('controlsBtn').addEventListener('click', () => { if (!controlsOpen) openControls(null); });
   // W1 fix D2: the Menu button only OPENS the in-canvas pause menu; once it has, the keys must drive THAT menu, so focus goes back to the canvas (a button left focused
   // re-activated on every Enter, which closed the menu again and made CONTROLS unreachable from the keyboard). A mouse click, a tap and a keyboard activation all do it.
-  els.menu.addEventListener('click', () => { if (scene) scene.press('start'); setTimeout(() => { if (!controlsOpen && !document.querySelector('[role="dialog"]:not([hidden])')) { try { canvas.focus({ preventScroll: true }); } catch (_e) { /* ignore */ } } }, 0); });
+  els.menu.addEventListener('click', () => { if (scene && !askUp()) scene.press('start'); setTimeout(() => { if (!controlsOpen && !document.querySelector('[role="dialog"]:not([hidden])')) { try { canvas.focus({ preventScroll: true }); } catch (_e) { /* ignore */ } } }, 0); });
 
   // W1 fix A4/A5: the move menu is the one battle screen with no VISIBLE way back (the party screen has CANCEL, the pause menu RESUME, a YES / NO its NO) and no visible way for a mouse
   // or a finger to read a move: two chips over the picture's top-right corner while it is open (B, and the move-info action, as the pad's B and X / the keys C do). They take no room.
@@ -397,6 +409,7 @@ async function main() {
     try { const u = new URL(location.href); u.searchParams.set('seed', String(params.seed)); history.replaceState(null, '', u.pathname + u.search + u.hash); } catch (_e) { /* the seed is shown in the hook anyway */ }
   }
   hook.params = params; hook.seed = params.seed;
+  homeTo();
 
   const load = async () => {
     hook.state = 'boot'; els.err.hidden = true; els.boot.hidden = false; canvas.hidden = true; els.bar.value = 0;
@@ -583,7 +596,7 @@ async function main() {
         const left = await towerFight.leaveUnrestorable(); resumeStore.clear(); hook.towerRefused = { status: 'abandoned', why: 'the saved fight could not be resumed' };
         towerError(left.message, 'The last fight was left'); return;
       }
-      const sceneOpts = { ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: towerFight ? 'LEAVE TOWER' : 'BACK TO HUB', leaveAsk: towerFight ? (kind, where) => towerFight.leaveAsk(kind, where) : undefined, anim: animCfg, style: styleCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: mkHooks({ onResult: onResult, onMatchEnd: towerFight ? towerMatchEnd : recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); if (towerFight) { towerFight.onQuit(); return; } whenCareerSettled(() => navigate(hubUrl())); } }) };
+      const sceneOpts = { ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: towerFight ? 'LEAVE TOWER' : 'BACK TO HUB', leaveAsk: towerFight ? (kind, where) => towerFight.leaveAsk(kind, where) : undefined, open: towerFight ? undefined : openSwitch, anim: animCfg, style: styleCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: mkHooks({ onResult: onResult, onMatchEnd: towerFight ? towerMatchEnd : recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); if (towerFight) { towerFight.onQuit(); return; } whenCareerSettled(() => navigate(hubUrl())); } }) };
       // (leaveAsk: LEAVE TOWER and FORFEIT say what leaving this fight costs NOW: nothing before the first choice, an Extra Life or one of the retries left after it, the climb when none is left)
       // the result buttons are read when the result screen comes up (scene.js startResult), so a Tower floor's can follow who won
       if (towerFight) Object.defineProperty(sceneOpts, 'resultOptions', { enumerable: true, get: () => resultOptionsFor() });
@@ -598,20 +611,48 @@ async function main() {
     } catch (e) { showError({ title: 'The battle could not start', message: String(e && e.message ? e.message : e), detail: Array.isArray(e && e.detail) ? e.detail.slice(0, 3).map((x) => x.message || x.code).join('; ') : '', kind: 'internal' }); return; }
 
     showReady();
-    // OPEN TO BATTLES (presence_boot.js): mounted in EVERY battle against the CPU. While the switch is on, a challenge reaches the player here too, in the middle of this battle: the dialog pauses the battle
-    // like the Controls panel does, and Accept leaves this battle (a battle left unfinished is recorded as nothing) for the challenger's. While the switch is OFF the mount is dormant (no board connection,
-    // no dialog in the page): it keeps the header's Open button (the way to switch it on or off from here) and follows the switch going on in another tab.
-    // The button is un-hidden now only to hold its room (battle.css keeps it invisible until the module has mounted and wired it), so the header does not move when it appears.
-    const openBtn = $('openBtn');
-    if (towerFight) return;          // OPEN TO BATTLES is NOT mounted in a Tower fight (the button stays hidden): Accepting a challenge would leave the page mid-fight, which the Tower counts as a loss. A challenge reaches you in the hub, between floors.
-    if (openBtn) openBtn.hidden = false;
-    import('./presence_boot.js').then((m) => {
-      hook.presence = m.mountPresence({
-        win: window, doc: document, pack: packRef, input, enableDomNav, navigate, button: openBtn, buttonText: false,
-        focusHome: () => { if (!controlsOpen) { try { canvas.focus({ preventScroll: true }); } catch (_e) { /* ignore */ } } },
-        onDialog: { open: (which) => { setPaused('presence:' + which, true); }, close: (which) => { setPaused('presence:' + which, false); setTimeout(() => { if (!controlsOpen) { try { canvas.focus({ preventScroll: true }); } catch (_e) { /* ignore */ } } }, 0); } },
+    // OPEN TO BATTLES: mounted in EVERY battle against the CPU (battle_ask.js: the hub's presence service on this page, its questions in the picture). While the switch is on, a challenge reaches the player
+    // here too, in the middle of this battle: the question is drawn over the battle, which is paused behind it, and YES leaves this battle (a battle left unfinished is recorded as nothing) for the
+    // challenger's. While the switch is OFF the mount is dormant (no board connection, nothing in the picture): the pause menu's OPEN TO BATTLES row switches it, and it follows the switch going on
+    // in another tab. There is no DOM dialog and no header button: the row appears once the module is up (scene.js asks openSwitch.label() each time the menu opens).
+    if (towerFight) return;          // NOT in a Tower fight (no row, no question): accepting a challenge would leave the page mid-fight, which the Tower counts as a loss. A challenge reaches you in the hub, between floors.
+    Promise.all([import('./battle_ask.js'), import('./hub_screen.js')]).then(([A, HS]) => {
+      paintAsk = A.createAskPainter(ui, HS.createHubScreen);
+      ask = A.createBattleAsk({
+        win: window, doc: document, pack: packRef, navigate,
+        measure: (font, s) => ui.measure(font, ui.safeText(String(s))), msgPx: ui.R.msg.w - 4,
+        panelOpen: panelUp, changed: askChanged,
       });
-    }).catch((e) => { if (window.console) console.warn('[presence] not available', e); if (openBtn) openBtn.hidden = true; });
+      hook.presence = ask.svc;
+      hook.ask = {
+        get: () => ask, state: () => ask.state(), view: () => ask.view(), rects: () => ask.rects(), spoken: () => askSpoken,
+        press: (a, info) => askPress(a, info), pointer: (ev) => askPointer(ev), tick: (n = 1) => { for (let i = 0; i < n; i++) ask.tick(); draw(true); return ask.state(); },
+        frameHash: () => fnv(composeFrame(scene.view()).rgba), canvasHash: () => fnv(ctx.getImageData(0, 0, SCREEN_W, SCREEN_H).data),
+      };
+      askChanged();
+    }).catch((e) => { if (window.console) console.warn('[presence] not available', e); hook.askError = String(e && e.message ? e.message : e); });
+  }
+
+  // the pause menu's OPEN TO BATTLES row (scene.js opts.open): its label while the module is up, and what choosing it does (the disclosure is asked in the picture the first time)
+  const openSwitch = { label: () => (ask ? ask.label() : null), toggle: (done) => { if (!ask) { done(); return; } ask.toggle(done); } };
+  /** Something the question layer shows changed: the battle is paused while a question is in the picture, and drawn again. */
+  function askChanged() {
+    setPaused('presence:ask', !!ask && ask.isOpen());
+    lastSig = '';
+  }
+  /** A button while a question is in the picture: the question takes it (the battle hears nothing), with the menu's sounds for what it changed. */
+  function askPress(action, info) {
+    const before = JSON.stringify(ask.layer.state());
+    ask.press(action, info || { repeat: false });
+    const moved = JSON.stringify(ask.layer.state()) !== before;
+    if (soundSys && moved) { try { soundSys.menuSfx(action, true, true); } catch (_e) { /* a sound is never worth a press */ } }
+    if (scene) draw(true);
+  }
+  function askPointer(ev) {
+    const before = JSON.stringify(ask.layer.state());
+    ask.pointer(ev);
+    if (soundSys && ev.kind === 'click' && JSON.stringify(ask.layer.state()) !== before) { try { soundSys.menuSfx('a', true, true); } catch (_e) { /* ignore */ } }
+    if (scene) draw(true);
   }
 
   /* ---- input ---- */
@@ -630,9 +671,10 @@ async function main() {
     input.on('source', (e) => { if (e.source === 'touch' && !touchPad) padTo(true); else if (e.source === 'mouse' && touchPad) padTo(false); });
     if ($('keys')) watchHints(input, $('keys'), { menu: true, battle: true, pad: () => touchPad });         // the hint line speaks of the device the player last used
     const toLocal = input.mapClientToLogical(canvas, SCREEN_W, SCREEN_H);
-    input.registerPointerTarget(canvas, { toLocal, cursor: { actionable: (x, y) => { if (onlineUp()) return !!onlinePanel.hit(x, y, online.view()); if (!scene) return false; const h = scene.hit(x, y); return !!h && h.kind !== 'text'; } } });
+    input.registerPointerTarget(canvas, { toLocal, cursor: { actionable: (x, y) => { if (askUp()) { const h = ask.hit(x, y); return !!h && h.kind === 'option'; } if (onlineUp()) return !!onlinePanel.hit(x, y, online.view()); if (!scene) return false; const h = scene.hit(x, y); return !!h && h.kind !== 'text'; } } });
     for (const b of document.querySelectorAll('[data-btn]')) input.bindPad(b, b.dataset.btn);
     input.on('action', (e) => {
+      if (askUp()) { if (e.pressed && !e.native) askPress(e.action, { repeat: !!e.repeat }); return; }          // a question in the picture takes every button (and tells a held direction's repeat from a press)
       if (controlsOpen) return;
       if (onlineUp()) { if (e.pressed && !e.native) onlinePress(e.action); return; }          // (inside the key handler: COPY and SHARE need the user gesture)
       if (!scene) return;
@@ -643,6 +685,13 @@ async function main() {
       if (soundSys) soundSys.pressWithSfx(scene, e.action); else scene.press(e.action);
     });
     input.on('pointer', (e) => {
+      if (askUp()) {
+        if (e.kind === 'wheel') { if (e.el === canvas || e.x === null) askPointer({ kind: 'wheel', steps: e.steps }); return; }
+        if (e.el !== canvas || !e.inside) return;
+        if (e.kind === 'move' || (e.kind === 'down' && e.source === 'touch')) askPointer({ kind: 'move', x: e.x, y: e.y });
+        else if (e.kind === 'click') askPointer({ kind: 'click', x: e.x, y: e.y });
+        return;
+      }
       if (controlsOpen) return;
       if (onlineUp()) {
         if (e.kind === 'wheel' || e.el !== canvas || !e.inside) return;
@@ -663,7 +712,7 @@ async function main() {
   let lastSig = '', renders = 0;
   const fnv = (u8) => { let h = 0x811c9dc5; for (let i = 0; i < u8.length; i++) h = Math.imul(h ^ u8[i], 0x01000193) >>> 0; return h.toString(16).padStart(8, '0'); };
   /* ---- the online screens before a battle (online_view.js / online_draw.js): drawn here while there is no scene, pressed here until a scene takes over ---- */
-  const onlinePanel = createOnlinePanel();
+  const onlinePanel = createOnlinePanel({ now: () => performance.now(), armMs: PANEL_ARM_MS });          // (a screen that replaced another answers no A for PANEL_ARM_MS: a double press does not undo what its first press started)
   let onlineScreen = null, onlineSig = '', onlineSpoken = '';
   const onlineUp = () => !!online && !!onlineScreen && !scene;
   const say = (t) => { onlineSpoken = t; const n = $('live'); if (n && n.textContent !== t) n.textContent = t; };          // the polite live region: the canvas has only a static label
@@ -694,13 +743,21 @@ async function main() {
     drawOnline(true);
     return r;
   }
+  /** The battle's frame, and the question of OPEN TO BATTLES over it when one is in the picture. -> { rgba, dialog } */
+  function composeFrame(v) {
+    const f = ui.render(v), dv = ask ? ask.view() : null;
+    return { rgba: dv && paintAsk ? paintAsk(f.rgba, dv) : f.rgba, dialog: dv };
+  }
   function draw(force) {
-    const v = scene.view();
-    const sig = JSON.stringify(v);
+    const v = scene.view(), dv = ask ? ask.view() : null;
+    const sig = JSON.stringify(v) + (dv ? '#' + JSON.stringify(dv) : '');
     if (!force && sig === lastSig) return;
     lastSig = sig;
-    const f = ui.render(v);
+    const f = composeFrame(v);
     img.data.set(f.rgba); ctx.putImageData(img, 0, 0); renders++;
+    // the screen reader hears the question (the canvas has only a static label); nothing is said again while it is unchanged
+    const words = f.dialog ? ask.speak() : '';
+    if (words !== askSpoken) { askSpoken = words; if (words) { const n = $('live'); if (n) n.textContent = words; } }
   }
   let looping = false;
   function runLoop() {
@@ -710,6 +767,8 @@ async function main() {
     const loop = (now) => {
       const dt = Math.min(250, now - last); last = now;
       if (!scene) { if (onlineUp()) drawOnline(false); requestAnimationFrame(loop); return; }          // no scene yet: the online screen is the picture
+      // the question's own clock (its arm delay) runs while it is in the picture and the tab is visible, whatever has paused the battle
+      if (askUp() && !document.hidden) { askAcc += dt; let k = 0; while (askAcc >= STEP_MS && k < 8) { ask.tick(); askAcc -= STEP_MS; k++; } if (k >= 8) askAcc = 0; } else askAcc = 0;
       if (!document.hidden && !hook.paused && !controlsOpen) {
         acc += dt;
         let n = 0;

@@ -9,7 +9,8 @@
 //   sessions read what the page shows through window.__arenaOnline.view(), set the form through its setForm (what the hub's online menu stores as preferences), and press through its named actions
 //   (go, startAs, quick, cancel, pick ...) or the picture itself (window.__arenaBattle.onlineScreen.press, real keys, a real click, a real tap). No case reads a DOM control a player does not have.
 //   ON THE HUB PAGE the "wants to battle you" question and the first-time disclosure are IN THE PICTURE (js/hub_presence.js, the hub's dialog layer): the hub sessions of `presence` and `presenceui` read
-//   and drive them through window.__arenaHub. In a battle against the CPU they are still the DOM dialogs of presence_boot.js, and those sessions read the DOM.
+//   and drive them through window.__arenaHub. In a battle against the CPU they are in the picture too (js/battle_ask.js: the same service, drawn over the battle), and the switch is the pause menu's
+//   OPEN TO BATTLES row: those sessions read and drive window.__arenaBattle.ask and the scene's menu. Nothing on the battle page is a DOM dialog or a header button any more.
 //   EVERY CASE ID BELONGS TO ONE GROUP (checkCaseIds, ID1, reads this file): a failure is named by its id, and two groups sharing one made "B3 failed" mean either of two things.
 //
 // Browsers: tools/headless_cdp.mjs only (bare CDP, throwaway profile, --mute-audio). Nothing here touches the user's browser, and nothing makes a sound.
@@ -120,10 +121,12 @@ const drive = (p, maxMs = 120000, withAi = true) => p.eval(`${DRIVE}(${maxMs}, $
 const OL_READY = 'window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "online" && !!window.__arenaBattle.onlineScreen && window.__arenaOnline.view().canGo';
 // what the screen says, and what is NOT in the page (dom: nodes of the old panel, or any form control in the screen's box)
 const OV = (p) => p.eval('(() => { const O = window.__arenaOnline, H = window.__arenaBattle, v = O.view(); return { screen: v.screen, kind: v.kind, heading: v.heading, ask: v.ask, lede: v.lede, info: v.info, who: v.who, title: v.title, steps: v.steps, at: v.at, status: v.status, hint: v.hint, elapsed: v.elapsed, code: v.code, codeLabel: v.codeLabel, link: v.link, canShare: v.canShare, copied: v.copied, cancel: v.cancel, rows: v.rows, ids: v.rows.map((r) => r.id).join(","), labels: v.rows.map((r) => r.label).join("|"), fmtShown: v.fmtShown, cursor: H.onlineScreen ? H.onlineScreen.cursor() : null, stage: O.state.stage, sess: !!O.session(), dom: document.querySelectorAll("#online, #screenWrap select, #screenWrap input, #screenWrap textarea, #screenWrap [id^=ol]").length, canvasHidden: document.getElementById("battle").hidden, state: H.state, fits: H.onlineScreen ? H.onlineScreen.fits() : null }; })()');
+// a screen that took the place of another answers no A for online_view.js PANEL_ARM_MS: a case that presses A on purpose waits until it listens (as a player who reads the screen does)
+const olArmed = (p) => p.waitFor('!window.__arenaBattle || !window.__arenaBattle.onlineScreen || !window.__arenaBattle.onlineScreen.up() || window.__arenaBattle.onlineScreen.armed()', { timeoutMs: 3000, pollMs: 40 }).catch(() => {});
 // buttons, as the page hears them: -> what each press meant ('move' | 'act:<row id>' | 'refused:<row id>' | null)
-const olPress = (p, ...actions) => p.eval('(() => { const S = window.__arenaBattle.onlineScreen; return ' + J(actions) + '.map((a) => { const r = S.press(a); return r ? r.kind + (r.id ? ":" + r.id : "") : null; }); })()');
+const olPress = async (p, ...actions) => { if (actions.includes('a')) await olArmed(p); return p.eval('(() => { const S = window.__arenaBattle.onlineScreen; return ' + J(actions) + '.map((a) => { const r = S.press(a); return r ? r.kind + (r.id ? ":" + r.id : "") : null; }); })()'); };
 // the row with this id: the d-pad goes to it, A presses it
-const olRow = (p, id) => p.eval('(() => { const O = window.__arenaOnline, S = window.__arenaBattle.onlineScreen, rows = O.view().rows, i = rows.findIndex((r) => r.id === ' + J(id) + '); if (i < 0) return null; for (let k = 0; k < rows.length && S.cursor() !== i; k++) S.press("down"); const r = S.press("a"); return r ? r.kind + (r.id ? ":" + r.id : "") : null; })()');
+const olRow = async (p, id) => { await olArmed(p); return p.eval('(() => { const O = window.__arenaOnline, S = window.__arenaBattle.onlineScreen, rows = O.view().rows, i = rows.findIndex((r) => r.id === ' + J(id) + '); if (i < 0) return null; for (let k = 0; k < rows.length && S.cursor() !== i; k++) S.press("down"); const r = S.press("a"); return r ? r.kind + (r.id ? ":" + r.id : "") : null; })()'); };
 // every line of the screen fits its window (the sentence in one of the two fonts, the heading, the rows, the code)
 const olFits = (v) => !!v.fits && v.fits.fits === true && v.fits.widths.every((w) => w.px <= w.max);
 // the client point of the middle of a row of the picture
@@ -755,6 +758,8 @@ async function groupHub() {
 async function openPanel(page, extra = '') {
   await page.navigate(BASE + '?online=1&ask=quick&net=local' + ANIM + extra);
   await page.waitFor('window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "online" && window.__arenaOnline.view().canGo && window.__arenaOnline.view().canQuick', { timeoutMs: 90000 });
+  // (the question dials NOTHING before YES; these cases need the board's list, so they ask for it the way YES does first. What the page had dialled by itself is kept for O1.)
+  await page.eval('(() => { window.__boardAtLoad = !!window.__arenaOnline.lobbies(); return window.__arenaOnline.watchBoard(); })()');
 }
 // (the name is set the way a player sets it: the page hears an `input` event, which is what makes it THEIR name - one the panel remembers - rather than one it filled in itself)
 const setForm = (page, { name, fmt, pub = false, role }) => page.eval('(() => {' +
@@ -798,8 +803,8 @@ async function groupOpen(S) {
   await withBrowser({ port: CDP0 + 10, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (host) => {
     const guest = await host.openTab({ width: 900, height: 760 });
     await openPanel(host, '&openquick=500&openjoin=6000'); await openPanel(guest, '&openquick=500&openjoin=6000');
-    const vis = await OV(host), watching = await host.eval('!!window.__arenaOnline.lobbies()');
-    ok(vis.kind === 'ask-quick' && vis.labels === 'YES|BACK' && watching && vis.dom === 0 && (await host.eval('document.querySelectorAll("#olPublicBox, #olOpenList").length')) === 0, 'O1 the plain address with ask=quick asks FIND AN OPPONENT? in the picture and watches the board; the page has no panel, no list of players, and NO switch that makes a friend\'s room public', J([vis.kind, vis.labels, watching, vis.dom]));
+    const vis = await OV(host), watching = await host.eval('!window.__boardAtLoad && !!window.__arenaOnline.lobbies()');
+    ok(vis.kind === 'ask-quick' && vis.labels === 'YES|BACK' && watching && vis.dom === 0 && (await host.eval('document.querySelectorAll("#olPublicBox, #olOpenList").length')) === 0, 'O1 the plain address with ask=quick asks FIND AN OPPONENT? in the picture and dials nothing by itself (the board is watched once asked for); the page has no panel, no list of players, and NO switch that makes a friend\'s room public', J([vis.kind, vis.labels, watching, vis.dom]));
     ok((await board(guest)).length === 0 && J(await boardAll(guest)) === '[]', 'O2 with nobody listed the page hears no game', J(await boardAll(guest)));
     await setForm(host, { name: 'Alice', fmt: '3v3', pub: true, role: 'host' });
     { const qn = (await OV(host)).lede; ok(/trainer name/.test(qn) && /online record/.test(qn), 'O3 the question says what other players see (trainer name, online record), before YES', qn); }
@@ -1296,8 +1301,9 @@ async function opCancel(c) {
     await a.send('Page.reload', { ignoreCache: false });
     await a.waitFor(UX_READY + ' && window.__arenaOnline.view().canQuick', { timeoutMs: 90000 });
     const reloaded = await a.eval('({ board: !!window.__arenaOnline.lobbies(), kind: window.__arenaOnline.view().kind, room: window.__arenaOnline.state.form.room, stage: window.__arenaOnline.state.stage, role: window.__arenaOnline.state.role })');
-    ok(reloaded.board === true && reloaded.kind === 'ask-quick' && reloaded.room === '' && reloaded.stage === 'setup' && reloaded.role !== 'guest', 'OP4b a reload after Cancel is the page that asks FIND AN OPPONENT? and watches the board (not YOU\'RE INVITED for the cancelled room)', J(reloaded));
-    // a game that never answers is given up on after the wait: the address comes back the same way
+    ok(reloaded.board === false && reloaded.kind === 'ask-quick' && reloaded.room === '' && reloaded.stage === 'setup' && reloaded.role !== 'guest', 'OP4b a reload after Cancel is the page that asks FIND AN OPPONENT? (not YOU\'RE INVITED for the cancelled room), and it dials nothing before YES', J(reloaded));
+    // a game that never answers is given up on after the wait: the address comes back the same way (the board's list asked for, as YES does first)
+    await a.eval('window.__arenaOnline.watchBoard()');
     await a.waitFor('window.__arenaOnline.board().some((g) => g.room === "AGHOP")', { timeoutMs: 10000 });
     await clickJoin(a, 'AGHOP');
     await a.waitFor('window.__arenaOnline.state.stage === "setup" && /not open any more/.test(window.__arenaOnline.view().status.text)', { timeoutMs: 25000 }).catch(() => null);
@@ -1585,23 +1591,23 @@ async function groupPresence(S) {
     ok((await toggleState(hub)).pressed === 'false', 'E4 and a reload stays off', '');
   });
 
-  // PF: the player is in a battle against the CPU: the challenge reaches them there, pauses the battle, and Accept leaves it
+  // PF: the player is in a battle against the CPU: the challenge reaches them there IN THE PICTURE (js/battle_ask.js), pauses the battle, and YES leaves it
   await withBrowser({ port: CDP0 + 24, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (me) => {
     const ch = await me.openTab({ width: 900, height: 760 });
     await me.navigate(ORIGIN + '/pokemonarena/?net=local');
     await me.eval('localStorage.setItem("arena.open", "1")');
     await me.navigate(BASE + '?net=local&anim=0&openchal=20000');
-    await me.waitFor('window.__arenaBattle && window.__arenaBattle.state === "ready" && window.__arenaPresence && window.__arenaPresence.isOn()', { timeoutMs: 120000 });
+    await me.waitFor('window.__arenaBattle && window.__arenaBattle.state === "ready" && window.__arenaPresence && window.__arenaPresence.isOn() && window.__arenaBattle.ask', { timeoutMs: 120000 });
     await openPanel(ch, '&openchal=20000');
     await ch.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
     await setForm(ch, { name: 'Cleo' });
     await ch.eval('void window.__arenaOnline.pick(window.__arenaOnline.board().find((g) => g.h).room)');
-    await me.waitFor('(() => { const d = document.getElementById("challenge"); return !!d && !d.hidden; })()', { timeoutMs: 15000 });
-    const paused = await me.eval('window.__arenaBattle.controlsOpen');
-    ok(paused === true, 'PF1 a challenge reaches a player in the middle of a CPU battle and pauses it like the Controls panel does', String(paused));
-    await me.eval('document.getElementById("chDecline").click()');
-    const handedBack = await me.waitFor('window.__arenaBattle.controlsOpen === false', { timeoutMs: 5000 }).then(() => true, () => false);
-    ok(handedBack, 'PF2 Not now gives the battle back', 'controlsOpen = ' + J(await me.eval('window.__arenaBattle.controlsOpen').catch(() => null)));
+    await me.waitFor('window.__arenaBattle.ask.state().challenge === "shown"', { timeoutMs: 15000 });
+    const q1 = await me.eval('({ paused: window.__arenaBattle.controlsOpen, text: window.__arenaBattle.ask.view().lines.join(" "), dom: document.querySelectorAll("#challenge, #openInfo, .arena-chal, #openBtn").length })');
+    ok(q1.paused === true && /Cleo/.test(q1.text) && /wants to battle you/.test(q1.text) && q1.dom === 0, 'PF1 a challenge reaches a player in the middle of a CPU battle IN THE PICTURE ("Cleo wants to battle you.", no DOM dialog) and pauses the battle', J(q1));
+    await me.eval('window.__arenaBattle.ask.tick(40); window.__arenaBattle.ask.press("b"); true');
+    const handedBack = await me.waitFor('window.__arenaBattle.controlsOpen === false && window.__arenaBattle.ask.state().challenge === null', { timeoutMs: 5000 }).then(() => true, () => false);
+    ok(handedBack, 'PF2 NO (B) gives the battle back', 'controlsOpen = ' + J(await me.eval('window.__arenaBattle.controlsOpen').catch(() => null)));
     if (!handedBack) return;
     await ch.waitFor('window.__arenaOnline.state.stage === "setup"', { timeoutMs: 10000 });
     // a different challenger this time, so the quiet period does not apply
@@ -1609,11 +1615,10 @@ async function groupPresence(S) {
     await openPanel(ch2, '&openchal=20000');
     await ch2.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
     await ch2.eval('void window.__arenaOnline.pick(window.__arenaOnline.board().find((g) => g.h).room)');
-    await me.waitFor('(() => { const d = document.getElementById("challenge"); return !!d && !d.hidden; })()', { timeoutMs: 15000 });
-    await sleep(800);
-    await me.eval('document.getElementById("chAccept").click()');
+    await me.waitFor('window.__arenaBattle.ask.state().challenge === "shown"', { timeoutMs: 15000 });
+    await me.eval('(() => { const A = window.__arenaBattle.ask; A.tick(40); for (let i = 0; i < 4 && A.state().current.page < A.state().current.pages - 1; i++) A.press("a"); A.press("up"); A.press("a"); return true; })()');
     const left = await me.waitFor('location.pathname === "/pokemonarena/battle.html" && new URLSearchParams(location.search).get("auto") === "host"', { timeoutMs: 30000 }).then(() => true, () => false);
-    ok(left, 'PF3 Accept leaves the CPU battle for the challenger\'s', await me.eval('location.search').catch(() => 'the page is mid-navigation'));
+    ok(left, 'PF3 YES leaves the CPU battle for the challenger\'s', await me.eval('location.search').catch(() => 'the page is mid-navigation'));
   });
 
   // G: a hostile challenger
@@ -2219,21 +2224,40 @@ async function uiCross(c) {
     await sleep(1500);
     const live0 = await uiLive(w);
     ok(live0.length === 3, 'UX0 (the rig) three tabs of one browser are listed: the hub, a second hub and the CPU battle', J(live0));
-    // UB: Controls open in the CPU battle, a challenge arrives
+    // UB: Controls open in the CPU battle, a challenge arrives: it WAITS behind the panel (INAPP.md decision 4) and appears in the picture when the panel closes
     await uiFront(cpu); await cpu.eval('window.__padConnect()'); await sleep(250);
     const sidC = await uiSid(cpu);
     await cpu.eval('window.__arenaBattle.openControls(null)');
     await uiUntil(cpu, 'window.__arenaBattle.controlsOpen === true && !document.getElementById("controlsDialog").hidden');
     await uiChal(w, sidC);
-    const shown = await uiUntil(cpu, UI_DLG());
-    const top = await cpu.eval(`({ top: ${UI_TOP_AT('#chDecline')}, focus: document.activeElement && document.activeElement.id, zc: Number(getComputedStyle(document.getElementById('challenge')).zIndex), zk: Number(getComputedStyle(document.getElementById('controlsDialog')).zIndex) })`);
-    ok(shown && top.top === 'chDecline' && top.focus === 'chDecline' && top.zc > top.zk, 'UB1 in a CPU battle a challenge over the Controls dialog is on top of it and has the focus', J(top));
+    const held = await uiUntil(cpu, 'window.__arenaBattle.ask.state().challenge === "waiting"');
+    await sleep(300);
+    const under = await cpu.eval('({ st: window.__arenaBattle.ask.state().challenge, drawn: !!window.__arenaBattle.ask.view(), dom: document.querySelectorAll("#challenge, #openInfo, .arena-chal").length, ctl: !document.getElementById("controlsDialog").hidden, paused: window.__arenaBattle.controlsOpen })');
+    ok(held && under.st === 'waiting' && !under.drawn && under.dom === 0 && under.ctl && under.paused === true, 'UB1 in a CPU battle a challenge that arrives while the Controls dialog is open WAITS: nothing is drawn under the panel, and there is no DOM dialog', J(under));
+    await uiPad(cpu, 'b');                                                                 // closes Controls
+    const up = await uiUntil(cpu, 'window.__arenaBattle.ask.state().challenge === "shown" && document.getElementById("controlsDialog").hidden', 3000);
+    const drawn = await uiUntil(cpu, 'window.__arenaBattle.ask.frameHash() === window.__arenaBattle.ask.canvasHash() && window.__arenaBattle.ask.canvasHash() !== window.__arenaBattle.frameHash()', 3000);
+    const aft = await cpu.eval('({ paused: window.__arenaBattle.controlsOpen, cur: window.__arenaBattle.ask.state().current })');
+    ok(up && drawn && aft.paused === true && aft.cur && aft.cur.choice.cursor === 1, 'UB2 when Controls closes the question appears IN THE PICTURE (the canvas is the battle with the question over it), NO highlighted, and the battle stays paused behind it', J({ up, drawn, aft }));
+    await uiPad(cpu, 'b', 60);
+    const early = await cpu.eval('window.__arenaBattle.ask.state().challenge');
+    await sleep(800);
     await uiPad(cpu, 'b');
-    const closed = await uiUntil(cpu, uiDlgGone(), 3000); await sleep(250);
-    const aft = await cpu.eval('({ paused: window.__arenaBattle.controlsOpen, ctl: !document.getElementById("controlsDialog").hidden, canvas: document.activeElement === window.__arenaBattle.canvas })');
-    ok(closed && aft.paused === true && aft.ctl === true && aft.canvas === false, 'UB2 Not now closes only the challenge: the battle stays paused behind the Controls dialog and the canvas does not take the focus', J(aft));
+    const closed = await uiUntil(cpu, 'window.__arenaBattle.ask.state().challenge === null && window.__arenaBattle.controlsOpen === false', 3000);
+    ok(early === 'shown' && closed, 'UB3 a pad B in its first 0.6 s answers nothing (the B that closed Controls was on its way); then pad B is NO and the battle runs again', J({ early, closed }));
+    // a panel opened OVER a question: the question leaves the picture and waits, and the battle stays paused behind the panel
+    await uiChal(w, sidC, 'Two');
+    await uiUntil(cpu, 'window.__arenaBattle.ask.state().challenge === "shown"');
+    await cpu.eval('window.__arenaBattle.openControls(null)');
+    const over = await uiUntil(cpu, 'window.__arenaBattle.ask.state().challenge === "waiting" && !document.getElementById("controlsDialog").hidden', 3000);
+    await sleep(200);
+    const ov = await cpu.eval('({ paused: window.__arenaBattle.controlsOpen, drawn: !!window.__arenaBattle.ask.view() })');
+    ok(over && ov.paused === true && !ov.drawn, 'UB4 the Controls dialog opened over a question takes it out of the picture (it waits) and the battle STAYS paused (the pause has several owners)', J({ over, ov }));
     await uiPad(cpu, 'b');
-    ok(await uiUntil(cpu, 'window.__arenaBattle.controlsOpen === false && document.getElementById("controlsDialog").hidden', 3000), 'UB3 B then closes Controls and the battle runs again', J(await cpu.eval('window.__arenaBattle.controlsOpen')));
+    await uiUntil(cpu, 'window.__arenaBattle.ask.state().challenge === "shown"', 3000);
+    await sleep(800);
+    await uiPad(cpu, 'b');
+    ok(await uiUntil(cpu, 'window.__arenaBattle.ask.state().challenge === null && window.__arenaBattle.controlsOpen === false', 3000), 'UB5 ... and comes back when it closes; B then answers it and the battle runs again', J(await cpu.eval('window.__arenaBattle.ask.state()')));
     // UX: tab A turns the switch off; the other two tabs follow and the board loses all three
     await uiFront(a);
     await a.eval('document.getElementById("openToggle").click()');
@@ -2534,96 +2558,119 @@ async function uiTouch(c) {
   });
 }
 
-// ---- UO / UN2 / UL: the CPU battle's OPEN button (the header's last tool). A battle against the computer is where "this lobby can be open while I am playing" happens, so the page shows that the player is
-// listed and has an off control; and a tab loaded with the switch OFF is mounted DORMANT, so it follows the switch going on in another tab. Phone widths (390, 320) and a desktop.
-const UI_BTN_GEOM = `(() => {
-  const b = document.getElementById('openBtn'), r = b.getBoundingClientRect(), cs = getComputedStyle(b);
-  const vis = (e) => { const q = e.getBoundingClientRect(), s = getComputedStyle(e); return q.width > 0 && q.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
-  const others = [...document.querySelectorAll('#top a, #top button, #top input')].filter((e) => e !== b && vis(e)).map((e) => { const q = e.getBoundingClientRect(); return { id: e.id || e.className, l: q.left, r: q.right, t: q.top, b: q.bottom }; });
-  const hit = others.filter((o) => r.left < o.r - 0.5 && r.right > o.l + 0.5 && r.top < o.b - 0.5 && r.bottom > o.t + 0.5).map((o) => o.id);
-  const tools = [...document.querySelectorAll('#top .tools .textbtn')].filter((e) => e !== b && vis(e)).map((e) => { const q = e.getBoundingClientRect(); return { id: e.id, w: q.width, h: q.height, right: q.right, clipped: e.scrollWidth > e.clientWidth + 1 }; });
-  const menu = document.getElementById('menuBtn').getBoundingClientRect();
-  return { hidden: b.hidden, display: cs.display, visibility: cs.visibility, w: r.width, h: r.height, l: r.left, r: r.right, vw: innerWidth, over: document.documentElement.scrollWidth - document.documentElement.clientWidth, hit, tools, sameRowAsMenu: Math.abs(r.top - menu.top) < 1.5,
-    svg: !!b.querySelector('svg'), icon: (() => { const q = getComputedStyle(b, '::before'); return q.content !== 'none' && parseFloat(q.width) === 22 && /svg/.test(q.webkitMaskImage || q.maskImage || ''); })(), text: b.textContent.trim(), pressed: b.getAttribute('aria-pressed'), label: b.getAttribute('aria-label'), bg: cs.backgroundColor, title: b.title };
-})()`;
-async function uiBattleBtn(c) {
+// ---- UO / UL: the CPU battle's switch is a ROW OF THE PAUSE MENU (OPEN TO BATTLES: ON / OFF), and its questions are in the picture (js/battle_ask.js). A battle against the computer is where "this lobby
+// can be open while I am playing" happens; a tab loaded with the switch OFF is mounted DORMANT, so it follows the switch going on in another tab. Phone widths (390, 320) and a desktop.
+const UI_ROWS = '(window.__arenaBattle.scene.S.menu ? window.__arenaBattle.scene.S.menu.rows.slice() : null)';
+const UI_OPEN_ROW = `(${UI_ROWS} || []).find((r) => /^OPEN TO BATTLES/.test(r)) || null`;
+// open the pause menu (the page's Menu button: a real click or tap), walk to the row with real keys or the pad, choose it
+async function uiChooseOpen(a, phone) {
+  const m = await uiCenter(a, '#menuBtn'); if (phone) await a.tap(m.x, m.y); else await a.click(m.x, m.y);
+  await uiUntil(a, 'window.__arenaBattle.mode === "menu"', 3000);
+  const rows = await a.eval(UI_ROWS) || [], i = rows.findIndex((r) => /^OPEN TO BATTLES/.test(r));
+  if (i < 0) return { rows, chosen: false };
+  if (phone) {          // a finger on the row (scene.js overlay rects)
+    const p = await a.eval(`(() => { const H = window.__arenaBattle, o = H.scene.view().overlay, g = H.ui.overlayRects(o).rows[${i}], c = H.canvas.getBoundingClientRect(); return { x: c.left + (g.x + g.w / 2) * c.width / 240, y: c.top + (g.y + g.h / 2) * c.height / 160 }; })()`);
+    await a.tap(p.x, p.y);
+  } else { for (let k = 0; k < i; k++) { await a.press('ArrowDown', 'ArrowDown', 40); await sleep(60); } await a.press('Enter', 'Enter', 13); }
+  return { rows, chosen: true };
+}
+const uiCloseMenu = async (a) => { if ((await a.eval('window.__arenaBattle.mode')) === 'menu') { await a.eval('window.__arenaBattle.press("b"); true'); await sleep(100); } };
+async function uiBattleRow(c) {
   const { ok } = c;
-  const views = [['a 390 px phone', { width: 390, height: 844, mobile: true }, 0, true], ['a desktop', { width: 900, height: 760 }, 1, true], ['a 320 px phone', { width: 320, height: 640, mobile: true }, 2, false], ['a 568 x 320 phone held sideways', { width: 568, height: 320, mobile: true }, 3, false]];
+  const views = [['a 390 px phone', { width: 390, height: 844, mobile: true }, 0, true], ['a desktop', { width: 900, height: 760 }, 1, true], ['a 320 px phone', { width: 320, height: 640, mobile: true }, 2, false]];
   for (const [tag, vp, k, full] of views) {
     await withBrowser({ port: c.cdp(k), ...vp, lock: false, args: NO_THROTTLE }, async (a) => {
       const phone = !!vp.mobile;
       const w = await a.openTab(vp);
       await uiWatcher(w, c.origin);
-      await uiFront(a);                                                                                  // the page under test is the one in front (a tab behind it renders nothing, and the accessibility tree waits for a frame)
-      await a.navigate(c.origin + '/pokemonarena/battle.html?net=local&anim=0');                         // the switch is OFF (a fresh browser)
+      await uiFront(a);                                                                                  // the page under test is the one in front (a tab behind it draws nothing)
+      await a.navigate(c.origin + '/pokemonarena/battle.html?net=local&anim=0&openchal=20000');          // the switch is OFF (a fresh browser)
       await a.waitFor('window.__arenaBattle && window.__arenaBattle.state === "ready"', { timeoutMs: 120000 });
-      const mounted = await uiUntil(a, 'window.__arenaPresence', 15000);
-      const g = await a.eval(UI_BTN_GEOM);
-      const dorm = mounted ? await a.eval('({ on: window.__arenaPresence.isOn(), presence: !!window.__arenaPresence.presence, lobbies: !!window.__arenaPresence.lobbies, dialogs: document.querySelectorAll("#challenge, #openInfo").length })') : null;
-      ok(mounted && dorm.on === false && dorm.presence === false && dorm.lobbies === false && dorm.dialogs === 0 && !g.hidden && g.display !== 'none' && g.visibility === 'visible' && g.pressed === 'false',
-        'UO1 on ' + tag + ' a CPU battle with the switch OFF mounts OPEN TO BATTLES dormant (no board connection, no dialog in the page) and shows the header\'s Open button, off', J({ mounted, dorm, g: { hidden: g.hidden, display: g.display, visibility: g.visibility, pressed: g.pressed } }));
+      const mounted = await uiUntil(a, 'window.__arenaPresence && window.__arenaBattle.ask && window.__arenaBattle.ask.get().label() !== null', 15000);
+      const dorm = mounted ? await a.eval('({ on: window.__arenaPresence.isOn(), presence: !!window.__arenaPresence.presence, lobbies: !!window.__arenaPresence.lobbies, dom: document.querySelectorAll("#challenge, #openInfo, .arena-chal, #openBtn").length, tools: [...document.querySelectorAll("#top .tools button")].map((b) => b.id).join() })') : null;
+      await a.eval('window.__arenaBattle.press("start"); true');
+      const row0 = await a.eval(UI_OPEN_ROW), rows0 = await a.eval(UI_ROWS);
+      await a.eval('window.__arenaBattle.tick(1); true'); await shot(a, 'U_battle_row_off_' + k);
+      await uiCloseMenu(a);
+      ok(mounted && dorm.on === false && !dorm.presence && !dorm.lobbies && dorm.dom === 0 && dorm.tools === 'soundBtn,controlsBtn,menuBtn' && row0 === 'OPEN TO BATTLES: OFF' && rows0[rows0.length - 1] === 'BACK TO HUB' && rows0.indexOf(row0) === rows0.indexOf('FORFEIT') - 1,
+        'UO1 on ' + tag + ' a CPU battle with the switch OFF mounts OPEN TO BATTLES dormant (no board connection, nothing in the page): the switch is the pause menu\'s row OPEN TO BATTLES: OFF (before FORFEIT); the header has no Open button', J({ mounted, dorm, rows0 }));
       if (!mounted) return;
-      ok(g.w >= 44 && g.w <= 48 && g.h >= 44 && g.l >= 0 && g.r <= g.vw - 15 && g.over <= 0 && g.hit.length === 0 && g.tools.length === 3 && g.tools.every((t) => t.w >= 44 && t.h <= 46 && !t.clipped && t.right <= g.vw - 15) && (!phone || g.sameRowAsMenu),
-        'UL1 on ' + tag + ' the Open button is a 44 px icon inside the 16 px gutters, overlaps no other header control, and Sound, Controls and Menu still fit beside it unclipped and on ONE line each (44 px tall, none wrapped to two lines)' + (phone ? ', all on the same row' : ''), J(g));
-      ok(g.icon && !g.svg && g.text === '', 'UO4 the button is an icon drawn by the stylesheet (no svg element in the page: the hostile-address test of the battle page counts them) with no printed text (the module leaves its face alone)', J({ icon: g.icon, svg: g.svg, text: g.text }));
-      const ax0 = await uiAx(a, '#openBtn');
-      await shot(a, 'U_battle_open_off_' + k);
-      if (!full) { ok(ax0.name === 'Open to battles', 'UN2 the battle button\'s accessible name is "Open to battles" (' + tag + ')', J(ax0)); return; }
-      // switched on from here: pressed, green, listed on the board, the focus back on the battle, and the NAME unchanged
-      const press = async () => { const p = await uiCenter(a, '#openBtn'); if (phone) await a.tap(p.x, p.y); else await a.click(p.x, p.y); };
-      await press();
-      const onOk = await uiUntil(a, 'window.__arenaPresence.isOn() && window.__arenaPresence.presence', 15000);
+      const g = await a.eval(`(() => { const t = [...document.querySelectorAll('#top .tools .textbtn')].map((e) => { const q = e.getBoundingClientRect(); return { id: e.id, w: q.width, h: q.height, right: q.right, clipped: e.scrollWidth > e.clientWidth + 1 }; }); return { t, vw: innerWidth, over: document.documentElement.scrollWidth - document.documentElement.clientWidth }; })()`);
+      ok(g.over <= 0 && g.t.length === 3 && g.t.every((x) => x.w >= 44 && x.h <= 46 && !x.clipped && x.right <= g.vw - 15), 'UL1 on ' + tag + ' the header\'s tools are Sound, Controls and Menu, each on one line and inside the 16 px gutter; nothing overflows', J(g));
+      if (!full) return;
+      // the row switches it ON: listed on the board, stored, said; the menu comes back on the row, which says ON
+      const ch1 = await uiChooseOpen(a, phone);
+      const onOk = await uiUntil(a, 'window.__arenaPresence.isOn() && window.__arenaPresence.presence && window.__arenaBattle.mode === "menu"', 15000);
       await sleep(600);
-      const g1 = await a.eval(UI_BTN_GEOM), st = await a.eval('({ stored: localStorage.getItem("arena.open"), canvas: document.activeElement === window.__arenaBattle.canvas, paused: window.__arenaBattle.controlsOpen === true })'), ax1 = await uiAx(a, '#openBtn');
+      const st = await a.eval(`({ row: ${UI_OPEN_ROW}, cursorOn: window.__arenaBattle.scene.S.menu ? window.__arenaBattle.scene.S.menu.rows[window.__arenaBattle.scene.S.menu.cursor] : null, stored: localStorage.getItem("arena.open"), live: (document.getElementById("live") || { textContent: null }).textContent })`);
       const live1 = await uiLive(w);
-      await shot(a, 'U_battle_open_on_' + k);
-      ok(onOk && g1.pressed === 'true' && g1.bg === 'rgb(31, 90, 55)' && /trainer name and online record/.test(g1.title) && st.stored === '1' && st.canvas && !st.paused && live1.length === 1,
-        'UO2 on ' + tag + ' a press switches it ON from the battle page: the button shows it (pressed, green), the player is on the board, the battle has the focus and is not paused', J({ onOk, g1: { pressed: g1.pressed, bg: g1.bg, title: g1.title.slice(0, 60) }, st, live1 }));
-      ok(ax0.name === 'Open to battles' && ax1.name === 'Open to battles' && ax0.pressed === 'false' && ax1.pressed === 'true', 'UN2 and its accessible name is the same before and after ("Open to battles"); aria-pressed carries the state', J({ ax0, ax1 }));
-      // a challenge reaches the player in the middle of the battle, and pauses it
+      await a.eval('window.__arenaBattle.tick(1); true'); await shot(a, 'U_battle_row_on_' + k);
+      ok(ch1.chosen && onOk && st.row === 'OPEN TO BATTLES: ON' && st.cursorOn === 'OPEN TO BATTLES: ON' && st.stored === '1' && /trainer name and online record/.test(st.live) && live1.length === 1,
+        'UO2 on ' + tag + ' choosing the row (' + (phone ? 'a tap' : 'real keys') + ') switches it ON: the player is on the board, the switch is stored, the live region says what is listed, and the menu comes back on the row, which says ON', J({ ch1, onOk, st, live1 }));
+      await uiCloseMenu(a);
+      // a challenge reaches the player in the middle of the battle: in the picture, the battle paused; it listens 0.6 s later; a click / tap on NO answers it
       const sid = await uiSid(a);
       await uiChal(w, sid, 'Mid');
-      const shown = await uiUntil(a, UI_DLG());
-      const paused = shown ? await a.eval('window.__arenaBattle.controlsOpen === true') : null;
-      ok(shown && paused === true, 'UO5 a challenge reaches the player in the middle of the battle (the dialog is up and the battle is paused behind it)', J({ shown, paused }));
-      if (shown) { const no = await uiCenter(a, '#chDecline'); if (phone) await a.tap(no.x, no.y); else await a.click(no.x, no.y); await uiUntil(a, uiDlgGone(), 3000); await sleep(200); }
-      // and OFF again from the same button
-      await press();
+      const shown = await uiUntil(a, 'window.__arenaBattle.ask.state().challenge === "shown"');
+      const drawn = await uiUntil(a, 'window.__arenaBattle.ask.frameHash() === window.__arenaBattle.ask.canvasHash() && window.__arenaBattle.ask.canvasHash() !== window.__arenaBattle.frameHash()', 3000);
+      const q = await a.eval('({ paused: window.__arenaBattle.controlsOpen, mode: window.__arenaBattle.mode, text: window.__arenaBattle.ask.view().lines.join(" "), live: (document.getElementById("live") || { textContent: null }).textContent, dom: document.querySelectorAll("#challenge, .arena-chal").length })');
+      await shot(a, 'U_battle_challenge_' + k);
+      ok(shown && drawn && q.paused === true && /^Mid wants to battle you\./.test(q.text) && /Mid wants to battle you/.test(q.live) && q.dom === 0,
+        'UO5 a challenge reaches the player in the middle of the battle IN THE PICTURE (the canvas is the battle with the question over it, the live region reads it, no DOM dialog) and the battle is paused behind it', J({ shown, drawn, q }));
+      // to the question's last page (a tap / click on its text turns the page only once it listens), then NO
+      await sleep(800);
+      for (let i = 0; i < 4; i++) { const cur = await a.eval('window.__arenaBattle.ask.state().current'); if (!cur || cur.page >= cur.pages - 1) break; const t = await a.eval('(() => { const c = window.__arenaBattle.canvas.getBoundingClientRect(); return { x: c.left + 120 * c.width / 240, y: c.top + 136 * c.height / 160 }; })()'); if (phone) await a.tap(t.x, t.y); else await a.click(t.x, t.y); await sleep(150); }
+      const no = await a.eval('(() => { const H = window.__arenaBattle, r = H.ask.rects()[1], c = H.canvas.getBoundingClientRect(); return r ? { x: c.left + (r.x + r.w / 2) * c.width / 240, y: c.top + (r.y + r.h / 2) * c.height / 160 } : null; })()');
+      if (no) { if (phone) await a.tap(no.x, no.y); else await a.click(no.x, no.y); }
+      const answered = await uiUntil(a, 'window.__arenaBattle.ask.state().challenge === null && window.__arenaBattle.controlsOpen === false', 3000);
+      const said = await uiUntil(w, 'window.__msgs.some((m) => m.k === "dec" && m.why === "declined")', 3000);
+      ok(!!no && answered && said, 'UO5b a ' + (phone ? 'tap' : 'click') + ' on NO answers it (the asker is told "declined") and the battle runs again', J({ no, answered, said }));
+      // and OFF again from the same row
+      await uiChooseOpen(a, phone);
       const offOk = await uiUntil(a, '!window.__arenaPresence.isOn() && window.__arenaPresence.presence === null && window.__arenaPresence.lobbies === null', 8000);
-      const g2 = await a.eval(UI_BTN_GEOM), st2 = await a.eval('({ stored: localStorage.getItem("arena.open") })');
-      ok(offOk && g2.pressed === 'false' && g2.bg !== 'rgb(31, 90, 55)' && st2.stored === null && await uiUntil(w, 'Object.keys(window.__live).length === 0', 5000), 'UO2b on ' + tag + ' pressing it again switches it OFF and takes the listing down', J({ offOk, g2: { pressed: g2.pressed, bg: g2.bg }, st2 }));
+      const st2 = await a.eval(`({ row: ${UI_OPEN_ROW}, stored: localStorage.getItem("arena.open") })`);
+      ok(offOk && st2.row === 'OPEN TO BATTLES: OFF' && st2.stored === null && await uiUntil(w, 'Object.keys(window.__live).length === 0', 5000), 'UO2b on ' + tag + ' choosing it again switches it OFF and takes the listing down', J({ offOk, st2 }));
       const liveTxt = await a.eval('(document.getElementById("live") || { textContent: null }).textContent');
-      ok(liveTxt === 'No longer open to battles.', 'UO2c on ' + tag + ' switching it off is ANNOUNCED on the battle page too (it has a live region: before, the message went nowhere and only aria-pressed changed)', J({ liveTxt }));
+      ok(liveTxt === 'No longer open to battles.', 'UO2c on ' + tag + ' switching it off is ANNOUNCED on the battle page (its live region)', J({ liveTxt }));
+      await uiCloseMenu(a);
       if (phone) return;
-      // the keyboard: Tab reaches it from Menu (it is an ordinary button of the header), Enter toggles it and the focus stays on it
-      await a.eval('document.getElementById("menuBtn").focus()');
-      await a.press('Tab', 'Tab', 9); await sleep(150);
-      const tabbed = await a.eval('document.activeElement && document.activeElement.id');
-      await uiEnter(a); await sleep(500);
-      const kOn = await a.eval('({ pressed: document.getElementById("openBtn").getAttribute("aria-pressed"), focus: document.activeElement && document.activeElement.id })');
-      await uiEnter(a); await sleep(500);
-      const kOff = await a.eval('({ pressed: document.getElementById("openBtn").getAttribute("aria-pressed"), focus: document.activeElement && document.activeElement.id })');
-      ok(tabbed === 'openBtn' && kOn.pressed === 'true' && kOn.focus === 'openBtn' && kOff.pressed === 'false' && kOff.focus === 'openBtn', 'UO7 on a desktop Tab reaches the button after Menu, Enter switches it on and off, and the focus stays on it', J({ tabbed, kOn, kOff }));
-      // a tab that was loaded with the switch OFF follows it going ON in another tab (the hub's), and OFF again
+      // a tab that was loaded with the switch OFF follows it going ON in another tab (the hub's), and OFF again; the row says so
       const b = await a.openTab(vp);
       await b.navigate(c.origin + '/pokemonarena/?net=local'); await uiHubReady(b);
       await b.eval('document.getElementById("openToggle").click()');
       const follow = await uiUntil(a, 'window.__arenaPresence.isOn() && window.__arenaPresence.presence', 10000);
-      const fb = await a.eval('document.getElementById("openBtn").getAttribute("aria-pressed")');
+      await a.eval('window.__arenaBattle.press("start"); true');
+      const fr = await a.eval(UI_OPEN_ROW);
+      await uiCloseMenu(a);
       await sleep(800);
       const live3 = await uiLive(w);
       await b.eval('document.getElementById("openToggle").click()');
       const unfollow = await uiUntil(a, '!window.__arenaPresence.isOn() && window.__arenaPresence.presence === null', 8000);
-      ok(follow && fb === 'true' && live3.length === 2 && unfollow, 'UO3 a CPU battle loaded with the switch OFF follows it going ON in another tab (the button, the listing: two on the board) and OFF again', J({ follow, fb, live3, unfollow }));
-      // the online page and an error screen never show the button (and take no room)
+      ok(follow && fr === 'OPEN TO BATTLES: ON' && live3.length === 2 && unfollow, 'UO3 a CPU battle loaded with the switch OFF follows it going ON in another tab (the row, the listing: two on the board) and OFF again', J({ follow, fr, live3, unfollow }));
+      await b.close?.();
+      // the first switch-on of a browser that was never told: the disclosure IN THE PICTURE; its NO publishes nothing and the row stays OFF
+      await a.navigate(c.origin + '/pokemonarena/battle.html?net=local&anim=0&opendisc=1');
+      await a.waitFor('window.__arenaBattle && window.__arenaBattle.state === "ready" && window.__arenaBattle.ask && window.__arenaBattle.ask.get().label() !== null', { timeoutMs: 120000 });
+      await uiChooseOpen(a, phone);
+      const asked = await uiUntil(a, 'window.__arenaBattle.ask.state().disclosure === "shown"', 3000);
+      const dq = await a.eval('({ text: window.__arenaBattle.ask.view().lines.join(" "), paused: window.__arenaBattle.controlsOpen, on: window.__arenaPresence.isOn(), dom: document.querySelectorAll("#openInfo, .arena-chal").length })');
+      await sleep(700);
+      await a.press('x', 'KeyX', 88);                                                                    // B: NO, from any page
+      const settled = await uiUntil(a, 'window.__arenaBattle.ask.state().disclosure === null && window.__arenaBattle.mode === "menu"', 3000);
+      const after = await a.eval(`({ row: ${UI_OPEN_ROW}, on: window.__arenaPresence.isOn(), seen: localStorage.getItem("arena.open.seen"), paused: window.__arenaBattle.controlsOpen })`);
+      ok(asked && /trainer name/.test(dq.text) && /online record/.test(dq.text) && dq.paused === true && !dq.on && dq.dom === 0 && settled && after.row === 'OPEN TO BATTLES: OFF' && !after.on && after.seen === null && (await uiLive(w)).length === 0,
+        'UO9 the row\'s first switch-on asks the disclosure IN THE PICTURE (what is published: the trainer name, the online record); B is NO: nothing is published or remembered, and the menu comes back saying OFF', J({ asked, dq, after }));
+      await uiCloseMenu(a);
+      // the online page and an error screen never mount it
       await a.navigate(c.origin + '/pokemonarena/battle.html?online=1&ask=host&net=local&anim=0');
       await a.waitFor('window.__arenaBattle && window.__arenaBattle.state === "online"', { timeoutMs: 90000 });
-      const onl = await a.eval('({ display: getComputedStyle(document.getElementById("openBtn")).display, mounted: !!window.__arenaPresence })');
+      await sleep(600);
+      const onl = await a.eval('({ mounted: !!window.__arenaPresence, ask: !!window.__arenaBattle.ask })');
       await a.navigate(c.origin + '/pokemonarena/battle.html?cpu=nonsense&anim=0');
       await a.waitFor('window.__arenaBattle && window.__arenaBattle.state === "error"', { timeoutMs: 60000 });
-      const err = await a.eval('({ display: getComputedStyle(document.getElementById("openBtn")).display, mounted: !!window.__arenaPresence })');
-      ok(onl.display === 'none' && !onl.mounted && err.display === 'none' && !err.mounted, 'UO6 the online page and an error screen never show the Open button and never mount OPEN TO BATTLES', J({ onl, err }));
-      ok(uiErrs(a, w, b).length === 0, 'UO8 no page errors', J(uiErrs(a, w, b)).slice(0, 300));
+      const err = await a.eval('({ mounted: !!window.__arenaPresence, ask: !!window.__arenaBattle.ask })');
+      ok(!onl.mounted && !onl.ask && !err.mounted && !err.ask, 'UO6 the online page and an error screen never mount OPEN TO BATTLES', J({ onl, err }));
+      ok(uiErrs(a, w).length === 0, 'UO8 no page errors', J(uiErrs(a, w)).slice(0, 300));
     });
   }
 }
@@ -2648,15 +2695,16 @@ async function uiHidden(c) {
       await uiUntil(hub, 'window.__arenaPresence', 20000);
       const post = await hub.eval(`(() => { const b = document.getElementById('openToggle'); return { vis: getComputedStyle(b).visibility, attr: b.dataset.presence }; })()`);
       ok(post.vis === 'visible' && post.attr === 'ready', 'UH1b and once it has mounted the switch is there (negative control: the rule hides only the unmounted state)', J(post));
-      // the CPU battle's Open button: its room is held from the moment the battle is up, but it is invisible, and cannot be hit, until the module has mounted and wired it
+      // the CPU battle's switch is the pause menu's row: there is no row before the module is up (a choice that would do nothing), and there is one once it is
       await hub.navigate(slow.url + '/pokemonarena/battle.html?net=local&anim=0');
       await hub.waitFor('window.__arenaBattle && window.__arenaBattle.state === "ready"', { timeoutMs: 120000 });
-      const BTN = `(() => { const b = document.getElementById('openBtn'); const r = b.getBoundingClientRect(); const e = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); return { hidden: b.hidden, vis: getComputedStyle(b).visibility, w: r.width, hit: e && e.id, mounted: !!window.__arenaPresence, attr: b.dataset.presence || null }; })()`;
-      const pre2 = await hub.eval(BTN);
-      ok(!pre2.mounted && pre2.hidden === false && pre2.vis === 'hidden' && pre2.w >= 44 && pre2.hit !== 'openBtn' && pre2.attr === null, 'UH3 on the battle page, before the module has mounted, the Open button holds its room but is invisible and cannot be hit or focused', J(pre2));
-      await uiUntil(hub, 'window.__arenaPresence', 20000);
-      const post2 = await hub.eval(BTN);
-      ok(post2.vis === 'visible' && post2.attr === 'ready' && post2.hit === 'openBtn', 'UH3b and once it has mounted the Open button is there and can be hit', J(post2));
+      const ROW = '(() => { const H = window.__arenaBattle; H.press("start"); const rows = H.scene.S.menu ? H.scene.S.menu.rows.slice() : []; H.press("b"); return { rows, mounted: !!window.__arenaPresence, btn: !!document.getElementById("openBtn") }; })()';
+      await uiUntil(hub, '!!window.__arenaBattle.ask', 3000);          // (battle_ask.js is up; presence_boot.js, which it loads, is the slow one)
+      const pre2 = await hub.eval(ROW);
+      ok(!pre2.mounted && !pre2.btn && pre2.rows.length > 2 && !pre2.rows.some((r) => /^OPEN TO BATTLES/.test(r)), 'UH3 on the battle page, before the module has mounted, the pause menu has no OPEN TO BATTLES row (and there is no header button)', J(pre2));
+      await uiUntil(hub, 'window.__arenaPresence && window.__arenaBattle.ask && window.__arenaBattle.ask.get().label() !== null', 20000);
+      const post2 = await hub.eval(ROW);
+      ok(post2.mounted && post2.rows.includes('OPEN TO BATTLES: OFF'), 'UH3b and once it has mounted the row is there', J(post2));
     });
     await withBrowser({ port: c.cdp(1), width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (hub) => {
       await hub.navigate(broken.url + '/pokemonarena/?net=local');
@@ -2667,8 +2715,8 @@ async function uiHidden(c) {
       await hub.navigate(broken.url + '/pokemonarena/battle.html?net=local&anim=0');
       await hub.waitFor('window.__arenaBattle && window.__arenaBattle.state === "ready"', { timeoutMs: 120000 });
       await sleep(1500);
-      const gone2 = await hub.eval(`(() => { const b = document.getElementById('openBtn'); return { display: getComputedStyle(b).display, hidden: b.hidden, mounted: !!window.__arenaPresence }; })()`);
-      ok(gone2.hidden === true && gone2.display === 'none' && gone2.mounted === false, 'UH4 when presence_boot.js cannot load, the battle page\'s Open button is GONE too (no dead icon)', J(gone2));
+      const gone2 = await hub.eval('(() => { const H = window.__arenaBattle; H.press("start"); const rows = H.scene.S.menu ? H.scene.S.menu.rows.slice() : []; H.press("b"); return { rows, mounted: !!window.__arenaPresence, btn: !!document.getElementById("openBtn"), mode: H.mode }; })()');
+      ok(!gone2.mounted && !gone2.btn && gone2.rows.length > 2 && !gone2.rows.some((r) => /^OPEN TO BATTLES/.test(r)), 'UH4 when presence_boot.js cannot load, the battle page has no OPEN TO BATTLES row at all (no dead choice), and the battle goes on', J(gone2));
     });
   } finally { slow.stop(); broken.stop(); try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_e) { /* ignore */ } }
 }
@@ -2682,7 +2730,7 @@ const UI_MUTANTS = [
   { id: 'M05', what: 'a question is put into the picture while a DOM panel covers it', file: 'js/hub_presence.js', from: "    if (panelOpen()) { a.waited = true; emit(); return; }\n", to: '', run: 'stack', fails: 'US1' },
   { id: 'M06', what: 'the presence service is not told when a DOM panel opens or closes (a question that waited never appears)', file: 'js/boot.js', from: ' if (hook.presence) hook.presence.panels(); };', to: ' };', run: 'stack', fails: 'US4' },
   { id: 'M07', what: 'the hub\'s "a panel is up" state is one boolean again (closing one of two panels lets the question out under the other)', file: 'js/boot.js', from: 'dialogOpen = dlgOwners.size > 0;', to: 'dialogOpen = !!v;', run: 'stack', fails: 'US2' },
-  { id: 'M08', what: 'the battle page\'s pause state is one boolean again', file: 'js/battle_boot.js', from: 'controlsOpen = pauseOwners.size > 0;', to: 'controlsOpen = !!v;', run: 'cross', fails: 'UB2' },
+  { id: 'M08', what: 'the battle page\'s pause state is one boolean again', file: 'js/battle_boot.js', from: 'controlsOpen = pauseOwners.size > 0;', to: 'controlsOpen = !!v;', run: 'cross', fails: 'UB4' },
   { id: 'M09', what: 'no storage listener (another tab\'s switch is not followed)', file: 'js/presence_boot.js', from: "listen(win, 'storage', onStorage);", to: '', run: 'cross', fails: 'UX1' },
   { id: 'M10', what: 'the listing is not refreshed when the tab becomes visible', file: 'js/presence_boot.js', from: "listen(doc, 'visibilitychange', () => { if (!doc.hidden) refresh(); });", to: '', run: 'refresh', fails: 'UR1' },
   { id: 'M11', what: 'refresh() does not read the trainer again (and neither does the restore path)', file: 'js/presence_boot.js', from: 'const r = await readTrainer();', to: 'const r = { ok: true, trainer };', run: 'refresh', fails: 'UR1' },
@@ -2695,24 +2743,27 @@ const UI_MUTANTS = [
   { id: 'M17', what: 'a dead switch is not hidden when the module cannot load (the [hidden] rule is gone)', file: 'arena.css', from: '#openToggle[hidden] { display: none; }', to: '', run: 'hidden', fails: 'UH2' },
   { id: 'M18', what: 'the switch is visible before the module has mounted', file: 'arena.css', from: '#openToggle:not([data-presence="ready"]) { visibility: hidden; }', to: '', run: 'hidden', fails: 'UH1' },
   { id: 'M20', what: 'the hub switch\'s name changes with its state again (no constant aria-label)', file: 'js/presence_boot.js', from: "button.setAttribute('aria-label', OPEN_LABEL);", to: '', also: [{ file: 'index.html', from: ' aria-label="Open to battles" title=', to: ' title=' }], run: 'words', fails: 'UN1' },
-  { id: 'M21', what: 'the battle page\'s Open button changes its name with its state again (no constant aria-label)', file: 'js/presence_boot.js', from: "button.setAttribute('aria-label', OPEN_LABEL);", to: '', also: [{ file: 'battle.html', from: ' aria-label="Open to battles" hidden title=', to: ' hidden title=' }], run: 'battlebtn', fails: 'UN2' },
   { id: 'M22', what: 'the dialog layer takes the repeats of a held direction as steps (a key held since before the question drifts the highlight onto YES)', file: 'js/hub_dialog.js', from: "    if (info && info.repeat) return [];\n", to: '', run: 'drift', fails: 'UA5' },
   { id: 'M23', what: 'the off-state tooltip names only the trainer name', file: 'js/presence_boot.js', from: 'list your trainer name and online record on public servers so anyone using Play online can challenge you', to: 'list your trainer name on public servers so anyone using Play online can challenge you', run: 'words', fails: 'UW1' },
   { id: 'M24', what: 'the live-region message names only the trainer name', file: 'js/presence_boot.js', from: "const ON_SAYS = 'Open to battles. Your trainer name and online record are listed for anyone using Play online.';", to: "const ON_SAYS = 'Open to battles. Your trainer name is listed for anyone using Play online.';", run: 'words', fails: 'UW2' },
   { id: 'M25', what: 'RESET RECORD in the hub does not tell the listing', file: 'js/boot.js', from: 'if (hook.presence) hook.presence.refresh().catch(', to: 'if (false) hook.presence.refresh().catch(', run: 'record', fails: 'UQ1' },
   { id: 'M26', what: 'a store that cannot be read lists the player as "Player" with no record', file: 'js/presence_boot.js', from: 'if (r.ok && trainerKey(r.trainer) !== trainerKey(trainer))', to: 'if (trainerKey(r.ok ? r.trainer : null) !== trainerKey(trainer))', run: 'record', fails: 'UQ2' },
   { id: 'M27', what: 'a refresh asked for while a read is under way is handed the old answer', file: 'js/presence_boot.js', from: 'if (refreshing) { again = true; return refreshing; }', to: 'if (refreshing) { return refreshing; }', run: 'record', fails: 'UQ3' },
-  { id: 'M28', what: 'a CPU battle loaded with the switch off does not mount OPEN TO BATTLES (the old condition)', file: 'js/battle_boot.js', from: "if (openBtn) openBtn.hidden = false;\n    import('./presence_boot.js').then((m) => {", to: "if (openBtn) openBtn.hidden = false;\n    if (window.localStorage.getItem('arena.open') === '1') import('./presence_boot.js').then((m) => {", run: 'battlebtn', fails: 'UO1' },
-  { id: 'M29', what: 'the battle page never shows the Open button', file: 'js/battle_boot.js', from: 'if (openBtn) openBtn.hidden = false;', to: '', run: 'battlebtn', fails: 'UO1' },
-  { id: 'M30', what: 'the module prints "Open: off" over the battle button\'s icon', file: 'js/battle_boot.js', from: 'button: openBtn, buttonText: false,', to: 'button: openBtn,', run: 'battlebtn', fails: 'UO4' },
-  { id: 'M31', what: 'on a phone the Open button takes an equal share of the tools row like the text buttons', file: 'battle.css', from: '#top .tools .textbtn.iconbtn { flex: 0 0 44px; }', to: '', run: 'battlebtn', fails: 'UL1' },
-  { id: 'M32', what: 'the battle page\'s Open button is visible before the module has mounted', file: 'battle.css', from: '#openBtn:not([data-presence="ready"]) { visibility: hidden; }', to: '', run: 'hidden', fails: 'UH3' },
-  { id: 'M33', what: 'a dead Open button stays on the battle page when the module cannot load (the [hidden] rule is gone)', file: 'battle.css', from: '#openBtn[hidden] { display: none; }', to: '', run: 'hidden', fails: 'UH4' },
-  { id: 'M34', what: 'at 320 px the Open button squeezes "Sound: on" onto two lines (the narrow-phone padding rule is gone)', file: 'battle.css', from: '@media (max-width: 359px) { #top .tools .textbtn:not(.iconbtn) { padding-left: 6px; padding-right: 6px; } }', to: '', run: 'battlebtn', fails: 'UL1' },
-  { id: 'M35', what: 'a phone held sideways (568 x 320): the header with the Open icon is wider than the screen (the landscape squeeze is gone)', file: 'battle.css', from: '@media (max-width: 640px) and (max-height: 500px) {\n  #top { gap: 6px; }\n  #top .tools { gap: 6px; }\n  #top .tools .textbtn:not(.iconbtn) { padding-left: 9px; padding-right: 9px; }\n}', to: '', run: 'battlebtn', fails: 'UL1' },
-  { id: 'M36', what: 'the battle page has no live region, so the Open switch messages go nowhere', file: 'battle.html', from: '<div id="live" class="sr" role="status" aria-live="polite"></div>', to: '', run: 'battlebtn', fails: 'UO2c' },
+  { id: 'M28', what: 'a CPU battle loaded with the switch off does not mount OPEN TO BATTLES (the old condition)', file: 'js/battle_boot.js', from: "    Promise.all([import('./battle_ask.js'), import('./hub_screen.js')]).then(([A, HS]) => {", to: "    if (window.localStorage.getItem('arena.open') === '1') Promise.all([import('./battle_ask.js'), import('./hub_screen.js')]).then(([A, HS]) => {", run: 'battlerow', fails: 'UO1' },
+  { id: 'M29', what: 'the pause menu never offers the switch (the page does not hand the scene its row)', file: 'js/battle_boot.js', from: 'open: towerFight ? undefined : openSwitch,', to: 'open: undefined,', run: 'battlerow', fails: 'UO1' },
+  { id: 'M30', what: 'the scene lists the row but choosing it does nothing', file: 'js/scene.js', from: "    else if (label.startsWith('OPEN TO BATTLES') && opts.open && typeof opts.open.toggle === 'function') { close(); opts.open.toggle(() => { if (S.mode === back) openMenu('OPEN TO BATTLES'); }); }\n", to: '', run: 'battlerow', fails: 'UO2' },
+  { id: 'M31', what: 'the menu does not come back on the row after it is chosen', file: 'js/scene.js', from: "opts.open.toggle(() => { if (S.mode === back) openMenu('OPEN TO BATTLES'); });", to: 'opts.open.toggle(() => {});', run: 'battlerow', fails: 'UO2' },
+  { id: 'M32', what: 'a question in the picture does not pause the battle', file: 'js/battle_boot.js', from: "    setPaused('presence:ask', !!ask && ask.isOpen());", to: "    setPaused('presence:ask', false);", run: 'battlerow', fails: 'UO5' },
+  { id: 'M33', what: 'the question is never drawn over the battle (the canvas shows the battle only)', file: 'js/battle_boot.js', from: 'return { rgba: dv && paintAsk ? paintAsk(f.rgba, dv) : f.rgba, dialog: dv };', to: 'return { rgba: f.rgba, dialog: dv };', run: 'battlerow', fails: 'UO5' },
+  { id: 'M34', what: 'the buttons and the pointer go to the battle, not to the question in the picture', file: 'js/battle_boot.js', from: '  const askUp = () => !!ask && ask.isOpen() && !panelUp();', to: '  const askUp = () => false;', run: 'battlerow', fails: 'UO5b' },
+  { id: 'M35', what: 'the question\'s own clock does not run in real time (it never starts to listen)', file: 'js/battle_boot.js', from: '      if (askUp() && !document.hidden) { askAcc += dt;', to: '      if (false) { askAcc += dt;', run: 'battlerow', fails: 'UO5b' },
+  { id: 'M36', what: 'the battle page has no live region, so the Open switch messages go nowhere', file: 'battle.html', from: '<div id="live" class="sr" role="status" aria-live="polite"></div>', to: '', run: 'battlerow', fails: 'UO2c' },
+  { id: 'M37', what: 'the screen reader is not told the question', file: 'js/battle_boot.js', from: "    if (words !== askSpoken) { askSpoken = words; if (words) { const n = $('live'); if (n) n.textContent = words; } }\n", to: '', run: 'battlerow', fails: 'UO5' },
+  { id: 'M38', what: 'the page does not tell the question when the Controls dialog closes (it never appears)', file: 'js/battle_boot.js', from: "    if (had !== !!v && (who === 'controls' || who === 'sound') && ask) ask.panels();\n", to: '', run: 'cross', fails: 'UB2' },
+  { id: 'M39', what: 'the page says no panel is up (a question is drawn under the Controls dialog)', file: 'js/battle_boot.js', from: "  const panelUp = () => pauseOwners.has('controls') || pauseOwners.has('sound');", to: '  const panelUp = () => false;', run: 'cross', fails: 'UB1' },
+  { id: 'M40', what: 'the row is offered before the module is up (a choice that does nothing)', file: 'js/battle_ask.js', from: "return st === 'loading' || st === 'unavailable' ? null : openRowLabel(svc.isOn());", to: 'return openRowLabel(svc.isOn());', run: 'hidden', fails: 'UH3' },
 ];
-const UI_SESSIONS = { keys: uiKeys, accept: uiAccept, drift: uiDrift, stack: uiStack, cross: uiCross, refresh: uiRefresh, record: uiRecord, rapid: uiRapid, disclosure: uiDisclosure, words: uiWords, touch: uiTouch, battlebtn: uiBattleBtn, hidden: uiHidden };
+const UI_SESSIONS = { keys: uiKeys, accept: uiAccept, drift: uiDrift, stack: uiStack, cross: uiCross, refresh: uiRefresh, record: uiRecord, rapid: uiRapid, disclosure: uiDisclosure, words: uiWords, touch: uiTouch, battlerow: uiBattleRow, hidden: uiHidden };
 
 async function groupPresenceUi(S) {
   ANIM = '&anim=0';
@@ -2720,7 +2771,7 @@ async function groupPresenceUi(S) {
   const mk = (origin, okFn, portBase, treeDir) => ({ origin, ok: okFn, cdp: base, port: (k) => portBase + k, treeDir });
   const run = async (name, c) => { try { await UI_SESSIONS[name](c); } catch (e) { c.ok(false, 'UI ' + name + ' session crashed', e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : String(e)); } };
   const wanted = (process.env.ARENA_UI || '').split(',').filter(Boolean);          // ARENA_UI=keys,accept runs only those sessions (while working on one)
-  for (const name of ['keys', 'accept', 'drift', 'stack', 'cross', 'refresh', 'record', 'rapid', 'disclosure', 'words', 'touch', 'battlebtn', 'hidden']) if (!wanted.length || wanted.includes(name)) await run(name, mk(ORIGIN, ok, PORT + 1, path.join(root, 'pokemonarena')));
+  for (const name of ['keys', 'accept', 'drift', 'stack', 'cross', 'refresh', 'record', 'rapid', 'disclosure', 'words', 'touch', 'battlerow', 'hidden']) if (!wanted.length || wanted.includes(name)) await run(name, mk(ORIGIN, ok, PORT + 1, path.join(root, 'pokemonarena')));
   if (!process.argv.includes('--mutants')) return;
   if (REMOTE) { ok(true, 'UMUT (skipped against a deployed site)'); return; }
   const { copyTree, mutateFile, startOverlay } = await import('./pokemonarena_overlay.mjs');
@@ -2758,7 +2809,8 @@ async function groupPresenceUi(S) {
 // Every page of a session is on ONE origin (c.origin: the real server, or a mutated copy of the game in front of it), because the board is a BroadcastChannel and a channel is per origin.
 const UX_URL = (c, q) => c.origin + '/pokemonarena/battle.html?' + q;
 const UX_READY = OL_READY;
-const uxPanel = async (c, page, extra = '') => { await page.navigate(UX_URL(c, 'online=1&ask=quick&net=local&anim=0' + extra)); await page.waitFor(UX_READY + ' && window.__arenaOnline.view().canQuick', { timeoutMs: 90000 }); };
+// (the question dials nothing before YES: a page these cases use to WATCH the board asks for its list, as YES does first)
+const uxPanel = async (c, page, extra = '') => { await page.navigate(UX_URL(c, 'online=1&ask=quick&net=local&anim=0' + extra)); await page.waitFor(UX_READY + ' && window.__arenaOnline.view().canQuick', { timeoutMs: 90000 }); await page.eval('window.__arenaOnline.watchBoard()'); };
 const uxRoom = async (c, page, room, role, extra = '') => { await page.navigate(UX_URL(c, 'np=' + room + '&' + (role === 'host' ? 'host=1' : 'join=1') + '&net=local&anim=0' + extra)); await page.waitFor(UX_READY, { timeoutMs: 90000 }); };
 // a same-origin page with nothing in it that speaks and listens on the board's channel (the page under test hears it as "another browser"); uxKeep keeps some listings alive on it (a beacon lasts 13 s)
 const uxWire = async (c, page) => { await page.navigate(c.origin + '/pokemonarena/input.css'); await page.eval('(() => { window.__spy = []; const ch = new BroadcastChannel("bemental-arena-open-1"); ch.onmessage = (e) => window.__spy.push(e.data); window.__spyCh = ch; return true; })()'); };
@@ -3204,6 +3256,8 @@ async function tkStart(c) {
       [{ what: 'host', room: 'AXYZ4' }, 'online=1', 'a room\'s token on the plain page'],
       [{ what: 'quick' }, 'np=AXYZ5&host=1', 'a { quick } token on a room\'s address'],
       [{ what: 'host', room: 'AXYZ6' }, 'np=AXYZ6&join=1', 'a host token on the room\'s JOIN address'],
+      [{ what: 'host' }, 'online=1&ask=quick', 'INVITE A FRIEND\'s { host } token on the address that asks FIND AN OPPONENT?'],
+      [{ what: 'quick' }, 'online=1&ask=host', 'BATTLE ANYONE\'s { quick } token on the address that asks OPEN A ROOM FOR A FRIEND?'],
     ]) {
       await arrive(tok, query);
       const x = await nothing(2000);
@@ -3276,6 +3330,7 @@ async function tkPrefs(c) {
 const TK_SESSIONS = { start: tkStart, prefs: tkPrefs };
 // every defect below must fail the NAMED case; the session that holds it is run against a copy of the game with only that defect in it
 const TOKEN_MUTANTS = [
+  { id: 'T07', what: 'a token for the other question starts it (a { host } token on ?ask=quick opens a private room)', file: 'js/online.js', from: '  if (startTok && cfg.query.ask && startTok !== cfg.query.ask) startTok = null;\n', to: '', run: 'start', fails: 'TK7' },
   { id: 'T01', what: 'the plain address opens a friend\'s room with or without a token', file: 'js/online.js', from: 'startTok = startPlan(takeStartToken(ss, Date.now()), cfg.query); }', to: "takeStartToken(ss, Date.now()); startTok = cfg.query.role === null && !cfg.query.room && !cfg.query.auto ? 'host' : null; }", run: 'start', fails: 'TK3' },
   { id: 'T02', what: 'the hub\'s press is lost: the start token is never honoured', file: 'js/online.js', from: '    else if (startTok) { const what = startTok;', to: '    else if (false) { const what = startTok;', run: 'start', fails: 'TK1' },
   { id: 'T03', what: 'a { quick } token opens a private room instead of finding an opponent', file: 'js/online.js', from: "if (what === 'quick') quick(); else if (what === 'room') go(); else startAs('host'); }", to: "if (what === 'room') go(); else startAs('host'); }", run: 'start', fails: 'TK5' },
@@ -3370,7 +3425,8 @@ async function scAsk(c) {
     await sleep(1500);
     const pub = (await spied(spy)).filter((m) => m && m.k === 'open');
     const idle = await a.eval('({ stage: window.__arenaOnline.state.stage, sess: !!window.__arenaOnline.session(), hosting: window.__arenaOnline.lobbies() ? window.__arenaOnline.lobbies().hosting() : "no board", room: window.__arenaOnline.state.room })');
-    ok(pub.length === 0 && idle.stage === 'setup' && !idle.sess && idle.hosting === null && !idle.room, 'SC2a nothing is published before YES: the page listens to the board, lists nothing and opens no room', J([idle, pub]).slice(0, 300));
+    const asked = (await spied(spy)).filter((m) => m && m.t === 'arenaopen');
+    ok(pub.length === 0 && asked.length === 0 && idle.stage === 'setup' && !idle.sess && idle.hosting === 'no board' && !idle.room, 'SC2a NOTHING IS DIALLED BEFORE YES: the question opens no board connection (not even "who is open?"), lists nothing and opens no room', J([idle, asked.length]).slice(0, 300));
     await olPress(a, 'a');
     const up = await a.waitFor('window.__arenaOnline.state.stage === "open" && window.__arenaOnline.state.quick === true && window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 }).then(() => true, () => false);
     const v2 = await OV(a);
@@ -3384,6 +3440,20 @@ async function scAsk(c) {
     await sleep(800);
     ok((await a.eval('window.__arenaOnline.lobbies()')) === null, 'SC2d a page that asks OPEN A ROOM FOR A FRIEND? does not dial the open-games board at all (a private room has no business there)', '');
     ok(uiErrs(a).length === 0, 'SC2e no page errors', J(uiErrs(a)).slice(0, 200));
+  });
+  // THE REAL TRANSPORT (no net=local): the question connects to NOTHING before YES. Every WebSocket the page constructs is recorded (the board's brokers are WebSockets) and every script it loads (the
+  // board's MQTT client comes from a CDN); nothing is pressed, so nothing may be there. (YES is not pressed here: that would dial the public brokers from a test.)
+  if (!/^http:\/\/localhost/.test(c.origin)) return;
+  await withBrowser({ port: c.cdp(1), width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (a) => {
+    await a.send('Page.addScriptToEvaluateOnNewDocument', { source: '(() => { window.__ws = []; const W = window.WebSocket; const R = function (u, p) { window.__ws.push(String(u)); return p === undefined ? new W(u) : new W(u, p); }; R.prototype = W.prototype; R.CONNECTING = 0; R.OPEN = 1; R.CLOSING = 2; R.CLOSED = 3; window.WebSocket = R; })();' });
+    await a.navigate(c.origin + '/pokemonarena/battle.html?online=1&ask=quick&anim=0');
+    await a.waitFor('window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "online" && window.__arenaOnline.view().ready', { timeoutMs: 90000 });
+    await sleep(3000);
+    const net = await a.eval('({ ws: window.__ws.slice(), scripts: [...document.scripts].map((x) => x.src).filter((u) => u && !u.startsWith(location.origin)), res: performance.getEntriesByType("resource").map((e) => e.name).filter((u) => !u.startsWith(location.origin)), board: !!window.__arenaOnline.lobbies(), kind: window.__arenaOnline.view().kind, lede: window.__arenaOnline.view().lede })');
+    await a.eval('(() => { try { new WebSocket("ws://localhost:" + location.port + "/no-such-socket"); } catch (_e) { /* counted all the same */ } return true; })()');
+    const counted = await a.eval('window.__ws.length');
+    ok(net.kind === 'ask-quick' && net.ws.length === 0 && net.scripts.length === 0 && net.res.length === 0 && !net.board && counted === 1 && /public servers/.test(net.lede),
+      'SC2f on the REAL transport FIND AN OPPONENT? connects to nothing before YES: no WebSocket (no broker), no script or file from another site (no CDN); the question says YES goes through public servers (and the recorder does count a socket: 1 after one is made)', J(net).slice(0, 400));
   });
 }
 
@@ -3402,6 +3472,7 @@ async function scCopy(c) {
     ok(v.ids === 'copy-link,copy-code,cancel' && v.canShare === false, 'SC4 where the browser cannot share there is no SHARE row', v.ids);
     // a REAL key: the cursor is on COPY LINK, Enter is A
     await a.eval('document.getElementById("battle").focus()');
+    await olArmed(a);
     await a.press('Enter', 'Enter', 13);
     await sleep(200);
     const c1 = await a.eval('({ clip: window.__clip, copied: window.__arenaOnline.view().copied, label: window.__arenaOnline.view().rows[0].label })');
@@ -3421,6 +3492,9 @@ async function scCopy(c) {
     await olRow(a, 'copy-link'); await sleep(200);
     const c4 = await OV(a);
     ok(c4.status.bad && /refused/.test(c4.status.text) && c4.status.text.includes(v.code) && c4.copied !== 'link' && c4.code === v.code && c4.stage === 'open' && olFits(c4), 'SC3c a copy the browser refuses is said in the picture, pointing at the room code on the screen (which always works); the room stays open', J([c4.status, c4.copied, c4.fits]));
+    await sleep(6400);
+    const c6 = await OV(a);
+    ok(!c6.status.bad && /Waiting for your friend/.test(c6.status.text) && c6.stage === 'open', 'SC3e ... for six seconds: then the sentence that says what is happening comes back (the refusal used to stay, in red, for the rest of the wait)', J(c6.status));
     // a browser that can share: the row is there, and SHARE is called inside the press with the link and the code
     await olRow(a, 'cancel'); await sleep(300);
     await a.eval('window.__clipFail = false; window.__shareOn(true); true');
@@ -3428,6 +3502,7 @@ async function scCopy(c) {
     await a.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
     const v5 = await OV(a);
     ok(v5.ids === 'copy-link,share,copy-code,cancel' && v5.labels === 'COPY LINK|SHARE|COPY CODE|CLOSE THE ROOM' && olFits(v5), 'SC4a where the browser can share, SHARE is a row between COPY LINK and COPY CODE, and the screen still fits', v5.ids + ' ' + J(v5.fits));
+    await olArmed(a);
     await a.press('ArrowDown', 'ArrowDown', 40); await sleep(80);
     await a.press('Enter', 'Enter', 13); await sleep(200);
     const s = await a.eval('window.__shared');
@@ -3453,6 +3528,9 @@ async function scBack(c) {
     const b0 = await olPress(a, 'b');
     ok(J(b0) === J(['act:back']) && J(await nav()) === J([['/pokemonarena/#center', 'assign']]), 'SC5 BACK on a confirm screen (B is its BACK row) leaves for the hub screen the player came from (arena.back = center)', J([b0, await nav()]));
     ok(home === '/pokemonarena/#center', 'SC5c ... and so does the header\'s link', home);
+    await arrive('np=ABACK&join=1&openjoin=9000', { 'arena.back': 'center' });
+    const href0 = await a.eval('document.getElementById("homeLink").getAttribute("href")');
+    ok(href0 === '/pokemonarena/#center', 'SC5d the header\'s link SAYS so from the start, before any click: a middle click or "open in a new tab" follows it too', href0);
     for (const bad of ['../evil', 'main', 'Center', 'https://example.com/', 'a'.repeat(40)]) {
       await arrive('np=ABACK&join=1', { 'arena.back': bad });
       await olRow(a, 'back');
@@ -3515,6 +3593,7 @@ async function scInput(c) {
     const joined = await a.waitFor('window.__arenaOnline.state.stage === "waiting"', { timeoutMs: 15000 }).then(() => true, () => false);
     ok(joined, 'SC10 a real click on JOIN THE BATTLE presses it: the join is under way', await a.eval('window.__arenaOnline.state.stage'));
     // B never closes anything on a waiting screen: it puts the cursor on the way out, and A (a real Enter) takes it
+    await olArmed(a);
     const b1 = await olPress(a, 'b', 'b');
     const still = await a.eval('window.__arenaOnline.state.stage');
     ok(still === 'waiting' && b1.every((x) => x === null || x === 'move'), 'SC10c B on a waiting screen closes nothing (it only puts the cursor on the way out)', J([b1, still]));
@@ -3523,6 +3602,13 @@ async function scInput(c) {
     ok(k2.stage === 'setup' && k2.kind === 'invited' && k2.status.text === 'Cancelled.', 'SC10d ... and a real Enter on CANCEL takes it', J([k2.stage, k2.kind, k2.status]));
     const live = await a.eval('document.getElementById("live").textContent');
     ok(/INVITED/.test(live) && /Cancelled/.test(live) && /JOIN THE BATTLE/.test(live) && !/\d:\d\d/.test(live), 'SC13 the screen reader\'s live region says the screen (its heading, the sentence, the highlighted row) and never the running clock', live);
+    // A DOUBLE PRESS (a double tap, a key bounced): the second A of JOIN THE BATTLE must not take the CANCEL of the wait the first one opened (the wait's only row, under the cursor)
+    await olArmed(a);
+    await a.press('Enter', 'Enter', 13); await sleep(350); await a.press('Enter', 'Enter', 13);
+    await sleep(900);
+    const dbl = await OV(a);
+    ok(dbl.stage === 'waiting' && dbl.ids === 'cancel' && !/Cancelled/.test(dbl.status.text), 'SC14 two Enters 350 ms apart on JOIN THE BATTLE join, and STAY joining: the second does not cancel the wait the first opened (that screen listens 0.6 s after it appears)', J([dbl.stage, dbl.ids, dbl.status]));
+    await olRow(a, 'cancel'); await sleep(300);
     ok(uiErrs(a).length === 0, 'SC10e no page errors', J(uiErrs(a)).slice(0, 200));
   });
   // a phone: a finger on a row presses it, and the on-screen buttons drive the screen too
@@ -3534,6 +3620,7 @@ async function scInput(c) {
     const joined = await p.waitFor('window.__arenaOnline.state.stage === "waiting"', { timeoutMs: 15000 }).then(() => true, () => false);
     ok(joined && go.h >= 18 && go.w >= 150, 'SC10f on a phone a tap on JOIN THE BATTLE presses it (the row is ' + Math.round(go.w) + ' x ' + Math.round(go.h) + ' css px)', J(go));
     await sleep(700);          // (the on-screen pad is laid out a moment after the first touch)
+    await olArmed(p);
     const pad = await p.eval('(() => { const b = document.getElementById("bA"), r = b.getBoundingClientRect(); return { shown: b.offsetParent !== null, x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height }; })()');
     await p.tap(pad.x, pad.y); await sleep(400);
     const k = await OV(p);
@@ -3547,6 +3634,9 @@ async function scBattle(c) {
   const { ok } = c;
   await withBrowser({ port: c.cdp(0), width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (host) => {
     const guest = await host.openTab({ width: 900, height: 760 });
+    // every node lib/netplay.js could put on a page of its own (its 'waiting for the host' card, its relay chip, its Allow prompt), recorded the moment it is added, whatever removes it after
+    const NPDOM = '(() => { window.__npDom = []; const seen = (n) => { if (n && n.nodeType === 1) { for (const e of [n, ...n.querySelectorAll("*")]) if (/^np(Waiting|Relay|Approve)/.test(e.id || "")) window.__npDom.push(e.id); } }; const go = () => new MutationObserver((ms) => { for (const m of ms) for (const n of m.addedNodes) seen(n); }).observe(document.documentElement, { childList: true, subtree: true }); if (document.documentElement) go(); else document.addEventListener("readystatechange", go, { once: true }); })();';
+    await host.send('Page.addScriptToEvaluateOnNewDocument', { source: NPDOM }); await guest.send('Page.addScriptToEvaluateOnNewDocument', { source: NPDOM });
     await scOpen(c, host, 'np=ASCRN&host=1');
     const h0 = await OV(host);
     ok(h0.kind === 'room' && h0.heading === 'YOUR ROOM ASCRN' && h0.labels === 'OPEN THE ROOM|CHANGE TEAM|BACK' && h0.fmtShown && h0.info.some((l) => l.label === 'ROOM' && l.value === 'ASCRN') && olFits(h0), 'SC11a a room\'s own address (the site lobby\'s hand-off) with no token asks in the picture: YOUR ROOM, OPEN THE ROOM / CHANGE TEAM / BACK', J(h0).slice(0, 400));
@@ -3565,6 +3655,8 @@ async function scBattle(c) {
     const moved = await guest.eval('JSON.stringify(window.__arenaBattle.scene.state()) !== window.__sc0');
     ok(moved, 'SC11b a real key now moves the battle\'s own cursor (the team preview)', after.mode);
     ok(uiErrs(host, guest).length === 0, 'SC11c no page errors', J(uiErrs(host, guest)).slice(0, 200));
+    const npDom = [await host.eval('window.__npDom'), await guest.eval('window.__npDom')];
+    ok(r.phases[1] === 'playing' && npDom.every((x) => Array.isArray(x) && x.length === 0), 'SC11d lib/netplay.js put NOTHING on either page (no "waiting for the host" card, no relay chip, no Allow prompt: the Session is made with ui: false); the joiner was told in the picture', J(npDom));
     // an Accept address with no accept token: said in the picture, nothing started, nothing dialled
     await host.navigate(SC_PAGE(c, 'online=1&auto=host&for=' + 'ab'.repeat(8) + '&rq=' + 'cd'.repeat(8) + '&format=3v3'));
     await host.waitFor('window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "online" && window.__arenaOnline.view().ready', { timeoutMs: 90000 });
@@ -3578,13 +3670,16 @@ const SC_SESSIONS = { bare: scBare, ask: scAsk, copy: scCopy, back: scBack, inpu
 const SCREEN_MUTANTS = [
   { id: 'S01', what: 'the plain address with no token stays, and asks to open a room', file: 'js/online.js', from: "    if (boardPage() && !state.ask && !autoNotice) { closed = true; state.stage = 'left'; paint(); if (hooks.toMenu) hooks.toMenu(); return; }\n", to: '', run: 'bare', fails: 'SC1' },
   { id: 'S02', what: 'the hub\'s menu is opened ON TOP of the page that sends away (Back loops)', file: 'js/battle_boot.js', from: "toMenu: () => navigateReplacing(HUB_PAGE_URL + (pass ? '?' + pass.slice(1) : '') + '#online'),", to: "toMenu: () => navigate(HUB_PAGE_URL + (pass ? '?' + pass.slice(1) : '') + '#online'),", run: 'bare', fails: 'SC1b' },
-  { id: 'S03', what: 'the question page starts the search by itself', file: 'js/online.js', from: "    if (boardWatched()) { ensureLobbies(); lobbies.startWatching(); }\n    // (the Trainer Center's hand-off", to: "    if (boardWatched()) { ensureLobbies(); lobbies.startWatching(); void quick(); }\n    // (the Trainer Center's hand-off", run: 'ask', fails: 'SC2a' },
-  { id: 'S04', what: 'every plain page dials the open-games board, a private room\'s too', file: 'js/online.js', from: "const boardWatched = () => state.stage === 'setup' && supportedHere() && boardPage() && state.ask === 'quick';", to: "const boardWatched = () => state.stage === 'setup' && supportedHere() && boardPage();", run: 'ask', fails: 'SC2d' },
+  { id: 'S03', what: 'the question page starts the search by itself', file: 'js/online.js', from: "    say('');\n    // (the Trainer Center's hand-off", to: "    say(''); if (state.ask === 'quick') void quick();\n    // (the Trainer Center's hand-off", run: 'ask', fails: 'SC2a' },
+  { id: 'S04', what: 'every plain page dials the open-games board, a private room\'s too', file: 'js/online.js', from: "    say('');\n    // (the Trainer Center's hand-off", to: "    say(''); if (boardPage()) watchBoard();\n    // (the Trainer Center's hand-off", run: 'ask', fails: 'SC2d' },
+  { id: 'S23', what: 'FIND AN OPPONENT? dials the board before YES (as it did: the brokers saw the IP address of anyone who opened a link)', file: 'js/online.js', from: "    say('');\n    // (the Trainer Center's hand-off", to: "    say(''); if (state.ask === 'quick') watchBoard();\n    // (the Trainer Center's hand-off", run: 'ask', fails: 'SC2a' },
   { id: 'S05', what: 'the question does not say what other players see', file: 'js/online_view.js', from: " Other players see your trainer name and your online record.',", to: "',", run: 'ask', fails: 'SC2' },
   { id: 'S06', what: 'a pressed row acts in a later task, outside the user gesture', file: 'js/battle_boot.js', from: "    const r = onlinePanel.press(action, online.view());\n    if (r && r.kind === 'act') online.act(r.id);\n", to: "    const r = onlinePanel.press(action, online.view());\n    if (r && r.kind === 'act') setTimeout(() => online.act(r.id), 0);\n", run: 'copy', fails: 'SC3' },
   { id: 'S07', what: 'COPIED is never taken back', file: 'js/online.js', from: "    copiedTimer = win.setTimeout(() => { state.copied = null; paint(); }, 2000);\n", to: '', run: 'copy', fails: 'SC3b' },
-  { id: 'S08', what: 'a refused copy says nothing', file: 'js/online.js', from: "    if (!ok) { say(COPY_REFUSED(state.room), true); return false; }\n", to: "    if (!ok) { return false; }\n", run: 'copy', fails: 'SC3c' },
+  { id: 'S08', what: 'a refused copy says nothing', file: 'js/online.js', from: "      say(said, true);\n", to: '', run: 'copy', fails: 'SC3c' },
+  { id: 'S24', what: 'a refused copy is said for the rest of the wait', file: 'js/online.js', from: "      refusedTimer = win.setTimeout(() => { if (state.status.text === said) { state.status = prev; paint(); } }, REFUSED_MS);", to: '', run: 'copy', fails: 'SC3e' },
   { id: 'S09', what: 'SHARE is offered where the browser cannot share', file: 'js/online_view.js', from: "if (v.canShare) v.rows.push({ id: 'share', label: R.share });", to: "v.rows.push({ id: 'share', label: R.share });", run: 'copy', fails: 'SC4' },
+  { id: 'S25', what: 'the header\'s link says the plain hub until it is clicked (a middle click loses arena.back)', file: 'js/battle_boot.js', from: '  hook.params = params; hook.seed = params.seed;\n  homeTo();\n', to: '  hook.params = params; hook.seed = params.seed;\n', run: 'back', fails: 'SC5d' },
   { id: 'S10', what: 'the way back ignores where the hub said the player came from', file: 'js/battle_boot.js', from: "const p = readBack(ss); return p ? HUB_PAGE_URL + '#' + p : HUB_PAGE_URL; };", to: "const p = readBack(ss); return p ? HUB_PAGE_URL : HUB_PAGE_URL; };", run: 'back', fails: 'SC5' },
   { id: 'S11', what: 'arena.back is followed whatever it holds', file: 'js/battle_boot.js', from: "const p = readBack(ss); return p ? HUB_PAGE_URL + '#' + p : HUB_PAGE_URL; };", to: "let p = null; try { p = ss.getItem('arena.back'); } catch (_e) { p = null; } return p ? HUB_PAGE_URL + '#' + p : HUB_PAGE_URL; };", run: 'back', fails: 'SC5b' },
   { id: 'S12', what: 'CHANGE TEAM forgets the room', file: 'js/battle_boot.js', from: "HUB_PAGE_URL + '?np=' + encodeURIComponent(room) + (role === 'host' ? '&host=1' : '&join=1') + pass + '#online'", to: "HUB_PAGE_URL + '?' + pass.slice(1) + '#online'", run: 'back', fails: 'SC6' },
@@ -3595,8 +3690,10 @@ const SCREEN_MUTANTS = [
   { id: 'S15', what: 'the canvas stays hidden until the first battle', file: 'js/battle_boot.js', from: "        els.boot.hidden = true; els.err.hidden = true; canvas.hidden = false;\n        document.body.dataset.state = 'online'; hook.state = 'online';\n", to: "        els.boot.hidden = true; els.err.hidden = true; canvas.hidden = true;\n        document.body.dataset.state = 'online'; hook.state = 'online';\n", run: 'input', fails: 'SC8' },
   { id: 'S16', what: 'the loop does not draw the screen (only a press does)', file: 'js/battle_boot.js', from: "      if (!scene) { if (onlineUp()) drawOnline(false); requestAnimationFrame(loop); return; }", to: "      if (!scene) { requestAnimationFrame(loop); return; }", run: 'input', fails: 'SC8b' },
   { id: 'S17', what: 'B on a waiting screen closes the room', file: 'js/online_view.js', from: "        return i === cursor ? null : setCursor(v, i);\n", to: "        return { kind: 'act', id: 'cancel' };\n", run: 'input', fails: 'SC10c' },
+  { id: 'S26', what: 'a screen that replaced another answers A at once (the second A of a double press cancels the join the first started)', file: 'js/battle_boot.js', from: 'const onlinePanel = createOnlinePanel({ now: () => performance.now(), armMs: PANEL_ARM_MS });', to: 'const onlinePanel = createOnlinePanel({ now: () => performance.now(), armMs: 0 });', run: 'input', fails: 'SC14' },
   { id: 'S18', what: 'the screen is not spoken', file: 'js/battle_boot.js', from: "    const words = speakOnline(v, cursor); if (words !== onlineSpoken) say(words);\n", to: '', run: 'input', fails: 'SC13' },
   { id: 'S19', what: 'the online screen keeps the buttons after the battle is up', file: 'js/battle_boot.js', from: "  const onlineUp = () => !!online && !!onlineScreen && !scene;\n", to: "  const onlineUp = () => !!online && !!onlineScreen;\n", run: 'battle', fails: 'SC11' },
+  { id: 'S27', what: 'lib/netplay.js draws its own DOM notices on the page (the Session is made without ui: false)', file: 'js/online.js', from: 'portCount: 2, transport: state.transport, ui: false });', to: 'portCount: 2, transport: state.transport });', run: 'battle', fails: 'SC11d' },
   { id: 'S20', what: 'an Accept address without its token opens a room all the same', file: 'js/online.js', from: "    if (!acceptTok) { query = { ...query, role: null, room: null, auto: null };", to: "    if (!acceptTok) { acceptTok = { ck: 'x' }; } if (false) { query = { ...query, role: null, room: null, auto: null };", run: 'battle', fails: 'SC12' },
 ];
 
