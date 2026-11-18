@@ -1379,6 +1379,29 @@ async function runCtl(jsDir, ok, guard, M) {
       await endAll();
     }
 
+    // a player whose own challenge has just been ACCEPTED answers nobody else: the battle is opening. Whoever asks is told no at once, and the battle still opens
+    {
+      const [a, b] = await two();
+      const c = page(QC + '&ctrname=Cara&ctrav=' + lk(8), { seed: 2 });
+      c.go('center'); await inRoom(c);
+      await settle(() => c.people().some((p) => p.name === 'Alice' && p.doing === 'here'));
+      askName(a, 'Bob');
+      await questioned(b);
+      b.read(); b.last(); b.press('up'); b.press('a');          // Bob: YES (his page leaves for the battle page, which will open the room)
+      await settle(() => a.dlg() && a.dlg().id === 'center:note' && /accepted/.test(a.text() || ''));
+      askName(c, 'Alice');                                      // ... and Cara asks Alice in that moment
+      await settle(() => c.dlg() && c.dlg().id === 'center:note', 2000);
+      const caraTold = c.text(), aliceReads = a.text();
+      const tok = JSON.parse((b.nav[0] || {}).accept || '{}');
+      const lob = OL.createOpenLobbies({ bus: OL.createLocalBus({ BroadcastChannel: globalThis.BroadcastChannel }), now: () => performance.now(), mine: { rom: 'x', fp: 'y' } });
+      const acc = P.createAcceptor({ lobbies: lob, to: tok.for, r: tok.rq, room: 'QWERT', ck: tok.ck });
+      await settle(() => a.nav.length === 1);
+      acc.stop(); lob.close();
+      ok(/said not now/.test(caraTold || '') && /accepted! Opening the battle/.test(aliceReads || '') && a.nav.length === 1 && /np=QWERT&join=1&meet=1/.test((a.nav[0] || {}).url || '') && c.nav.length === 0,
+        'K8g a player whose own challenge was just ACCEPTED is not interrupted: somebody else who asks is told no at once, "accepted! Opening the battle..." stays, and the battle opens', J([caraTold, aliceReads, a.nav]));
+      await endAll();
+    }
+
     // the Center's own question makes way for a challenge too (a player whose switch is on can be asked before they have walked in), and comes back
     {
       const h = page('?net=local&opendisc=1&openchal=3000&ctrname=Hal&ctrav=' + lk(9), { local: { 'arena.open': '1', 'arena.open.seen': '1' } });
@@ -1597,6 +1620,7 @@ const NODE_MUTANTS = [
   { id: 'NC29', part: 'ctl', file: 'center_ctl.js', from: "      const waits = mutual && String(svc.boardId()) > String(p.s);", to: "      const waits = false;", fails: 'K8d' },
   { id: 'NC30', part: 'ctl', file: 'center_ctl.js', from: "      if (!waits) { dropChal(); app.askWithdrawn(!mutual); }", to: "      if (!waits && mutual) { dropChal(); app.askWithdrawn(!mutual); }", fails: 'K8b' },
   { id: 'NC31', part: 'ctl', file: 'center_ctl.js', from: "      if (!waits) { dropChal(); app.askWithdrawn(!mutual); }", to: "      if (!waits) { chal = null; chalTo = null; app.askWithdrawn(!mutual); }", fails: 'K8b' },
+  { id: 'NC42', part: 'ctl', file: 'center_ctl.js', from: "    if (chal && chalOk) { safe(() => svc.mount.decline()); return; }\n", to: "", fails: 'K8g' },
   { id: 'NC39', part: 'ctl', file: 'center_ctl.js', from: "    if (!p) { if (asked !== null) { asked = null; if (app.resume() === false) { settleEntry(false); run(app.out()); } redraw(); } return; }", to: "    if (!p) { asked = null; return; }", fails: 'K8f' },
   // ---- CANCEL and leaving withdraw a challenge
   { id: 'NC32', part: 'ctl', file: 'center_ctl.js', from: "      else if (eff.type === 'cancel-ask') dropChal();", to: "      else if (eff.type === 'cancel-ask') { chal = null; chalTo = null; }", fails: 'K9a' },

@@ -63,7 +63,7 @@ export function createCtl(env) {
   let mine = false;           // Open to battles was switched on by a visit to the Center and has not been put back yet
   let leaving = false;        // on the way out (or the page is going away): the switch going off is then no news
   let center = null, offWatch = null, offSvc = null, timer = 0, boardId = null;
-  let chal = null, chalTo = null;          // my own challenge in flight, and the board id of the player it asks
+  let chal = null, chalTo = null, chalOk = false;          // my own challenge in flight, the board id of the player it asks, and: they said YES (their battle page is opening the room)
   let entry = null;           // the Center's own question is on the screen: what its answer settles
   let asked = null;           // the request id of the "<name> wants to battle you" the Center has made way for
   let away = 0;               // (a timer) the player is in the Team Builder they opened from the room
@@ -112,13 +112,15 @@ export function createCtl(env) {
   /** The board connection can be rebuilt (the switch went off and on): the room is told the new listing id. */
   function syncBoard() { const b = svc.boardId(); if (b !== boardId) { boardId = b; if (center) center.update(); } }
   function beat() { if (!inside) return; syncBoard(); push(); }
-  const dropChal = () => { if (chal) safe(() => chal.cancel()); chal = null; chalTo = null; };          // (cancel() tells the player who was asked: their question closes)
+  const dropChal = () => { if (chal) safe(() => chal.cancel()); chal = null; chalTo = null; chalOk = false; };          // (cancel() tells the player who was asked: their question closes)
   /**
    * SOMEBODY ASKS THIS PLAYER TO BATTLE while the Center is the open screen (the service's question is in the hub's dialog layer). Called at every change the service announces.
    *   - the Center's own dialogs make way (once per question), so the question is the one on the screen: a notice nobody pressed A on must not turn the question into an automatic NO;
    *   - ONE QUESTION AT A TIME: if this player is waiting for an answer to a challenge of their own, that challenge is withdrawn (with a line saying so behind the question) ...
    *   - ... EXCEPT WHEN THE TWO ASKED EACH OTHER. Both pages see the same two board ids, so both know which of them gives way: the one with the SMALLER id withdraws its challenge and sees
    *     the other's question; the other keeps waiting for the answer (the question it was sent closes when the withdrawal arrives). One battle, never two rooms and never two automatic NOs.
+   *   - A CHALLENGE OF THIS PLAYER'S THAT WAS ACCEPTED IS NOT WITHDRAWN: the player who said YES has left for the battle page and is opening the room for this one. Whoever asks now is told
+   *     no at once (the service's decline), and "accepted! Opening the battle..." stays on the screen.
    * When the question is gone, what was put away for it comes back (the Center's own question).
    */
   function onAsked() {
@@ -126,6 +128,7 @@ export function createCtl(env) {
     if (!p) { if (asked !== null) { asked = null; if (app.resume() === false) { settleEntry(false); run(app.out()); } redraw(); } return; }
     if (asked === p.r) return;
     asked = p.r;
+    if (chal && chalOk) { safe(() => svc.mount.decline()); return; }
     app.makeWay();
     if (chal) {
       const mutual = p.s === chalTo;
@@ -252,12 +255,12 @@ export function createCtl(env) {
     if (!p) return fail('gone');
     if (!svc.canChallenge()) return fail('unsupported');
     const c = svc.challenge(p, {
-      state: () => { app.askAccepted(); redraw(); },
-      accepted: (code) => { if (chal === c) { chal = null; chalTo = null; } goBattle(code); },
-      failed: (why) => { if (chal === c) { chal = null; chalTo = null; } fail(why); },
+      state: () => { if (chal === c) chalOk = true; app.askAccepted(); redraw(); },
+      accepted: (code) => { if (chal === c) { chal = null; chalTo = null; chalOk = false; } goBattle(code); },
+      failed: (why) => { if (chal === c) { chal = null; chalTo = null; chalOk = false; } fail(why); },
     });
     if (!c) return fail('off');
-    chal = c; chalTo = eff.id;
+    chal = c; chalTo = eff.id; chalOk = false;
   }
   function roomSound(what) {
     const s = ROOM_SOUNDS[what]; if (!s) return;

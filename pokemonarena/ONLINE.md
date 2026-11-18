@@ -149,7 +149,8 @@ its tests are is in `INAPP.md`, section **"CENTER: as built"**. What is unchange
 * **Being asked.** "<name> wants to battle you" is the presence service's question in the hub's dialog layer, which shows one dialog at a time: whatever the Center has on the screen (a notice, a sign,
   the nurse, a question about a trainer, its own question before walking in) makes way at once, so the question is never behind something nobody is reading (it is a NO by itself after 25 s). One
   question at a time: a player who is waiting for an answer to a challenge of their own has it withdrawn. Two players who ask EACH OTHER at once: the page with the smaller board id withdraws and sees
-  the other's question, the other keeps waiting, and YES ends in one battle.
+  the other's question, the other keeps waiting, and YES ends in one battle. A player whose own challenge has just been accepted answers nobody else (whoever asks is told no at once): their battle
+  is opening.
 * **A look** is one of the ROM's overworld trainer sprites, as seven characters: `w` and the ROM graphics id in base 36 (`js/center_look.js`; `localStorage` `arena.avatar`). It rides on the board
   listing as `av`. A code of the first Trainer Center (first character 0-5) is never listed again and draws the first avatar.
 * **Emotes** are the ROM's sixteen icons, by number, shown for two seconds. There is no free text anywhere in the room.

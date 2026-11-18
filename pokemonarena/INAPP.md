@@ -849,11 +849,13 @@ of the Center's may stand in front of it. The ctl listens to the service from th
 * **one question at a time**: a player who is waiting for an answer to a challenge of their own has that challenge withdrawn (`app.askWithdrawn(true)`: the player they asked stops seeing it, and after the
   question a line says "Your challenge to <NAME> was withdrawn.");
 * **two players who ask EACH OTHER at once**: both pages see the same two board ids, so both know which gives way. The page with the SMALLER board id withdraws its challenge and sees the other's question;
-  the other keeps waiting (the question it was sent closes when the withdrawal arrives). One battle: never two rooms, never two automatic NOs.
+  the other keeps waiting (the question it was sent closes when the withdrawal arrives). One battle: never two rooms, never two automatic NOs;
+* **a challenge of this player's that was ACCEPTED is not withdrawn** (the player who said YES has left for the battle page and is opening the room): whoever asks now is told no at once
+  (`svc.mount.decline()`), and "accepted! Opening the battle..." stays on the screen.
 
 ### What the Center calls of the other tracks, and what they can rely on
 
-* **SEAM** (`hubPresence(env)`): `ready`, `isOn()`, `mount.needsDisclosure()`, `mount.pending()` (who asks: `{ s, r }`), `state().challenge`, `turnOn({ persist: false, also: WORDS.also })`,
+* **SEAM** (`hubPresence(env)`): `ready`, `isOn()`, `mount.needsDisclosure()`, `mount.pending()` (who asks: `{ s, r }`), `mount.decline()`, `state().challenge`, `turnOn({ persist: false, also: WORDS.also })`,
   `turnOff({ persist: false })`, `stored()`, `status()`, `onChange(fn)`, `watchPlayers(bool)`, `players()`, `boardId()`, `trainer()`, `canChallenge()`, `challenge(player, { state, accepted, failed })`,
   `relist()`, `goBattle('join', room)` (the default `back`: the Center). "<name> wants to battle you" and the first-time disclosure are the service's questions; the Center asks only its own
   (`center:enter`), through `ctx.dialog`.
@@ -970,12 +972,12 @@ Still naming them, in files that are not CENTER's: a comment in `js/openlobby.js
 ### Tests (2026-11-18, this tree)
 
 ```bash
-node tools/pokemonarena_center_test.mjs node             # the Node checks (274): L (looks), R (the room from the ROM), G (the grid), M1-M14 (the model; M14: the Center's own question, making way, notices,
+node tools/pokemonarena_center_test.mjs node             # the Node checks (275): L (looks), R (the room from the ROM), G (the grid), M1-M14 (the model; M14: the Center's own question, making way, notices,
                                                          # the guards the review's mutants walked through), S (the renderer, the hashes, the name plates), N (the room's messages, what a here carries,
                                                          # the two caps), T (the MEET token), K1-K10 (the ctl on two and three pages over Node's BroadcastChannel; K7 the Center's own question,
                                                          # K8 somebody asks over the Center's dialogs and two who ask each other, K9 CANCEL and leaving withdraw, K10 the public transport on a double
                                                          # of the MQTT library)
-node tools/pokemonarena_center_test.mjs node --mutants   # ... and 113 defects, one at a time, each in a process of its own; each must fail the case it names (CENTER_MUT=<id> runs one; a ctl mutant
+node tools/pokemonarena_center_test.mjs node --mutants   # ... and 114 defects, one at a time, each in a process of its own; each must fail the case it names (CENTER_MUT=<id> runs one; a ctl mutant
                                                          # runs only the block of the case it names)
 node tools/pokemonarena_center_test.mjs                  # the Node checks, then real Chrome (54 cases): CB0 the redirect; CB1 the disclosure, NO, YES; CB2 two tabs; CB3 real keys and a click; CB4 a look
                                                          # and an emote; CB5 a hub player at a spot; CB6 a challenge declined; CB7 one accepted: a battle on both screens, the MEET token; CB8 the door mat;
@@ -989,5 +991,5 @@ Ports: `ARENA_PORT` / `ARENA_CDP` (or `CENTER_PORT` / `CENTER_CDP`; defaults 824
 
 What the review found and where each fix is pinned: (1) a player whose switch was off and who had once answered the hub's disclosure was listed with no question, and never told about the look and the
 cell: K7a-K7k, CB13a-CB13f, mutants NC20-NC26, NC40, NC41, BM6; (2) a challenge that arrived while a dialog of the Center was open was never shown, and two players who asked each other were both told
-"said not now": K8a-K8f, M14h-M14k, CB14a-CB14d, mutants NC27-NC31, NC39, NM22-NM25, BM7; (3) three guards had no check: what a walker publishes (N7a2, K1g; NN18, NC38), CANCEL withdrawing a
+"said not now": K8a-K8g, M14h-M14k, M14t, CB14a-CB14d, mutants NC27-NC31, NC39, NC42, NM22-NM25, BM7; (3) three guards had no check: what a walker publishes (N7a2, K1g; NN18, NC38), CANCEL withdrawing a
 challenge (K9a; NC32), leaving withdrawing it (K9b, K9c; NC33).
