@@ -907,7 +907,7 @@ Still naming them, in files that are not CENTER's: a comment in `js/openlobby.js
 ```bash
 node tools/pokemonarena_center_test.mjs node             # the Node checks: L (looks), R (the room from the ROM), G (the grid), M1-M13 (the model), S (the renderer, the hashes), N (the room's messages),
                                                          # T (the MEET token), K1-K6 (the ctl on two and three pages over Node's BroadcastChannel): 213 checks
-node tools/pokemonarena_center_test.mjs node --mutants   # ... and 66 defects, one at a time, each in a process of its own; each must fail the case it names (CENTER_MUT=<id> runs one)
+node tools/pokemonarena_center_test.mjs node --mutants   # ... and 65 defects, one at a time, each in a process of its own; each must fail the case it names (CENTER_MUT=<id> runs one)
 node tools/pokemonarena_center_test.mjs                  # the Node checks, then real Chrome: CB0 the redirect; CB1 the disclosure, NO, YES; CB2 two tabs; CB3 real keys and a click; CB4 a look and an emote;
                                                          # CB5 a hub player at a spot; CB6 a challenge declined; CB7 one accepted: a battle on both screens, the MEET token; CB8 the door mat; CB9 the PC and back;
                                                          # CB10 Open switched off elsewhere; CB11 a background tab; CB12 a phone (touch only) and a controller
