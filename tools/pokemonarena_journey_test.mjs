@@ -187,13 +187,17 @@ async function journey(vp, port) {
     await page.navigate(BASE + '/pokemonarena/');
     await waitFor(page, `window.${HUB} && ${HUB}.state === 'ready'`);
     await page.eval(`${HUB}.pause(true); ${HUB}.setMascot(25)`);
-    ok((await hubRows()).join() === 'quick,team,tower,record,builder,import,controls,sound', tag + '1 hub: the main menu shows eight of its nine rows (TOWER, IMPORT SAVE and RECORD included; ABOUT is below the fold, the menu scrolls)', JSON.stringify(await hubRows()));
+    ok((await hubRows()).join() === 'quick,team,online,tower,builder,record,import,controls', tag + '1 hub: the main menu shows eight of its ten rows (PLAY ONLINE, TOWER, TEAM BUILDER, RECORD and IMPORT SAVE included; SOUND and ABOUT are below the fold, the menu scrolls)', JSON.stringify(await hubRows()));
     await shot(page, vp, 'hub_main');
 
-    // ---- 2 TEAM BUILDER from the menu (a mix of devices on the desktop run: keys, then the mouse)
+    // ---- 2 TEAM BUILDER from the menu (a mix of devices on the desktop run: keys, then the mouse). The row opens the builder SCREEN in the picture now (an app of the hub); until the
+    //      Team Builder itself is in the picture, that screen's OPEN TEAM BUILDER row is what leaves for the team editor page
     await hubPick('builder');
+    await waitFor(page, `${HUB}.model.path() === 'builder'`);
+    ok((await page.eval('location.hash')) === '#builder' && /\/pokemonarena\/$/.test(await page.eval('location.pathname')), tag + '2 TEAM BUILDER on the hub menu opens the builder screen in the picture (#builder, the same page)', await page.eval('location.pathname + location.hash'));
+    await hubRow('editor');
     await waitFor(page, 'window.__editor && (window.__editor.ready || window.__editor.error)');
-    ok(/\/pokemonarena\/editor\.html/.test(await page.eval('location.pathname')) && (await page.eval('__editor.ready')) === true, tag + '2 TEAM BUILDER on the hub menu opens the team editor', await page.eval('location.pathname'));
+    ok(/\/pokemonarena\/editor\.html/.test(await page.eval('location.pathname')) && (await page.eval('__editor.ready')) === true, tag + '2 OPEN TEAM BUILDER on that screen opens the team editor', await page.eval('location.pathname'));
     await shot(page, vp, 'editor_profiles_empty');
 
     // ---- 3 create a profile (typed name, tapped / clicked button)

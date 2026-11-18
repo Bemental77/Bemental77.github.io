@@ -55,8 +55,8 @@ function checkModelBody(HM, f, TH) {
   const D = (tw, o) => mkData([tw], o);
   // ---- the main menu row and the screens it leads to
   let m = mk(D(F.fight)); const mainRows = m.rows(); let e = tower(m);
-  t('main: the TOWER row is the third row and opens the Tower screen', () => (mainRows[2].id === 'tower' && mainRows[2].label === 'TOWER' && m.path() === 'tower' && eff(e, 'screen').length === 1 && e[0].path === 'tower'), () => (J(e)));
-  e = m.press('b'); t('tower: B goes back to the main menu with the cursor on TOWER (the same effect the other screens give: a return to main needs no flag)', () => (m.path() === 'main' && e.length === 1 && e[0].path === 'main' && e[0].back === undefined && m.state().cursor.main === 2), () => (J(e)));
+  t('main: the TOWER row is the fourth row (PLAY ONLINE joined the menu above it) and opens the Tower screen', () => (mainRows[3].id === 'tower' && mainRows[3].label === 'TOWER' && m.path() === 'tower' && eff(e, 'screen').length === 1 && e[0].path === 'tower'), () => (J(e)));
+  e = m.press('b'); t('tower: B goes back to the main menu with the cursor on TOWER (the same effect the other screens give: a return to main needs no flag)', () => (m.path() === 'main' && e.length === 1 && e[0].path === 'main' && e[0].back === undefined && m.state().cursor.main === 3), () => (J(e)));
   // ---- the home screen by state
   m = mk(D(F.fight)); tower(m);
   t('home: a run waiting for its fight shows FIGHT: FLOOR n first', () => (J(labels(m)) === J(['FIGHT: FLOOR ' + F.fight.run.floor, 'MY BUFFS', 'NEW RUN', 'LAST RUN', 'ACHIEVEMENTS', 'BACK'])), () => (J(labels(m))));
@@ -296,15 +296,15 @@ function checkModelBody(HM, f, TH) {
   t('last: the last climb: how far, in which format, what it held and what it earned', () => (m.path() === 'tower-last' && v.tower.last.cleared === F.none.last.cleared && v.tower.last.format && Array.isArray(v.tower.last.held) && Array.isArray(v.tower.last.earned)), () => (J(v.tower.last)));
   e = m.press('a'); t('last: A or B goes back', () => (m.path() === 'tower' && e[0].back === true), () => (''));
   // ---- plain, deterministic, JSON
-  const script = (mm) => { const out = []; for (const a of ['down', 'down', 'a', 'a', 'down', 'a', 'right', 'a', 'left', 'a', 'b', 'b']) { mm.press(a); out.push(J(mm.view())); } return out.join('|'); };
+  const script = (mm) => { const out = []; for (const a of ['down', 'down', 'down', 'a', 'a', 'down', 'a', 'right', 'a', 'left', 'a', 'b', 'b']) { mm.press(a); out.push(J(mm.view())); } return out.join('|'); };
   t('determinism: the same presses give the same views', () => (script(mk(D(F.offer3))) === script(mk(D(F.offer3)))), () => (''));
   m = mk(D(F.offer3)); tower(m); m.press('a'); t('views are plain JSON (no undefined, no functions)', () => (plainOk(m.view()).length === 0 && J(JSON.parse(J(m.view()))) === J(m.view())), () => (plainOk(m.view()).join(',')));
   m = mk(D(F.fight)); tower(m); const st1 = J(m.state()); t('state() is plain JSON and carries the Tower\'s', () => (J(JSON.parse(st1)) === st1 && JSON.parse(st1).tower.profileId === 'p1'), () => (st1.slice(0, 60)));
   // ---- the main menu scrolls: any number of rows
-  m = mk(D(F.fight)); t('main: the menu shows eight of its nine rows, scrolled so the cursor is visible, with arrows for what is hidden', () => (m.view().menu.rows.length === 8 && m.view().menu.down === true && m.view().menu.up === false && (press(m, 'up'), m.view().menu.up === true && m.view().menu.down === false && m.view().menu.offset === 1 && m.view().menu.rows[7].label === 'ABOUT')), () => (J(m.view().menu)));
+  m = mk(D(F.fight)); t('main: the menu shows eight of its ten rows, scrolled so the cursor is visible, with arrows for what is hidden', () => (m.view().menu.rows.length === 8 && m.view().menu.total === 10 && m.view().menu.down === true && m.view().menu.up === false && (press(m, 'up'), m.view().menu.up === true && m.view().menu.down === false && m.view().menu.offset === 2 && m.view().menu.rows[7].label === 'ABOUT')), () => (J(m.view().menu)));
   m = mk(D(F.fight)); press(m, 'up'); e = m.pointer({ kind: 'click', x: 60, y: 10 + 7 * 12 + 4 });
   t('main: a click on the last visible row of a scrolled menu is that row (ABOUT), not the one the window started at', () => (m.path() === 'about'), () => (m.path()));
-  m = mk(D(F.fight)); press(m, 'up'); m.pointer({ kind: 'move', x: 60, y: 10 + 3 * 12 + 4 }); t('main: hovering a row of a scrolled menu moves the cursor to that row of the whole list', () => (m.state().cursor.main === 1 + 3), () => (String(m.state().cursor.main)));
+  m = mk(D(F.fight)); press(m, 'up'); m.pointer({ kind: 'move', x: 60, y: 10 + 3 * 12 + 4 }); t('main: hovering a row of a scrolled menu moves the cursor to that row of the whole list', () => (m.state().cursor.main === 2 + 3), () => (String(m.state().cursor.main)));          // (the window starts at row 2 of the ten: its fourth row is row 5)
 }
 
 /* ================================================================================================ the mutants */
@@ -333,11 +333,11 @@ const MUTANTS = [
   { file: 'tower_hub.js', name: 'a newer-build profile can start a run', find: "rows.push({ id: 'new', kind: 'item', label: 'NEW RUN', disabled: !writable() || !t });", replace: "rows.push({ id: 'new', kind: 'item', label: 'NEW RUN', disabled: !t });", expect: 'a profile of a newer build cannot start a run' },
   { file: 'tower_hub.js', name: 'START works while the data is loading', find: "if (env.dataState() !== 'ready') return [];", replace: "", expect: 'START while the profiles are still being read does nothing' },
   { file: 'tower_hub.js', name: 'B from a Tower screen goes to the main menu', find: "const PARENT = Object.freeze({ tower: 'main', 'tower-new': 'tower', 'tower-offer': 'tower', 'tower-buffs': 'tower', 'tower-ach': 'tower', 'tower-last': 'tower' });", replace: "const PARENT = Object.freeze({ tower: 'main', 'tower-new': 'main', 'tower-offer': 'main', 'tower-buffs': 'main', 'tower-ach': 'main', 'tower-last': 'main' });", expect: 'B goes back to the Tower screen' },
-  { file: 'hub_model.js', name: 'the TOWER row opens nothing', find: "        case 'tower': return go('tower');\n", replace: "", expect: 'the TOWER row is the third row and opens the Tower screen' },
-  { file: 'hub_model.js', name: 'the main menu does not scroll', find: "    let off = clamp(S.offset.main, 0, Math.max(0, n - MAIN_VISIBLE));\n    if (cur < off) off = cur; else if (cur >= off + MAIN_VISIBLE) off = cur - MAIN_VISIBLE + 1;", replace: "    let off = 0;", expect: 'the menu shows eight of its nine rows' },
+  { file: 'hub_model.js', name: 'the TOWER row opens nothing', find: "        case 'tower': return go('tower');\n", replace: "", expect: 'the TOWER row is the fourth row (PLAY ONLINE joined the menu above it) and opens the Tower screen' },
+  { file: 'hub_model.js', name: 'the main menu does not scroll', find: "    let off = clamp(S.offset.main, 0, Math.max(0, n - MAIN_VISIBLE));\n    if (cur < off) off = cur; else if (cur >= off + MAIN_VISIBLE) off = cur - MAIN_VISIBLE + 1;", replace: "    let off = 0;", expect: 'the menu shows eight of its ten rows' },
   { file: 'hub_model.js', name: 'a step back is not reported as one', find: "(e.type === 'screen' && up !== 'main' ? { ...e, back: true } : e)", replace: "e", expect: 'BACK returns to the Tower screen' },
   { file: 'hub_model.js', name: 'a click on a scrolled menu hits the wrong row', find: "const index = (win ? win.off : 0) + Math.floor((y - m.y) / pitch);", replace: "const index = Math.floor((y - m.y) / pitch);", expect: 'a click on the last visible row of a scrolled menu' },
-  { file: 'hub_model.js', name: 'setData forgets the Tower', find: "      return tower.onData();", replace: "      return [];", expect: 'when the offer has been taken' },
+  { file: 'hub_model.js', name: 'setData forgets the Tower', find: "      const towerFx = tower.onData();", replace: "      const towerFx = [];", expect: 'when the offer has been taken' },          // (the line changed with the apps: setData now returns the Tower's effects and then every app's)
   { file: 'hub_model.js', name: 'the Tower data is not kept', find: "readOnly: !!p.readOnly, tower: p.tower && typeof p.tower === 'object' ? JSON.parse(JSON.stringify(p.tower)) : null })) : [],", replace: "readOnly: !!p.readOnly, tower: null })) : [],", expect: 'a run waiting for its fight shows FIGHT' },
   { file: 'tower_hub.js', name: 'B on the offer asks to skip again', find: "      case 'b': return env.back();          // the Tower menu: the offer is still waiting there (CHOOSE A BUFF), and MY BUFFS is the row under it\n", replace: "      case 'b': if (o.cursor !== n) { o.cursor = n; return []; } o.confirm = { kind: 'skip', cursor: 1 }; return [];\n", expect: 'offer: B steps back to the Tower menu' },
   { file: 'tower_hub.js', name: 'a pick forgets which offer it answers', find: ", floor: c.floor, offer: c.key }];", replace: ", floor: c.floor }];", expect: 'offer: the pick carries the floor and the key' },
@@ -413,7 +413,7 @@ const frameHash = (v, s = screen) => L.fnv(s.render(v).rgba);
 const mkM = (data) => { const m = HM.createHubModel({ mascot: 25, measure: screen.measure, msgPx: screen.msgPx }); m.setData(data); return m; };
 const D = (tw, o) => mkData([tw], o);
 const at = (data, steps) => { const m = mkM(data); for (const s of steps) m.press(s); return m; };
-const GO = ['down', 'down', 'a'];                         // TOWER
+const GO = ['down', 'down', 'down', 'a'];                 // TOWER (the fourth row of the main menu)
 {
   // every Tower view draws a full opaque frame, and every message fits the message window
   const views = [];

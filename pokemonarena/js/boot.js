@@ -5,15 +5,22 @@
 // builder, the Controls panel, the Sound switch. Input is the shared input layer (input.js): keyboard, mouse, touch and controller all
 // arrive as the same twelve actions. No third-party code, no CDN. The old single-screen battle page that used to live here is gone.
 //
+// THE HUB'S APPS (hub_apps.js: online, center, builder). The model delegates their screens to js/<id>_hub.js and the renderer to js/<id>_screen.js; THIS file carries their effects out without
+// knowing any of them: an effect with a string `app` is handed to that app's ctl (js/<id>_ctl.js: createCtl(env) -> { effect, enter?, leave?, dispose? }; hub_app_ctls.js lists them), which is loaded the first time one of the
+// app's screens is entered or one of its effects appears. A REAL KEYBOARD TYPES INTO A TEXT ENTRY: while the model says wantsText(), a capture listener turns printable keys, Backspace, Enter,
+// Escape, Delete, Home, End and the left / right arrows into model.type(...) and keeps them from the input layer (so Z, X, W, A, S, D, M, P and Enter are letters, not buttons), and a paste
+// delivers its text. pokemonarena/INAPP.md "The app interface" is the contract.
+//
 // Import-safe in Node: nothing touches `document` unless it exists (tools/pokemonarena_page_test.mjs imports computeScale).
 //
-// Test hook: window.__arenaHub = { state: 'boot' | 'ready' | 'error', kind, error, model, press(), pointer(), ... } (see makeHook).
+// Test hook: window.__arenaHub = { state: 'boot' | 'ready' | 'error', kind, error, model, press(), pointer(), type(), dialog, apps, ... } (see makeHook).
 
 import { loadVerifiedRom, romUrl, RomLoadError } from './romfetch.js';
 import { loadPack } from './tables.js';
 import { createBattleUi } from './battle_ui.js';
-import { createHubModel, SCREEN_W, SCREEN_H, PATHS } from './hub_model.js';
+import { createHubModel, SCREEN_W, SCREEN_H, PATHS, arrivalTrail, historySeedPlan } from './hub_model.js';          // (arrivalTrail / historySeedPlan: the history a screen opened by address should have, for ANY hub path: the Tower's and every app's)
 import { createHubScreen } from './hub_screen.js';
+import { APP_CTLS } from './hub_app_ctls.js';          // how each hub app's ctl is loaded (a function per app that imports the file when called: nothing is loaded here)
 import { readHubData, teamCodeFor, battleHref, pickMascot } from './hub_data.js';
 import { openStore } from './store.js';
 import * as cries from './cries.js';
@@ -22,7 +29,7 @@ import { describeRomError, showRomError } from './rom_error.js';
 import { watchHints } from './hints.js';
 import { fitScale, fitPicture, createFullscreen, stackBelow } from './screenfit.js';
 import { launchFloorBattle } from './tower_launch.js';          // the one place the Tower names a page (the fight is still its own page; tomorrow this mounts it here)
-import { arrivalTrail, createStartGuard, historySeedPlan, speakTower } from './tower_hub.js';          // the Tower screens' pure helpers: the history a screen opened by address should have (and whether it needs writing), the one-start-at-a-time guard for START, the screen-reader words
+import { createStartGuard, speakTower } from './tower_hub.js';          // the Tower screens' pure helpers: the one-start-at-a-time guard for START, the screen-reader words
 
 export const GBA_FPS = 59.7275;                 // the hardware frame rate; the menu's idle-animation clock, not a speed-up knob
 const STEP_MS = 1000 / GBA_FPS;
@@ -68,7 +75,8 @@ async function main() {
   const early = { got: 0, total: 0, onProgress: null };
   const earlyLoad = loadVerifiedRom({ deferVerify: true, onProgress: (got, total) => { early.got = got; early.total = total; if (early.onProgress) early.onProgress(got, total); } });
   earlyLoad.catch(() => { /* load() awaits it and shows the error screen */ });
-  const [{ createInput }, nav, soundMod] = await Promise.all([import('./input.js').catch(() => ({})), import('./uinav.js').catch(() => ({})), import('./sound_system.js').catch((e) => { console.warn('[sound] sound_system.js did not load; the old switch is used:', e); return {}; })]);
+  const [inputMod, nav, soundMod] = await Promise.all([import('./input.js').catch(() => ({})), import('./uinav.js').catch(() => ({})), import('./sound_system.js').catch((e) => { console.warn('[sound] sound_system.js did not load; the old switch is used:', e); return {}; })]);
+  const { createInput } = inputMod;
   const $ = (id) => document.getElementById(id);
   const canvas = $('hub'), ctx = canvas.getContext('2d', { alpha: false });
   const els = { boot: $('boot'), bar: $('bar'), bootText: $('bootText'), err: $('error'), errTitle: $('errTitle'), errMsg: $('errMsg'), errDetail: $('errDetail'), retry: $('retry'), note: $('note'), status: $('romStatus'), top: $('top'), padA: $('dpad'), padB: $('ab'), sound: $('soundBtn'), controls: $('controlsBtn'), live: $('live'), dialog: $('controlsDialog'), host: $('controlsHost'), close: $('controlsClose'), keys: $('keys') };
@@ -78,6 +86,7 @@ async function main() {
   let pushed = 0;                                // history entries this page load added for hub screens
   let model = null, screen = null, ui = null, pack = null, romBytes = null, store = null, touchPad = false, dialogOpen = false, errNav = null;
   const storage = (() => { try { return window.localStorage; } catch (_e) { return null; } })();
+  const session = (() => { try { return window.sessionStorage; } catch (_e) { return null; } })();
   // WHO holds the "a dialog is up" state (the hub ignores its own keys and pointer while it is true): the Sound panel, the Controls dialog, and the Open-to-battles dialogs can be up TOGETHER (a
   // challenge arrives while Controls is open), so it is a SET of owners, not one boolean: closing one dialog never un-pauses the page behind another that is still open
   const dlgOwners = new Set();
@@ -208,6 +217,8 @@ async function main() {
   function run(effects) {
     for (const eff of effects || []) {
       hook.effects.push(eff.type);
+      if (hook.effects.length > 4000) hook.effects.splice(0, 2000);          // (a log for the tests: an app that asks for something every frame must not grow it for ever)
+      if (typeof eff.app === 'string') { appEffect(eff); continue; }          // an app's effect (a dialog's answer for an app included) goes to that app's ctl, whatever its type
       if (eff.type === 'screen') {
         // going into a screen adds a history entry; coming back to the menu steps BACK through that entry (so B and the browser's Back button agree and the history does not grow)
         try {
@@ -215,6 +226,7 @@ async function main() {
           else { history.pushState({ arenaHub: eff.path }, '', hashFor(eff.path)); if (eff.path !== 'main') pushed++; }
         } catch (_e) { /* a sandboxed frame */ }
         syncTitle();
+        syncFamily();          // (before the effects that follow in this list: an app's ctl hears enter(path) first)
       }
       else if (eff.type === 'navigate') { saveSettings(); navigate(eff.url); }
       else if (eff.type === 'sound') setSound(eff.on);
@@ -223,10 +235,11 @@ async function main() {
       else if (eff.type === 'record-reset') resetRecord(eff.profileId);
       else if (eff.type === 'tower-new' || eff.type === 'tower-fight' || eff.type === 'tower-pick' || eff.type === 'tower-giveup') towerEffect(eff);
     }
+    if (model) syncFamily();
     dirty = true;
   }
-  function syncTitle() { document.title = SCREEN_TITLES[model.path()] || SCREEN_TITLES.main; }
-  window.addEventListener('popstate', () => { if (!model) return; pushed = arrivalTrail(pathFromHash(location.hash)).length; model.goto(pathFromHash(location.hash)); syncTitle(); dirty = true; });
+  function syncTitle() { document.title = model.title(model.path()) || SCREEN_TITLES[model.path()] || SCREEN_TITLES.main; }
+  window.addEventListener('popstate', () => { if (!model) return; pushed = arrivalTrail(pathFromHash(location.hash)).length; model.goto(pathFromHash(location.hash)); syncTitle(); syncFamily(); dirty = true; });
   // The page was OPENED at a screen other than the menu (the way back from a Tower fight lands on #tower-offer or #tower-last, and a link may name any screen). Its history then holds only that one entry, so B
   // (history.back) would leave the hub for the page that was just left. Give it the entries the screen would have had if it had been walked to from the menu: the menu's own, then each screen on the way.
   // ONLY on a fresh arrival (historySeedPlan): a reload, or a back / forward step onto an entry this page wrote, already stands on the trail (its history.state carries the marker), so nothing is added and the Forward entry is kept.
@@ -241,6 +254,94 @@ async function main() {
       pushed = plan.trail.length;
     } catch (_e) { /* a sandboxed frame: B falls back to pushing the menu */ }
   }
+
+  /* ---- the hub's APPS: <id>_hub.js is the pure model the hub delegates to (hub_apps.js); <id>_ctl.js carries its effects out and is loaded the first time it is needed ---- */
+  const ctls = new Map();                        // app id -> { promise, ctl, error, chain }
+  let storeIsOpen = null; const storeOpened = new Promise((res) => { storeIsOpen = res; });          // resolves with the profile store (or null when it could not be opened): a ctl that starts before the store has may wait for it
+  hook.appEffects = [];
+  // a note in the picture (the dialog layer), one at a time per app: an id that is already open or queued is refused, so a failing ctl cannot stack them
+  const appNote = (id, a, b) => { if (model) { model.dialog.open({ id: 'app:' + id, pages: [[String(a).slice(0, 34), String(b || '').slice(0, 34)]], choice: null }); dirty = true; } };
+  const appName = (id) => String(model.title(model.app(id).paths[0]) || id).replace(/^Pokemon Arena - /, '');
+  // what an app's ctl is given (INAPP.md "The app interface"): the page's services, the hub model and the app's own model
+  const ctlEnv = (id) => ({
+    win: window, doc: document, hook, model, app: model.app(id), store: () => store, whenStore: () => storeOpened, pack, rom: romBytes, ui, navigate, input, storage, session,
+    refreshData, redraw: () => { dirty = true; draw(true); }, run, freshSeed,
+  });
+  function loadCtl(id) {
+    let c = ctls.get(id);
+    if (c) return c;
+    c = { ctl: null, error: null, problem: null, chain: Promise.resolve(), promise: null };
+    ctls.set(id, c);
+    const load = Object.prototype.hasOwnProperty.call(APP_CTLS, id) ? APP_CTLS[id] : null;
+    c.promise = (load ? load() : Promise.reject(new Error('no ctl is listed for ' + id + ' in hub_app_ctls.js'))).then((m) => {
+      if (typeof m.createCtl !== 'function') throw new Error(id + '_ctl.js does not export createCtl');
+      c.ctl = m.createCtl(ctlEnv(id)) || {};
+      return c.ctl;
+    }).catch((e) => {
+      c.error = String(e && e.message ? e.message : e);
+      console.warn('[apps] ' + id + '_ctl.js is not available', e);
+      appNote(id, appName(id) + ' could not load.', 'Reload the page and try again.');
+      return null;
+    });
+    return c;
+  }
+  // one queue per app, so its ctl hears enter(path), its effects and leave(path) in the order the hub produced them, even while the file is still loading. Each call is STARTED in that order and
+  // not waited for: a ctl whose effect() returns a promise may get the next effect while it is pending (a ctl that asks a question and waits for the answer would otherwise wait for ever)
+  function toCtl(id, what, arg) {
+    if (!model.app(id)) return Promise.resolve();
+    const c = loadCtl(id);
+    const failed = (e) => { const msg = String(e && e.message ? e.message : e); console.warn('[apps] ' + id + ' ' + what + ' failed', e); if (c.problem !== msg) { c.problem = msg; appNote(id, appName(id) + ' hit a problem:', msg); } };          // (the same fault is said once, not once per effect)
+    c.chain = c.chain.then(() => c.promise).then((ctl) => {
+      if (!ctl) { if (what === 'enter') appNote(id, appName(id) + ' could not load.', 'Reload the page and try again.'); return; }          // (said again each time its screen is opened, never once per effect)
+      if (typeof ctl[what] !== 'function') return;
+      const r = ctl[what](arg);
+      if (r && typeof r.then === 'function') r.then(null, failed);
+    }).catch(failed);
+    return c.chain;
+  }
+  function appEffect(eff) { hook.appEffects.push({ app: eff.app, type: eff.type }); if (hook.appEffects.length > 200) hook.appEffects.shift(); return toCtl(eff.app, 'effect', eff); }
+  // which app's family of screens is open: its ctl hears enter(path) when the hub's path moves into the family and leave(path) when it moves out (not for a move inside it)
+  let family = null, familyPath = null;
+  function syncFamily() {
+    const p = model.path(), a = model.appOf(p), now = a ? a.id : null;
+    if (now === family) { familyPath = p; return; }
+    if (family) toCtl(family, 'leave', familyPath);
+    family = now; familyPath = p;
+    if (now) toCtl(now, 'enter', p);
+  }
+  function disposeCtls() { for (const c of ctls.values()) { if (c.ctl && typeof c.ctl.dispose === 'function') { try { c.ctl.dispose(); } catch (_e) { /* the page is going */ } } } }
+
+  /* ---- a REAL KEYBOARD types into a text entry (textentry.js): while the open app says wantsText(), its keys are text, not buttons ---- */
+  const isTextTarget = typeof inputMod.isTextTarget === 'function' ? inputMod.isTextTarget : () => false;
+  const nativeUse = typeof inputMod.nativeUse === 'function' ? inputMod.nativeUse : () => 'none';
+  const TEXT_KEYS = Object.freeze({ Backspace: 'backspace', Enter: 'enter', Escape: 'escape', Delete: 'delete', ArrowLeft: 'left', ArrowRight: 'right', Home: 'home', End: 'end' });
+  const typingNow = () => !!model && hook.state === 'ready' && !dialogOpen && model.wantsText();          // never while a DOM dialog (Controls, Sound, the music list) is open
+  const keyTarget = (e) => { try { const p = typeof e.composedPath === 'function' ? e.composedPath() : null; if (p && p.length) return p[0]; } catch (_e) { /* ignore */ } return e.target; };
+  const heldAsText = new Set();                                            // the keys whose press was taken as text (their auto-repeat is text too; the repeat of a key that was a BUTTON press -- the Z that opened the entry -- is not)
+  window.addEventListener('keyup', (e) => { heldAsText.delete(e.code || e.key); }, true);
+  function typeText(input) { hook.typed = (hook.typed | 0) + 1; run(model.type(input)); }
+  window.addEventListener('keydown', (e) => {
+    if (!typingNow() || e.defaultPrevented) return;
+    if (e.repeat && !heldAsText.has(e.code || e.key)) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;                       // browser shortcuts (Ctrl+V arrives as a paste event, below), AltGr: left alone
+    if (e.isComposing || e.keyCode === 229) return;                        // an IME is composing
+    const t = keyTarget(e), key = e.key;
+    if (isTextTarget(t)) return;                                           // a real text field of the page keeps its own keys
+    let input = null;
+    if (Object.prototype.hasOwnProperty.call(TEXT_KEYS, key)) input = { key: TEXT_KEYS[key] };
+    else if (typeof key === 'string' && key.length === 1) input = { text: key };
+    else return;                                                           // Tab, the function keys, the up / down arrows (those two still move the key cursor) ...
+    if (nativeUse(t, key, e.code) !== 'none') return;                      // Enter or Space on a focused page button presses that button
+    e.preventDefault(); e.stopPropagation();                               // ... and nothing else sees the key: not the input layer (no game button), not the M-mutes shortcut
+    heldAsText.add(e.code || e.key);
+    typeText(input);
+  }, true);
+  window.addEventListener('paste', (e) => {
+    if (!typingNow() || isTextTarget(keyTarget(e))) return;
+    let text = ''; try { text = (e.clipboardData || window.clipboardData).getData('text') || ''; } catch (_e) { text = ''; }
+    e.preventDefault();
+    if (text) typeText({ text });
+  }, true);
 
   /* ---- the team list: read from the browser-local store (profiles are never uploaded) ---- */
   // ST1: RESET RECORD was answered YES: the profile's battle record is emptied in the store (an automatic backup and a history entry are taken there), then the list is read again
@@ -322,7 +423,8 @@ async function main() {
   }
   async function openProfiles() {
     try { store = await openStore(); hook.store = store.status && store.status.notSaved ? 'memory' : 'indexeddb'; try { store.on('external', () => refreshData()); store.on('status', () => refreshData()); } catch (_e) { /* optional */ } }
-    catch (e) { store = null; hook.store = 'unavailable'; model.setData({ state: 'unavailable', profiles: [], note: 'Storage could not be opened.' }); dirty = true; return; }
+    catch (e) { store = null; hook.store = 'unavailable'; storeIsOpen(null); run(model.setData({ state: 'unavailable', profiles: [], note: 'Storage could not be opened.' })); dirty = true; return; }
+    storeIsOpen(store);
     await refreshData();
   }
 
@@ -335,14 +437,16 @@ async function main() {
     const sig = sigOf(v);
     if (!force && sig === lastSig) { dirty = false; return; }
     lastSig = sig;
-    const f = screen.render(v);
+    // (a renderer that throws -- an app's, on a view it did not expect -- must not stop the page's clock: the picture keeps its last frame and the fault is on the hook and in the console, once per message)
+    let f; try { f = screen.render(v); } catch (e) { const msg = String(e && e.message ? e.message : e); if (hook.renderError !== msg) { hook.renderError = msg; console.error('[hub] the screen could not be drawn', e); } dirty = false; return; }
     img.data.set(f.rgba); ctx.putImageData(img, 0, 0); renders++; dirty = false;
     speak(v);
   }
   // a plain-text mirror of the canvas for screen readers (the canvas itself has only a static label)
   function speak(v) {
-    let s;
-    if (v.tower) s = speakTower(v);
+    let s = model.speak(v);          // an app's screen, a text entry or a dialog words itself (null: one of the hub's own screens, worded below)
+    if (s !== null) { /* said */ }
+    else if (v.tower) s = speakTower(v);
     else if (v.record) s = 'Record' + (v.record.trainer ? ' of ' + v.record.trainer.name : '') + ', page ' + (v.record.index + 1) + ' of ' + v.record.count + ': ' + v.record.page.title + '. ' + v.record.page.lines.map((l) => l.cells.map((c) => c.t).filter(Boolean).join(' ')).join('. ') + (v.record.confirm ? ' Choose YES or NO.' : '');
     else if (v.about) s = 'About, page ' + (v.about.page + 1) + ' of ' + v.about.pages + '. ' + v.about.lines.join(' ');
     else if (v.menu) { const r = v.menu.rows[v.menu.cursor]; s = (v.screen === 'main' ? 'Main menu. ' : v.screen === 'quick' ? 'Quick battle. ' : 'Battle with my team. ') + (r ? r.label + (r.value !== undefined ? ' ' + r.value : '') + '. ' : '') + (v.msg || []).join(' '); }
@@ -371,7 +475,7 @@ async function main() {
     let leaveArmed = -1e9;
     input.on('action', (e) => {
       if (!e.pressed || e.native || dialogOpen) return;
-      if (e.action === 'b' && e.source === 'gamepad' && !e.repeat && model.path() === 'main') {
+      if (e.action === 'b' && e.source === 'gamepad' && !e.repeat && model.path() === 'main' && !model.dialog.isOpen()) {
         const t = performance.now();
         if (t - leaveArmed < 4000) { leaveArmed = -1e9; saveSettings(); navigate('/'); return; }
         leaveArmed = t; model.notify(['Press B again to leave', 'the Arena for the site.']); dirty = true; return;
@@ -393,7 +497,7 @@ async function main() {
     let last = performance.now(), acc = 0;
     const loop = (now) => {
       const dt = Math.min(250, now - last); last = now;
-      if (!document.hidden && !hook.paused) { acc += dt; let n = 0; while (acc >= STEP_MS && n < 8) { model.tick(); acc -= STEP_MS; n++; } if (n >= 8) acc = 0; }
+      if (!document.hidden && !hook.paused) { acc += dt; let n = 0; while (acc >= STEP_MS && n < 8) { const fx = model.tick(); if (fx && fx.length) run(fx); acc -= STEP_MS; n++; } if (n >= 8) acc = 0; }          // (a tick may ask for something: a dialog that timed out, the open app's tick)
       draw(false);
       requestAnimationFrame(loop);
     };
@@ -408,8 +512,11 @@ async function main() {
       model, ui, pack, canvas,
       press: (a) => { run(model.press(a)); return model.path(); },
       pointer: (ev) => { run(model.pointer(ev)); return model.path(); },
+      type: (input) => { run(model.type(input)); return model.path(); },
+      goto: (path) => { run(model.goto(path)); return model.path(); },          // open a screen as the page does (a history entry, the title, the app's ctl): what ctx.go(path) from a press leads to
+      wantsText: () => model.wantsText(),
       view: () => model.view(),
-      tick: (n = 1) => { for (let i = 0; i < n; i++) model.tick(); draw(true); },
+      tick: (n = 1) => { for (let i = 0; i < n; i++) { const fx = model.tick(); if (fx && fx.length) run(fx); } draw(true); },
       pause: (v) => { hook.paused = !!v; },
       refresh: () => refreshData(),
       frameHash: () => fnv(screen.render(model.view()).rgba),
@@ -418,6 +525,13 @@ async function main() {
       closeControls, openControls,
       dialogOpen: () => dialogOpen,
       tower: { loaded: () => !!towerMod, effect: (e) => towerEffect(e), state: () => model.tower.state() },
+      // the dialog layer and the apps: the model's own handles, plus what the page knows about each app's ctl
+      dialog: model.dialog,
+      apps: {
+        ids: Object.keys(model.apps), state: () => model.state().apps, family: () => family,
+        loaded: () => [...ctls].filter(([, c]) => !!c.ctl).map(([id]) => id), errors: () => Object.fromEntries([...ctls].filter(([, c]) => c.error).map(([id, c]) => [id, c.error])),
+        ctl: (id) => (ctls.has(id) ? ctls.get(id).ctl : null), load: (id) => loadCtl(id).promise, idle: (id) => (ctls.has(id) ? ctls.get(id).chain : Promise.resolve()), effect: (e) => appEffect(e),
+      },
     });
     Object.defineProperty(hook, 'renders', { get: () => renders, configurable: true });
     hook.sound = { on: () => (soundSys ? soundSys.audible() : cries.isSoundOn()) };
@@ -459,7 +573,7 @@ async function main() {
       ui = createBattleUi(bytes);
       screen = createHubScreen(ui);
       const saved = readSettings(storage);
-      model = createHubModel({ sound: soundSys ? soundSys.audible() : cries.isSoundOn(), mascot: pickMascot(pack, Math.floor(Date.now() / 86400000)), env: 0, quick: saved.quick, selection: saved.selection, measure: screen.measure, msgPx: screen.msgPx });          // (the Tower wraps its long texts by the real font)
+      model = createHubModel({ sound: soundSys ? soundSys.audible() : cries.isSoundOn(), mascot: pickMascot(pack, Math.floor(Date.now() / 86400000)), env: 0, quick: saved.quick, selection: saved.selection, measure: screen.measure, msgPx: screen.msgPx, measureFont: screen.measureFont });          // (the Tower, the apps and the dialog layer wrap their texts by the real font)
     } catch (e) {
       if (!verify) { showError(romError(e)); return; }
       // A RECALLED copy only passed romcache.js's cheap checks (length, headers, cartridge header). One that is damaged INSIDE -- a table the menu decodes -- throws right here, before the re-check below is
@@ -478,6 +592,7 @@ async function main() {
     model.goto(pathFromHash(location.hash));
     seedHistory(model.path());
     syncTitle();
+    syncFamily();                                    // a page opened AT an app's screen loads that app's ctl now
     fit();
     wireInput();
     hook.state = 'ready'; hook.kind = null; hook.error = null; hook.sha256 = sha256;
@@ -508,6 +623,7 @@ async function main() {
     document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshData(); });
     window.addEventListener('pageshow', (e) => { if (e.persisted) { startGuard.reset(); refreshData(); } });          // restored from the back / forward cache: not leaving for the floor any more, so START works again
     window.addEventListener('pagehide', saveSettings);
+    window.addEventListener('pagehide', (e) => { if (!e.persisted) disposeCtls(); });          // the page is really going (not into the back / forward cache): every loaded ctl lets go of what it holds
   }
 
   let loaded = await load(earlyLoad);

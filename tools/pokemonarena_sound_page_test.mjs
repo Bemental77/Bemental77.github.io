@@ -215,7 +215,7 @@ async function scnPersistence(page, R, base) {
   R.ok(J(s) === J({ v: 1, master: 0.55, music: 0.25, fx: 0.95, muted: true, soundtrack: st0 }) && (await stored(page)) === before, '(f) settings persist across a reload (master, music, fx, mute)', J(s));
   R.ok((await page.eval(`document.getElementById('soundBtn').textContent`)) === 'Sound: off' && (await page.eval('window.__snd.ctor')) === 0, '(f) after the reload a muted page says "Sound: off" and still has no AudioContext');
   R.ok((await page.eval(`document.getElementById('soundPrompt').hidden`)) === true, 'a muted page shows no "press any key" prompt (nothing to start)');
-  R.ok((await page.eval(`${HUB}.view().menu.rows.map((r) => r.label).find((l) => /^SOUND/.test(l))`)) === 'SOUND: OFF', 'the hub SOUND row shows OFF while muted');
+  R.ok((await page.eval(`${HUB}.model.rows().map((r) => r.label).find((l) => /^SOUND/.test(l))`)) === 'SOUND: OFF', 'the hub SOUND row shows OFF while muted');
   // migration of the old key
   await page.eval(`localStorage.removeItem('arena.audio'); localStorage.setItem('arena.sound', '0');`);
   await page.navigate(base + '/pokemonarena/'); await hubReady(page);
@@ -265,7 +265,7 @@ async function scnKeyboard(page, R, base) {
   await page.waitFor(`window.__snd.ctor === 1`, { timeoutMs: 8000 });
   // the SOUND row: found by its label (other stages add rows to the hub's main menu)
   const cur = await page.eval(`${HUB}.model.state().cursor.main`);
-  const soundRow = await page.eval(`${HUB}.view().menu.rows.findIndex((r) => /^SOUND/.test(r.label))`);
+  const soundRow = await page.eval(`${HUB}.model.rows().findIndex((r) => /^SOUND/.test(r.label))`);          // (among ALL the rows: SOUND is below the eight the menu shows at once; the cursor scrolls it into view)
   for (let i = cur; i < soundRow; i++) await key(page, 'down');
   await key(page, 'a'); await sleep(300);
   R.ok(await panelOpen(page), '(d) keyboard: Enter on the hub SOUND row opens the SOUND panel (no longer a bare toggle)');
@@ -308,7 +308,7 @@ async function scnPad(page, R, base) {
   const pr = await page.eval(`({ hidden: document.getElementById('soundPrompt').hidden, why: window.__arenaSound.state().promptWhy, prompt: window.__arenaSound.state().prompt })`);
   R.ok(pr.hidden === true && pr.prompt === false && pr.why === 'pad', '(c) controller: a controller button hides the "click, tap or press a key" hint (it cannot start the sound, but it must not leave a pad-only visitor staring at it)', J(pr));
   const cur = await page.eval(`${HUB}.model.state().cursor.main`);
-  const soundRow = await page.eval(`${HUB}.view().menu.rows.findIndex((r) => /^SOUND/.test(r.label))`);
+  const soundRow = await page.eval(`${HUB}.model.rows().findIndex((r) => /^SOUND/.test(r.label))`);          // (among ALL the rows: SOUND is below the eight the menu shows at once; the cursor scrolls it into view)
   for (let i = cur; i < soundRow; i++) await pad(page, 'down');
   await pad(page, 'a'); await sleep(300);
   R.ok(await panelOpen(page), '(d) controller: A on the SOUND row opens the SOUND panel');

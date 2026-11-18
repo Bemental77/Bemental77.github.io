@@ -176,10 +176,25 @@ class Dev {
   async hubState() { return this.page.eval(`(() => { const h = window.${HUB}, m = h.model, st = m.state(); const v = m.view(); return { path: m.path(), cursor: st.cursor[m.path()], rows: v.menu ? v.menu.rows.map((r) => ({ id: r.id, label: r.label, value: r.value, disabled: !!r.disabled })) : null, allRows: m.rows().map((r) => r.id), offset: v.menu && v.menu.offset ? v.menu.offset : 0, rects: m.rects(), src: h.input ? h.input.lastSource : null, dialog: h.dialogOpen() }; })()`); }
   async hubChoose(id, { activate = true } = {}) {
     const s0 = await this.hubState();
-    // the main menu scrolls (nine rows, eight shown): the cursor is an index into ALL the rows, the rectangles are those of the rows SHOWN
+    // the main menu scrolls (ten rows, eight shown): the cursor is an index into ALL the rows, the rectangles are those of the rows SHOWN
     const idx = s0.allRows.indexOf(id);
     if (idx < 0) throw new Error('no hub row ' + id + ' in ' + J(s0.allRows));
-    if (!this.cursorBased) { const r = s0.rects[idx - s0.offset]; if (!r) throw new Error('hub row ' + id + ' is scrolled out of view; a pointer cannot reach it'); await this.pointAt(HUB + '.canvas', r.x + r.w / 2 - 20, r.y + r.h / 2, { hover: true }); return; }
+    if (!this.cursorBased) {
+      // a row below the fold (SOUND and ABOUT since PLAY ONLINE joined the menu) is scrolled into view with the device's OWN means first: the mouse by its wheel over the menu (a notch moves
+      // the cursor a row, and the window follows the cursor), a finger by the on-screen pad
+      let s = s0;
+      if (idx < s.offset || idx >= s.offset + s.rects.length) {
+        const p = await this.canvasPoint(HUB + '.canvas', 60, 16);
+        if (this.family === 'mouse') { await moveMouse(this.page, p.x, p.y); await sleep(80); }
+        for (let g = 0; g < 14; g++) {
+          s = await this.hubState();
+          if (idx >= s.offset && idx < s.offset + s.rects.length) break;
+          if (this.family === 'mouse') { await wheel(this.page, p.x, p.y, idx > s.cursor ? 100 : -100); await sleep(100); } else await this.act(idx > s.cursor ? 'down' : 'up');
+        }
+        s = await this.hubState();
+      }
+      const r = s.rects[idx - s.offset]; if (!r) throw new Error('hub row ' + id + ' is scrolled out of view; a pointer cannot reach it'); await this.pointAt(HUB + '.canvas', r.x + r.w / 2 - 20, r.y + r.h / 2, { hover: true }); return;
+    }
     for (let g = 0; g < 14; g++) {
       const s = await this.hubState();
       if (s.cursor === idx) break;

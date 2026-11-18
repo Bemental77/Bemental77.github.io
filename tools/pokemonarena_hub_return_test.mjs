@@ -718,6 +718,9 @@ async function groupBattle(origin) {
 async function groupBfcache(proxyOrigin) {
   await withBrowser({ port: CDP0 + 7, width: 900, height: 700, lock: false }, async (page) => {
     await newPage(page);
+    // (when the cache is NOT used, Chrome says why: Page.backForwardCacheNotUsed. The reasons go into the failure's detail, so a failed F1 names its cause instead of only its symptom)
+    const why = [];
+    page.handlers.push((m) => { if (m.method !== 'Page.backForwardCacheNotUsed') return; const add = (e) => why.push(e.type + ':' + e.reason + (e.context ? '(' + e.context + ')' : '')); for (const e of m.params.notRestoredExplanations || []) add(e); const walk = (t) => { if (!t) return; for (const e of t.explanations || []) add(e); for (const c of t.children || []) walk(c); }; walk(m.params.notRestoredExplanationsTree); });
     await visit(page, proxyOrigin + '/pokemonarena/');
     await page.eval('window.__marker = 424242; true');
     await page.eval('location.href = "/pokemonarena/battle.html?online=1&net=local"; true');
@@ -725,7 +728,7 @@ async function groupBfcache(proxyOrigin) {
     await page.eval('history.back(); true');
     await page.waitFor('window.__marker === 424242 && window.__arenaHub && window.__arenaHub.state === "ready"', { timeoutMs: 15000 }).catch(() => {});
     const r = await page.eval('({ marker: window.__marker || null, state: window.__arenaHub && window.__arenaHub.state, shows: window.__rec && window.__rec.shows, vis: !document.getElementById("hub").hidden })');
-    ok(r.marker === 424242 && r.state === 'ready' && r.vis, 'F1 browser Back to the hub restores the page itself from the back/forward cache (its state survived the trip: no load at all) when the server allows caching', J(r));
+    ok(r.marker === 424242 && r.state === 'ready' && r.vis, 'F1 browser Back to the hub restores the page itself from the back/forward cache (its state survived the trip: no load at all) when the server allows caching', J(r) + ' Chrome: ' + J([...new Set(why)]));
     ok(page.errors.length === 0, 'F2 and the restored hub raises no error', J(page.errors).slice(0, 200));
   });
 }

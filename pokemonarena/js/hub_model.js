@@ -10,8 +10,10 @@
 //   hub.press('a');                    // -> [{ type: 'screen', path: 'quick' }]  (a screen change; the page mirrors it into the address bar)
 //   hub.view()                         // -> a plain JSON description hub_screen.js draws
 //
-// SCREENS   main    QUICK BATTLE / BATTLE WITH MY TEAM / TOWER / RECORD / TEAM BUILDER / IMPORT SAVE / CONTROLS / SOUND / ABOUT   (more rows than fit scroll: MAIN_VISIBLE at a time)
+// SCREENS   main    QUICK BATTLE / BATTLE WITH MY TEAM / PLAY ONLINE / TOWER / TEAM BUILDER / RECORD / IMPORT SAVE / CONTROLS / SOUND / ABOUT   (more rows than fit scroll: MAIN_VISIBLE at a time)
 //           tower*  the Pokemon Tower's screens (tower_hub.js owns them; this module only hands every tower path to it): tower, tower-new, tower-offer, tower-buffs, tower-ach, tower-last
+//           APPS    every other family of screens is an APP (hub_apps.js lists them: online, center, builder). This module hands an app EVERY press / hit / pointer / rects / tick / view while one
+//                   of its paths is open, calls enter(path) / leave(path) as its screens open and close, and onData() after every data refresh. pokemonarena/INAPP.md has the contract
 //           quick   FORMAT, CPU, START, BACK            (random teams against the CPU)
 //           team    [PROFILE], TEAM, FORMAT, CPU, START, BACK   (one of the player's saved teams against a random CPU team)
 //           record  the trainer's battle record, in pages (record_model.js); left / right turn the page, up / down switch trainer (several profiles) or turn it (one),
@@ -20,6 +22,9 @@
 // INPUT     one vocabulary for every device: the twelve actions of input.js (up down left right a b x y l r start select) and, for
 //           canvas pointers, hit(x, y) / pointer({ kind: 'move' | 'click' | 'wheel' }). Mouse, touch, keyboard and controller therefore
 //           reach exactly the same states.
+// DIALOGS   hub.dialog.open({ id, pages, choice, ticksLeft?, app? }) / close(id) / current(): a message box with an optional list of options OVER ANY SCREEN (hub_dialog.js). While one is open it
+//           takes every press and pointer event; its answer is the effect { type: 'dialog', id, value, app? }, and the model of the app that asked hears it first (app.onDialog(id, value))
+// TEXT      while the open app says wantsText(path) (it has a text entry open: textentry.js), hub.type({ text } | { key }) hands it a real keyboard's keys and pastes
 // EFFECTS   { type: 'screen', path }        the screen changed (mirror it into history)
 //           { type: 'navigate', url }       leave for another page (the team builder; IMPORT SAVE opens its save-import screen)
 //           { type: 'sound', on }           the SOUND row was toggled (persist it, play a cry)
@@ -28,16 +33,22 @@
 //           { type: 'blocked', reason }     START refused (a message is also shown in the text box)
 //           { type: 'record-reset', profileId }   RESET RECORD was answered YES (the page empties that profile's record in the store and reloads the list)
 //           { type: 'tower-new' | 'tower-fight' | 'tower-pick' | 'tower-giveup', ... }   the Tower's (tower_hub.js lists them)
+//           { type: 'dialog', id, value, app? }   a dialog was answered (value: the option's index | 'timeout' | 'closed')
+//           { app: '<id>', type, ... }      ANY effect with a string `app` belongs to that app: the page hands it to the app's ctl (js/<id>_ctl.js), whatever its type
 
 import { buildRecordNotice, buildResetConfirm } from './record_model.js';
 import { createTowerHub, TOWER_PATHS, isTowerPath, towerParent } from './tower_hub.js';
+import { APPS, pathsOf, appOfPath, checkRegistry, createAppHost } from './hub_apps.js';
+import { createDialogLayer, wrapDialog, speakDialog } from './hub_dialog.js';
+import { speakEntry } from './textentry.js';
 
 export const SCREEN_W = 240, SCREEN_H = 160;
 export const FORMATS = Object.freeze(['3v3', '6v6']);
 export const CPU_LEVELS = Object.freeze(['easy', 'normal', 'hard']);
 export const BUILDER_URL = '/pokemonarena/editor.html';
 export const IMPORT_URL = '/pokemonarena/editor.html#/import';
-export const PATHS = Object.freeze(['main', 'quick', 'team', 'record', 'about', ...TOWER_PATHS]);
+const HUB_PATHS = Object.freeze(['main', 'quick', 'team', 'record', 'about', ...TOWER_PATHS]);          // the screens this module and the Tower own
+export const PATHS = Object.freeze([...HUB_PATHS, ...pathsOf(APPS)]);                                    // ... and every app's (the address hash may name any of them)
 export const MAIN_VISIBLE = 8;                   // the main menu shows this many rows; with more it scrolls (a row added later needs no change here)
 
 // geometry shared with the renderer and with hit testing (logical 240x160 pixels)
@@ -51,15 +62,37 @@ export const GEOM = Object.freeze({
     chips: Object.freeze([Object.freeze({ id: 'prev', x: 10, y: 140, w: 64, h: 16 }), Object.freeze({ id: 'back', x: 88, y: 140, w: 64, h: 16 }), Object.freeze({ id: 'next', x: 166, y: 140, w: 64, h: 16 })]) }),
 });
 
+/** Where B goes from `path`: null from the main menu, the Tower's own parent for a Tower screen, the app's parent(path) for an app screen, the main menu from everything else. */
+export function parentOf(path, apps = APPS) {
+  if (path === 'main') return null;
+  if (isTowerPath(path)) return towerParent(path) || 'main';
+  const a = appOfPath(path, apps);
+  return a ? a.parent(path) || 'main' : 'main';
+}
+/** The screens to walk through to reach `path` from the main menu, outermost first ('tower-offer' -> ['tower', 'tower-offer'], an app's nested screen likewise; the main menu -> []). The page seeds the
+ *  browser's history with these, so a screen the page was OPENED at has the same Back stack as one walked to from the menu. (tower_hub.js arrivalTrail is the same rule for the Tower's paths alone.) */
+export function arrivalTrail(path, apps = APPS) {
+  const out = [];
+  for (let p = path, n = 0; p && p !== 'main' && n < 16; p = parentOf(p, apps), n++) out.unshift(p);
+  return out;
+}
+/** What the hub page must do about its browser history when it has just booted on `path`: tower_hub.js historySeedPlan's rule, with the trail of ANY hub path (an app's included). -> { trail, write } */
+export function historySeedPlan(path, state, apps = APPS) {
+  const trail = arrivalTrail(path, apps);
+  const marked = !!state && typeof state === 'object' && typeof state.arenaHub === 'string';
+  return { trail, write: trail.length > 0 && !marked };
+}
+
 /** Row spacing of a menu of n rows: seven rows do not fit above the text box at the normal 16 px, so they sit 14 px apart; the eight rows of the main menu (RECORD joined it) sit 12 px apart. */
 export function menuPitch(n) { return n > 7 ? GEOM.menu.pitchEight : n > 6 ? GEOM.menu.pitchTight : GEOM.menu.pitch; }
 
 const MAIN_ITEMS = Object.freeze([
   { id: 'quick', label: 'QUICK BATTLE', help: ['Random teams against the CPU.', 'Pick 3v3 or 6v6 and the CPU level.'] },
   { id: 'team', label: 'BATTLE WITH MY TEAM', help: ['Fight with a team you built.', 'Make one in the TEAM BUILDER first.'] },
+  { id: 'online', label: 'PLAY ONLINE', help: ['Battle a friend, or anyone who', 'is open to battles.'] },
   { id: 'tower', label: 'TOWER', help: ['Climb 30 floors of trainers.', 'Win a buff after every floor.'] },
-  { id: 'record', label: 'RECORD', help: ['Wins, streaks, best hits, favourites', 'and your last battles, by trainer.'] },
   { id: 'builder', label: 'TEAM BUILDER', help: ['Make a profile and build teams:', 'natures, EVs, IVs, items, moves.'] },
+  { id: 'record', label: 'RECORD', help: ['Wins, streaks, best hits, favourites', 'and your last battles, by trainer.'] },
   { id: 'import', label: 'IMPORT SAVE', help: ['Bring Pokemon from your own', 'SoulGold save file. It stays here.'] },
   { id: 'controls', label: 'CONTROLS', help: ['Mouse, keyboard, controller and', 'touch all work. Change the keys here.'] },
   { id: 'sound', label: 'SOUND', help: ['Volume, music, effects, soundtrack.', 'The M key mutes on any page.'] },
@@ -90,7 +123,10 @@ export function defaultFormat(size) { return size >= 4 ? '6v6' : size === 3 ? '3
 
 /**
  * opts: { sound: bool, mascot: species id, env: terrain id, quick: { format, cpu }, selection: { profileId, teamId, cpu },
- *         pickMascot: (view-model) -> species id (default keeps the opts.mascot) }
+ *         pickMascot: (view-model) -> species id (default keeps the opts.mascot),
+ *         measure: (s) -> pixels in the message font, msgPx: the message window's inner width (the Tower wraps its texts by them),
+ *         measureFont: (font, s) -> pixels in any ROM font (what an app's ctx.measure and the dialog layer use; default 6 px a character),
+ *         apps: a list of app descriptors to host INSTEAD of hub_apps.js APPS (tests give fakes; PATHS above is the default registry's) }
  */
 export function createHubModel(opts = {}) {
   const S = {
@@ -156,6 +192,34 @@ export function createHubModel(opts = {}) {
     S.offset.main = off;
     return { off, n, size: Math.min(n, MAIN_VISIBLE) };
   }
+  /* ------------------------------------------------------------------------------------------ the dialog layer and the apps */
+  const measureFont = typeof opts.measureFont === 'function' ? (font, s) => opts.measureFont(font, String(s)) : (font, s) => (font === 'normal' && typeof opts.measure === 'function' ? opts.measure(String(s)) : String(s).length * 6);
+  const msgPx = Number.isFinite(opts.msgPx) && opts.msgPx > 40 ? opts.msgPx : 204;
+  const dialog = createDialogLayer({ measure: measureFont });
+  const appList = Array.isArray(opts.apps) ? opts.apps : APPS;
+  { const bad = checkRegistry(appList, HUB_PATHS, (p) => parentOf(p, [])); if (bad.length) throw new Error('the hub app registry is broken: ' + bad.join('; ')); }
+  const paths = appList === APPS ? PATHS : Object.freeze([...HUB_PATHS, ...pathsOf(appList)]);
+  const fxOf = (r) => (Array.isArray(r) ? r : []);
+  const pagesOf = (lines) => { const out = []; for (let i = 0; i < lines.length; i += 2) out.push([String(lines[i]), lines[i + 1] === undefined ? '' : String(lines[i + 1])]); return out.length ? out : [['', '']]; };
+  // what an app's factory is given: the data the store reader built, the screen changes, the font, a notice, and its own door to the dialog layer (the answers come back to its onDialog)
+  const apps = createAppHost(appList, (desc) => ({
+    profiles: () => S.data.profiles, activeId: () => S.data.activeId, dataState: () => S.data.state,
+    go: (path) => go(path), back: () => back(), path: () => S.path,
+    measure: measureFont, msgPx,
+    notify(lines) { const id = 'notice:' + desc.id; dialog.close(id); return dialog.open({ id, pages: Array.isArray(lines) ? pagesOf(lines) : wrapDialog(lines, measureFont, msgPx), choice: null }); },
+    dialog: Object.freeze({ open: (spec) => dialog.open({ ...spec, app: desc.id }), close: (id) => dialog.close(id), current: () => dialog.current() }),
+  }));
+  // a dialog's answer: the model of the app that asked hears it first (its effects follow the answer's), then the page hands the answer to that app's ctl
+  function dialogFx(fx) {
+    let out = [];
+    for (const e of fx) {
+      out.push(e);
+      const a = e.type === 'dialog' && e.app ? apps.byId(e.app) : null;
+      if (a && typeof a.onDialog === 'function') out = out.concat(fxOf(a.onDialog(e.id, e.value)));
+    }
+    return out;
+  }
+
   // THE TOWER (tower_hub.js): every path that starts with "tower" is its own state machine; it gets the profiles the store reader built and asks this module for screen changes
   const tower = createTowerHub({ profiles: () => S.data.profiles, activeId: () => S.data.activeId, dataState: () => S.data.state, go: (path) => go(path), back: () => back(), path: () => S.path, arrivedByLink: () => S.link, measure: opts.measure, msgPx: opts.msgPx });
 
@@ -268,11 +332,14 @@ export function createHubModel(opts = {}) {
     }
   }
 
-  function view() {
+  // (a dialog rides on whatever the screen's view is: the key exists only while one is open, so an ordinary view is exactly what it was)
+  function view() { const v = screenView(), d = dialog.view(); if (d) v.dialog = d; return v; }
+  function screenView() {
     clampCursor();
     const base = { screen: S.path, env: S.env, mascot: mascotNow(), tick: S.tick, sound: S.sound };
     if (S.path === 'record') return recordView();
     if (isTowerPath(S.path)) return tower.view(S.path, base);
+    { const a = apps.of(S.path); if (a) return { ...a.view(S.path, base), screen: S.path, app: a.id }; }
     if (S.path === 'about') {
       const pg = ABOUT_PAGES[S.about.page];
       return { ...base, title: false, about: { page: S.about.page, pages: ABOUT_PAGES.length, lines: pg.slice(), last: S.about.page === ABOUT_PAGES.length - 1 }, menu: null, msg: null };
@@ -289,9 +356,11 @@ export function createHubModel(opts = {}) {
 
   /* ------------------------------------------------------------------------------------------ transitions */
   function go(path) {
-    if (!PATHS.includes(path) || path === S.path) return [];
+    if (!paths.includes(path) || path === S.path) return [];
+    { const was = apps.of(S.path); if (was) was.leave(S.path); }          // (the app is told while its screen is still the open one)
     S.from = S.path; S.path = path; S.flash = null;
     if (isTowerPath(path)) tower.enter(path);
+    { const now = apps.of(path); if (now) now.enter(path); }
     if (path === 'about') S.about.page = 0;
     if (path === 'team') normaliseTeamSel();
     if (path === 'record') { const rp = curRecordProfile(); S.record.profileId = rp ? rp.id : null; S.record.page = 0; S.record.focus = 'page'; S.record.confirm = null; S.record.hover = null; }
@@ -300,7 +369,7 @@ export function createHubModel(opts = {}) {
   }
   function back() {
     if (S.path === 'main') return [];
-    const up = isTowerPath(S.path) ? towerParent(S.path) : 'main';
+    const up = parentOf(S.path, appList);
     return go(up).map((e) => (e.type === 'screen' && up !== 'main' ? { ...e, back: true } : e));          // a step back to a Tower screen says so (the page steps the browser history back rather than adding an entry); the page already treats a return to 'main' as one
   }
 
@@ -328,9 +397,10 @@ export function createHubModel(opts = {}) {
       switch (row.id) {
         case 'quick': return go('quick');
         case 'team': return go('team');
+        case 'online': return go('online');
         case 'tower': return go('tower');
         case 'record': return go('record');
-        case 'builder': return [{ type: 'navigate', url: BUILDER_URL }];
+        case 'builder': return go('builder');
         case 'import': return [{ type: 'navigate', url: IMPORT_URL }];
         case 'controls': return [{ type: 'controls' }];
         case 'sound': S.sound = !S.sound; return [{ type: 'sound', on: S.sound }];
@@ -355,11 +425,41 @@ export function createHubModel(opts = {}) {
   const api = {
     view,
     path: () => S.path,
-    state: () => JSON.parse(JSON.stringify({ path: S.path, cursor: S.cursor, quick: S.quick, team: S.team, sound: S.sound, about: S.about, record: { page: S.record.page, focus: S.record.focus, confirm: S.record.confirm ? S.record.confirm.cursor : null }, data: { state: S.data.state, profiles: S.data.profiles.length }, tower: tower.state() })),
-    rows: () => rows().map(({ values, ...r }) => r),
+    state: () => JSON.parse(JSON.stringify({ path: S.path, cursor: S.cursor, quick: S.quick, team: S.team, sound: S.sound, about: S.about, record: { page: S.record.page, focus: S.record.focus, confirm: S.record.confirm ? S.record.confirm.cursor : null }, data: { state: S.data.state, profiles: S.data.profiles.length }, tower: tower.state(), apps: apps.state(), dialog: dialog.state() })),
+    /** The rows of the open menu (on an app's screen: the rows of the menu its view carries, [] when it has none). */
+    rows: () => { const a = apps.of(S.path); if (a) { const mn = a.view(S.path, { screen: S.path, env: S.env, mascot: null, tick: S.tick, sound: S.sound }).menu; return mn && Array.isArray(mn.rows) ? mn.rows.map((r) => ({ ...r })) : []; } return rows().map(({ values, ...r }) => r); },
     /** The Tower's screens (tower_hub.js): a handle for the page and the tests. */
     tower,
-    tick() { S.tick = (S.tick + 1) >>> 0; },
+    /** THE APPS (hub_apps.js): { id: the app's model } for the page and the tests; app(id) -> one of them or null; appOf(path) -> the one that owns the path or null. */
+    apps: Object.freeze(apps.handles()),
+    app: (id) => apps.byId(id),
+    appOf: (path) => apps.of(path),
+    /** Every path this model knows (the hub's, the Tower's, every hosted app's). */
+    paths,
+    /** THE DIALOG LAYER (hub_dialog.js): open(spec) -> bool (shown, or queued behind the open one; false = refused), close(id) -> bool, current() -> the dialog shown or null, isOpen(). */
+    dialog: Object.freeze({ open: (spec) => dialog.open(spec), close: (id) => dialog.close(id), current: () => dialog.current(), isOpen: () => dialog.isOpen() }),
+    /** One frame (59.7275 a second). -> effects: a dialog that timed out, and whatever the open app's tick(path) asks for (an app is ticked only while one of its screens is open). */
+    tick() {
+      S.tick = (S.tick + 1) >>> 0;
+      let fx = dialogFx(dialog.tick());
+      const a = apps.of(S.path);
+      if (a) fx = fx.concat(fxOf(a.tick(S.path)));
+      return fx;
+    },
+    /** Is the open screen taking typed text (an app with a text entry open, and no dialog over it)? The page then sends a real keyboard's keys to type() instead of treating them as buttons. */
+    wantsText() { if (dialog.isOpen()) return false; const a = apps.of(S.path); return !!(a && a.wantsText(S.path)); },
+    /** Typed text for the open app: { text } (a key, or a paste) or { key: 'backspace' | 'delete' | 'left' | 'right' | 'home' | 'end' | 'enter' | 'escape' }. -> effects ([] when nothing is taking text). */
+    type(input) { if (dialog.isOpen()) return []; const a = apps.of(S.path); return a && a.wantsText(S.path) ? fxOf(a.type(S.path, input)) : []; },
+    /** The screen reader's words for a view that an app, a text entry or a dialog owns; null for the hub's own screens (the page words those). */
+    speak(v) {
+      if (!v) return null;
+      if (v.dialog) return speakDialog(v.dialog);
+      if (v.entry) return speakEntry(v.entry);
+      const a = typeof v.app === 'string' ? apps.byId(v.app) : null;
+      return a ? String(a.speak(v) || '') : null;
+    },
+    /** The page title of an app's screen (null for the hub's own: the page has those). */
+    title(path) { const a = apps.of(path); return a ? String(a.title(path) || '') || null : null; },
     setTick(n) { S.tick = n >>> 0; },
     setSound(on) { S.sound = !!on; },
     setMascot(id) { if (Number.isInteger(id)) S.mascot = id; },
@@ -377,13 +477,16 @@ export function createHubModel(opts = {}) {
       if (S.path === 'team' || S.team.profileId || S.team.teamId) normaliseTeamSel();
       if (S.path === 'record') { const rp = curRecordProfile(); S.record.profileId = rp ? rp.id : null; S.record.page = clamp(S.record.page, 0, recordPages().length - 1); S.record.confirm = null; }
       clampCursor();
-      return tower.onData();                  // the Tower's screens follow the data (a ball taken closes the offer): the effects are screen changes the page mirrors into history
+      const towerFx = tower.onData();         // the Tower's screens follow the data (a ball taken closes the offer): the effects are screen changes the page mirrors into history
+      return towerFx.concat(apps.onData());   // ... and so does every app (open or not: an app keeps its own copy of what it needs)
     },
-    goto(path) { if (!PATHS.includes(path) || path === S.path) return []; if (isTowerPath(path) && S.path === 'main') S.link = true; return go(path); },          // (also what a link or the browser's history does: a Tower screen reached that way may open the pending offer by itself)
+    goto(path) { if (!paths.includes(path) || path === S.path) return []; if (isTowerPath(path) && S.path === 'main') S.link = true; return go(path); },          // (also what a link or the browser's history does: a Tower screen reached that way may open the pending offer by itself)
     back,
     press(action) {
+      if (dialog.isOpen()) return dialogFx(dialog.press(action));          // an open dialog takes every press, whatever is under it
       if (S.path === 'record') return recordPress(action);
       if (isTowerPath(S.path)) return tower.press(S.path, action);
+      { const a = apps.of(S.path); if (a) return fxOf(a.press(S.path, action)); }
       if (S.path === 'about') {
         const last = ABOUT_PAGES.length - 1;
         if (action === 'a' || action === 'down' || action === 'right' || action === 'r') { if (S.about.page < last) { S.about.page++; return []; } return action === 'a' ? back() : []; }
@@ -406,8 +509,10 @@ export function createHubModel(opts = {}) {
     },
     /** Which thing is under the logical point? { kind: 'row', index, zone } | { kind: 'page' } | null. zone 'prev' = the left arrow of a choice row. */
     hit(x, y) {
+      if (dialog.isOpen()) return dialog.hit(x, y);
       if (S.path === 'record') return recordHit(x, y);
       if (isTowerPath(S.path)) return tower.hit(S.path, x, y);
+      { const a = apps.of(S.path); if (a) return a.hit(S.path, x, y) || null; }
       if (S.path === 'about') { const g = GEOM.about; return x >= g.x - 6 && y >= g.y - 6 && x < g.x + g.w + 6 && y < g.y + g.h + 6 ? { kind: 'page' } : null; }
       const rs = rows(), win = S.path === 'main' ? mainWindow() : null, m = GEOM.menu, shown = win ? win.size : rs.length, pitch = menuPitch(shown);
       if (x < m.x - 6 || x >= m.x + m.w + 6 || y < m.y || y >= m.y + shown * pitch) return null;
@@ -418,8 +523,10 @@ export function createHubModel(opts = {}) {
     },
     pointer(ev) {
       if (!ev) return [];
+      if (dialog.isOpen()) return dialogFx(dialog.pointer(ev));           // ... and every pointer event
       if (S.path === 'record') return recordPointer(ev);
       if (isTowerPath(S.path)) return tower.pointer(S.path, ev);
+      { const a = apps.of(S.path); if (a) return fxOf(a.pointer(S.path, ev)); }
       if (ev.kind === 'wheel') { const n = Math.abs(ev.steps || 0); const act = (ev.steps || 0) > 0 ? 'down' : 'up'; let out = []; for (let i = 0; i < n; i++) out = out.concat(api.press(act)); return out; }
       const h = ev.x === undefined || ev.x === null ? null : api.hit(ev.x, ev.y);
       if (!h) return [];
@@ -436,7 +543,9 @@ export function createHubModel(opts = {}) {
     },
     /** Rectangles the renderer and the tests use (logical pixels). */
     rects() {
+      if (dialog.isOpen()) return dialog.rects();
       if (isTowerPath(S.path)) return tower.rects(S.path);
+      { const a = apps.of(S.path); if (a) return a.rects(S.path) || []; }
       const all = rows(), win = S.path === 'main' ? mainWindow() : null, shown = win ? win.size : all.length, m = GEOM.menu, p = menuPitch(shown), from = win ? win.off : 0;
       return all.slice(from, from + shown).map((_, i) => ({ x: m.x - 4, y: m.y + i * p, w: m.w + 8, h: p }));
     },

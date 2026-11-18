@@ -9,6 +9,7 @@
 // NODE UNITS
 //   M  hub_model.js (pure state machine): navigation, wrap, back, choice rows, START effects, the team screen (loading / none / unavailable /
 //      legal / illegal / small teams / several profiles), hit testing, pointer = cursor + A, wheel, determinism, plain-JSON views.
+//      (The app host -- PLAY ONLINE, the Trainer Center, the Team Builder, the dialog layer, the text entry -- has its own suite: tools/pokemonarena_apps_test.mjs.)
 //      Each check family has MUTANTS (hub_model.js source with one defect, loaded from a temp copy) that must trip a NAMED check, and an unmutated twin.
 //   R  hub_screen.js (ROM renderer): every view draws opaque 240x160, every text fits its window, every mascot species draws, frames change with
 //      cursor / terrain / mascot, a zeroed ROM font / text colours / textbox art changes the picture, hashes match hub.golden.json (and a one-pixel
@@ -49,6 +50,7 @@ const RU = await mod('rules.js');
 const TC = await mod('teamcode.js');
 const BB = await mod('battle_boot.js');
 const EL = await mod('editor_links.js');
+const TE = await mod('textentry.js');
 const rom = L.readRom();
 const GOLDEN = path.join(root, 'pokemonarena', 'hub.golden.json');
 console.log('pokemonarena hub test; ROM', ROM_PATH, rom.length, 'B; node', process.version);
@@ -63,7 +65,7 @@ async function loadModel(mutation) {
   const n = SRC.split(mutation.find).length - 1;
   if (n !== 1) throw new Error('mutant "' + mutation.name + '": the text to replace occurs ' + n + ' times (must be 1)');
   // the mutant is written to the temp folder, so its relative import of record_model.js (ST1) is pointed at the real file
-  const src = SRC.replace(mutation.find, mutation.replace).replace("from './record_model.js'", "from '" + pathToFileURL(path.join(root, 'pokemonarena', 'js', 'record_model.js')).href + "'").replace("from './tower_hub.js'", "from '" + pathToFileURL(path.join(root, 'pokemonarena', 'js', 'tower_hub.js')).href + "'");
+  const src = SRC.replace(mutation.find, mutation.replace).replace(/from '\.\/([A-Za-z0-9_]+\.js)'/g, (_m, file) => "from '" + pathToFileURL(path.join(root, 'pokemonarena', 'js', file)).href + "'");          // (record_model.js, tower_hub.js, hub_apps.js, hub_dialog.js, textentry.js)
   const f = path.join(os.tmpdir(), 'arena-hub-mutant-' + process.pid + '-' + mutantCache.size + '.mjs');
   fs.writeFileSync(f, src);
   const m = await import(pathToFileURL(f).href);
@@ -98,12 +100,12 @@ function checkModel(M) {
   const mk = (o) => M.createHubModel({ mascot: 25, ...(o || {}) });
   // ---- main menu
   let m = mk();
-  t('main: nine items in order (W1 added IMPORT SAVE, ST1 added RECORD, the Tower added TOWER)', J(m.rows().map((r) => r.label)) === J(['QUICK BATTLE', 'BATTLE WITH MY TEAM', 'TOWER', 'RECORD', 'TEAM BUILDER', 'IMPORT SAVE', 'CONTROLS', 'SOUND: OFF', 'ABOUT']), J(m.rows().map((r) => r.label)));
-  t('main: nine rows do not fit above the text box, so the menu shows eight and scrolls', m.view().menu.rows.length === 8 && m.view().menu.total === 9 && m.view().menu.down === true && m.view().menu.up === false && m.view().menu.offset === 0, J(m.view().menu));
+  t('main: ten items in order (W1 added IMPORT SAVE, ST1 added RECORD, the Tower added TOWER, the apps added PLAY ONLINE and moved TEAM BUILDER up)', J(m.rows().map((r) => r.label)) === J(['QUICK BATTLE', 'BATTLE WITH MY TEAM', 'PLAY ONLINE', 'TOWER', 'TEAM BUILDER', 'RECORD', 'IMPORT SAVE', 'CONTROLS', 'SOUND: OFF', 'ABOUT']), J(m.rows().map((r) => r.label)));
+  t('main: ten rows do not fit above the text box, so the menu shows eight and scrolls', m.view().menu.rows.length === 8 && m.view().menu.total === 10 && m.view().menu.down === true && m.view().menu.up === false && m.view().menu.offset === 0, J(m.view().menu));
   t('main: the cursor starts on the first row', m.view().menu.cursor === 0);
-  press(m, 'up'); t('main: up from the first row wraps to the last, and the window scrolls to show it', m.state().cursor.main === 8 && m.view().menu.cursor === 7 && m.view().menu.offset === 1 && m.view().menu.up === true && m.view().menu.down === false, J(m.view().menu));
+  press(m, 'up'); t('main: up from the first row wraps to the last, and the window scrolls to show it', m.state().cursor.main === 9 && m.view().menu.cursor === 7 && m.view().menu.offset === 2 && m.view().menu.up === true && m.view().menu.down === false, J(m.view().menu));
   press(m, 'down'); t('main: down from the last row wraps to the first, and the window scrolls back', m.state().cursor.main === 0 && m.view().menu.offset === 0);
-  press(m, 'down', 'down', 'down', 'down', 'down', 'down'); t('main: six downs reach CONTROLS', m.state().cursor.main === 6 && m.rows()[6].id === 'controls');
+  press(m, 'down', 'down', 'down', 'down', 'down', 'down', 'down'); t('main: seven downs reach CONTROLS', m.state().cursor.main === 7 && m.rows()[7].id === 'controls');
   t('main: B on the main menu does nothing (a menu is not an exit)', m.press('b').length === 0 && m.path() === 'main');
   // ---- QUICK BATTLE
   m = mk();
@@ -123,9 +125,13 @@ function checkModel(M) {
   press(m, 'down'); e = m.press('a'); t('quick: BACK returns to the main menu', m.path() === 'main' && e[0].path === 'main');
   t('quick: the main cursor is where it was left (QUICK BATTLE)', m.view().menu.cursor === 0);
   m = mk(); m.press('a'); m.press('b'); t('quick: B goes back too', m.path() === 'main');
-  // ---- TEAM BUILDER / CONTROLS / SOUND / ABOUT
+  // ---- PLAY ONLINE / TEAM BUILDER (the apps' screens) / CONTROLS / SOUND / ABOUT
+  m = mk(); toRow(m, 'online'); e = m.press('a');
+  t('main: PLAY ONLINE opens the online screen (an app: hub_apps.js), in the picture', m.path() === 'online' && e.length === 1 && e[0].type === 'screen' && e[0].path === 'online' && m.view().app === 'online', J(e));
+  e = m.press('b'); t('main: B on the online screen comes back with the cursor on PLAY ONLINE', m.path() === 'main' && e.length === 1 && e[0].path === 'main' && m.rows()[m.state().cursor.main].id === 'online', J(e));
   m = mk(); toRow(m, 'builder'); e = m.press('a');
-  t('main: TEAM BUILDER navigates to the team builder', e.length === 1 && e[0].type === 'navigate' && e[0].url === '/pokemonarena/editor.html', J(e));
+  t('main: TEAM BUILDER opens the builder screen in the picture (it no longer leaves for the team builder page)', m.path() === 'builder' && e.length === 1 && e[0].type === 'screen' && e[0].path === 'builder' && m.view().app === 'builder' && eff(e, 'navigate').length === 0, J(e));
+  t('main: every app path is a hub path the address may name, and an unknown one is not', ['online', 'center', 'builder'].every((p) => M.PATHS.includes(p)) && !M.PATHS.includes('builder-nowhere'), J(M.PATHS));
   m = mk(); toRow(m, 'import'); e = m.press('a'); t('main: IMPORT SAVE navigates to the team builder save-import screen', e.length === 1 && e[0].type === 'navigate' && e[0].url === '/pokemonarena/editor.html#/import' && M.IMPORT_URL === e[0].url, J(e));
   m = mk(); toRow(m, 'controls'); e = m.press('a'); t('main: CONTROLS asks the page to open the Controls panel', e.length === 1 && e[0].type === 'controls', J(e));
   m = mk(); toRow(m, 'sound'); e = m.press('a');
@@ -192,7 +198,7 @@ function checkModel(M) {
   t('hit: the middle, top edge and bottom edge of every row map to that row', allRows);
   t('hit: left of the window and below the last row are misses', m.hit(2, 20) === null && m.hit(70, 10 + 7 * 14 + 1) === null && m.hit(200, 20) === null && m.hit(70, 5) === null);
   let ev = m.pointer({ kind: 'move', x: 60, y: 10 + 4 * 12 + 4 }); t('pointer: hover moves the cursor and activates nothing', ev.length === 0 && m.view().menu.cursor === 4);
-  ev = m.pointer({ kind: 'click', x: 60, y: 10 + 6 * 12 + 4 }); t('pointer: a click is cursor + A (CONTROLS)', ev.length === 1 && ev[0].type === 'controls', J(ev));
+  ev = m.pointer({ kind: 'click', x: 60, y: 10 + 7 * 12 + 4 }); t('pointer: a click is cursor + A (CONTROLS)', ev.length === 1 && ev[0].type === 'controls', J(ev));
   m = mk(); ev = m.pointer({ kind: 'click', x: 60, y: 14 }); t('pointer: clicking QUICK BATTLE opens it', m.path() === 'quick' && ev[0].path === 'quick');
   ev = m.pointer({ kind: 'click', x: 100, y: 10 + 1 * 16 + 4 }); t('pointer: clicking a choice row cycles it (CPU -> HARD)', rowValue(m, 'cpu') === 'HARD', rowValue(m, 'cpu'));
   ev = m.pointer({ kind: 'click', x: 60, y: 10 + 1 * 16 + 4 }); t('pointer: clicking the left half of a choice row steps BACK (CPU HARD -> NORMAL)', rowValue(m, 'cpu') === 'NORMAL' && m.view().menu.cursor === 1, rowValue(m, 'cpu'));
@@ -225,7 +231,11 @@ const MUTANTS = [
   { name: 'team START loses the team id', find: 'profileId: p.id, teamId: t.id }]', replace: 'profileId: p.id, teamId: null }]', expect: 'START on a legal team emits one battle effect' },
   { name: 'a 5-Pokemon team starts on 3v3', find: "size >= 4 ? '6v6' : size === 3 ? '3v3' : '6v6'", replace: "size >= 6 ? '6v6' : '3v3'", expect: 'a 5-Pokemon team defaults to 6v6' },
   { name: 'the wheel is ignored', find: "      if (ev.kind === 'wheel') { const n = Math.abs(ev.steps || 0); const act", replace: "      if (ev.kind === 'wheel' && false) { const n = Math.abs(ev.steps || 0); const act", expect: 'two notches down move the cursor' },
-  { name: 'the TEAM BUILDER row goes to the wrong page', find: "export const BUILDER_URL = '/pokemonarena/editor.html';", replace: "export const BUILDER_URL = '/pokemonarena/editor.htm';", expect: 'TEAM BUILDER navigates to the team builder' },
+  { name: 'the TEAM BUILDER button of the team screen goes to the wrong page', find: "export const BUILDER_URL = '/pokemonarena/editor.html';", replace: "export const BUILDER_URL = '/pokemonarena/editor.htm';", expect: 'team: A on TEAM BUILDER leaves for the team builder' },
+  { name: 'the TEAM BUILDER row of the main menu still leaves for the page', find: "        case 'builder': return go('builder');", replace: "        case 'builder': return [{ type: 'navigate', url: BUILDER_URL }];", expect: 'TEAM BUILDER opens the builder screen in the picture' },
+  { name: 'the PLAY ONLINE row opens nothing', find: "        case 'online': return go('online');\n", replace: '', expect: 'PLAY ONLINE opens the online screen' },
+  { name: 'the PLAY ONLINE row is dropped from the main menu', find: "  { id: 'online', label: 'PLAY ONLINE',", replace: "  { id: 'onlineX', label: 'PLAY ONLINE',", expect: 'PLAY ONLINE opens the online screen' },
+  { name: 'B from an app screen does not come back', find: "    const up = parentOf(S.path, appList);", replace: "    const up = parentOf(S.path, appList); if (apps.of(S.path)) return [];", expect: 'B on the online screen comes back' },
   { name: 'the left half of a choice row cannot step back', find: "h.zone === 'prev') return change(row, -1);", replace: "h.zone === 'never') return change(row, -1);", expect: 'clicking the left half of a choice row steps BACK' },
   { name: 'A on the last ABOUT page does not go back', find: "return action === 'a' ? back() : [];", replace: 'return [];', expect: 'A on the last page goes back' },
   { name: 'the active profile is not preselected', find: 'S.team.profileId = d.activeId;', replace: 'void 0;', expect: 'the active profile is preselected' },
@@ -269,7 +279,7 @@ const frameHash = (v, s = screen) => L.fnv(s.render(v).rgba);
   // every text fits its window: walk the whole state space the menu can reach
   const states = [];
   const walk = (label, fn) => states.push([label, view0(fn)]);
-  walk('main', null); for (let i = 1; i < 9; i++) walk('main' + i, (m) => { for (let k = 0; k < i; k++) m.press('down'); });
+  walk('main', null); for (let i = 1; i < 10; i++) walk('main' + i, (m) => { for (let k = 0; k < i; k++) m.press('down'); });
   walk('sound on', (m) => { toRow(m, 'sound'); m.press('a'); });
   for (const fmt of [0, 1]) for (const cpu of [0, 1, 2]) for (const row of [0, 1, 2, 3]) walk('quick f' + fmt + ' c' + cpu + ' r' + row, (m) => { m.press('a'); if (fmt) m.press('right'); m.press('down'); for (let k = 0; k < cpu; k++) m.press('right'); for (let k = 1; k < row; k++) m.press('down'); if (row === 0) { m.press('up'); } if (row === 3) m.press('down'); });
   for (let ti = 0; ti < 5; ti++) for (const row of [0, 1, 2, 3, 4, 5]) walk('team t' + ti + ' r' + row, (m) => { m.press('down'); m.press('a'); m.press('down'); for (let k = 0; k < ti; k++) m.press('right'); for (let k = 0; k < row - 1; k++) m.press('down'); if (row === 0) m.press('up'); });
@@ -314,7 +324,7 @@ const frameHash = (v, s = screen) => L.fnv(s.render(v).rgba);
   const TF = await L.towerFixtures(pack);
   const twData = (tw) => ({ state: 'ready', activeId: 'p1', profiles: [{ id: 'p1', name: 'RED', readOnly: false, tower: tw, teams: [{ id: 't1', name: 'Kanto Squad', size: 3, legal: true, problems: 0, names: ['A', 'B', 'C'], lead: { species: 25 }, ruleset: 'arena-gen3-standard' }] }] });
   const twView = (tw, steps) => view0((m) => { m.setData(twData(tw)); for (const k of steps) m.press(k); });
-  const TW = ['down', 'down', 'a'];
+  const TW = ['down', 'down', 'down', 'a'];                 // TOWER is the fourth row of the main menu
   Object.assign(GV, {
     'main-scrolled': view0((m) => { m.press('up'); }),
     'tower-home-fight': twView(TF.fight, TW), 'tower-home-none': twView(TF.none, TW), 'tower-home-giveup': twView(TF.fight, [...TW, 'down', 'down', 'a']),
@@ -324,6 +334,21 @@ const frameHash = (v, s = screen) => L.fnv(s.render(v).rgba);
     'tower-ach': twView(TF.fight, [...TW, 'down', 'down', 'down', 'down', 'a']), 'tower-ach-8': twView(TF.fight, [...TW, 'down', 'down', 'down', 'down', 'a', ...Array(9).fill('down')]),
     'tower-last': twView(TF.none, [...TW, 'down', 'a']), 'tower-noprofile': view0((m) => { m.setData({ state: 'ready', activeId: null, profiles: [] }); for (const k of TW) m.press(k); }),
   });
+  // the shell's own layers, as hub_screen.js draws them over whatever is open: the text entry (any view that carries `entry`) and the dialog layer (`dialog`). They are drawn here over the
+  // hub's own main menu, so these pictures do not depend on what any app shows. Their behaviour, and the three placeholder apps, are tested in tools/pokemonarena_apps_test.mjs.
+  const CODE = 'ARENA1.' + 'eJxjYGBgYWBg_M-AwMDIwMDwn4GBgQEAFQYCAQ'.repeat(30).slice(0, 1012) + '.1a2b';          // 1024 characters of the team code alphabet
+  const entryOver = (o, fn) => { const e = TE.createTextEntry({ id: 'e', title: 'YOUR NAME?', value: '', max: 10, charset: 'name', ...(o || {}) }); if (fn) fn(e); return { ...view0(), entry: e.view() }; };
+  Object.assign(GV, {
+    'main-online-row': view0((m) => { toRow(m, 'online'); }),
+    'entry-name-empty': entryOver(), 'entry-name-lower': entryOver({}, (e) => { e.type({ text: 'Red' }); e.press('select'); e.press('down'); }),
+    'entry-teamcode-1024': entryOver({ title: 'TEAM CODE?', charset: 'teamcode', max: 1024 }, (e) => { e.type({ text: CODE }); }),
+    'dialog-yesno-main': view0((m) => { m.dialog.open({ id: 'q', pages: [['RED wants to battle you.', '3v3, standard rules.']], choice: { options: ['YES', 'NO'], cursor: 1 } }); }),
+    'dialog-notice-more': view0((m) => { m.dialog.open({ id: 'n', pages: [['The first page of a notice.', 'A turns the page.'], ['The second page.', '']], choice: null }); }),
+    'dialog-over-entry': { ...view0((m) => { m.dialog.open({ id: 'q', pages: [['Keep this name?', '']], choice: { options: ['YES', 'NO', 'LATER'], cursor: 0 } }); }), entry: TE.createTextEntry({ id: 'e', title: 'YOUR NAME?', value: 'Red', max: 10, charset: 'name' }).view() },
+  });
+  for (const k of ['entry-name-empty', 'entry-name-lower', 'entry-teamcode-1024', 'dialog-yesno-main', 'dialog-notice-more', 'dialog-over-entry']) states.push([k, GV[k]]);
+  { let over2 = []; for (const [label, v] of states.slice(-6)) for (const w of screen.widths(v)) if (w.px > w.max) over2.push(label + ': ' + w.what + ' ' + w.px + ' > ' + w.max); ok(over2.length === 0, 'R. every dialog line and option, and every entry title, field and note, fits its window', over2.slice(0, 4).join('; ')); }
+  ok(new Set(['entry-name-empty', 'entry-name-lower', 'entry-teamcode-1024', 'dialog-yesno-main', 'dialog-notice-more', 'dialog-over-entry', 'main-0'].map((k) => frameHash(GV[k]))).size === 7, 'R. the text entry and the dialog layer change the picture (seven different pictures over one menu)');
   const got = {}; for (const [k, v] of Object.entries(GV)) got[k] = frameHash(v);
   if (UPDATE) { fs.writeFileSync(GOLDEN, JSON.stringify({ note: 'hashes only (fnv1a of the 240x160 RGBA frame); regenerate with node tools/pokemonarena_hub_test.mjs --update', rom: 'Pokemon SoulGold v1.1.1', views: got }, null, 2) + '\n'); console.log('hub.golden.json written'); }
   const gold = fs.existsSync(GOLDEN) ? JSON.parse(fs.readFileSync(GOLDEN, 'utf8')).views : null;
@@ -410,10 +435,10 @@ const url = (q = '') => BASE + '/pokemonarena/' + q;
 const HUB = '__arenaHub';
 const hv = (page) => page.eval(`${HUB}.view()`);
 const where = (page) => page.eval(`${HUB}.model.path()`);
-const cursor = (page) => page.eval(`${HUB}.view().menu ? ${HUB}.view().menu.cursor : -1`);          // the cursor's place in the rows SHOWN (the main menu shows eight of its nine)
+const cursor = (page) => page.eval(`${HUB}.view().menu ? ${HUB}.view().menu.cursor : -1`);          // the cursor's place in the rows SHOWN (the main menu shows eight of its ten)
 const mainCursor = (page) => page.eval(`${HUB}.model.state().cursor.main`);                         // ... and in ALL the rows
-// ABOUT is the ninth row and the menu shows eight: walk the cursor onto it (the window scrolls to keep it in view), by the on-screen pad or by key
-const reachAbout = async (page, how) => { for (let i = 0; i < 12 && (await mainCursor(page)) !== 8; i++) { if (how === 'pad') await tapSel(page, '#bDown'); else await key(page, 'down'); await sleep(80); } };
+// ABOUT is the tenth row and the menu shows eight: walk the cursor onto it (the window scrolls to keep it in view), by the on-screen pad or by key
+const reachAbout = async (page, how) => { for (let i = 0; i < 14 && (await mainCursor(page)) !== 9; i++) { if (how === 'pad') await tapSel(page, '#bDown'); else await key(page, 'down'); await sleep(80); } };
 const rowVal = (page, id) => page.eval(`(() => { const r = ${HUB}.view().menu.rows.find((x) => x.id === ${J(id)}); return r ? r.value : null; })()`);
 const msgOf = (page) => page.eval(`${HUB}.view().msg.join(' ')`);
 const shot = async (page, name) => { await page.screenshot(path.join(OUT, name + '.png')); return name; };
@@ -503,18 +528,20 @@ try {
     // BACK with the on-screen B button
     await tapSel(page, '#bB'); await sleep(150);
     ok((await where(page)) === 'main', tag + 'the on-screen B button goes back');
-    // on-screen pad: down x4 then A -> TEAM BUILDER navigates (ST1: TOWER is the third row, RECORD the fourth, TEAM BUILDER the fifth)
+    // on-screen pad: down x4 then A -> TEAM BUILDER (the fifth row) opens the builder screen IN THE PICTURE (an app of the hub: what that screen offers is tested with it, in pokemonarena_apps_test.mjs)
     for (let i = 0; i < 4; i++) { await tapSel(page, '#bDown'); await sleep(100); }
     ok((await cursor(page)) === 4, tag + 'the on-screen pad moves the cursor (four downs -> TEAM BUILDER)', String(await cursor(page)));
     await tapSel(page, '#bA'); await sleep(200);
-    const n2 = await navs(page); ok(n2.length === 2 && n2[1] === '/pokemonarena/editor.html', tag + 'A on TEAM BUILDER goes to the team builder', J(n2));
+    ok((await where(page)) === 'builder' && (await page.eval('location.hash')) === '#builder' && (await navs(page)).length === 1, tag + 'A on TEAM BUILDER opens the builder screen in the picture (#builder; nothing navigated)', (await where(page)) + ' ' + J(await navs(page)));
+    await tapSel(page, '#bB'); await sleep(250);
+    ok((await where(page)) === 'main' && (await page.eval('location.hash')) === '', tag + 'the on-screen B button leaves the builder screen for the main menu');
     // MY TEAM with no profile
     await tapLogical(page, `${HUB}.canvas`, 60, mainY(1)); await sleep(300);
     ok((await where(page)) === 'team', tag + 'tapping BATTLE WITH MY TEAM opens the team screen');
     ok(/no team yet/i.test(await msgOf(page)) && (await page.eval(`${HUB}.view().menu.rows.map((r) => r.label).join()`)) === 'TEAM BUILDER,BACK', tag + 'with no profile it offers TEAM BUILDER (message: ' + await msgOf(page) + ')');
     await shot(page, 'hub_touch_3_team_empty');
     await tapSel(page, '#bB'); await sleep(120);
-    // ABOUT by tapping its window (it is the ninth row: the on-screen UP wraps to it and scrolls it into the eighth window)
+    // ABOUT by tapping its window (it is the tenth row: the on-screen pad walks to it and scrolls it into the eighth place of the window)
     await reachAbout(page, 'pad'); await sleep(60);
     await tapLogical(page, `${HUB}.canvas`, 60, mainY(7)); await sleep(150);
     ok((await where(page)) === 'about', tag + 'tapping ABOUT opens it');
@@ -551,11 +578,13 @@ try {
     ok((await page.eval(`${HUB}.sound.on()`)) === true && (await page.eval(`localStorage.getItem('arena.audio')`)) === null && (await page.eval(`localStorage.getItem('arena.sound')`)) === null && (await page.eval('window.__audioLog.ctor')) <= 1 && (await page.eval('window.__arenaSound.state().mixer.ctx')) !== 'running', tag + 'SOUND IS ON BY DEFAULT (MU3): nothing stored, and nothing is RUNNING before the first click, tap or key (the page tried at load: its context, if the double made one, is suspended, as a real browser keeps it without a gesture)');
     // (UPDATED DELIBERATELY with the new defaults: nothing stored now means Master 50%, and the visible audio bar says so)
     ok((await page.eval(`window.__arenaSound.mixer.getAudioState().settings.master`)) === 0.5 && (await page.eval(`document.getElementById('abVolume').value`)) === '50', tag + 'the starting volume is half the slider: Master 0.5, and the bar\'s slider reads 50');
-    // keyboard: down x4, Enter -> TEAM BUILDER (ST1: RECORD sits between BATTLE WITH MY TEAM and TEAM BUILDER)
+    // keyboard: down x4, Enter -> TEAM BUILDER (the fifth row) opens the builder screen in the picture (an app of the hub: what that screen offers is tested with it, in pokemonarena_apps_test.mjs)
     for (let i = 0; i < 4; i++) await key(page, 'down'); await sleep(80);
     ok((await cursor(page)) === 4, tag + 'four ArrowDown presses reach TEAM BUILDER');
     await key(page, 'a'); await sleep(200);
-    ok(J(await navs(page)) === J(['/pokemonarena/editor.html']), tag + 'Enter on TEAM BUILDER navigates to the team builder', J(await navs(page)));
+    ok((await where(page)) === 'builder' && (await navs(page)).length === 0 && (await page.eval('location.hash')) === '#builder' && /Team Builder/.test(await page.eval('document.title')), tag + 'Enter on TEAM BUILDER opens the builder screen in the picture (#builder, the title follows; nothing navigated)', (await where(page)) + ' ' + J(await navs(page)));
+    await key(page, 'esc'); await sleep(250);
+    ok((await where(page)) === 'main' && (await page.eval('location.hash')) === '' && (await cursor(page)) === 4, tag + 'Escape leaves the builder screen for the main menu, with the cursor on TEAM BUILDER');
     // Z opens quick, ArrowRight cycles, Backspace goes back
     await page.eval(`${HUB}.press('up'); ${HUB}.press('up'); ${HUB}.press('up'); ${HUB}.press('up')`);
     await key(page, 'z'); await sleep(120);
@@ -566,9 +595,9 @@ try {
     await key(page, 'b'); await sleep(120); ok((await where(page)) === 'main', tag + 'Backspace goes back');
     await key(page, 'z'); await sleep(100); await key(page, 'esc'); await sleep(120); ok((await where(page)) === 'main', tag + 'Escape goes back too');
     // mouse: hover moves the cursor without activating
-    const p3 = await logicalToPage(page, `${HUB}.canvas`, 60, mainY(6));
+    const p3 = await logicalToPage(page, `${HUB}.canvas`, 60, mainY(7));
     await moveMouse(page, p3.x, p3.y); await sleep(120);
-    ok((await cursor(page)) === 6 && (await where(page)) === 'main', tag + 'hovering the CONTROLS row moves the cursor and activates nothing');
+    ok((await cursor(page)) === 7 && (await where(page)) === 'main', tag + 'hovering the CONTROLS row (the eighth) moves the cursor and activates nothing');
     ok((await page.eval(`getComputedStyle(${HUB}.canvas).cursor`)) === 'pointer', tag + 'the mouse pointer becomes a hand over a row', await page.eval(`getComputedStyle(${HUB}.canvas).cursor`));
     await clickLogical(page, `${HUB}.canvas`, 60, mainY(0)); await sleep(150);
     ok((await where(page)) === 'quick', tag + 'a click on QUICK BATTLE opens it');
@@ -585,7 +614,7 @@ try {
     await shot(page, 'hub_kbd_1_main');
     // history: screens are real history entries
     const hist0 = await page.eval('history.length');
-    await reachAbout(page, 'key');                                              // the ninth row: the window scrolls to show it
+    await reachAbout(page, 'key');                                              // the tenth row: the window scrolls to show it
     await clickLogical(page, `${HUB}.canvas`, 60, mainY(7)); await sleep(150);   // ABOUT
     ok((await where(page)) === 'about' && (await page.eval('location.hash')) === '#about' && (await page.eval('history.state && history.state.arenaHub')) === 'about', tag + 'opening ABOUT pushes a history entry for it (#about, state arenaHub=about)');
     await page.eval('history.back()'); await sleep(250);
@@ -609,9 +638,9 @@ try {
     const L3 = await page.eval('history.length');
     ok(L3 - L2 >= 5, tag + 'control: when B pushes a new entry instead of stepping back, three round trips pile up ' + (L3 - L2) + ' entries (so the check above can fail)', L2 + ' -> ' + L3);
     await boot(page);
-    // sound: Enter on SOUND (cursor 7); double counts; persisted
+    // sound: Enter on SOUND (cursor 8); double counts; persisted
     await page.eval(`${HUB}.model.goto('main')`);
-    while ((await mainCursor(page)) !== 7) await key(page, 'down');
+    while ((await mainCursor(page)) !== 8) await key(page, 'down');
     await key(page, 'a'); await sleep(400);
     // MU3's policy: Enter on SOUND OPENS the SOUND panel (it no longer toggles); that Enter is the first gesture, so it created the page's one (fake) AudioContext
     const soundOpen = () => page.eval(`(() => { const d = document.getElementById('soundDialog'); return !!d && !d.hidden; })()`);
@@ -641,7 +670,7 @@ try {
     await page.eval(`localStorage.removeItem('arena.audio'); localStorage.setItem('arena.sound', '0')`);
     // Controls dialog by keyboard
     await boot(page);
-    while ((await mainCursor(page)) !== 6) await key(page, 'down');
+    while ((await mainCursor(page)) !== 7) await key(page, 'down');
     await key(page, 'a'); await page.waitFor(`${HUB}.dialogOpen()`, { timeoutMs: 8000 });
     const c3 = await cursor(page);
     ok((await page.eval(`document.getElementById('controlsDialog').getAttribute('aria-modal')`)) === 'true' && (await page.eval(`!!document.querySelector('#controlsDialog .ip')`)), tag + 'Enter on CONTROLS opens the modal dialog with the input panel');
@@ -695,7 +724,7 @@ try {
     await padPress(page, 1);
     ok((await page.eval(`window.__navTo`)) === '/', tag + 'A7: a second B leaves for the site', String(await page.eval(`window.__navTo`)));
     await page.eval(`window.__navTo = null`);
-    for (let i = 0; i < 6; i++) await padPress(page, 13);
+    for (let i = 0; i < 7; i++) await padPress(page, 13);                // CONTROLS is the eighth row
     await padPress(page, 0); await page.waitFor(`${HUB}.dialogOpen()`, { timeoutMs: 8000 });
     ok(true, tag + 'A on CONTROLS opens the dialog');
     await padPress(page, 1); await sleep(200);

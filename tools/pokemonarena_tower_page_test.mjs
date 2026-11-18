@@ -143,8 +143,8 @@ try {
     const started = await ev(page, START_RUN(pid, seeded.team, SEED_A, '3v3'));
     ok(started.applied && started.floor === 1 && started.phase === 'battle', tag + 'a run starts at floor 1, waiting for its fight', J(started));
     await openHub(page);
-    ok((await where(page)) === 'main' && (await rowsOf(page)).indexOf('tower') === 2, tag + 'the hub opens on the main menu; TOWER is its third row');
-    await tapLogical(page, `${HUB}.canvas`, 60, mainY(2)); await sleep(300);
+    ok((await where(page)) === 'main' && (await rowsOf(page)).indexOf('tower') === 3, tag + 'the hub opens on the main menu; TOWER is its fourth row (PLAY ONLINE joined the menu above it)');
+    await tapLogical(page, `${HUB}.canvas`, 60, mainY(3)); await sleep(300);
     ok((await where(page)) === 'tower', tag + 'tapping TOWER opens the Tower screen');
     const home = await labelsOf(page);
     ok(home[0] === 'FIGHT: FLOOR 1' && home.includes('MY BUFFS') && home.includes('ACHIEVEMENTS'), tag + 'it offers FIGHT: FLOOR 1, MY BUFFS and ACHIEVEMENTS', J(home));
@@ -267,8 +267,8 @@ try {
     ok(started.applied, tag + 'a run starts', J(started));
     await openHub(page);
     await page.send('Runtime.evaluate', { expression: `window.dispatchEvent(new Event('gamepadconnected'))` });
-    await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(300);
-    ok((await where(page)) === 'tower', tag + 'down, down, Enter opens the Tower screen');
+    await key(page, 'down'); await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(300);
+    ok((await where(page)) === 'tower', tag + 'down, down, down, Enter opens the Tower screen');
     await shot(page, 'desk_1_home');
     await key(page, 'a');
     ok((await toBattle(page)) === 'ready', tag + 'Enter on FIGHT opens floor 1');
@@ -339,7 +339,7 @@ try {
     // ---- NEW RUN from the hub: a random team, floor 1 opens by itself
     await openHub(page);
     await page.send('Runtime.evaluate', { expression: `window.dispatchEvent(new Event('gamepadconnected'))` });
-    await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(300);
+    await key(page, 'down'); await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(300);
     const h2 = await labelsOf(page);
     ok(h2[0] === 'NEW RUN', tag + 'with the run over the Tower screen offers NEW RUN first', J(h2));
     await key(page, 'a'); await sleep(250);
@@ -369,7 +369,7 @@ try {
     const pressB = async () => { await ev(page, `${HUB}.press('b')`); await sleep(300); };
     await openHub(page);
     // ---- NO PROFILE YET: START pressed twice in the same moment makes ONE profile and ONE run (not two profiles, not a run made and at once given up)
-    await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(300);
+    await key(page, 'down'); await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(300);
     ok((await where(page)) === 'tower', tag + 'with no profile the Tower screen opens');
     await key(page, 'a'); await sleep(250);
     ok((await where(page)) === 'tower-new', tag + 'NEW RUN opens the team screen');
@@ -401,7 +401,7 @@ try {
     const started = await ev(page, START_RUN(pid, seeded.team, SEED_B, '3v3'));
     ok(started.applied, tag + 'a run with the seeded team starts', J(started));
     await openHub(page);
-    await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(300);
+    await key(page, 'down'); await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(300);
     await key(page, 'a');
     ok((await toBattle(page)) === 'ready', tag + 'FIGHT opens floor 1');
     ok((await ev(page, DRIVE("a.mode === 'action' && a.ctl.turn >= 1"))) === 'action', tag + 'it is begun');
@@ -419,7 +419,7 @@ try {
     ok((await where(page)) === 'main' && (await ev(page, `location.pathname.endsWith('/pokemonarena/') && window.__m === 7`)) === true, tag + 'B again lands on the hub\'s MAIN MENU, in the same page: B, B never leaves the hub for the battle page it came from', J({ path: await where(page), href: await ev(page, 'location.href'), m: await ev(page, 'window.__m') }));
     ok((await ev(page, 'history.length')) === len0 + 1 || (await ev(page, 'history.length')) === len0, tag + 'and the history did not run away (' + len0 + ' -> ' + (await ev(page, 'history.length')) + ')');
     // the browser's own Back steps through the same screens
-    await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(250);
+    await key(page, 'down'); await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(250);
     await key(page, 'a'); await sleep(250);
     ok((await where(page)) === 'tower-offer', tag + 'CHOOSE A BUFF opens the same offer');
     await ev(page, `history.back()`); await sleep(400);
@@ -456,7 +456,7 @@ try {
     const tower1 = async () => { const ps = await ev(page, PROFILES); return ps.length === 1 ? ps[0] : null; };
     await openHub(page);
     // ---- START, B, NEW RUN, START inside ONE tick: two visits to NEW RUN (two tokens), and still ONE profile and ONE run (the guard is page-wide, not per token)
-    await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(300);
+    await key(page, 'down'); await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(300);
     await key(page, 'a'); await sleep(250);
     ok((await where(page)) === 'tower-new', tag + 'with no profile NEW RUN opens the team screen');
     await key(page, 'down'); await key(page, 'down');
@@ -515,7 +515,7 @@ try {
     await ev(page, `${HUB}.press('b')`); await sleep(300);
     ok((await where(page)) === 'main' && (await ev(page, `location.pathname.endsWith('/pokemonarena/') && window.__m === 9`)) === true, tag + 'B again is the MAIN MENU, in the same page, after the reloads: B, B never leaves the hub for the page before it', J({ path: await where(page), href: await ev(page, 'location.href') }));
     // the Forward entry survives a back arrival (the hub is rebooted or restored; either way nothing is rewritten)
-    await ev(page, `${HUB}.press('down')`); await ev(page, `${HUB}.press('down')`); await ev(page, `${HUB}.press('a')`); await sleep(300);
+    await ev(page, `${HUB}.press('down')`); await ev(page, `${HUB}.press('down')`); await ev(page, `${HUB}.press('down')`); await ev(page, `${HUB}.press('a')`); await sleep(300);
     const lenIn = await ev(page, 'history.length');
     await page.navigate(BASE + '/pokemonarena/js/battle_resume.js');
     await ev(page, `history.back()`); await sleep(500);
