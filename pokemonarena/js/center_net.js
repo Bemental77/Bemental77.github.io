@@ -20,9 +20,13 @@
 //
 // LIKE THE BOARD, EVERYTHING HERE IS ADVICE FROM STRANGERS. Every message is shape-checked (checkCenterMsg): a name that is not already safe text (what the board's cleanName leaves of it)
 // is refused, a look that is not a valid code of a sprite a player can be is refused, a position that is not a cell of THIS room a trainer can stand on is refused, an emote that is not
-// one of the ROM's is refused, one sender cannot send more than TIMING.perSenderMax messages a second,
-// the whole room is cut off above TIMING.totalMax, and the roster holds at most TIMING.maxWalkers trainers. Nobody can move anybody but themselves (a sender id is just a claim,
-// but the worst a copycat can do is draw a second trainer with the same name; talking to a trainer always goes through the board, where their own listing answers).
+// one of the ROM's is refused, and the roster holds at most TIMING.maxWalkers trainers.
+// TWO CAPS, IN THIS ORDER: one sender cannot be heard more than TIMING.perSenderMax times a second, and what a sender sends beyond that is dropped BEFORE the room's own count, so one page
+// that floods (a bug, a stuck loop) is cut off by itself and the others are still heard; then the whole room is cut off above TIMING.totalMax messages a second (a flood under many sender
+// ids still deafens it for the rest of that second: nothing on a public topic can tell those from a crowd).
+// WHAT A STRANGER CAN STILL DO, honestly: a sender id is only a claim, so anybody who has heard a trainer's id can send a step in their name. The room then shows that trainer on the
+// forged cell until their own next `here` or step puts them back (at most TIMING.hereMs later), and a forged `bye` takes them out for as long. Nothing else follows from it: a forged
+// cell is still a cell of the room, and talking to a trainer always goes through the board, where their own listing answers.
 // There is no free text: an emote is the number of an icon.
 //
 // Pure: no DOM, no network, timers injected. tools/pokemonarena_center_test.mjs runs it in Node.
@@ -180,13 +184,15 @@ export function createCenter({ bus, me, rules = NO_ROOM, now, timers, random = d
     if (closed) return;
     const t = clock();
     if (t - winStart > 1000) { winStart = t; winCount = 0; }
+    // one sender's share first, by the id the message CLAIMS (junk with no id shares one): a page that floods is cut off here, before it can use up the room's count
+    const who = raw && typeof raw === 'object' && typeof raw.s === 'string' ? raw.s.slice(0, 16) : '';
+    let p = per.get(who);
+    if (!p || t - p.start > 1000) { p = { start: t, n: 0 }; per.set(who, p); if (per.size > 200) per.delete(per.keys().next().value); }
+    if (++p.n > timing.perSenderMax) return;
     if (++winCount > timing.totalMax) return;
     const r = checkCenterMsg(raw, rules);
     if (!r.ok || r.b.s === sid) return;
     const b = r.b;
-    let p = per.get(b.s);
-    if (!p || t - p.start > 1000) { p = { start: t, n: 0 }; per.set(b.s, p); if (per.size > 200) per.delete(per.keys().next().value); }
-    if (++p.n > timing.perSenderMax) return;
     if (b.k === 'ask') {
       if (started && t - lastAnswer >= timing.answerGapMs) {
         lastAnswer = t;
