@@ -66,26 +66,24 @@ const shot = async (p, name) => { if (SHOTS) { try { await p.screenshot(path.joi
 let ANIM = '&anim=0';           // the scene's move animations take real time to play; the cases that are not about them skip them (groupMatch plays one with them ON, the production default)
 async function openRoom(page, room, role, extra = '', base = BASE) {          // (base: a mutated copy of the game served by profileDesync's --mutants)
   await page.navigate(`${base}?np=${room}&${role === 'host' ? 'host=1' : 'join=1'}&net=local${ANIM}${extra}`);
-  await page.waitFor('window.__arenaOnline && document.getElementById("olGo") && !document.getElementById("olGo").disabled && window.__arenaBattle && window.__arenaBattle.state === "online"', { timeoutMs: 90000 });
+  await page.waitFor('window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "online" && window.__arenaOnline.view().canGo', { timeoutMs: 90000 });
 }
-// fill the setup panel and press the button. team: 'random' | 'paste' (with code) ; fmt only matters to the host
+// set the form (the hook's setForm: what the hub's online menu stores as preferences) and press the page's button (go()). team: 'random' | 'paste' (a code, which pair() put in the address) ; fmt only matters to the host
 async function fillAndGo(page, { name, team = 'random', code = '', fmt }) {
-  return page.eval(`(() => {
-    document.getElementById('olName').value = ${JSON.stringify(name)};
-    const t = document.getElementById('olTeam'); t.value = ${JSON.stringify(team)}; t.dispatchEvent(new Event('change'));
-    ${code ? `document.getElementById('olPaste').value = ${JSON.stringify(code)};` : ''}
-    ${fmt ? `document.getElementById('olFmt').value = ${JSON.stringify(fmt)};` : ''}
-    document.getElementById('olGo').click();
-    return document.getElementById('olStatus').textContent; })()`);
+  void code;          // (a team code rides in the ADDRESS, &team=: pair() puts it there, and `team: 'paste'` then means the choice 'url', "the team in the address")
+  return page.eval(`(() => { const O = window.__arenaOnline;
+    O.setForm({ teamKey: ${JSON.stringify(team === 'paste' ? 'url' : team)}, name: ${JSON.stringify(name)}${fmt ? ', fmt: ' + JSON.stringify(fmt) : ''} });
+    void O.go();
+    return O.view().status.text; })()`);
 }
 // a room lets the first player in by itself (there is no Allow prompt any more): nothing to press. Kept as a seam so a case can say where the old prompt was.
 async function approve(_host) { /* nothing to answer */ }
 // two tabs paired and past the handshake (or failed): returns the final phases
 async function pair(host, guest, room, o = {}) {
-  await openRoom(host, room, 'host', o.hostExtra || '');
-  await openRoom(guest, room, 'guest', o.guestExtra || '');
+  await openRoom(host, room, 'host', (o.hostExtra || '') + (o.hostCode ? '&team=' + encodeURIComponent(o.hostCode) : ''));
+  await openRoom(guest, room, 'guest', (o.guestExtra || '') + (o.guestCode ? '&team=' + encodeURIComponent(o.guestCode) : ''));
   await fillAndGo(host, { name: o.hostName || 'Alice', team: o.hostTeam || 'random', code: o.hostCode, fmt: o.fmt || '3v3' });
-  await host.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });      // the room is open: now a friend may knock
+  await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });      // the room is open: now a friend may knock
   await fillAndGo(guest, { name: o.guestName || 'Bob', team: o.guestTeam || 'random', code: o.guestCode });
   await approve(host);
   for (let i = 0; i < 120; i++) {
@@ -321,7 +319,7 @@ async function groupRejoin(S) {
     await playSome(host, guest, 4);
     const url = await guest.eval('location.href');
     await guest.navigate('about:blank'); await guest.navigate(url);
-    await guest.waitFor('window.__arenaOnline && document.getElementById("olGo") && !document.getElementById("olGo").disabled', { timeoutMs: 90000 });
+    await guest.waitFor('window.__arenaOnline && window.__arenaOnline.view().canGo', { timeoutMs: 90000 });
     ok(await guest.eval('window.__arenaBattle.state') === 'online' && !(await guest.eval('window.__arenaBattle.resume')), 'J21 a fresh visit to the same address shows the setup form, it does not resume', await guest.eval('window.__arenaBattle.state'));
   });
 }
@@ -339,9 +337,9 @@ async function groupResume(S) {
     const [pa, pb] = seeded.profiles;
     await openRoom(host, 'ARSM1', 'host'); await openRoom(guest, 'ARSM1', 'guest');          // the panels read the profiles' teams now
     await pickTeam(host, 'saved:' + pa.id + ':' + pa.teams[0]); await pickTeam(guest, 'saved:' + pb.id + ':' + pb.teams[0]);
-    await host.eval('document.getElementById("olFmt").value = "3v3"; document.getElementById("olGo").click()');
-    await host.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-    await guest.eval('document.getElementById("olGo").click()');
+    await host.eval('window.__arenaOnline.setForm({ fmt: "3v3" }); void window.__arenaOnline.go()');
+    await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    await guest.eval('void window.__arenaOnline.go()');
     await approve(host, true);
     for (let i = 0; i < 160 && !((await phase(host)) === 'playing' && (await phase(guest)) === 'playing'); i++) await sleep(250);
     const started = (await phase(host)) === 'playing' && (await phase(guest)) === 'playing';
@@ -415,22 +413,22 @@ async function groupEasyJoin(S) {
   await withBrowser({ port: CDP0 + 12, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (host) => {
     const guest = await host.openTab({ width: 390, height: 844 });
     await host.navigate(BASE + '?online=1&net=local' + ANIM);
-    await host.waitFor('window.__arenaOnline && document.getElementById("olGo") && !document.getElementById("olGo").disabled && window.__arenaBattle && window.__arenaBattle.state === "online"', { timeoutMs: 90000 });
+    await host.waitFor('window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "online" && window.__arenaOnline.view().canGo', { timeoutMs: 90000 });
     const v0 = await host.eval('({ go: document.getElementById("olGo").textContent, quick: document.getElementById("olQuick").textContent, cards: !document.getElementById("olCards").hidden, prog: !document.getElementById("olProgress").hidden, cardTitles: [...document.querySelectorAll("#olCards h3")].map((h) => h.textContent).join("|") })');
     ok(v0.go === 'Get an invite link' && v0.quick === 'Find an opponent' && v0.cards && !v0.prog && v0.cardTitles === 'Invite a friend|Join a friend|Battle anyone', 'EZ1 the Play online page has three separate cards, Invite a friend / Join a friend / Battle anyone, and no progress card yet', J(v0));
     // a bad code is refused on the spot, in words, without connecting anywhere
     await host.eval('document.getElementById("olRoom").value = "zz"; document.getElementById("olJoin").click()');
     await sleep(300);
-    const bad = await host.eval('({ st: document.getElementById("olStatus").textContent, stage: window.__arenaOnline.state.stage, sess: !!window.__arenaOnline.session() })');
+    const bad = await host.eval('({ st: window.__arenaOnline.view().status.text, stage: window.__arenaOnline.state.stage, sess: !!window.__arenaOnline.session() })');
     ok(/not a room code/.test(bad.st) && bad.stage === 'setup' && !bad.sess, 'EZ2 a code that cannot be one is refused at once, with what a code looks like, and nothing connects', J(bad));
     // a whole invite link pasted into the code box is read for its code
     await host.eval('const r = document.getElementById("olRoom"); r.value = "https://caseybement.com/pokemonarena/battle.html?np=k7q2p&join=1"; r.dispatchEvent(new Event("input", { bubbles: true }))');
-    ok((await host.eval('document.getElementById("olRoom").value')) === 'K7Q2P', 'EZ3 an invite link pasted into the code box becomes its code', await host.eval('document.getElementById("olRoom").value'));
+    ok((await host.eval('window.__arenaOnline.state.form.room')) === 'K7Q2P', 'EZ3 an invite link pasted into the code box becomes its code', await host.eval('window.__arenaOnline.state.form.room'));
     await host.eval('document.getElementById("olRoom").value = ""');
     // Create a room: the code at once, big, with the invite link; steps say the room is open and the friend is next
-    await host.eval('document.getElementById("olGo").click()');
-    await host.waitFor('!document.getElementById("olCode").hidden', { timeoutMs: 30000 });
-    const v1 = await host.eval('({ code: document.getElementById("olCode").textContent.trim(), prog: !document.getElementById("olProgress").hidden, cards: !document.getElementById("olCards").hidden, at: document.getElementById("olSteps").dataset.at, steps: [...document.querySelectorAll("#olSteps li")].map((li) => li.className + ":" + li.textContent), cur: (document.querySelector("#olSteps [aria-current=step]") || {}).textContent, link: !!document.getElementById("olCopyLink") && document.getElementById("olCopyLink").offsetParent !== null, close: document.getElementById("olCancelAsk").textContent, closeShown: !document.getElementById("olCancelAsk").hidden, st: document.getElementById("olStatus").textContent, role: document.getElementById("olRole").textContent, title: document.getElementById("olProgTitle").textContent, linkText: document.getElementById("olLinkText").value, linkShown: document.getElementById("olLinkText").offsetParent !== null, pageTitle: !document.getElementById("olTitle").hidden, back: !document.getElementById("olBack").closest(".row").hidden })');
+    await host.eval('void window.__arenaOnline.startAs("host")');
+    await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    const v1 = await host.eval('({ code: window.__arenaOnline.view().code.trim(), prog: !document.getElementById("olProgress").hidden, cards: !document.getElementById("olCards").hidden, at: document.getElementById("olSteps").dataset.at, steps: [...document.querySelectorAll("#olSteps li")].map((li) => li.className + ":" + li.textContent), cur: (document.querySelector("#olSteps [aria-current=step]") || {}).textContent, link: !!document.getElementById("olCopyLink") && document.getElementById("olCopyLink").offsetParent !== null, close: window.__arenaOnline.view().cancel.label, closeShown: window.__arenaOnline.view().cancel.shown, st: window.__arenaOnline.view().status.text, role: document.getElementById("olRole").textContent, title: document.getElementById("olProgTitle").textContent, linkText: document.getElementById("olLinkText").value, linkShown: document.getElementById("olLinkText").offsetParent !== null, pageTitle: !document.getElementById("olTitle").hidden, back: !document.getElementById("olBack").closest(".row").hidden })');
     ok(v1.prog && !v1.cards && /^[A-Z0-9]{4,8}$/.test(v1.code) && v1.link, 'EZ4 Create a room replaces the form with one card: the room code and Copy invite link', J(v1));
     ok(v1.at === '1' && v1.steps.length === 4 && /^done/.test(v1.steps[0]) && /Friend joins/.test(v1.cur || ''), 'EZ5 the steps show the room open (done) and "Friend joins" as the current step', J(v1.steps) + ' ' + v1.cur);
     ok(/Waiting for your friend/.test(v1.st) && !/allow/i.test(v1.st), 'EZ6 the sentence says who is awaited and that nobody has to allow anything', v1.st);
@@ -439,23 +437,23 @@ async function groupEasyJoin(S) {
     ok(v1.linkShown && v1.linkText.includes('np=' + v1.code) && /join=1/.test(v1.linkText), 'EZ14 the invite link itself is on screen, ready to copy by hand', v1.linkText);
     ok(!v1.pageTitle && !v1.back, 'EZ15 while waiting nothing else is on screen: no page heading over the card, no second way out beside Close the room', J([v1.pageTitle, v1.back]));
     // Close the room: back to the form, nothing left open
-    await host.eval('document.getElementById("olCancelAsk").click()');
+    await host.eval('void window.__arenaOnline.cancel()');
     await sleep(400);
-    const v2 = await host.eval('({ stage: window.__arenaOnline.state.stage, sess: !!window.__arenaOnline.session(), cards: !document.getElementById("olCards").hidden, code: !document.getElementById("olCode").hidden, st: document.getElementById("olStatus").textContent, search: location.search })');
+    const v2 = await host.eval('({ stage: window.__arenaOnline.state.stage, sess: !!window.__arenaOnline.session(), cards: !document.getElementById("olCards").hidden, code: window.__arenaOnline.view().code !== "", st: window.__arenaOnline.view().status.text, search: location.search })');
     ok(v2.stage === 'setup' && !v2.sess && v2.cards && !v2.code && /Room closed/.test(v2.st) && /online=1/.test(v2.search), 'EZ8 Close the room goes back to the Play online page with no session left and says so', J(v2));
     // a fresh room for the real join (a NEW code: the closed one is not reused)
-    await host.eval('document.getElementById("olGo").click()');
-    await host.waitFor('!document.getElementById("olCode").hidden', { timeoutMs: 30000 });
-    const code = (await host.eval('document.getElementById("olCode").textContent')).trim();
+    await host.eval('void window.__arenaOnline.startAs("host")');
+    await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    const code = (await host.eval('window.__arenaOnline.view().code')).trim();
     ok(code !== v1.code, 'EZ9 a room created after closing one gets a new code', code + ' vs ' + v1.code);
     // the friend opens the invite link: one page, one button
     const link = await host.eval('window.__arenaOnline.state.transport') === 'local' ? BASE + '?np=' + code + '&join=1&net=local' + ANIM : null;
     await guest.navigate(link);
-    await guest.waitFor('window.__arenaOnline && document.getElementById("olGo") && !document.getElementById("olGo").disabled && window.__arenaBattle && window.__arenaBattle.state === "online"', { timeoutMs: 90000 });
+    await guest.waitFor('window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "online" && window.__arenaOnline.view().canGo', { timeoutMs: 90000 });
     const g0 = await guest.eval('({ title: document.getElementById("olTitle").textContent, lede: document.getElementById("olLede").textContent, go: document.getElementById("olGo").textContent, cards: !document.getElementById("olCards").hidden, fmt: !document.getElementById("olFmt").closest("label").hidden })');
     ok(/invited/.test(g0.title) && g0.lede.includes(code) && g0.go === 'Join the battle' && !g0.cards && !g0.fmt, 'EZ10 the invite link opens a page that names the room and has one button, Join the battle (no format, no other choices)', J(g0));
     await shot(guest, 'EZ_invite');
-    await guest.eval('document.getElementById("olGo").click()');
+    await guest.eval('void window.__arenaOnline.go()');
     const r = await bothPlaying(host, guest, 60000, host);
     ok(r.phases[0] === 'playing' && r.phases[1] === 'playing' && !r.prompted, 'EZ11 one press and both are in the battle; the host never saw an Allow prompt', J(r));
     ok(host.errors.length === 0 && guest.errors.length === 0, 'EZ12 no page errors', J(host.errors.concat(guest.errors)).slice(0, 200));
@@ -463,16 +461,16 @@ async function groupEasyJoin(S) {
   // a code nobody has opened: the joiner sees that they are JOINING, what is happening, and after a while what to check; Cancel takes them back
   await withBrowser({ port: CDP0 + 13, width: 390, height: 844, mobile: true, lock: false, args: NO_THROTTLE }, async (p) => {
     await p.navigate(BASE + '?online=1&net=local' + ANIM);
-    await p.waitFor('window.__arenaOnline && document.getElementById("olGo") && !document.getElementById("olGo").disabled && window.__arenaBattle && window.__arenaBattle.state === "online"', { timeoutMs: 90000 });
+    await p.waitFor('window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "online" && window.__arenaOnline.view().canGo', { timeoutMs: 90000 });
     await p.eval('document.getElementById("olRoom").value = "NOBODY"; document.getElementById("olJoin").click()');
     await p.waitFor('window.__arenaOnline.state.stage === "waiting"', { timeoutMs: 15000 });
-    const j0 = await p.eval('({ role: document.getElementById("olRole").textContent, title: document.getElementById("olProgTitle").textContent, hint: !document.getElementById("olHint").hidden, invite: !document.getElementById("olInvite").hidden, cancel: !document.getElementById("olCancelAsk").hidden && document.getElementById("olCancelAsk").textContent })');
+    const j0 = await p.eval('({ role: document.getElementById("olRole").textContent, title: document.getElementById("olProgTitle").textContent, hint: !document.getElementById("olHint").hidden, invite: !document.getElementById("olInvite").hidden, cancel: window.__arenaOnline.view().cancel.shown && window.__arenaOnline.view().cancel.label })');
     ok(/joining/i.test(j0.role) && j0.role.includes('NOBODY') && /Connecting to your friend/.test(j0.title) && !j0.hint && !j0.invite && j0.cancel === 'Cancel', 'EZ16 a join by code says JOINING (and the room) and "Connecting to your friend", with Cancel and no invite box', J(j0));
     await p.waitFor('!document.getElementById("olHint").hidden', { timeoutMs: 20000 }).catch(() => {});
     const hint = await p.eval('document.getElementById("olHint").hidden ? "" : document.getElementById("olHint").textContent');
     ok(/Taking a while/.test(hint) && hint.includes('NOBODY'), 'EZ17 a join that is taking a while says what to check (the code, that the friend is still waiting)', hint);
     await shot(p, 'EZ_slow_join');
-    await p.eval('document.getElementById("olCancelAsk").click()'); await sleep(400);
+    await p.eval('void window.__arenaOnline.cancel()'); await sleep(400);
     const j1 = await p.eval('({ stage: window.__arenaOnline.state.stage, cards: !document.getElementById("olCards").hidden, hint: !document.getElementById("olHint").hidden, sess: !!window.__arenaOnline.session() })');
     ok(j1.stage === 'setup' && j1.cards && !j1.hint && !j1.sess, 'EZ18 Cancel goes back to the three cards with nothing left connecting', J(j1));
     ok(p.errors.length === 0, 'EZ19 no page errors', J(p.errors).slice(0, 200));
@@ -488,10 +486,10 @@ async function groupRefusals(S) {
     const third = await host.openTab({ width: 900, height: 760 });
     await openRoom(third, 'ADENY', 'guest');
     await fillAndGo(third, { name: 'Cat' });
-    await third.waitFor('document.getElementById("olStatus").textContent.length > 0 && !document.getElementById("olGo").disabled && window.__arenaOnline.state.stage === "setup"', { timeoutMs: 60000 }).catch(() => {});
-    const st = await third.eval('document.getElementById("olStatus").textContent');
+    await third.waitFor('window.__arenaOnline.view().status.text.length > 0 && window.__arenaOnline.view().canGo && window.__arenaOnline.state.stage === "setup"', { timeoutMs: 60000 }).catch(() => {});
+    const st = await third.eval('window.__arenaOnline.view().status.text');
     ok(/already has two players|did not let you in|taken/i.test(st), 'R1 a third player with the code is told the room is taken', st);
-    ok(await third.eval('!document.getElementById("olGo").disabled'), 'R2 and can try again', '');
+    ok(await third.eval('window.__arenaOnline.view().canGo'), 'R2 and can try again', '');
     await shot(third, 'R_denied');
   });
   await withBrowser({ port: CDP0 + 5, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (host) => {
@@ -502,20 +500,20 @@ async function groupRefusals(S) {
     await host.navigate(BASE + '?np=ABCDE&host=1&join=1&net=local');
     await host.waitFor('window.__arenaBattle && window.__arenaBattle.state === "error"', { timeoutMs: 60000 });
     ok(/both host and join/i.test(await host.eval('document.getElementById("errMsg").textContent')), 'R4 an address that asks to host AND join is refused', '');
-    await openRoom(host, 'ABAD1', 'host');
+    await openRoom(host, 'ABAD1', 'host', '&team=ARENA1.AAAA.0000');          // (a team code comes in through the address: it has the shape of one, and does not decode)
     const s1 = await fillAndGo(host, { name: 'Zed', team: 'paste', code: 'ARENA1.AAAA.0000', fmt: '3v3' });
     await sleep(600);
-    const s2 = await host.eval('document.getElementById("olStatus").textContent');
-    ok(s2.length > 0 && /team|code|check/i.test(s2) && !(await host.eval('document.getElementById("olCode").hidden === false')), 'R5 a team code that does not decode is refused before anything connects', s2);
-    ok(await host.eval('!document.getElementById("olGo").disabled'), 'R6 and the panel stays usable', '');
+    const s2 = await host.eval('window.__arenaOnline.view().status.text');
+    ok(s2.length > 0 && /team|code|check/i.test(s2) && !(await host.eval('window.__arenaOnline.view().code !== ""')), 'R5 a team code that does not decode is refused before anything connects', s2);
+    ok(await host.eval('window.__arenaOnline.view().canGo'), 'R6 and the panel stays usable', '');
     const sIn = await host.eval(`(() => { document.getElementById('olTeam').value = 'paste'; document.getElementById('olPaste').value = ''; document.getElementById('olGo').click(); return document.getElementById('olStatus').textContent; })()`);
     await sleep(300);
-    ok(/Paste a team code/i.test(await host.eval('document.getElementById("olStatus").textContent')), 'R7 pasting nothing says to paste a team code', '');
+    ok(/Paste a team code/i.test(await host.eval('window.__arenaOnline.view().status.text')), 'R7 pasting nothing says to paste a team code', '');
     // the host's waiting screen shows the code and the invite link
-    await host.eval(`(() => { document.getElementById('olTeam').value = 'random'; document.getElementById('olTeam').dispatchEvent(new Event('change')); document.getElementById('olGo').click(); })()`);
-    await host.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 20000 });
-    ok(await host.eval('document.getElementById("olCode").textContent') === 'ABAD1', 'R8 the host sees the room code to give out', await host.eval('document.getElementById("olCode").textContent'));
-    ok(/ABAD1/.test(await host.eval('document.getElementById("olStatus").textContent')), 'R9 and the waiting message names it', '');
+    await host.eval(`(() => { const O = window.__arenaOnline; O.setForm({ teamKey: 'random' }); void O.go(); })()`);
+    await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 20000 });
+    ok(await host.eval('window.__arenaOnline.view().code') === 'ABAD1', 'R8 the host sees the room code to give out', await host.eval('window.__arenaOnline.view().code'));
+    ok(/ABAD1/.test(await host.eval('window.__arenaOnline.view().status.text')), 'R9 and the waiting message names it', '');
     await shot(host, 'R_host_waiting');
   });
 }
@@ -556,7 +554,7 @@ async function leadSession(origin, rec) {
     const guest = await host.openTab({ width: 900, height: 760 });
     await openRoom(host, 'ALEAD', 'host', '', base); await openRoom(guest, 'ALEAD', 'guest', '', base);
     await fillAndGo(host, { name: 'Alice', team: 'random', fmt: '6v6' });
-    await host.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
+    await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
     await fillAndGo(guest, { name: 'Bob', team: 'random' });
     await approve(host, true);
     let ph = [null, null];
@@ -663,7 +661,7 @@ async function groupLayout(S) {
     ok(sizes.length >= 4 && sizes.every(([id, h, w]) => h >= 44 && w >= 44), 'V2 every control in the panel is at least 44 css px', JSON.stringify(sizes.filter(([id, h, w]) => h < 44 || w < 44)));
     await shot(host, 'V_phone_setup');
     await openRoom(guest, 'AMOBI', 'guest');
-    await fillAndGo(host, { name: 'Alice', fmt: '3v3' }); await host.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 }); await fillAndGo(guest, { name: 'Bob' });
+    await fillAndGo(host, { name: 'Alice', fmt: '3v3' }); await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 }); await fillAndGo(guest, { name: 'Bob' });
     await approve(host, true);
     for (let i = 0; i < 80 && !((await phase(host)) === 'playing' && (await phase(guest)) === 'playing'); i++) await sleep(250);
     await host.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 }); await guest.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
@@ -697,7 +695,7 @@ async function groupLobby(S) {
     const invite = await host.eval('document.getElementById("invite").value');
     ok(invite.includes('np=' + code) && /sys=pokemonarena/.test(invite), 'B3 the invite link names the room and the console', invite);
     await host.eval('document.getElementById("btnGo").click()');
-    await host.waitFor(`window.__arenaOnline && location.pathname === "/pokemonarena/battle.html" && document.getElementById("olGo") && !document.getElementById("olGo").disabled`, { timeoutMs: 90000 });
+    await host.waitFor(`window.__arenaOnline && location.pathname === "/pokemonarena/battle.html" && window.__arenaOnline.view().canGo`, { timeoutMs: 90000 });
     const hu = new URL(await host.eval('location.href'));
     ok(hu.searchParams.get('np') === code && hu.searchParams.get('host') === '1' && hu.searchParams.get('net') === 'local', 'B4 "Start my console" lands on the battle page as the host, under the lobby code', hu.search);
     // the joiner: the code alone is enough, and it names the Arena
@@ -709,13 +707,13 @@ async function groupLobby(S) {
     await guest.waitFor('!document.getElementById("btnJoin").disabled', { timeoutMs: 10000 });
     const pressed = await guest.eval(`[...document.querySelectorAll("#jConsoles button[aria-pressed=true]")].map((b) => b.textContent.replace(/ ·.*$/, "").trim())`);
     ok(pressed.join() === 'Pokemon Arena', 'B5 a joiner who types only the code is taken to the Arena without being asked', JSON.stringify(pressed));
-    await host.eval(`(() => { document.getElementById('olName').value = 'Hosty'; const t = document.getElementById('olTeam'); t.value = 'random'; t.dispatchEvent(new Event('change')); document.getElementById('olFmt').value = '3v3'; document.getElementById('olGo').click(); })()`);
-    await host.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
+    await host.eval(`(() => { const O = window.__arenaOnline; O.setForm({ teamKey: 'random', name: 'Hosty', fmt: '3v3' }); void O.go(); })()`);
+    await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
     await guest.eval('document.getElementById("btnJoin").click()');
-    await guest.waitFor(`window.__arenaOnline && location.pathname === "/pokemonarena/battle.html" && document.getElementById("olGo") && !document.getElementById("olGo").disabled`, { timeoutMs: 90000 });
+    await guest.waitFor(`window.__arenaOnline && location.pathname === "/pokemonarena/battle.html" && window.__arenaOnline.view().canGo`, { timeoutMs: 90000 });
     const gu = new URL(await guest.eval('location.href'));
     ok(gu.searchParams.get('np') === code && gu.searchParams.get('join') === '1', 'B6 "Join" lands on the battle page as the guest, under the same code', gu.search);
-    ok(await guest.eval('document.getElementById("olRoom").value') === code && await guest.eval('document.getElementById("olFmt").closest("label").hidden') === true, 'B7 the guest panel has the code filled in and no format choice', '');
+    ok(await guest.eval('window.__arenaOnline.state.form.room') === code && await guest.eval('document.getElementById("olFmt").closest("label").hidden') === true, 'B7 the guest panel has the code filled in and no format choice', '');
     await fillAndGo(guest, { name: 'Guesty', team: 'random' });
     await approve(host, true);
     for (let i = 0; i < 120 && !((await phase(host)) === 'playing' && (await phase(guest)) === 'playing'); i++) await sleep(250);
@@ -741,21 +739,21 @@ async function groupHub() {
 /* ---------------------------------------------------------------------------------------------- open games (js/openlobby.js + the panel in js/online.js) */
 // the setup panel with the board on it (no role, no code in the address); openquick / openjoin shorten Find a battle's look-around and a silent game's patience (net=local only)
 async function openPanel(page, extra = '') {
-  await page.navigate(BASE + '?online=1&net=local' + ANIM + extra);
-  await page.waitFor('window.__arenaOnline && document.getElementById("olGo") && !document.getElementById("olGo").disabled && !document.getElementById("olQuick").disabled && window.__arenaBattle && window.__arenaBattle.state === "online"', { timeoutMs: 90000 });
+  await page.navigate(BASE + '?online=1&ask=quick&net=local' + ANIM + extra);
+  await page.waitFor('window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "online" && window.__arenaOnline.view().canGo && window.__arenaOnline.view().canQuick', { timeoutMs: 90000 });
 }
 // (the name is set the way a player sets it: the page hears an `input` event, which is what makes it THEIR name - one the panel remembers - rather than one it filled in itself)
 const setForm = (page, { name, fmt, pub = false, role }) => page.eval('(() => {' +
-  'document.getElementById("olName").value = ' + JSON.stringify(name) + '; document.getElementById("olName").dispatchEvent(new Event("input", { bubbles: true }));' +
-  (void role, '') +          // (role: 'host' is the default of the Play online page now: #olGo is Get an invite link)
-  (fmt ? 'document.getElementById("olFmt").value = ' + JSON.stringify(fmt) + ';' : '') +
+  'window.__arenaOnline.setForm({ name: ' + JSON.stringify(name) + ', typed: true' + (fmt ? ', fmt: ' + JSON.stringify(fmt) : '') + ' });' +
+  (void role, '') +          // (role: a private room is startAs("host"), a listed game is quick())
   (void pub, '') +          // (pub: the game is meant to be LISTED; the caller presses Find an opponent, the only public way in now that a friend's room is always private)
   'return true; })()');
-const board = (p) => p.eval('[...document.querySelectorAll("#olOpenList li")].map((li) => ({ room: li.dataset.room, who: li.querySelector(".who").textContent, fmt: li.querySelector(".fmt").textContent, label: li.querySelector("button").getAttribute("aria-label") }))');
+// the open games as THIS page hears them (the hook's board(): the board's list without the games on another build): what the players list showed, read without it
+const board = (p) => p.eval('window.__arenaOnline.board().map((g) => { const fmt = g.fmt === "3v3" ? "3 v 3" : "6 v 6"; return { room: g.room, who: g.who, fmt, label: (g.h ? "Challenge " : "Join ") + g.who + " (" + fmt + ")" }; })');
 const boardNote = (p) => p.eval('document.getElementById("olOpenNote").textContent');
-const statusText = (p) => p.eval('document.getElementById("olStatus").textContent');
+const statusText = (p) => p.eval('window.__arenaOnline.view().status.text');
 const stageOf = (p) => p.eval('window.__arenaOnline.state.stage');
-const clickJoin = (p, room) => p.eval('document.querySelector(\'#olOpenList li[data-room="' + room + '"] button\').click()');
+const clickJoin = (p, room) => p.eval('(window.__arenaOnline.pick(' + JSON.stringify(room) + '), true)');          // (pick: join a listed game, or challenge a resident: what a press on its row meant)
 const promptShown = (p) => p.eval('!!document.getElementById("npApprove")');
 // a message from "some other browser" on the board (another tab of the same browser can speak on the channel the net=local board uses)
 const inject = (p, o) => p.eval('(() => { const c = new BroadcastChannel("bemental-arena-open-1"); c.postMessage(' + JSON.stringify(o) + '); c.close(); return true; })()');
@@ -790,11 +788,11 @@ async function groupOpen(S) {
     ok((await board(guest)).length === 0 && /Nobody is waiting/.test(await boardNote(guest)), 'O2 with nobody listed the board says so, and what to do', await boardNote(guest));
     await setForm(host, { name: 'Alice', fmt: '3v3', pub: true, role: 'host' });
     { const qn = await host.eval('document.getElementById("olQuickNote").textContent'); ok(/trainer name/.test(qn) && /online record/.test(qn), 'O3 the Battle anyone card says what other players see (trainer name, online record)', qn); }
-    await host.eval('document.getElementById("olQuick").click()');
-    await host.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-    const room = (await host.eval('document.getElementById("olCode").textContent')).trim();
+    await host.eval('void window.__arenaOnline.quick()');
+    await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    const room = (await host.eval('window.__arenaOnline.view().code')).trim();
     ok(/game is open: anyone can join/i.test(await statusText(host)) && room.length >= 4, 'O4 the host is told the game is open to anyone (and still has the code for a friend)', await statusText(host));
-    await guest.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 15000 });
+    await guest.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 15000 });
     const rows = await board(guest);
     ok(rows.length === 1 && rows[0].room === room && rows[0].who === 'Alice' && rows[0].fmt === '3 v 3' && /Join Alice/.test(rows[0].label), 'O5 the other browser\'s board shows the game: who, the format and a Join button', J(rows));
     ok(/1 game is waiting/.test(await boardNote(guest)), 'O6 and counts it', await boardNote(guest));
@@ -820,14 +818,14 @@ async function groupOpen(S) {
     const b = await a.openTab({ width: 900, height: 760 });
     await openPanel(a, '&openquick=500&openjoin=6000'); await openPanel(b, '&openquick=500&openjoin=6000');
     await setForm(a, { name: 'Ann', fmt: '6v6' });
-    await a.eval('document.getElementById("olQuick").click()');
+    await a.eval('void window.__arenaOnline.quick()');
     await a.waitFor('window.__arenaOnline.state.stage === "open"', { timeoutMs: 30000 });
     const hosting = await a.eval('window.__arenaOnline.lobbies().hosting()');
     ok(hosting && hosting.q === true && hosting.fmt === '6v6' && hosting.name === 'Ann', 'Q1 with nobody waiting Find a battle opens an open game of its own, in the format chosen', J(hosting));
     ok(/Nobody was waiting/.test(await statusText(a)), 'Q2 and says so', await statusText(a));
-    await b.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 15000 });
+    await b.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 15000 });
     await setForm(b, { name: 'Ben' });
-    await b.eval('document.getElementById("olQuick").click()');
+    await b.eval('void window.__arenaOnline.quick()');
     const r = await bothPlaying(a, b, 60000, a);
     ok(r.phases[0] === 'playing' && r.phases[1] === 'playing' && !r.prompted, 'Q3 the next Find a battle joins it and the battle starts, with no prompt', J(r));
     const roles = [await a.eval('window.__arenaOnline.state.role'), await b.eval('window.__arenaOnline.state.role')];
@@ -840,7 +838,7 @@ async function groupOpen(S) {
     const b = await a.openTab({ width: 900, height: 760 });
     await openPanel(a, '&openquick=1200&openjoin=8000'); await openPanel(b, '&openquick=1200&openjoin=8000');
     await setForm(a, { name: 'Zed', fmt: '3v3' }); await setForm(b, { name: 'Yan', fmt: '3v3' });
-    await Promise.all([a.eval('document.getElementById("olQuick").click()'), b.eval('document.getElementById("olQuick").click()')]);
+    await Promise.all([a.eval('void window.__arenaOnline.quick()'), b.eval('void window.__arenaOnline.quick()')]);
     const r = await bothPlaying(a, b, 90000);
     ok(r.phases[0] === 'playing' && r.phases[1] === 'playing', 'Q6 two simultaneous Find a battle presses still end in ONE battle', J(r));
     const roles = [await a.eval('window.__arenaOnline.state.role'), await b.eval('window.__arenaOnline.state.role')].sort();
@@ -859,27 +857,27 @@ async function groupOpen(S) {
     ok((await board(a)).length === 0 && /1 open on a different version/.test(await boardNote(a)), 'X1 a game on another build is hidden, and the board says one was', await boardNote(a));
     // a hostile name is plain text
     await inject(b, fake(id, { room: 'AHOST', s: '00000000000000a2', name: '<img src=x onerror=window.__pwned=1>Eve' }));
-    await a.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 8000 });
+    await a.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 8000 });
     const hostile = await a.eval('({ who: document.querySelector("#olOpenList .who").textContent, imgs: document.querySelectorAll("#olOpenList img").length, pwned: !!window.__pwned })');
     ok(/^[A-Za-z0-9 .'_!?-]{1,10}$/.test(hostile.who) && hostile.imgs === 0 && !hostile.pwned, 'X2 a hostile name is cut to safe text and nothing in it runs', J(hostile));
     // a made-up game: pressing Join finds nobody; the joiner gives up on it in a few seconds, says so, and it stays off the board
     await inject(b, fake(id, { room: 'AGHOS', s: '00000000000000a3', name: 'Ghost' }));
-    await a.waitFor('document.querySelector(\'#olOpenList li[data-room="AGHOS"]\')', { timeoutMs: 8000 });
+    await a.waitFor('window.__arenaOnline.board().some((g) => g.room === "AGHOS")', { timeoutMs: 8000 });
     await setForm(a, { name: 'Ann' });
     await clickJoin(a, 'AGHOS');
-    await a.waitFor('window.__arenaOnline.state.stage === "setup" && /not open any more/.test(document.getElementById("olStatus").textContent)', { timeoutMs: 25000 });
+    await a.waitFor('window.__arenaOnline.state.stage === "setup" && /not open any more/.test(window.__arenaOnline.view().status.text)', { timeoutMs: 25000 });
     ok(true, 'X3 a game that never answers is given up on, in words', await statusText(a));
     ok(!(await board(a)).some((g) => g.room === 'AGHOS'), 'X4 and it is off the board (muted), even though its beacon keeps arriving', J(await board(a)));
-    ok((await a.eval('document.getElementById("olGo").disabled')) === false && (await a.eval('document.getElementById("olQuick").disabled')) === false, 'X5 the panel is usable again', '');
+    ok((await a.eval('!window.__arenaOnline.view().canGo')) === false && (await a.eval('!window.__arenaOnline.view().canQuick')) === false, 'X5 the panel is usable again', '');
     // a game whose rules are not my team's: refused BEFORE connecting
     await inject(b, fake(id, { room: 'ARULE', s: '00000000000000a4', rs: 'some-other-ruleset', name: 'Odd' }));
-    await a.waitFor('document.querySelector(\'#olOpenList li[data-room="ARULE"]\')', { timeoutMs: 8000 });
+    await a.waitFor('window.__arenaOnline.board().some((g) => g.room === "ARULE")', { timeoutMs: 8000 });
     await clickJoin(a, 'ARULE');
-    await a.waitFor('/different rules/.test(document.getElementById("olStatus").textContent)', { timeoutMs: 10000 });
+    await a.waitFor('/different rules/.test(window.__arenaOnline.view().status.text)', { timeoutMs: 10000 });
     ok((await stageOf(a)) === 'setup', 'X6 a game under other rules is refused in words, before any connection', await statusText(a));
     // a game that says it is gone
     await inject(b, { t: 'arenaopen', v: 1, k: 'gone', s: '00000000000000a2', room: 'AHOST' });
-    await a.waitFor('!document.querySelector(\'#olOpenList li[data-room="AHOST"]\')', { timeoutMs: 8000 });
+    await a.waitFor('!window.__arenaOnline.board().some((g) => g.room === "AHOST")', { timeoutMs: 8000 });
     ok(true, 'X7 a game that says it is gone leaves the board at once', '');
     // junk does not break the panel
     for (const junk of ['x', 7, null, { t: 'arenaopen' }, { t: 'arenaopen', v: 1, k: 'open', s: 'zz' }]) await inject(b, junk);
@@ -892,22 +890,22 @@ async function groupOpen(S) {
     const b = await a.openTab({ width: 900, height: 760 });
     await openPanel(a); await openPanel(b);
     await setForm(a, { name: 'Lea', pub: true, role: 'host' });
-    await a.eval('document.getElementById("olQuick").click()');
-    await a.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-    await b.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 15000 });
+    await a.eval('void window.__arenaOnline.quick()');
+    await a.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    await b.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 15000 });
     await a.navigate('about:blank');
     const t0 = Date.now();
-    await b.waitFor('document.querySelectorAll("#olOpenList li").length === 0', { timeoutMs: 8000 });
+    await b.waitFor('window.__arenaOnline.board().length === 0', { timeoutMs: 8000 });
     ok(Date.now() - t0 < 8000, 'OL1 closing the host\'s page takes the game off the other board within seconds (not the 13 s a missing beacon would take)', String(Date.now() - t0));
     await openPanel(a);
     await setForm(a, { name: 'Pat', role: 'host' });         // the switch stays off: a private game
-    await a.eval('document.getElementById("olGo").click()');
-    await a.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
+    await a.eval('void window.__arenaOnline.startAs("host")');
+    await a.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
     await sleep(1800);
     ok((await board(b)).length === 0 && (await a.eval('window.__arenaOnline.lobbies()')) === null, 'OL2 a private game is never listed (and opens no connection to the board)', J(await board(b)));
     ok(/Waiting for your friend/.test(await statusText(a)) && !/allow/i.test(await statusText(a)), 'OL3 and waits for the friend (nobody has to press Allow)', await statusText(a));
     await b.navigate(BASE + '?np=ABCDE&host=1&net=local' + ANIM);
-    await b.waitFor('window.__arenaOnline && document.getElementById("olGo") && !document.getElementById("olGo").disabled', { timeoutMs: 60000 });
+    await b.waitFor('window.__arenaOnline && window.__arenaOnline.view().canGo', { timeoutMs: 60000 });
     const hv = await b.eval('({ board: !document.getElementById("olOpen").hidden, pub: !!document.getElementById("olPublicBox") })');
     ok(!hv.board && !hv.pub, 'OL4 a lobby hand-off (a code in the address) has no board and no public switch: a room with a code is private', J(hv));
   });
@@ -917,11 +915,11 @@ async function groupOpen(S) {
     const g1 = await h.openTab({ width: 900, height: 760 }), g2 = await h.openTab({ width: 900, height: 760 });
     await openPanel(h); await openPanel(g1, '&openjoin=15000'); await openPanel(g2, '&openjoin=15000');
     await setForm(h, { name: 'Hal', pub: true, role: 'host' });
-    await h.eval('document.getElementById("olQuick").click()');
-    await h.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-    const room = (await h.eval('document.getElementById("olCode").textContent')).trim();
-    await g1.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 15000 });
-    await g2.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 15000 });
+    await h.eval('void window.__arenaOnline.quick()');
+    await h.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    const room = (await h.eval('window.__arenaOnline.view().code')).trim();
+    await g1.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 15000 });
+    await g2.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 15000 });
     await setForm(g1, { name: 'One' }); await setForm(g2, { name: 'Two' });
     await Promise.all([clickJoin(g1, room), clickJoin(g2, room)]);
     let out = null;
@@ -942,17 +940,17 @@ async function groupOpen(S) {
     const raw = await h.openTab({ width: 900, height: 760 }), real = await h.openTab({ width: 900, height: 760 });
     await openPanel(h); await openPanel(raw); await openPanel(real);
     await setForm(h, { name: 'Vic', fmt: '3v3', pub: true, role: 'host' });
-    await h.eval('document.getElementById("olQuick").click()');
-    await h.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-    const room1 = (await h.eval('document.getElementById("olCode").textContent')).trim();
+    await h.eval('void window.__arenaOnline.quick()');
+    await h.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    const room1 = (await h.eval('window.__arenaOnline.view().code')).trim();
     // a bare lib/netplay.js session that is let in and then says a hello the host must refuse (a ROM that is not ours)
     await raw.eval('(async () => { const s = new Netplay.Session({ code: ' + JSON.stringify(room1) + ', host: false, portCount: 2, transport: "local" }); window.__rawS = s; const up = new Promise((res) => s.on("status", (e) => { if (e.state === "connected") res(true); })); s.start(); await up; s._send({ t: "lsarena", v: ' + PROTO + ', mn: 1, k: "hello", rom: "0".repeat(64), fp: "x", rs: "x", name: "Mallory", team: "x", fmt: null }); return true; })()');
     await h.waitFor('window.__arenaOnline.state.room !== ' + JSON.stringify(room1) + ' && window.__arenaOnline.state.stage === "open"', { timeoutMs: 60000 });
-    const room2 = (await h.eval('document.getElementById("olCode").textContent')).trim();
+    const room2 = (await h.eval('window.__arenaOnline.view().code')).trim();
     ok(room2 !== room1 && (await h.eval('document.getElementById("error").hidden')), 'OV1 a joiner whose game does not match is turned away and the host is NOT shown an error: the game is open again under a new code', room1 + ' -> ' + room2);
     const hosting = await h.eval('window.__arenaOnline.lobbies().hosting()');
     ok(hosting && hosting.room === room2, 'OV2 and it is listed under the new code', J(hosting));
-    await real.waitFor('document.querySelector(\'#olOpenList li[data-room="' + room2 + '"]\')', { timeoutMs: 20000 });
+    await real.waitFor('window.__arenaOnline.board().some((g) => g.room === "' + room2 + '")', { timeoutMs: 20000 });
     ok(!(await board(real)).some((g) => g.room === room1), 'OV3 the old code is not on the board', J(await board(real)));
     await setForm(real, { name: 'Rae' });
     await clickJoin(real, room2);
@@ -963,9 +961,9 @@ async function groupOpen(S) {
     const raw = await h.openTab({ width: 900, height: 760 });
     await openPanel(h); await openPanel(raw);
     await setForm(h, { name: 'Walt', fmt: '3v3', pub: true, role: 'host' });
-    await h.eval('document.getElementById("olQuick").click()');
-    await h.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-    const room1 = (await h.eval('document.getElementById("olCode").textContent')).trim();
+    await h.eval('void window.__arenaOnline.quick()');
+    await h.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    const room1 = (await h.eval('window.__arenaOnline.view().code')).trim();
     // a joiner that is let in and then goes away before the handshake is over
     await raw.eval('(async () => { const s = new Netplay.Session({ code: ' + JSON.stringify(room1) + ', host: false, portCount: 2, transport: "local" }); window.__rawS = s; const up = new Promise((res) => s.on("status", (e) => { if (e.state === "connected") res(true); })); s.start(); await up; return true; })()');
     await h.waitFor('window.__arenaOnline.nm() !== null', { timeoutMs: 20000 });
@@ -980,32 +978,32 @@ async function groupOpen(S) {
     const g = await h.openTab({ width: 900, height: 760 }), o = await h.openTab({ width: 900, height: 760 });
     await openPanel(h); await openPanel(g, '&openjoin=20000'); await openPanel(o, '&openjoin=20000');
     await setForm(h, { name: 'Uma', fmt: '3v3', pub: true, role: 'host' });
-    await h.eval('document.getElementById("olQuick").click()');
-    await h.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-    const room = (await h.eval('document.getElementById("olCode").textContent')).trim();
-    await g.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 15000 });
-    await o.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 15000 });
+    await h.eval('void window.__arenaOnline.quick()');
+    await h.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    const room = (await h.eval('window.__arenaOnline.view().code')).trim();
+    await g.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 15000 });
+    await o.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 15000 });
     // the board loses every broker under a listed game: the host is told nobody can find it (it used to go on saying "your game is open"), and is told the good news again when the board is back
     const hid = await identity(h);
     const kick = (name) => inject(o, fake(hid, { room: 'AKICK', s: '00000000000000e1', fp: 'e0.other.build', name }));          // another build: on the board's books but not in anybody's list; any change makes the page look at the connection again
     await h.eval('(() => { const L = window.__arenaOnline.lobbies(); window.__realStatus = L.status; L.status = () => "down"; return true; })()');
     await kick('Kick1');
-    const sawDown = await h.waitFor('/cannot be reached/.test(document.getElementById("olStatus").textContent)', { timeoutMs: 8000 }).then(() => true, () => false);
+    const sawDown = await h.waitFor('/cannot be reached/.test(window.__arenaOnline.view().status.text)', { timeoutMs: 8000 }).then(() => true, () => false);
     ok(sawDown, 'U0 a listed game on a board that has lost every broker is told nobody can find it', await statusText(h));
     await h.eval('window.__arenaOnline.lobbies().status = window.__realStatus; true');
     await kick('Kick2');
-    const sawUp = await h.waitFor('/anyone can join/i.test(document.getElementById("olStatus").textContent)', { timeoutMs: 8000 }).then(() => true, () => false);
+    const sawUp = await h.waitFor('/anyone can join/i.test(window.__arenaOnline.view().status.text)', { timeoutMs: 8000 }).then(() => true, () => false);
     ok(sawUp, 'U0b ... and is told it is open again when the board is back', await statusText(h));
     // the library is made to sit on the admission: the knock IS let in (the page approves it) but no link is ever made, so "connected" never comes
     await h.eval('(() => { const S = window.__arenaOnline.session(); S.approve = async () => false; return true; })()');
     await setForm(g, { name: 'Gus' });
     await clickJoin(g, room);
     await h.waitFor('window.__arenaOnline.state.admitted === true', { timeoutMs: 30000 });
-    const gone = await o.waitFor('document.querySelectorAll("#olOpenList li").length === 0', { timeoutMs: 4000 }).then(() => true, () => false);
+    const gone = await o.waitFor('window.__arenaOnline.board().length === 0', { timeoutMs: 4000 }).then(() => true, () => false);
     ok(gone && (await h.eval('window.__arenaOnline.nm()')) === null && (await h.eval('window.__arenaOnline.state.stage')) === 'open', 'U1 the moment the knock is let in the game is off the board (within seconds, not the 13 s a silent listing takes to age off), although nothing has connected yet', J(await board(o)));
     // the library reports that the admitted link is gone before it was ever up
     await h.eval('(() => { const S = window.__arenaOnline.session(); const p = S._pending; delete S.approve; if (p) S.deny(p.nonce, "test"); S._emit("peer-left", { peer: p ? p.nonce : "x", why: "ice-timeout", remaining: 0 }); return true; })()');
-    const back = await o.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 8000 }).then(() => true, () => false);
+    const back = await o.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 8000 }).then(() => true, () => false);
     ok(back && (await h.eval('window.__arenaOnline.state.admitted')) === false && (await h.eval('window.__arenaOnline.state.admittedId')) === null, 'U2 the player never got connected: the seat is free again and the game is back on the board', J(await board(o)));
     await setForm(o, { name: 'Ola' });
     await clickJoin(o, room);
@@ -1021,12 +1019,12 @@ async function groupOpen(S) {
     await setForm(a, { name: 'Tia', fmt: '3v3' });
     // a board that has lost every broker: Find a battle says so and opens nothing (it used to open a game and say it was open)
     await a.eval('(() => { const L = window.__arenaOnline.lobbies(); window.__realStatus = L.status; L.status = () => "down"; return true; })()');
-    await a.eval('document.getElementById("olQuick").click()');
-    const refused = await a.waitFor('/could not be reached/.test(document.getElementById("olStatus").textContent)', { timeoutMs: 15000 }).then(() => true, () => false);
-    ok(refused && (await stageOf(a)) === 'setup' && (await a.eval('window.__arenaOnline.lobbies().hosting()')) === null && (await a.eval('document.getElementById("olQuick").disabled')) === false, 'OT0 with the board down Find a battle opens no game and says so, and the panel is usable again', (await stageOf(a)) + ' ' + (await statusText(a)));
+    await a.eval('void window.__arenaOnline.quick()');
+    const refused = await a.waitFor('/could not be reached/.test(window.__arenaOnline.view().status.text)', { timeoutMs: 15000 }).then(() => true, () => false);
+    ok(refused && (await stageOf(a)) === 'setup' && (await a.eval('window.__arenaOnline.lobbies().hosting()')) === null && (await a.eval('!window.__arenaOnline.view().canQuick')) === false, 'OT0 with the board down Find a battle opens no game and says so, and the panel is usable again', (await stageOf(a)) + ' ' + (await statusText(a)));
     if (!refused) return;
     await a.eval('window.__arenaOnline.lobbies().status = window.__realStatus; true');
-    await a.eval('document.getElementById("olQuick").click()');
+    await a.eval('void window.__arenaOnline.quick()');
     await a.waitFor('window.__arenaOnline.state.stage === "open"', { timeoutMs: 30000 });
     const mine = (await a.eval('window.__arenaOnline.lobbies().hosting()')).room;
     const id = await identity(a);
@@ -1042,7 +1040,7 @@ async function groupOpen(S) {
     const rehosted = await a.waitFor('window.__arenaOnline.state.stage === "open" && window.__arenaOnline.lobbies() && !!window.__arenaOnline.lobbies().hosting()', { timeoutMs: 30000 }).then(() => true, () => false);
     ok(rehosted, 'OT3a when the rival does not answer the host is back to an open, listed game (not the setup form)', (await stageOf(a)) + ' ' + (await statusText(a)));
     if (!moved || !rehosted) return;
-    const again = await a.eval('({ role: window.__arenaOnline.state.role, quick: window.__arenaOnline.state.quick, hosting: window.__arenaOnline.lobbies().hosting(), codeShown: !document.getElementById("olCode").hidden, status: document.getElementById("olStatus").textContent })');
+    const again = await a.eval('({ role: window.__arenaOnline.state.role, quick: window.__arenaOnline.state.quick, hosting: window.__arenaOnline.lobbies().hosting(), codeShown: window.__arenaOnline.view().code !== "", status: window.__arenaOnline.view().status.text })');
     ok(again.role === 'host' && again.quick === true && again.hosting.q === true && again.hosting.room !== '0AAAA' && again.codeShown && /not there/.test(again.status), 'OT3 when the rival does not answer the host gets its OWN game back (open, listed, quick), with a new code, and is told why', J(again));
     const relisted = await b.waitFor('window.__arenaOnline.lobbies().list().some((g) => g.room === ' + JSON.stringify(again.hosting.room) + ')', { timeoutMs: 10000 }).then(() => true, () => false);
     ok(relisted, 'OT4 and the other browser sees it listed again', 'the other board lists ' + J(await b.eval('window.__arenaOnline.lobbies().list().map((g) => g.room)').catch(() => null)) + ', wanted ' + again.hosting.room);
@@ -1058,10 +1056,10 @@ async function groupOpen(S) {
     const g = await h.openTab({ width: 900, height: 760 });
     await openPanel(h); await openPanel(g, '&openjoin=15000');
     await setForm(h, { name: 'Sal', fmt: '3v3', pub: true, role: 'host' });
-    await h.eval('document.getElementById("olQuick").click()');
-    await h.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-    const room = (await h.eval('document.getElementById("olCode").textContent')).trim();
-    await g.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 15000 });
+    await h.eval('void window.__arenaOnline.quick()');
+    await h.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    const room = (await h.eval('window.__arenaOnline.view().code')).trim();
+    await g.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 15000 });
     await setForm(g, { name: 'Gil' });
     await clickJoin(g, room);
     const r = await bothPlaying(h, g, 60000, h);
@@ -1072,7 +1070,7 @@ async function groupOpen(S) {
     ok(true, 'S2 the host builds a NEW Session under the same code (it has forgotten who it let in)', '');
     let prompted = false;
     const up = await (async () => { for (let i = 0; i < 180; i++) { if (await promptShown(h)) prompted = true; const [a, b] = [await h.eval('window.__arenaOnline.nm() && window.__arenaOnline.nm().status().link'), await g.eval('window.__arenaOnline.nm() && window.__arenaOnline.nm().status().link')]; if (a === 'up' && b === 'up' && (await h.eval('window.__arenaOnline.session() !== window.__oldSession'))) return true; await sleep(250); } return false; })();
-    ok(up, 'S3 the player in the match is let back in by the new Session: both sides report the link up again', await g.eval('document.getElementById("olStatus").textContent'));
+    ok(up, 'S3 the player in the match is let back in by the new Session: both sides report the link up again', await g.eval('window.__arenaOnline.view().status.text'));
     ok(!prompted && !(await promptShown(h)), 'S4 and nobody was asked to press Allow, and nobody was told the game is taken', '');
     ok(h.errors.length === 0 && g.errors.length === 0, 'S5 no page errors', J(h.errors.concat(g.errors)).slice(0, 200));
   });
@@ -1089,7 +1087,7 @@ async function groupOpen(S) {
 const OP_STALL = '(() => { const S = window.__arenaOnline.session(); const real = S._sig.send; window.__dropOffers = true; S._sig.send = function (m) { if (window.__dropOffers && m && m.t === "offer") return undefined; return real.apply(this, arguments); }; return true; })()';
 const OP_COUNT_HOST = '(() => { const L = window.__arenaOnline.lobbies(); const real = L.host; window.__hostCalls = 0; L.host = function () { window.__hostCalls++; return real.apply(this, arguments); }; return true; })()';
 const opGiveUp = (h, nonce) => h.eval('(() => { const S = window.__arenaOnline.session(); const L = S._links.get(' + J(nonce) + '); if (!L) return false; S._linkGone(L, "ice-timeout"); return true; })()');
-const opBoardCount = (p) => p.eval('document.querySelectorAll("#olOpenList li").length');
+const opBoardCount = (p) => p.eval('window.__arenaOnline.board().length');
 const opKnock = (p, room) => p.eval('(async () => { const s = new Netplay.Session({ code: ' + J(room) + ', host: false, portCount: 2, transport: "local" }); window.__rawS = s; window.__rawN = s._nonce; s.start(); return s._nonce; })()');
 
 async function groupOpenSessions(S) {
@@ -1131,7 +1129,7 @@ async function opForger(c) {
     const b = await a.openTab({ width: 900, height: 760 });
     await uxPanel(c, a, '&openquick=300&openjoin=3000'); await uxPanel(c, b, '&openquick=300&openjoin=3000');
     await setForm(a, { name: 'Tia', fmt: '3v3' });
-    await a.eval('document.getElementById("olQuick").click()');
+    await a.eval('void window.__arenaOnline.quick()');
     await a.waitFor('window.__arenaOnline.state.stage === "open"', { timeoutMs: 30000 });
     const id = await identity(a);
     const ghost = (i) => fake(id, { room: '0AAB' + 'CDEFGH'[i], s: '00000000000000f' + (i + 1), q: 1, name: 'Ghost' + i });
@@ -1164,7 +1162,7 @@ async function opJoining(c) {
     const o = await h.openTab({ width: 900, height: 760 }), raw = await h.openTab({ width: 900, height: 760 });
     const room = await uxHost(c, h, 'Hana', '&openhold=1500');
     await uxPanel(c, o); await uxPanel(c, raw);
-    await o.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 15000 });
+    await o.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 15000 });
     await h.eval(OP_STALL); await h.eval(OP_COUNT_HOST);
     await h.eval('(() => { const S = window.__arenaOnline.session(); window.__left = []; S.on("peer-left", (e) => window.__left.push(e.why)); return true; })()');
     const nonce = await opKnock(raw, room);                // a bare library session: the open game lets it in, and the offer never leaves
@@ -1172,19 +1170,19 @@ async function opJoining(c) {
     const joining = await statusText(h);
     ok(admitted && /player is joining/.test(joining) && !/anyone can join it/.test(joining), 'OP2 the moment somebody is let in the host is told a player is joining, not that the game is open to anyone', joining);
     if (!admitted) return;
-    await o.waitFor('document.querySelectorAll("#olOpenList li").length === 0', { timeoutMs: 6000 }).catch(() => null);
+    await o.waitFor('window.__arenaOnline.board().length === 0', { timeoutMs: 6000 }).catch(() => null);
     // the same player knocks again on a new page (a second Session with the same code in that tab: same nonce, new incarnation): the library tears the old link down (peer-left) and re-admits by itself
     const knock = await raw.eval('(async () => { const n = window.__rawN, first = window.__rawS; first.close(); const s = new Netplay.Session({ code: ' + J(room) + ', host: false, portCount: 2, transport: "local" }); window.__rawS2 = s; s.start(); return { same: s._nonce === n, newInc: s._inc !== first._inc }; })()');
     const left = await h.waitFor('window.__left.length > 0', { timeoutMs: 15000 }).then(() => true, () => false);
     ok(knock.same && knock.newInc && left && (await h.eval('window.__left[0]')) === 'peer-reloaded', 'OP2r (the rig) a page that came back with the same identity makes the library emit peer-left "peer-reloaded", the reason the page keys on', J([knock, await h.eval('window.__left')]));
     let relistedDuring = false;
     for (let i = 0; i < 12; i++) { if ((await opBoardCount(o)) > 0 || (await h.eval('window.__hostCalls')) > 0) relistedDuring = true; await sleep(250); }
-    const during = await h.eval('({ admitted: window.__arenaOnline.state.admitted, hostCalls: window.__hostCalls, status: document.getElementById("olStatus").textContent })');
+    const during = await h.eval('({ admitted: window.__arenaOnline.state.admitted, hostCalls: window.__hostCalls, status: window.__arenaOnline.view().status.text })');
     ok(!relistedDuring && during.admitted === true && during.hostCalls === 0 && /player is joining/.test(during.status), 'OP2b while the player who knocked again is being let back in the game is NOT put back on the board (no listing sent, none on the other board, still "a player is joining")', J({ relistedDuring, during }));
     // the library gives up on the link (its connect watchdog): now the seat IS free, the game is listed again and says it is open again
     ok(await opGiveUp(h, nonce), 'OP2g (the rig) the library holds a link for the player who was let back in (so there was something to give up on)', '');
-    const again = await o.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 8000 }).then(() => true, () => false);
-    const words = await h.eval('({ admitted: window.__arenaOnline.state.admitted, id: window.__arenaOnline.state.admittedId, status: document.getElementById("olStatus").textContent })');
+    const again = await o.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 8000 }).then(() => true, () => false);
+    const words = await h.eval('({ admitted: window.__arenaOnline.state.admitted, id: window.__arenaOnline.state.admittedId, status: window.__arenaOnline.view().status.text })');
     ok(again && words.admitted === false && words.id === null && /anyone can join it/.test(words.status), 'OP2c when the library gives up on the link the seat is free again: the game is back on the board AND says it is open (not "a player is joining")', J(words));
     ok(h.errors.length === 0 && o.errors.length === 0 && raw.errors.length === 0, 'OP2d no page errors', J(h.errors.concat(o.errors, raw.errors)).slice(0, 200));
   });
@@ -1193,13 +1191,13 @@ async function opJoining(c) {
     const o = await h.openTab({ width: 900, height: 760 }), raw = await h.openTab({ width: 900, height: 760 });
     const room = await uxHost(c, h, 'Vera', '&openhold=1200');
     await uxPanel(c, o); await uxPanel(c, raw);
-    await o.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 15000 });
+    await o.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 15000 });
     await h.eval(OP_STALL); await h.eval(OP_COUNT_HOST);
     await opKnock(raw, room);
     const admitted = await h.waitFor('window.__arenaOnline.state.admitted === true', { timeoutMs: 30000 }).then(() => true, () => false);
     if (!admitted) { ok(false, 'OP2f (the rig) the first knock is let in', await statusText(h)); return; }
     await raw.eval('(async () => { window.__rawS.close(); const s = new Netplay.Session({ code: ' + J(room) + ', host: false, portCount: 2, transport: "local" }); await s.start(); s.close(); return true; })()');          // the hello leaves, the page is gone before it can answer
-    const freed = await o.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 15000 }).then(() => true, () => false);
+    const freed = await o.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 15000 }).then(() => true, () => false);
     const st = await h.eval('({ admitted: window.__arenaOnline.state.admitted, id: window.__arenaOnline.state.admittedId, hostCalls: window.__hostCalls })');
     ok(freed && st.admitted === false && st.id === null && st.hostCalls === 1, 'OP2e an admitted player who knocked again and never got a link does not hold the seat for ever: after the hold the game is listed again, once', J({ freed, st }));
   });
@@ -1212,7 +1210,7 @@ async function opReadmit(c) {
     const g = await h.openTab({ width: 900, height: 760 }), o = await h.openTab({ width: 900, height: 760 }), third = await h.openTab({ width: 900, height: 760 });
     const room = await uxHost(c, h, 'Rhea', '&openhold=1500');
     await uxPanel(c, g, '&openjoin=90000'); await uxPanel(c, o); await uxPanel(c, third);
-    await g.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 15000 });
+    await g.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 15000 });
     await h.eval(OP_STALL); await h.eval(OP_COUNT_HOST);
     await h.eval('(() => { window.__joinReq = 0; window.__arenaOnline.session().on("join-request", () => { window.__joinReq++; }); return true; })()');
     await setForm(g, { name: 'Gus' });
@@ -1224,13 +1222,13 @@ async function opReadmit(c) {
     // the link never comes up and the library gives up on it: the seat is free (record cleared), the game is listed again
     ok(await opGiveUp(h, gNonce), 'OP3g (the rig) the library holds the link it is about to give up on', '');
     await h.waitFor('window.__arenaOnline.state.admitted === false && window.__arenaOnline.state.admittedId === null', { timeoutMs: 8000 }).catch(() => null);
-    await o.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 8000 }).catch(() => null);
+    await o.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 8000 }).catch(() => null);
     // the guest knocks again with the same identity: the library re-admits it BY ITSELF, with no join-request (offers are still held back)
     const calls0 = await h.eval('window.__hostCalls');
     await g.eval('window.__arenaOnline.session()._reknock("test: knocking again")');
     const silent = await h.waitFor('window.__arenaOnline.state.admitted === true', { timeoutMs: 8000 }).then(() => true, () => false);
-    await o.waitFor('document.querySelectorAll("#olOpenList li").length === 0', { timeoutMs: 5000 }).catch(() => null);
-    const sv = await h.eval('({ req: window.__joinReq, calls: window.__hostCalls, status: document.getElementById("olStatus").textContent })');
+    await o.waitFor('window.__arenaOnline.board().length === 0', { timeoutMs: 5000 }).catch(() => null);
+    const sv = await h.eval('({ req: window.__joinReq, calls: window.__hostCalls, status: window.__arenaOnline.view().status.text })');
     ok(silent && sv.req === 1 && (await opBoardCount(o)) === 0 && /player is joining/.test(sv.status) && sv.calls === calls0, 'OP3c a player the library re-admits by itself (no join-request) is a player who is in: the seat is taken, the game comes off the board and says a player is joining', J({ silent, sv, calls0 }));
     // it gives up again; this time the offer goes out, the guest connects and the match starts
     ok(await opGiveUp(h, gNonce), 'OP3h (the rig) the library holds the link it is about to give up on, a second time', '');
@@ -1256,7 +1254,7 @@ async function opReadmit(c) {
     let prompted = false;
     const link = (p) => p.eval('window.__arenaOnline.nm() && window.__arenaOnline.nm().status().link');
     const up = await (async () => { for (let i = 0; i < 180; i++) { if (await promptShown(h)) prompted = true; if ((await link(h)) === 'up' && (await link(g)) === 'up') return true; await sleep(250); } return false; })();
-    ok(up && !prompted, 'OP3b the player the match belongs to is let back in by the REBUILT Session: both sides report the link up again, nobody was asked to press Allow, nobody was told the game is taken', J({ up, prompted, status: await g.eval('document.getElementById("olStatus").textContent') }));
+    ok(up && !prompted, 'OP3b the player the match belongs to is let back in by the REBUILT Session: both sides report the link up again, nobody was asked to press Allow, nobody was told the game is taken', J({ up, prompted, status: await g.eval('window.__arenaOnline.view().status.text') }));
     ok(h.errors.length === 0 && g.errors.length === 0 && o.errors.length === 0, 'OP3e no page errors', J(h.errors.concat(g.errors, o.errors)).slice(0, 200));
   });
 }
@@ -1270,24 +1268,24 @@ async function opCancel(c) {
     await uxWire(c, b);
     const id = await identity(a);
     await uxKeep(b, [fake(id, { room: 'AGHOP', s: '00000000000000c8', name: 'Ghost' })]);          // a made-up game: nobody will ever answer a knock on it
-    await a.waitFor('document.querySelector(\'#olOpenList li[data-room="AGHOP"]\')', { timeoutMs: 10000 });
+    await a.waitFor('window.__arenaOnline.board().some((g) => g.room === "AGHOP")', { timeoutMs: 10000 });
     await setForm(a, { name: 'Ann' });
     await clickJoin(a, 'AGHOP');
     await a.waitFor('window.__arenaOnline.state.stage === "waiting"', { timeoutMs: 15000 });
     const q = (p) => p.eval('(() => { const u = new URLSearchParams(location.search); return { np: u.get("np"), join: u.get("join"), online: u.get("online"), net: u.get("net"), anim: u.get("anim") }; })()');
     const during = await q(a);
     ok(during.np === 'AGHOP' && during.join === '1', 'OP4r (the rig) while the join waits the address names the room and join=1 (so a reload finds the room)', J(during));
-    await a.eval('document.getElementById("olCancelAsk").click()');
+    await a.eval('void window.__arenaOnline.cancel()');
     const cancelled = await q(a);
     ok(cancelled.np === null && cancelled.join === null && cancelled.online === '1' && cancelled.net === 'local' && cancelled.anim === '0', 'OP4a Cancel puts the plain Play online address back (no room, no join=1, online=1; net and anim kept)', J(cancelled));
     await a.send('Page.reload', { ignoreCache: false });
-    await a.waitFor(UX_READY + ' && !document.getElementById("olQuick").disabled', { timeoutMs: 90000 });
-    const reloaded = await a.eval('({ board: !document.getElementById("olOpen").hidden, room: document.getElementById("olRoom").value, roomField: !document.getElementById("olRoom").closest("label").hidden, stage: window.__arenaOnline.state.stage, role: window.__arenaOnline.state.role })');
+    await a.waitFor(UX_READY + ' && window.__arenaOnline.view().canQuick', { timeoutMs: 90000 });
+    const reloaded = await a.eval('({ board: !document.getElementById("olOpen").hidden, room: window.__arenaOnline.state.form.room, roomField: !document.getElementById("olRoom").closest("label").hidden, stage: window.__arenaOnline.state.stage, role: window.__arenaOnline.state.role })');
     ok(reloaded.board === true && reloaded.room === '' && reloaded.roomField === true && reloaded.stage === 'setup' && reloaded.role !== 'guest', 'OP4b a reload after Cancel is the Play online page with the Open games board (not the join-by-code form with the cancelled room filled in)', J(reloaded));
     // a game that never answers is given up on after the wait: the address comes back the same way
-    await a.waitFor('document.querySelector(\'#olOpenList li[data-room="AGHOP"]\')', { timeoutMs: 10000 });
+    await a.waitFor('window.__arenaOnline.board().some((g) => g.room === "AGHOP")', { timeoutMs: 10000 });
     await clickJoin(a, 'AGHOP');
-    await a.waitFor('window.__arenaOnline.state.stage === "setup" && /not open any more/.test(document.getElementById("olStatus").textContent)', { timeoutMs: 25000 }).catch(() => null);
+    await a.waitFor('window.__arenaOnline.state.stage === "setup" && /not open any more/.test(window.__arenaOnline.view().status.text)', { timeoutMs: 25000 }).catch(() => null);
     const gaveUp = await q(a);
     ok(gaveUp.np === null && gaveUp.join === null && gaveUp.online === '1', 'OP4c and so does a game that never answered and was given up on', J(gaveUp));
     ok(a.errors.length === 0, 'OP4d no page errors', J(a.errors).slice(0, 200));
@@ -1295,9 +1293,9 @@ async function opCancel(c) {
   // a join-by-code page (the lobby's hand-off, an address with a room) is NOT the board: Cancel there leaves its address alone
   await withBrowser({ port: c.cdp(1), width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (a) => {
     await uxRoom(c, a, 'AGHOQ', 'guest', '&openjoin=4000');
-    await a.eval('document.getElementById("olGo").click()');
+    await a.eval('void window.__arenaOnline.go()');
     await a.waitFor('window.__arenaOnline.state.stage === "waiting"', { timeoutMs: 15000 });
-    await a.eval('document.getElementById("olCancelAsk").click()');
+    await a.eval('void window.__arenaOnline.cancel()');
     const u = await a.eval('(() => { const q = new URLSearchParams(location.search); return { np: q.get("np"), join: q.get("join"), online: q.get("online") }; })()');
     ok(u.np === 'AGHOQ' && u.join === '1' && u.online === null, 'OP4e a join-by-code page keeps its own address after Cancel (it was never the board)', J(u));
   });
@@ -1325,9 +1323,9 @@ async function groupOpenLayout(S) {
     const b = await a.openTab({ width: 390, height: 844, mobile: true });
     await openPanel(a); await openPanel(b);
     await setForm(b, { name: 'Bea', pub: true, role: 'host' });
-    await b.eval('document.getElementById("olQuick").click()');
-    await b.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-    await a.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 15000 });
+    await b.eval('void window.__arenaOnline.quick()');
+    await b.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    await a.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 15000 });
     const overflow = await a.eval('document.documentElement.scrollWidth - document.documentElement.clientWidth');
     ok(overflow <= 0, 'Y1 the setup panel with the board does not overflow a 390 px phone', String(overflow));
     const sizes = await a.eval('[...document.querySelectorAll("#online button, #online select, #online input, #online a.textbtn")].filter((n) => n.offsetParent !== null).map((n) => { const r = n.getBoundingClientRect(); return [n.id || n.getAttribute("aria-label") || n.textContent, Math.round(r.height), Math.round(r.width)]; })');
@@ -1367,7 +1365,7 @@ const hubYes = (p) => p.eval('(() => { const H = window.__arenaHub, d = H.dialog
 // the client point of a logical point of the picture (240 x 160), and of the middle of option k of the question that is up
 const hubPoint = (p, lx, ly) => p.eval(`(() => { const r = window.__arenaHub.canvas.getBoundingClientRect(); return { x: r.left + ${lx} * r.width / 240, y: r.top + ${ly} * r.height / 160, k: r.width / 240 }; })()`);
 const hubOption = (p, k) => p.eval(`(() => { const H = window.__arenaHub, rs = H.model.rects(), r = H.canvas.getBoundingClientRect(), o = rs[${k}]; return o ? { x: r.left + (o.x + o.w / 2) * r.width / 240, y: r.top + (o.y + o.h / 2) * r.height / 160, h: o.h * r.height / 160, w: o.w * r.width / 240, n: rs.length } : null; })()`);
-const residentRow = (p) => p.eval('(() => { const li = [...document.querySelectorAll("#olOpenList li")].find((x) => /^H/.test(x.dataset.room)); return li ? { room: li.dataset.room, who: li.querySelector(".who").textContent, button: li.querySelector("button").textContent, label: li.querySelector("button").getAttribute("aria-label") } : null; })()');
+const residentRow = (p) => p.eval('(() => { const g = window.__arenaOnline.board().find((x) => x.h); return g ? { room: g.room, who: g.who, button: "Challenge", label: "Challenge " + g.who + " (" + (g.fmt === "3v3" ? "3 v 3" : "6 v 6") + ")" } : null; })()');
 
 async function groupPresence(S) {
   ANIM = '&anim=0';
@@ -1384,12 +1382,12 @@ async function groupPresence(S) {
     const t1 = await toggleState(hub);
     ok(t1.pressed === 'true' && t1.text === 'Open: on' && t1.stored === '1', 'A2 switching it on says so, and remembers it', J(t1));
     await openPanel(ch, '&openchal=5000');
-    await ch.waitFor('(() => [...document.querySelectorAll("#olOpenList li")].some((x) => /^H/.test(x.dataset.room)))()', { timeoutMs: 20000 });
+    await ch.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
     const row = await residentRow(ch);
     ok(row && row.who === 'HUBHERO' && row.button === 'Challenge' && /Challenge HUBHERO/.test(row.label), 'A3 another browser\'s board lists the hub player by their PROFILE\'s trainer name, with a Challenge button (not Join)', J(row));
     await shot(ch, 'P_board_resident');
     await setForm(ch, { name: 'Chad' });
-    await ch.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
+    await ch.eval('void window.__arenaOnline.pick(window.__arenaOnline.board().find((g) => g.h).room)');
     await hubFront(hub);
     await hub.waitFor(HUB_Q_ARMED(), { timeoutMs: 15000 });
     const dlg = await hubQ(hub);
@@ -1398,18 +1396,18 @@ async function groupPresence(S) {
     const dlg2 = await hub.eval('(() => { const H = window.__arenaHub; H.press("a"); const d = H.dialog.current(); return { page: d.page, on: d.choice.options[d.choice.cursor], options: d.choice.options, shown: !!H.view().dialog.choice }; })()');
     ok(/^Chad.* wants to battle you\.$/.test(dlg.text) && dlg.dom === 0 && dlg.pages === 2 && dlg2.page === 1 && dlg2.shown && J(dlg2.options) === J(['YES', 'NO']) && dlg2.on === 'NO' && behind.same && behind.asked === true && behind.panel === false,
       'A4 the owner is asked IN THE PICTURE (no DOM dialog), naming the challenger, with YES / NO and NO highlighted (a stray press must not carry them off), and the menu behind the question hears nothing', J({ dlg, dlg2, behind }));
-    ok(/Asked HUBHERO/.test(await statusText(ch)) && (await stageOf(ch)) === 'asking' && !(await ch.eval('document.getElementById("olCancelAsk").hidden')), 'A5 the challenger is told it asked, and can cancel', await statusText(ch));
+    ok(/Asked HUBHERO/.test(await statusText(ch)) && (await stageOf(ch)) === 'asking' && !(await ch.eval('!window.__arenaOnline.view().cancel.shown')), 'A5 the challenger is told it asked, and can cancel', await statusText(ch));
     await shot(hub, 'P_dialog_hub');
     await hubNo(hub);
     await ch.waitFor('window.__arenaOnline.state.stage === "setup"', { timeoutMs: 10000 });
     ok(/not available/.test(await statusText(ch)) && !(await hubAsked(hub)) && (await hub.eval('window.__arenaHub.dialog.isOpen()')) === false, 'A6 NO (the B button): the challenger is told in words, the question closes and the hub is live again', await statusText(ch));
-    await ch.waitFor('document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 15000 });
+    await ch.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 15000 });
     // The second ask must really go out and really be answered. This case used to wait for "setup + not available" with a `.catch(() => {})` and then sleep: a challenge that never left (the old
     // wait was already true from the first No, and a timeout was swallowed) passed as "no dialog". Now the challenge is COUNTED as it goes out (the challenger's own board connection), and the case
     // needs the answer to come back after that, in words; the status says "Checking your team..." the moment the button is pressed, so "not available" can only be the second No.
     await ch.eval('(() => { const L = window.__arenaOnline.lobbies(), sig = L.signal; window.__chals = 0; L.signal = function (k, ...a) { if (k === "chal") window.__chals++; return sig.call(this, k, ...a); }; return true; })()');
-    await ch.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
-    const asked2 = await ch.waitFor('window.__chals >= 1 && window.__arenaOnline.state.stage === "setup" && /not available/.test(document.getElementById("olStatus").textContent)', { timeoutMs: 15000 }).then(() => true, () => false);
+    await ch.eval('void window.__arenaOnline.pick(window.__arenaOnline.board().find((g) => g.h).room)');
+    const asked2 = await ch.waitFor('window.__chals >= 1 && window.__arenaOnline.state.stage === "setup" && /not available/.test(window.__arenaOnline.view().status.text)', { timeoutMs: 15000 }).then(() => true, () => false);
     ok(asked2 && (await ch.eval('window.__chals')) === 1 && !(await hubAsked(hub)), 'A7 asking again straight after NO: the second ask goes out (once), gets a quiet no in words, and the owner is not asked again', 'asked+answered=' + asked2 + ' chals=' + (await ch.eval('window.__chals')) + ' ' + (await statusText(ch)));
     ok(hub.errors.length === 0 && ch.errors.length === 0, 'A8 no page errors', J(hub.errors.concat(ch.errors)).slice(0, 200));
   });
@@ -1425,12 +1423,12 @@ async function groupPresence(S) {
     await hub.eval('document.getElementById("openToggle").click()');
     await hub.waitFor('window.__arenaPresence.isOn() && window.__arenaPresence.presence', { timeoutMs: 30000 });
     await openPanel(ch, '&openchal=20000');
-    await ch.waitFor('document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 20000 });
+    await ch.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
     await setForm(ch, { name: 'Chad' });          // typed in a tab of the SAME browser, so it is also what this browser remembers as "the name"
     // (the hub's clock is held while the challenge arrives, so the question is certainly still in its first moments when the presses below land: it has not started to listen)
     await hubFront(hub);
     await hub.eval('(window.__arenaHub.pause(true), true)');
-    await ch.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
+    await ch.eval('void window.__arenaOnline.pick(window.__arenaOnline.board().find((g) => g.h).room)');
     await hub.waitFor(HUB_Q(), { timeoutMs: 15000 });
     await hubYes(hub);
     await sleep(200);
@@ -1442,7 +1440,7 @@ async function groupPresence(S) {
     await hub.waitFor('location.pathname === "/pokemonarena/battle.html"', { timeoutMs: 30000 });
     const u = new URL(await hub.eval('location.href'));
     ok(u.searchParams.get('auto') === 'host' && /^[0-9a-f]{16}$/.test(u.searchParams.get('for')) && /^[0-9a-f]{16}$/.test(u.searchParams.get('rq')) && u.searchParams.get('format') === '3v3' && u.searchParams.get('net') === 'local', 'PB2 Accept takes the hub player to the battle page as the host of an accepted challenge', u.search);
-    const b3 = await ch.eval('document.getElementById("olStatus").textContent');          // it used to end in `|| true` (never failed) and look for the CHALLENGER's own name; the page says the OWNER's (online.js: g.name + ' accepted. Connecting...')
+    const b3 = await ch.eval('window.__arenaOnline.view().status.text');          // it used to end in `|| true` (never failed) and look for the CHALLENGER's own name; the page says the OWNER's (online.js: g.name + ' accepted. Connecting...')
     ok(/^(HUBHERO accepted\. Connecting|Joining HUBHERO)/.test(b3), 'PB3 the challenger was told the owner accepted ("HUBHERO accepted. Connecting...", or already "Joining HUBHERO..."): not still "Asked ...", not "not available"', b3);
     const r = await bothPlaying(hub, ch, 90000, hub);
     ok(r.phases[0] === 'playing' && r.phases[1] === 'playing', 'PB4 the battle starts: the challenger was told the room by the new page and joined', J(r));
@@ -1473,9 +1471,9 @@ async function groupPresence(S) {
     ok((await spied(spy)).filter((m) => m && m.k === 'acc').length === accsBefore, 'PB13 the reloaded host is an ordinary host (it lets the returning player back in by itself), the link is back up, and no second room was announced', '');
     // the Accept address is not a standing command: opened again (Back, a restored tab, a pasted link) it has no token left and hosts nothing
     await hub.navigate(u.href);
-    await hub.waitFor('window.__arenaOnline && document.getElementById("olGo") && window.__arenaBattle && window.__arenaBattle.state === "online" && (!document.getElementById("olOpen").hidden || !document.getElementById("olCode").hidden || window.__arenaOnline.state.stage !== "setup")', { timeoutMs: 90000 });       // (settled, one way or the other: a page that hosted a game for the address must fail PB14, not time out)
+    await hub.waitFor('window.__arenaOnline && document.getElementById("olGo") && window.__arenaBattle && window.__arenaBattle.state === "online" && (!document.getElementById("olOpen").hidden || window.__arenaOnline.view().code !== "" || window.__arenaOnline.state.stage !== "setup")', { timeoutMs: 90000 });       // (settled, one way or the other: a page that hosted a game for the address must fail PB14, not time out)
     await sleep(2500);
-    const replay = await hub.eval('({ stage: window.__arenaOnline.state.stage, room: window.__arenaOnline.state.room, hosting: window.__arenaOnline.lobbies() ? window.__arenaOnline.lobbies().hosting() : null, status: document.getElementById("olStatus").textContent, board: !document.getElementById("olOpen").hidden, codeShown: !document.getElementById("olCode").hidden })');
+    const replay = await hub.eval('({ stage: window.__arenaOnline.state.stage, room: window.__arenaOnline.state.room, hosting: window.__arenaOnline.lobbies() ? window.__arenaOnline.lobbies().hosting() : null, status: window.__arenaOnline.view().status.text, board: !document.getElementById("olOpen").hidden, codeShown: window.__arenaOnline.view().code !== "" })');
     ok(replay.stage === 'setup' && !replay.room && !replay.hosting && !replay.codeShown && replay.board && /ignored/.test(replay.status) && (await spied(spy)).filter((m) => m && m.k === 'acc').length === accsBefore, 'PB14 the same Accept address opened again hosts nothing, announces nothing, and shows the ordinary panel with a notice', J(replay));
   });
 
@@ -1485,8 +1483,8 @@ async function groupPresence(S) {
     await spyOn(spy);
     const FOR = 'ab'.repeat(8), RQ = 'cd'.repeat(8);
     const craft = () => BASE + '?online=1&auto=host&for=' + FOR + '&rq=' + RQ + '&format=3v3&net=local' + ANIM;
-    const panelReady = () => v.waitFor('window.__arenaOnline && document.getElementById("olGo") && window.__arenaBattle && window.__arenaBattle.state === "online" && (!document.getElementById("olOpen").hidden || !document.getElementById("olCode").hidden || window.__arenaOnline.state.stage !== "setup")', { timeoutMs: 90000 });       // (settled, one way or the other; not "enabled": a page that hosted a game for the link has its panel locked, and that must be a failed case below, not a timeout)
-    const view = () => v.eval('({ stage: window.__arenaOnline.state.stage, room: window.__arenaOnline.state.room, role: window.__arenaOnline.state.role, hosting: window.__arenaOnline.lobbies() ? window.__arenaOnline.lobbies().hosting() : null, status: document.getElementById("olStatus").textContent, board: !document.getElementById("olOpen").hidden, codeShown: !document.getElementById("olCode").hidden })');
+    const panelReady = () => v.waitFor('window.__arenaOnline && document.getElementById("olGo") && window.__arenaBattle && window.__arenaBattle.state === "online" && (!document.getElementById("olOpen").hidden || window.__arenaOnline.view().code !== "" || window.__arenaOnline.state.stage !== "setup")', { timeoutMs: 90000 });       // (settled, one way or the other; not "enabled": a page that hosted a game for the link has its panel locked, and that must be a failed case below, not a timeout)
+    const view = () => v.eval('({ stage: window.__arenaOnline.state.stage, room: window.__arenaOnline.state.room, role: window.__arenaOnline.state.role, hosting: window.__arenaOnline.lobbies() ? window.__arenaOnline.lobbies().hosting() : null, status: window.__arenaOnline.view().status.text, board: !document.getElementById("olOpen").hidden, codeShown: window.__arenaOnline.view().code !== "" })');
     await v.navigate(craft()); await panelReady(); await sleep(2500);
     const a = await view();
     ok(a.stage === 'setup' && !a.room && !a.hosting && !a.codeShown && a.board && /ignored/.test(a.status), 'PL1 a bare accepted-challenge link opens no room: the ordinary online panel (with the open games) and a notice', J(a));
@@ -1509,20 +1507,20 @@ async function groupPresence(S) {
     await hub.eval('document.getElementById("openToggle").click()');
     await hub.waitFor('window.__arenaPresence.isOn() && window.__arenaPresence.presence', { timeoutMs: 30000 });
     await openPanel(c1, '&openchal=20000'); await openPanel(c2, '&openchal=20000');
-    await c1.waitFor('document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 20000 });
-    await c2.waitFor('document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 20000 });
+    await c1.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
+    await c2.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
     await setForm(c1, { name: 'One' }); await setForm(c2, { name: 'Two' });
-    await c1.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
+    await c1.eval('void window.__arenaOnline.pick(window.__arenaOnline.board().find((g) => g.h).room)');
     await hub.waitFor(HUB_Q(), { timeoutMs: 15000 });
-    await c2.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
-    await c2.waitFor('window.__arenaOnline.state.stage === "setup" && /another challenge/.test(document.getElementById("olStatus").textContent)', { timeoutMs: 15000 });
+    await c2.eval('void window.__arenaOnline.pick(window.__arenaOnline.board().find((g) => g.h).room)');
+    await c2.waitFor('window.__arenaOnline.state.stage === "setup" && /another challenge/.test(window.__arenaOnline.view().status.text)', { timeoutMs: 15000 });
     const first = await hubQ(hub);
     ok(/^One/.test(first.text) && (await hub.eval('window.__arenaHub.model.state().dialog.queued.length')) === 0, 'C1 a second challenger is told the owner is busy, and the question in the picture is still the first one (nothing queued behind it)', J([first, await statusText(c2)]));
-    await c1.eval('document.getElementById("olCancelAsk").click()');
+    await c1.eval('void window.__arenaOnline.cancel()');
     await hub.waitFor(HUB_Q_GONE(), { timeoutMs: 10000 });
     ok((await stageOf(c1)) === 'setup' && /Cancelled/.test(await statusText(c1)), 'C2 cancelling closes the owner\'s question and puts the challenger back at the board', await statusText(c1));
-    await c2.waitFor('document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 15000 });
-    await c2.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
+    await c2.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 15000 });
+    await c2.eval('void window.__arenaOnline.pick(window.__arenaOnline.board().find((g) => g.h).room)');
     await hub.waitFor(HUB_Q(), { timeoutMs: 15000 });
     ok(/^Two/.test((await hubQ(hub)).text), 'C3 and the owner can be asked again once the question is gone', '');
     // the challenger closes the tab while it is waiting: the challenge is withdrawn at once (the question does not stay up for a player who has gone, for the rest of its 20 s)
@@ -1539,10 +1537,10 @@ async function groupPresence(S) {
     await hub.eval('document.getElementById("openToggle").click()');
     await hub.waitFor('window.__arenaPresence.isOn() && window.__arenaPresence.presence', { timeoutMs: 30000 });
     await openPanel(ch, '&openchal=1500');
-    await ch.waitFor('document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 20000 });
+    await ch.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
     // (watched from inside the page: with only 1.5 s to live, a poll from here could miss the question altogether)
     await hub.eval('(() => { window.__sawQ = false; const tick = () => { const d = window.__arenaHub.dialog.current(); if (d && d.id === "presence:challenge") window.__sawQ = true; if (!window.__qStop) setTimeout(tick, 20); }; tick(); return true; })()');
-    await ch.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
+    await ch.eval('void window.__arenaOnline.pick(window.__arenaOnline.board().find((g) => g.h).room)');
     await hub.waitFor('window.__sawQ === true', { timeoutMs: 15000 });
     await hub.waitFor(HUB_Q_GONE(), { timeoutMs: 10000 });
     await ch.waitFor('window.__arenaOnline.state.stage === "setup"', { timeoutMs: 10000 });
@@ -1557,15 +1555,15 @@ async function groupPresence(S) {
     await hub.eval('document.getElementById("openToggle").click()');
     await hub.waitFor('window.__arenaPresence.isOn() && window.__arenaPresence.presence', { timeoutMs: 30000 });
     await openPanel(ch);
-    await ch.waitFor('document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 20000 });
+    await ch.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
     await openHub(hub);
     const t = await toggleState(hub);
     ok(t.pressed === 'true' && t.stored === '1', 'E1 a reload keeps the switch on', J(t));
-    await ch.waitFor('document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 20000 });
+    await ch.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
     ok(true, 'E2 and the hub player is on the board again', '');
     await hub.eval('document.getElementById("openToggle").click()');
     const t0 = Date.now();
-    await ch.waitFor('!document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 8000 });
+    await ch.waitFor('!window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 8000 });
     const t2 = await toggleState(hub);
     ok(t2.pressed === 'false' && t2.stored === null && Date.now() - t0 < 8000 && (await hub.eval('window.__arenaPresence.presence === null && window.__arenaPresence.lobbies === null')), 'E3 off takes the listing down at once (not after the ttl), forgets the setting and lets go of the board', J(t2) + ' ' + (Date.now() - t0));
     await openHub(hub);
@@ -1580,9 +1578,9 @@ async function groupPresence(S) {
     await me.navigate(BASE + '?net=local&anim=0&openchal=20000');
     await me.waitFor('window.__arenaBattle && window.__arenaBattle.state === "ready" && window.__arenaPresence && window.__arenaPresence.isOn()', { timeoutMs: 120000 });
     await openPanel(ch, '&openchal=20000');
-    await ch.waitFor('document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 20000 });
+    await ch.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
     await setForm(ch, { name: 'Cleo' });
-    await ch.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
+    await ch.eval('void window.__arenaOnline.pick(window.__arenaOnline.board().find((g) => g.h).room)');
     await me.waitFor('(() => { const d = document.getElementById("challenge"); return !!d && !d.hidden; })()', { timeoutMs: 15000 });
     const paused = await me.eval('window.__arenaBattle.controlsOpen');
     ok(paused === true, 'PF1 a challenge reaches a player in the middle of a CPU battle and pauses it like the Controls panel does', String(paused));
@@ -1594,8 +1592,8 @@ async function groupPresence(S) {
     // a different challenger this time, so the quiet period does not apply
     const ch2 = await me.openTab({ width: 900, height: 760 });
     await openPanel(ch2, '&openchal=20000');
-    await ch2.waitFor('document.querySelector("#olOpenList li[data-room^=H]")', { timeoutMs: 20000 });
-    await ch2.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
+    await ch2.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
+    await ch2.eval('void window.__arenaOnline.pick(window.__arenaOnline.board().find((g) => g.h).room)');
     await me.waitFor('(() => { const d = document.getElementById("challenge"); return !!d && !d.hidden; })()', { timeoutMs: 15000 });
     await sleep(800);
     await me.eval('document.getElementById("chAccept").click()');
@@ -1668,7 +1666,7 @@ const LOAD_PROFILE_JS = (id) => `(async () => { const S = await import('/pokemon
 const RECORD_MODES_JS = (id) => `(async () => { const S = await import('/pokemonarena/js/store.js'), H = await import('/pokemonarena/js/hub_data.js'); const store = await S.openStore(); const d = await H.readHubData(store, window.__arenaBattle.pack, { tzMinutes: 0 }); await store.close(); const p = d.profiles.find((x) => x.id === ${J(id)}); const by = p && p.record.pages.find((x) => x.id === 'by'); const rc = p && p.record.pages.find((x) => x.id === 'recent0'); const t = (pg) => pg ? pg.lines.map((l) => l.cells.map((c) => c.t).filter((x) => x !== '').join(' | ')).join('\\n') : null; return { modes: t(by), recent: t(rc) }; })()`;
 const matchIdOf = (i) => (i.seed >>> 0) + '_' + i.fmt + '_o' + i.mn + '_' + i.room;
 async function pickTeam(page, key, typeName) {
-  await page.eval('(() => { if (' + J(typeName || null) + ') { const n = document.getElementById("olName"); n.value = ' + J(typeName || '') + '; n.dispatchEvent(new Event("input", { bubbles: true })); } const t = document.getElementById("olTeam"); t.value = ' + J(key) + '; t.dispatchEvent(new Event("change", { bubbles: true })); return true; })()');
+  await page.eval('(() => { const O = window.__arenaOnline; if (' + J(typeName || null) + ') O.setForm({ name: ' + J(typeName || '') + ', typed: true }); O.setForm({ teamKey: ' + J(key) + ' }); return true; })()');          // (a name the player gave first, then the team: the name stays)
 }
 const careerOf = (p) => p.eval('(() => { const c = window.__arenaBattle && window.__arenaBattle.career; return c ? { state: c.state, matchId: c.matchId, profileId: c.profileId } : null; })()');
 async function finishMatch(host, guest, wantId) {
@@ -1691,12 +1689,12 @@ async function groupProfile(S) {
     await pickTeam(host, keyA);
     // (the ACTIVE profile is ALICE, so ALICE would be the default name anyway: the guest's choice of BOBBY's team is what shows the name following the team)
     await pickTeam(guest, keyB);
-    ok((await guest.eval('document.getElementById("olName").value')) === 'BOBBY', 'F2 choosing a saved team fills in the name of the profile that owns it', await guest.eval('document.getElementById("olName").value'));
+    ok((await guest.eval('window.__arenaOnline.state.form.name')) === 'BOBBY', 'F2 choosing a saved team fills in the name of the profile that owns it', await guest.eval('window.__arenaOnline.state.form.name'));
     await pickTeam(guest, keyB, 'Zed');
-    ok((await guest.eval('document.getElementById("olName").value')) === 'Zed', 'F3 a name the player typed is kept when the team changes', await guest.eval('document.getElementById("olName").value'));
-    await host.eval('document.getElementById("olFmt").value = "3v3"; document.getElementById("olGo").click()');
-    await host.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-    await guest.eval('document.getElementById("olGo").click()');
+    ok((await guest.eval('window.__arenaOnline.state.form.name')) === 'Zed', 'F3 a name the player typed is kept when the team changes', await guest.eval('window.__arenaOnline.state.form.name'));
+    await host.eval('window.__arenaOnline.setForm({ fmt: "3v3" }); void window.__arenaOnline.go()');
+    await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    await guest.eval('void window.__arenaOnline.go()');
     await approve(host, true);
     const ph = await (async () => { for (let i = 0; i < 160; i++) { const [a, b] = [await phase(host), await phase(guest)]; if (a === 'playing' && b === 'playing') return [a, b]; await sleep(250); } return [await phase(host), await phase(guest)]; })();
     ok(ph[0] === 'playing' && ph[1] === 'playing', 'F4 the match starts with saved teams', J(ph));
@@ -1722,7 +1720,7 @@ async function groupProfile(S) {
     // a reload AT THE RESULT SCREEN (the finished match is gone, the setup is back) leaves the record as it was. That is all this case runs: the claim that the same match id folds once is proved in
     // Node (pokemonarena_netmatch_test.mjs case O: a page reloaded INTO a match computes the same id; pokemonarena_career_test.mjs: an id folded twice changes nothing)
     const rev1 = A.rev;
-    await host.eval('setTimeout(() => location.reload(), 10); true'); await sleep(1500); await host.waitFor('window.__arenaOnline && document.getElementById("olGo")', { timeoutMs: 60000 });
+    await host.eval('setTimeout(() => location.reload(), 10); true'); await sleep(1500); await host.waitFor('window.__arenaOnline && window.__arenaOnline.view().ready', { timeoutMs: 60000 });
     const A2 = await host.eval(LOAD_PROFILE_JS(pa.id));
     ok(sum(A2.stats.byCpu.online) === 1 && A2.stats.recent.length === 1 && A2.rev === rev1, 'F14 reloading the page does not count the battle again', J([sum(A2.stats.byCpu.online), A2.rev, rev1]));
   });
@@ -1733,9 +1731,9 @@ async function groupProfile(S) {
     const [pa, pb] = seeded.profiles;
     await openRoom(host, 'APRO2', 'host'); await openRoom(guest, 'APRO2', 'guest');
     await pickTeam(host, 'saved:' + pa.id + ':' + pa.teams[0]); await pickTeam(guest, 'saved:' + pb.id + ':' + pb.teams[0]);
-    await host.eval('document.getElementById("olFmt").value = "3v3"; document.getElementById("olGo").click()');
-    await host.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-    await guest.eval('document.getElementById("olGo").click()');
+    await host.eval('window.__arenaOnline.setForm({ fmt: "3v3" }); void window.__arenaOnline.go()');
+    await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    await guest.eval('void window.__arenaOnline.go()');
     await approve(host, true);
     for (let i = 0; i < 160 && !((await phase(host)) === 'playing' && (await phase(guest)) === 'playing'); i++) await sleep(250);
     await host.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 }); await guest.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
@@ -1758,11 +1756,11 @@ async function groupProfile(S) {
     const third = await host.openTab({ width: 900, height: 760 });
     await openPanel(third); await openPanel(host);
     await pickTeam(host, 'saved:' + pa.id + ':' + pa.teams[0]);
-    await host.eval('document.getElementById("olFmt").value = "3v3"; document.getElementById("olQuick").click()');
-    await host.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-    await third.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 20000 });
+    await host.eval('window.__arenaOnline.setForm({ fmt: "3v3" }); void window.__arenaOnline.quick()');
+    await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    await third.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 20000 });
     const want = A.stats.byCpu.online.w + '-' + (A.stats.byCpu.online.l + A.stats.byCpu.online.f);
-    const row = await third.eval('(() => { const li = document.querySelector("#olOpenList li"); const r = li.querySelector(".rec"); return { who: li.querySelector(".who").textContent, rec: r ? r.textContent : null }; })()');
+    const row = await third.eval('(() => { const g = window.__arenaOnline.board()[0]; return { who: g.who, rec: g.rec ? g.rec[0] + "-" + g.rec[1] : null }; })()');
     ok(row.who === 'ALICE' && row.rec === want, 'F19 the open game shows the trainer\'s name and online record (' + want + ')', J(row));
   });
 
@@ -1774,9 +1772,9 @@ async function groupProfile(S) {
     const [pa, pb] = seeded.profiles;
     await openRoom(host, 'APRO3', 'host'); await openRoom(guest, 'APRO3', 'guest');
     await pickTeam(host, 'saved:' + pa.id + ':' + pa.teams[0]); await pickTeam(guest, 'saved:' + pb.id + ':' + pb.teams[0]);
-    await host.eval('document.getElementById("olFmt").value = "3v3"; document.getElementById("olGo").click()');
-    await host.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-    await guest.eval('document.getElementById("olGo").click()');
+    await host.eval('window.__arenaOnline.setForm({ fmt: "3v3" }); void window.__arenaOnline.go()');
+    await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    await guest.eval('void window.__arenaOnline.go()');
     await approve(host, true);
     for (let i = 0; i < 160 && !((await phase(host)) === 'playing' && (await phase(guest)) === 'playing'); i++) await sleep(250);
     await host.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 }); await guest.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
@@ -1812,9 +1810,9 @@ async function profileDesync(c) {
     const [pa, pb] = seeded.profiles;
     await openRoom(host, 'APRO4', 'host', '', base); await openRoom(guest, 'APRO4', 'guest', '', base);
     await pickTeam(host, 'saved:' + pa.id + ':' + pa.teams[0]); await pickTeam(guest, 'saved:' + pb.id + ':' + pb.teams[0]);
-    await host.eval('document.getElementById("olFmt").value = "3v3"; document.getElementById("olGo").click()');
-    await host.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-    await guest.eval('document.getElementById("olGo").click()');
+    await host.eval('window.__arenaOnline.setForm({ fmt: "3v3" }); void window.__arenaOnline.go()');
+    await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    await guest.eval('void window.__arenaOnline.go()');
     await approve(host, true);
     for (let i = 0; i < 160 && !((await phase(host)) === 'playing' && (await phase(guest)) === 'playing'); i++) await sleep(250);
     await host.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 }); await guest.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
@@ -2744,8 +2742,8 @@ async function groupPresenceUi(S) {
 //   node tools/pokemonarena_online_page_test.mjs onlineux --mutants   ALSO serve a copy of the game with ONE defect at a time (tools/pokemonarena_overlay.mjs); each must fail the named case
 // Every page of a session is on ONE origin (c.origin: the real server, or a mutated copy of the game in front of it), because the board is a BroadcastChannel and a channel is per origin.
 const UX_URL = (c, q) => c.origin + '/pokemonarena/battle.html?' + q;
-const UX_READY = 'window.__arenaOnline && document.getElementById("olGo") && !document.getElementById("olGo").disabled && window.__arenaBattle && window.__arenaBattle.state === "online"';
-const uxPanel = async (c, page, extra = '') => { await page.navigate(UX_URL(c, 'online=1&net=local&anim=0' + extra)); await page.waitFor(UX_READY + ' && !document.getElementById("olQuick").disabled', { timeoutMs: 90000 }); };
+const UX_READY = 'window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "online" && window.__arenaOnline.view().canGo';
+const uxPanel = async (c, page, extra = '') => { await page.navigate(UX_URL(c, 'online=1&net=local&anim=0' + extra)); await page.waitFor(UX_READY + ' && window.__arenaOnline.view().canQuick', { timeoutMs: 90000 }); };
 const uxRoom = async (c, page, room, role, extra = '') => { await page.navigate(UX_URL(c, 'np=' + room + '&' + (role === 'host' ? 'host=1' : 'join=1') + '&net=local&anim=0' + extra)); await page.waitFor(UX_READY, { timeoutMs: 90000 }); };
 // a same-origin page with nothing in it that speaks and listens on the board's channel (the page under test hears it as "another browser"); uxKeep keeps some listings alive on it (a beacon lasts 13 s)
 const uxWire = async (c, page) => { await page.navigate(c.origin + '/pokemonarena/input.css'); await page.eval('(() => { window.__spy = []; const ch = new BroadcastChannel("bemental-arena-open-1"); ch.onmessage = (e) => window.__spy.push(e.data); window.__spyCh = ch; return true; })()'); };
@@ -2753,9 +2751,9 @@ const uxKeep = (p, msgs) => p.eval('(() => { window.__keepMsgs = ' + J(msgs) + '
 async function uxHost(c, page, name, extra = '') {
   await uxPanel(c, page, extra);
   await setForm(page, { name, fmt: '3v3', pub: true, role: 'host' });
-  await page.eval('document.getElementById("olQuick").click()');
-  await page.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-  return (await page.eval('document.getElementById("olCode").textContent')).trim();
+  await page.eval('void window.__arenaOnline.quick()');
+  await page.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+  return (await page.eval('window.__arenaOnline.view().code')).trim();
 }
 // counts every Session the page starts (the page looks Netplay.Session up each time it starts one)
 const UX_COUNT = '(() => { window.__sessions = 0; const S = Netplay.Session; Netplay.Session = class extends S { constructor(...a) { super(...a); window.__sessions++; } }; return Netplay.Session !== S; })()';
@@ -2775,10 +2773,10 @@ async function uxJoin(c) {
     const guest = await host.openTab({ width: 900, height: 760 });
     await uxHost(c, host, 'Hal', '&openjoin=15000');
     await uxPanel(c, guest, '&openjoin=15000');
-    await guest.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 15000 });
+    await guest.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 15000 });
     await setForm(guest, { name: 'Gus' });
     ok((await guest.eval(UX_COUNT)) === true, 'OXR0 (the rig) the page\'s Session constructor is replaced by one that counts', '');
-    await guest.eval('(() => { const b = document.querySelector("#olOpenList li button"); b.click(); b.click(); return true; })()');          // two presses in one tick: both pass the "still at the setup form" check
+    await guest.eval('(() => { const O = window.__arenaOnline, r = O.board()[0].room; void O.pick(r); void O.pick(r); return true; })()');          // two presses in one tick: both pass the "still at the setup form" check
     await guest.waitFor('window.__arenaOnline.state.stage !== "setup"', { timeoutMs: 20000 });
     await sleep(2000);
     const n = await guest.eval('window.__sessions');
@@ -2794,10 +2792,10 @@ async function uxQuick(c) {
     const guest = await host.openTab({ width: 900, height: 760 });
     await uxHost(c, host, 'Ivy', '&openquick=1500&openjoin=15000');
     await uxPanel(c, guest, '&openquick=1500&openjoin=15000');
-    await guest.waitFor('document.querySelectorAll("#olOpenList li").length === 1', { timeoutMs: 15000 });
+    await guest.waitFor('window.__arenaOnline.board().length === 1', { timeoutMs: 15000 });
     await setForm(guest, { name: 'Jon' });
     await guest.eval(UX_COUNT);
-    await guest.eval('(() => { document.getElementById("olQuick").click(); document.querySelector("#olOpenList li button").click(); return true; })()');          // Join pressed while Find a battle is still reading the team
+    await guest.eval('(() => { const O = window.__arenaOnline; void O.quick(); void O.pick(O.board()[0].room); return true; })()');          // Join pressed while Find a battle is still reading the team
     await guest.waitFor('window.__arenaOnline.state.stage !== "setup"', { timeoutMs: 20000 });
     await sleep(3500);
     const n = await guest.eval('window.__sessions');
@@ -2814,9 +2812,9 @@ async function uxChallenge(c) {
     await uxWire(c, wire);
     const id = await identity(ch);
     await uxKeep(wire, [fake(id, { room: 'HRESX', s: '00000000000000c1', h: 1, name: 'Resi' })]);          // a player who is in the hub: a resident game, challenged rather than joined
-    await ch.waitFor('document.querySelector("#olOpenList li[data-room^=H] button")', { timeoutMs: 15000 });
+    await ch.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 15000 });
     await setForm(ch, { name: 'Chad' });
-    await ch.eval('(() => { const b = document.querySelector("#olOpenList li[data-room^=H] button"); b.click(); b.click(); return true; })()');
+    await ch.eval('(() => { const O = window.__arenaOnline, r = O.board().find((g) => g.h).room; void O.pick(r); void O.pick(r); return true; })()');
     await ch.waitFor('window.__arenaOnline.state.stage === "asking"', { timeoutMs: 15000 });
     await sleep(1500);
     const chals = (await spied(wire)).filter((m) => m && m.k === 'chal');
@@ -2835,19 +2833,19 @@ async function uxCancel(c) {
     await uxWire(c, b);
     const id = await identity(a);
     await uxKeep(b, [fake(id, { room: 'AGHOX', s: '00000000000000c9', name: 'Ghost' })]);          // a made-up game: nobody will ever answer a knock on it
-    await a.waitFor('document.querySelector(\'#olOpenList li[data-room="AGHOX"]\')', { timeoutMs: 10000 });
+    await a.waitFor('window.__arenaOnline.board().some((g) => g.room === "AGHOX")', { timeoutMs: 10000 });
     await setForm(a, { name: 'Ann' });
     await clickJoin(a, 'AGHOX');
     await a.waitFor('window.__arenaOnline.state.stage === "waiting"', { timeoutMs: 15000 });
-    const w = await a.eval('({ cancel: !document.getElementById("olCancelAsk").hidden, status: document.getElementById("olStatus").textContent })');
+    const w = await a.eval('({ cancel: window.__arenaOnline.view().cancel.shown, status: window.__arenaOnline.view().status.text })');
     ok(w.cancel && /gives up after 4 seconds/.test(w.status), 'OXC1 while a listed join waits there is a Cancel, and the status says how long the wait can last', J(w));
-    await a.eval('document.getElementById("olCancelAsk").click()');
-    const x = await a.eval('({ stage: window.__arenaOnline.state.stage, status: document.getElementById("olStatus").textContent, noSession: window.__arenaOnline.session() === null, cancelHidden: document.getElementById("olCancelAsk").hidden, go: !document.getElementById("olGo").disabled, quick: !document.getElementById("olQuick").disabled, name: !document.getElementById("olName").disabled })');
+    await a.eval('void window.__arenaOnline.cancel()');
+    const x = await a.eval('({ stage: window.__arenaOnline.state.stage, status: window.__arenaOnline.view().status.text, noSession: window.__arenaOnline.session() === null, cancelHidden: !window.__arenaOnline.view().cancel.shown, go: window.__arenaOnline.view().canGo, quick: window.__arenaOnline.view().canQuick, name: !document.getElementById("olName").disabled })');
     ok(x.stage === 'setup' && x.status === 'Cancelled.' && x.noSession && x.cancelHidden && x.go && x.quick && x.name, 'OXC2 Cancel closes the connection and puts the panel back to the board, usable', J(x));
     // the same game can be tried again, and a join nobody answers still ends in words (nothing was left stuck by the cancel)
-    await a.waitFor('document.querySelector(\'#olOpenList li[data-room="AGHOX"]\')', { timeoutMs: 10000 });
+    await a.waitFor('window.__arenaOnline.board().some((g) => g.room === "AGHOX")', { timeoutMs: 10000 });
     await clickJoin(a, 'AGHOX');
-    await a.waitFor('window.__arenaOnline.state.stage === "setup" && /not open any more/.test(document.getElementById("olStatus").textContent)', { timeoutMs: 25000 });
+    await a.waitFor('window.__arenaOnline.state.stage === "setup" && /not open any more/.test(window.__arenaOnline.view().status.text)', { timeoutMs: 25000 });
     ok(true, 'OXC3 after a cancel the same game can be joined again, and when nobody answers it is given up on in words', await statusText(a));
     ok(a.errors.length === 0, 'OXC4 no page errors', J(a.errors).slice(0, 200));
   });
@@ -2864,18 +2862,18 @@ async function uxFocus(c) {
     const G = (room, s, over = {}) => fake(id, { room, s, name: room.slice(1).replace('FOC', 'Game '), ...over });
     const g1 = G('AFOC1', '00000000000000d1'), g2 = G('AFOC2', '00000000000000d2'), g3 = G('AFOC3', '00000000000000d3');
     await uxKeep(b, [g1, g2]);
-    await a.waitFor('document.querySelectorAll("#olOpenList li").length === 2', { timeoutMs: 10000 });
+    await a.waitFor('window.__arenaOnline.board().length === 2', { timeoutMs: 10000 });
     ok(await a.eval('(() => { const btn = document.querySelector(\'#olOpenList li[data-room="AFOC2"] button\'); btn.focus(); btn.__mark = "two"; window.__li2 = btn.closest("li"); return document.activeElement === btn; })()'), 'OXF0 (the rig) the second Join button can hold the keyboard focus', '');
     // another game appears and the first one changes its format and shows a record: the board changes under the focused button
     const g1b = G('AFOC1', '00000000000000d1', { fmt: '6v6', rec: [3, 1] });
     await uxKeep(b, [g1b, g2, g3]);
-    await a.waitFor('document.querySelectorAll("#olOpenList li").length === 3 && document.querySelector(\'#olOpenList li[data-room="AFOC1"] .fmt\').textContent === "6 v 6"', { timeoutMs: 10000 });
-    const kept = await a.eval('({ mark: document.activeElement && document.activeElement.__mark, same: document.querySelector(\'#olOpenList li[data-room="AFOC2"]\') === window.__li2, rec: (document.querySelector(\'#olOpenList li[data-room="AFOC1"] .rec\') || {}).textContent })');
+    await a.waitFor('window.__arenaOnline.board().length === 3 && document.querySelector(\'#olOpenList li[data-room="AFOC1"] .fmt\').textContent === "6 v 6"', { timeoutMs: 10000 });
+    const kept = await a.eval('({ mark: document.activeElement && document.activeElement.__mark, same: document.querySelector("#olOpenList li[data-room=AFOC2]") === window.__li2, rec: (document.querySelector(\'#olOpenList li[data-room="AFOC1"] .rec\') || {}).textContent })');
     ok(kept.mark === 'two' && kept.same && kept.rec === '3-1', 'OXF1 a game appearing and another changing leave the focused Join button where it was (same row, same button, still focused), and the changed row is updated in place', J(kept));
     // the focused game leaves: the focus goes to a neighbour, not to the top of the page
     await uxKeep(b, [g1b, g3]);
     await b.eval('(() => { const ch = new BroadcastChannel("bemental-arena-open-1"); ch.postMessage({ t: "arenaopen", v: 1, k: "gone", s: "00000000000000d2", room: "AFOC2" }); ch.close(); return true; })()');
-    await a.waitFor('document.querySelectorAll("#olOpenList li").length === 2', { timeoutMs: 10000 });
+    await a.waitFor('window.__arenaOnline.board().length === 2', { timeoutMs: 10000 });
     const heir = await a.eval('(() => { const e = document.activeElement; return { id: e && e.id, room: e && e.closest && e.closest("li") ? e.closest("li").dataset.room : null, body: e === document.body }; })()');
     ok(!heir.body && (heir.room === 'AFOC3' || heir.id === 'olQuick'), 'OXF2 when the focused game itself leaves, the focus moves to the row that took its place, not to the page body', J(heir));
     // a game on another build is hidden AND counted, with games on show too
@@ -2908,24 +2906,24 @@ async function uxRelist(c) {
 async function uxNames(c) {
   const { ok } = c;
   const SPEC = [['ALICE', [['Alice Squad', UX_SQUAD]]], ['BOBBY', [['Bobby Squad', ['Blastoise', 'Gengar', 'Eevee']]]]];
-  const nameBox = (p) => p.eval('document.getElementById("olName").value');
+  const nameBox = (p) => p.eval('window.__arenaOnline.state.form.name');
   const remembered = (p) => p.eval('localStorage.getItem("arena.online.name")');
   await withBrowser({ port: c.cdp(0), width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (p) => {
     await uxPanel(c, p);
     const seeded = await p.eval(SEED_PROFILES_JS(SPEC));
     const [pa, pb] = seeded.profiles, keyB = 'saved:' + pb.id + ':' + pb.teams[0];
     await uxPanel(c, p);
-    ok((await nameBox(p)) === 'ALICE' && (await p.eval('document.getElementById("olTeam").value')).startsWith('saved:' + pa.id), 'OXN0 (the rig) the active profile\'s team is pre-selected and the name box is its trainer', await nameBox(p));
+    ok((await nameBox(p)) === 'ALICE' && (await p.eval('window.__arenaOnline.state.form.teamKey')).startsWith('saved:' + pa.id), 'OXN0 (the rig) the active profile\'s team is pre-selected and the name box is its trainer', await nameBox(p));
     await pickTeam(p, keyB);
     ok((await nameBox(p)) === 'BOBBY', 'OXN0b choosing the other trainer\'s team fills in that trainer', await nameBox(p));
-    await p.eval('document.getElementById("olGo").click()');
-    await p.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
+    await p.eval('void window.__arenaOnline.startAs("host")');
+    await p.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
     ok((await remembered(p)) === null, 'OXN1 a name the PANEL filled in is not remembered as the player\'s (only a typed one is)', J(await remembered(p)));
     await uxPanel(c, p);
     ok((await nameBox(p)) === 'ALICE', 'OXN2 the next visit starts with the trainer who owns the pre-selected team, not the owner of the team used last time', await nameBox(p));
     await setForm(p, { name: 'Zed' });
-    await p.eval('document.getElementById("olGo").click()');
-    await p.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
+    await p.eval('void window.__arenaOnline.startAs("host")');
+    await p.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
     ok((await remembered(p)) === 'Zed', 'OXN3 a name the player TYPED is remembered', J(await remembered(p)));
     await uxPanel(c, p);
     ok((await nameBox(p)) === 'Zed', 'OXN3a and is what the next visit starts with', await nameBox(p));
@@ -2939,7 +2937,7 @@ async function uxNames(c) {
     const seeded = await p.eval(SEED_PROFILES_JS([['ALICE', []], SPEC[1]]));
     const pb = seeded.profiles[1];
     await uxPanel(c, p);
-    const v = await p.eval('({ name: document.getElementById("olName").value, team: document.getElementById("olTeam").value })');
+    const v = await p.eval('({ name: window.__arenaOnline.state.form.name, team: window.__arenaOnline.state.form.teamKey })');
     ok(v.name === 'BOBBY' && v.team.startsWith('saved:' + pb.id), 'OXN4 when the active profile has no team the pre-selected team is another trainer\'s and so is the name (it used to show the active profile\'s name over it)', J(v));
   });
 }
@@ -2958,23 +2956,23 @@ async function uxRec(c) {
     await uxWire(c, wire);
     const id = await identity(ch);
     await uxKeep(wire, [fake(id, { room: 'HRESX', s: '00000000000000c1', h: 1, name: 'Resi' })]);
-    await ch.waitFor('document.querySelector("#olOpenList li[data-room^=H] button")', { timeoutMs: 15000 });
+    await ch.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 15000 });
     const one = await ch.eval(`(async () => { let n = 0; const o = IDBFactory.prototype.open; IDBFactory.prototype.open = function (...a) { n++; return o.apply(this, a); }; const S = await import('/pokemonarena/js/store.js'); const st = await S.openStore(); await st.close(); IDBFactory.prototype.open = o; return n; })()`);
     const chalsNow = async () => { const all = (await spied(wire)).filter((m) => m && m.k === 'chal'); return all; };
     // the saved team (ALICE's, pre-selected): the challenge carries ALICE's online record, and the store was opened once for it
     await ch.eval(UX_IDB);
-    await ch.eval('document.querySelector("#olOpenList li[data-room^=H] button").click()');
+    await ch.eval('void window.__arenaOnline.pick(window.__arenaOnline.board().find((g) => g.h).room)');
     await ch.waitFor('window.__arenaOnline.state.stage === "asking"', { timeoutMs: 15000 });
     await sleep(500);
     const opens1 = await ch.eval('window.__idb');
     const c1 = (await chalsNow()).slice(-1)[0];
     ok(c1 && J(c1.rec) === J([2, 1]), 'OXP1 a challenge sent from the panel carries the challenger\'s online record (2-1), read before the challenge went out', J(c1));
     ok(opens1 === one, 'OXI2 and a saved team opens the store ONCE for the team and the record together', opens1 + ' opens, one openStore() = ' + one);
-    await ch.eval('document.getElementById("olCancelAsk").click()');
+    await ch.eval('void window.__arenaOnline.cancel()');
     await ch.waitFor('window.__arenaOnline.state.stage === "setup"', { timeoutMs: 10000 });
     // a random team: no profile owns it, so no record goes beside the name, and the store is not opened at all
     await pickTeam(ch, 'random');
-    await ch.eval('window.__idb = 0; document.querySelector("#olOpenList li[data-room^=H] button").click()');
+    await ch.eval('window.__idb = 0; void window.__arenaOnline.pick(window.__arenaOnline.board().find((g) => g.h).room)');
     await ch.waitFor('window.__arenaOnline.state.stage === "asking"', { timeoutMs: 15000 });
     await sleep(500);
     const opens2 = await ch.eval('window.__idb');
@@ -2996,9 +2994,9 @@ async function uxResume(c) {
     const [pa, pb] = seeded.profiles;
     await uxRoom(c, host, 'AUXR1', 'host'); await uxRoom(c, guest, 'AUXR1', 'guest');
     await pickTeam(host, 'saved:' + pa.id + ':' + pa.teams[0]); await pickTeam(guest, 'saved:' + pb.id + ':' + pb.teams[0]);
-    await host.eval('document.getElementById("olFmt").value = "3v3"; document.getElementById("olGo").click()');
-    await host.waitFor('document.getElementById("olCode").hidden === false', { timeoutMs: 30000 });
-    await guest.eval('document.getElementById("olGo").click()');
+    await host.eval('window.__arenaOnline.setForm({ fmt: "3v3" }); void window.__arenaOnline.go()');
+    await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    await guest.eval('void window.__arenaOnline.go()');
     await approve(host, true);
     for (let i = 0; i < 160 && !((await phase(host)) === 'playing' && (await phase(guest)) === 'playing'); i++) await sleep(250);
     await host.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 }); await guest.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
@@ -3027,7 +3025,7 @@ async function uxGiveUp(c) {
     await g.send('Page.reload', { ignoreCache: false });
     await g.waitFor(UX_READY, { timeoutMs: 90000 });
     await sleep(800);
-    const v = await g.eval('({ opts: [...document.getElementById("olTeam").options].map((o) => o.value), status: document.getElementById("olStatus").textContent, stage: window.__arenaOnline.state.stage })');
+    const v = await g.eval('({ opts: window.__arenaOnline.state.choices.map((c) => c.key), status: window.__arenaOnline.view().status.text, stage: window.__arenaOnline.state.stage })');
     ok(v.stage === 'setup' && v.opts.length === new Set(v.opts).size && v.opts.filter((x) => x === 'random').length === 1 && /Start a new battle below/.test(v.status), 'OXG1 a battle that cannot be picked up again shows the setup form once (each team listed once) with the reason, not a form built twice with the reason wiped', J(v));
     ok(g.errors.length === 0, 'OXG2 no page errors', J(g.errors).slice(0, 200));
   });
@@ -3154,7 +3152,7 @@ async function groupTokens(S) {
   console.log(`tokens mutants: ${killed}/${ran} killed`);
 }
 const TK_SETTLED = 'window.__arenaOnline && window.__arenaBattle && window.__arenaBattle.state === "online" && (() => { const g = document.getElementById("olGo"); return !!g && (!g.disabled || window.__arenaOnline.state.stage !== "setup"); })()';
-const TK_VIEW = '(() => { const O = window.__arenaOnline, st = O.state, code = document.getElementById("olCode"); return { stage: st.stage, role: st.role, room: st.room, open: !!st.open, quick: !!st.quick, tok: sessionStorage.getItem("arena.go"), search: location.search, go: document.getElementById("olGo").textContent, code: code.hidden ? null : code.textContent.trim(), status: document.getElementById("olStatus").textContent, prompt: !!document.getElementById("npApprove"), hosting: O.lobbies() ? !!O.lobbies().hosting() : false }; })()';
+const TK_VIEW = '(() => { const O = window.__arenaOnline, st = O.state, code = document.getElementById("olCode"); return { stage: st.stage, role: st.role, room: st.room, open: !!st.open, quick: !!st.quick, tok: sessionStorage.getItem("arena.go"), search: location.search, go: document.getElementById("olGo").textContent, code: code.hidden ? null : code.textContent.trim(), status: window.__arenaOnline.view().status.text, prompt: !!document.getElementById("npApprove"), hosting: O.lobbies() ? !!O.lobbies().hosting() : false }; })()';
 
 // ---- TK: the START token. Each of the three starts happens by itself WITH its token on its own address, and does not without it, with a stale one, or on another kind of address
 async function tkStart(c) {
@@ -3179,7 +3177,7 @@ async function tkStart(c) {
 
     // { host } on the plain page: a friend's private room, by itself
     await arrive({ what: 'host' }, 'online=1');
-    const opened = await a.waitFor('window.__arenaOnline.state.stage === "open" && !document.getElementById("olCode").hidden', { timeoutMs: 30000 }).then(() => true, () => false);
+    const opened = await a.waitFor('window.__arenaOnline.state.stage === "open" && window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 }).then(() => true, () => false);
     const v1 = await view(), u1 = new URLSearchParams(v1.search);
     ok(opened && v1.role === 'host' && /^[A-Z0-9]{4,8}$/.test(v1.room || '') && v1.code === v1.room && v1.open === false && v1.quick === false && u1.get('np') === v1.room && u1.get('host') === '1' && u1.get('online') === null && (await listed(v1.room)).length === 0,
       'TK1 with the hub\'s START token { host } the plain ?online=1 page OPENS A FRIEND\'S PRIVATE ROOM BY ITSELF, as pressing Get an invite link does: the room is open, its code is on the screen, the address names it, and it is not listed', J(v1));
@@ -3215,7 +3213,7 @@ async function tkStart(c) {
     await a.navigate('about:blank'); await sleep(300);
     // { host, room } on that room's own address: Open the room, by itself
     await arrive({ what: 'host', room: 'AXYZ1' }, 'np=AXYZ1&host=1');
-    const named = await a.waitFor('window.__arenaOnline.state.stage === "open" && !document.getElementById("olCode").hidden', { timeoutMs: 30000 }).then(() => true, () => false);
+    const named = await a.waitFor('window.__arenaOnline.state.stage === "open" && window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 }).then(() => true, () => false);
     const v6 = await view();
     ok(named && v6.role === 'host' && v6.room === 'AXYZ1' && v6.code === 'AXYZ1' && v6.open === false && v6.tok === null, 'TK6 with { host, room } the room\'s own address (?np=ROOM&host=1) OPENS THAT ROOM BY ITSELF, as pressing Open the room does', J(v6));
     // a token on an address that is not its own: nothing starts (and the token is gone all the same)
@@ -3259,7 +3257,7 @@ async function tkPrefs(c) {
       await setPrefs(prefs);
       await a.navigate(PAGE + '?' + query + '&net=local&anim=0');
       await a.waitFor(TK_SETTLED, { timeoutMs: 90000 });
-      return a.eval('({ team: document.getElementById("olTeam").value, fmt: document.getElementById("olFmt").value, name: document.getElementById("olName").value, keys: [...document.getElementById("olTeam").options].map((o) => o.value), stage: window.__arenaOnline.state.stage })');
+      return a.eval('({ team: window.__arenaOnline.state.form.teamKey, fmt: window.__arenaOnline.state.form.fmt, name: window.__arenaOnline.state.form.name, keys: [...document.getElementById("olTeam").options].map((o) => o.value), stage: window.__arenaOnline.state.stage })');
     };
     const p0 = await panel(null);
     ok(!seeded.notSaved && J(p0.keys.slice(0, 2)) === J([keyA, keyB]) && p0.team === keyA && p0.fmt === '6v6' && p0.stage === 'setup', 'TP0 (the rig, and the control) with no preference the page selects what it always did: the first saved team, 6 v 6 for a team of six', J(p0));
@@ -3281,7 +3279,7 @@ async function tkPrefs(c) {
       await a.eval('(() => { sessionStorage.clear(); sessionStorage.setItem("arena.accept", JSON.stringify({ for: ' + J('ab'.repeat(8)) + ', rq: ' + J('cd'.repeat(8)) + ', ck: ' + J(PK_SHAPE) + ', at: Date.now() })); return true; })()');
       await a.navigate(PAGE + '?online=1&auto=host&for=' + 'ab'.repeat(8) + '&rq=' + 'cd'.repeat(8) + '&format=3v3&net=local&anim=0');
       const up = await a.waitFor('window.__arenaOnline && window.__arenaOnline.state.stage === "open"', { timeoutMs: 60000 }).then(() => true, () => false);
-      const st = await a.eval('(() => { const st = window.__arenaOnline.state; return { stage: st.stage, role: st.role, size: st.mine ? st.mine.size : null, profileId: st.profileId, fmt: st.fmt, invite: !!st.invite, team: document.getElementById("olTeam").value }; })()');
+      const st = await a.eval('(() => { const st = window.__arenaOnline.state; return { stage: st.stage, role: st.role, size: st.mine ? st.mine.size : null, profileId: st.profileId, fmt: st.fmt, invite: !!st.invite, team: window.__arenaOnline.state.form.teamKey }; })()');
       await a.navigate(BLANK); await sleep(300);          // (the room is closed by leaving the page, for a same-origin page: the next case writes this origin's storage)
       return { up, ...st };
     };
