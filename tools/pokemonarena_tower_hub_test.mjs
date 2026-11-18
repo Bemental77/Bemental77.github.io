@@ -53,7 +53,10 @@ function checkModel(HM, TH) {
   try { checkModelBody(HM, f, TH); } catch (err) { f.push('checks aborted by an exception: ' + (err && err.message)); }
   return f;
 }
-function checkModelBody(HM, f, TH) {
+function checkModelBody(HM0, f, TH) {
+  // An app may answer a data refresh with an effect for its own ctl ({ app, ... }: INAPP.md "The app interface"; the online app does, so that its ctl runs from page load).
+  // Those are not the Tower's: this family reads what the TOWER answers, so setData's effects are read without them.
+  const HM = { ...HM0, createHubModel: (o) => { const m0 = HM0.createHubModel(o); return Object.create(m0, { setData: { value: (d) => m0.setData(d).filter((x) => !(x && x.app)) } }); } };
   const t = (name, cond, detail) => {
     let good = false, why = '';
     try { good = !!cond(); } catch (err) { why = ' [threw: ' + (err && err.message) + ']'; }
