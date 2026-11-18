@@ -1035,3 +1035,132 @@ words, every text in its room; each fix also has its own named check and mutants
   teams list). The screen is left first.
 
 **Not there yet** (stage 3): as listed above. Nothing of stage 2 points at `editor.html`.
+
+## ONLINE: as built
+
+The hub's `online` app (2026-11-18): PLAY ONLINE is rows of the picture, and the HTML row that stood under it (`#onlineLink`: Play online, Trainer Center, Open) is gone. Every name below is the
+name in the code. Nothing in the protocol moved (`js/netmatch.js`, `js/online_match.js`, `js/openlobby.js`, `js/matchctl.js`, `js/engine*.js`, `lib/netplay.js`, and `js/online.js`,
+`js/presence.js`, `js/presence_boot.js`, `js/hub_presence.js`, `js/online_prefs.js` are untouched by this track).
+
+### What exists
+
+| File | What |
+|---|---|
+| `js/online_hub.js` | the state machine (pure). `APP = { id: 'online', paths: ['online'], parent: () => 'main', create }`. Exports the geometry (`OGEOM`), the words (`WORDS`), `onlineName` (netmatch.js `cleanName`'s rule, kept here so the hub's first paint does not load the engine; a test compares them), `quickWords(board)`, `QUICK_ID`, `BLOCKED_ID`, `ONLINE_VISIBLE`, `NAME_MAX`, `ROOM_MAX`, `BUSY_TICKS` |
+| `js/online_screen.js` | the renderer (pure): `createScreen(ui, h) -> { render(f, view), rowLayout(row, g, on), bannerLayout(head) }`. The two layouts are what the tests measure every row with |
+| `js/online_ctl.js` | the side effects: `createCtl(env) -> { effect, enter, leave, dispose, state }`. Pure helpers: `inviteFromSearch(search)`, `boardOf(win)`, `withoutInvite(href)`. Keys: `NAME_KEY`, `TOLD_KEY`, `AWAY_KEY` |
+| `js/hub_model.js` (one hunk, the shell) | `appRow(id)`: an app's model may word its own row of the main menu, `mainRow() -> { label?, help? } \| null` (below) |
+| `pokemonarena/online_hub.golden.json` | FNV hashes of 34 scenes (hashes only) |
+| `tools/pokemonarena_hub_online_test.mjs`, `tools/pokemonarena_hub_online_browser.mjs` | the suite: Node cases with source mutants, and the browser sessions |
+
+### The screens
+
+ONE hub path, `online` (`/pokemonarena/#online`); which of its two screens is up is the app's state (`hub.state().apps.online.screen`: `'menu'` \| `'invite'`).
+
+| Row (id) | What A does |
+|---|---|
+| TRAINER CENTER (`center`) | `ctx.go('center')` |
+| BATTLE ANYONE (`anyone`) | a notice in message pages (dialog `online:quick`): what other players see, the public servers the battle page dials (`openlobby.js brokersFor`, each host once, at most six named) and the host its script comes from, that they see the IP address; then `Find an opponent?` YES / NO with NO under the cursor. Only YES starts: START token `{ what: 'quick' }`, then `battle.html?online=1`. A browser that has said YES before (`localStorage arena.online.told`) gets the short notice and the same question |
+| INVITE A FRIEND (`invite`) | START token `{ what: 'host' }`, then `battle.html?online=1` |
+| JOIN A FRIEND (`join`) | the text entry (charset `code`, 8 characters). A PASTE (more than one character at once) goes to the ctl, which reduces a friend's whole link to its code with the battle page's own `roomFromInput` (`js/online.js`, imported when the entry is opened); a paste that was cut to eight characters says so under the keys. OK: checked against `ROOM_RE`; a code that is not one is refused in the battle page's words and the entry comes back with what was typed. Then MEET token, `battle.html?np=ROOM&join=1&meet=1` |
+| TEAM (`team`) | a choice over the saved LEGAL teams, the active trainer's first, then RANDOM TEAM: the battle page's own list in its own order. Which one is shown is `online_prefs.js preselect()`, so it is the one that page will select. With no saved team the row says RANDOM TEAM and A opens the Team Builder (`ctx.go('builder')`) |
+| SIZE (`size`) | 3 V 3 / 6 V 6; a team of fewer than three is 6 V 6 only (the row is disabled and says why). On the guest's invite screen there is no SIZE row (the host decides) |
+| NAME (`name`) | the text entry (charset `name`, 10 characters). What is typed goes through `onlineName`; a name that rule would change comes back as it would be used, with the reason, to be accepted. Empty = the typed name is forgotten (the key is removed) and the trainer's own is used: the owner of the team chosen, else the active trainer, else none (`(NONE)`: the battle page says Host or Guest) |
+| OPEN TO BATTLES (`open`) | `hubPresence(env).toggle()`. ON / OFF follows `svc.status()` on every change; `unavailable` disables the row. The first ON asks the service's disclosure in the picture |
+| BACK (`back`), and B | the main menu |
+
+**The invite screens.** When the hub page's own address names a room (`?np=ROOM&join=1` or `&host=1`: the battle page's CHANGE TEAM row, an old bookmark), the ctl reads it with `inviteFromSearch`
+(the same room, role and refusals as `js/online.js parseOnlineQuery`; a room with no role is an invitation to join) and the model shows `YOU'RE INVITED / ROOM <CODE>` (TEAM, NAME, JOIN THE BATTLE,
+BACK) or `YOUR ROOM / ROOM <CODE>` (TEAM, SIZE, NAME, OPEN THE ROOM, BACK). A page that booted on the main menu is taken to `#online`; a player who has already walked elsewhere is not pulled away.
+JOIN THE BATTLE = MEET token + `?np=ROOM&join=1&meet=1`; OPEN THE ROOM = START `{ what: 'host', room }` + `?np=ROOM&host=1`. A room that is not one (or both roles, or another game) is refused in
+words in the picture (`notice:online`) and the plain menu is shown. BACK (or B) puts the room away: the menu is shown, the room leaves the address of the history entry the page stands on
+(`history.replaceState`, the test seams and `#online` stay) and is remembered in `sessionStorage arena.online.away`, so a reload, or the browser's Back onto an older entry that still names it, does
+not bring it back; a FRESH arrival with the same room is a new invitation.
+
+**When the token cannot be written** (the browser blocks `sessionStorage`): the page does not leave. The picture says so (dialog `online:blocked`, armed like a challenge: it answers nothing for 0.6 s)
+and asks GO ON / BACK. GO ON opens the fallback address of Contract 1 (`?online=1&ask=host`, `&ask=quick`, the plain `?np=ROOM&join=1` / `&host=1`); BACK stays. It never opens a bare `?online=1`.
+
+**A token of a start that did not leave the page is taken back.** One-time means the one page load that follows the press. If the page is still here `STALE_MS` (5 s) after it left for the battle
+page (the browser cancelled the navigation) the next thing the player does in the menu removes the START / MEET token; a page that comes back from the back / forward cache removes it at once.
+A data refresh, or a press in the moment before the page goes, does not.
+
+**A preference that cannot be stored** (TEAM, SIZE, NAME with `localStorage` blocked) is taken back in the picture at once, with the reason: what the menu shows is what the battle page will read.
+
+### What other tracks can call or rely on
+
+* **The addresses.** `/pokemonarena/#online` is the menu. `/pokemonarena/?np=ROOM&join=1#online` and `...&host=1#online` are the invite screens (BATTLE's CHANGE TEAM row; the hash may be left out).
+  `ctx.go('online')` from any hub app opens the menu on top of it; B comes back.
+* **The main menu's row.** `hub_model.js` asks each app whose id is a row of the main menu: `model.mainRow() -> { label?: string (at most 24 characters), help?: [line, line] } | null`. Optional; a
+  model without it, one that throws, or an answer of another shape leaves the row as the menu words it. PLAY ONLINE reads `PLAY ONLINE: OPEN` while the player is open to battles and
+  `PLAY ONLINE: OFFLINE` while that is on but no public server can be reached; plain `PLAY ONLINE` otherwise. `center` / `builder` may use it the same way (the builder's row is `builder`).
+* **The app's own methods** (`hub.apps.online`, a ctl's `env.model.app('online')`): `setPrefs({ teamKey, fmt })`, `setName(v)`, `setPresence(status)`, `setBoard({ hosts, cdn })`, `setSeen(bool)`,
+  `setInvite({ room, role: 'guest' | 'host' } | null) -> shown`, `say(words)`, `roomRefused(words)`, `roomTaken()`, `roomPasted(code | null, note?)`, `blocked() -> asked`, `notStored()`,
+  `select(rowId)`, `allRows()`, `mainRow()`. `state()`: `{ screen, row, cursor, offset, team, fmt, name, typed, open, invite, busy, entry, seen, flash }`.
+* **Effects** (all `app: 'online'`): `data` (from `onData()`: it is what wakes the ctl at the page's load), `start { kind: 'quick' | 'host' | 'room' | 'join', room?, seen? }`, `join-open`,
+  `join { code }`, `paste { text }`, `prefs { teamKey? | fmt? }`, `name { value | null }`, `open`, `invite-away`, `leave`, `stay`.
+* **A battle started from this menu comes back to the main menu**: the ctl clears `arena.back` before it navigates (Contract 6). The Center writes its own through `svc.goBattle`.
+
+### Storage keys
+
+| Store | Key | Value | Writer / reader |
+|---|---|---|---|
+| localStorage | `arena.online.team` | `{ teamKey, fmt }` (SEAM's) | TEAM / SIZE through `online_prefs.js` / the battle page |
+| localStorage | `arena.online.name` | the name the player typed; removed when the entry is accepted empty | NAME / the battle page (`js/online.js LS_NAME`) |
+| localStorage | `arena.online.told` (new) | `'1'` once YES was answered to the long BATTLE ANYONE notice | the ctl |
+| sessionStorage | `arena.online.away` (new) | the room of the address that this tab's player put away with BACK | the ctl |
+| sessionStorage | `arena.go`, `arena.meet`, `arena.back` | SEAM's, through `hub_presence.js battleStart` / `clearBack` | the ctl / the battle page |
+
+### What was deleted, and the hunks outside this track's files
+
+Deleted: the `<p id="onlineLink">` line of `index.html` (`#playFriend`, `#trainerCenter`, `#openToggle`); its rules in `arena.css` (the portrait `order`, the flex row, the pressed colour, the three
+`#openToggle` visibility rules, the boot-time `visibility: hidden`) and the `margin-block` rule in `audiobar.css`; `'#onlineLink'` in `sound_system.js PROMPT_OBSTACLES` and the prompt's two
+candidate spots beside the row; in `boot.js` the row's element in `fit()`'s `stackBelow`, and `button: $('openToggle')` / the `[hidden]` line of `noSwitch` (the service is handed `button: null`).
+The 44 px a phone reserves under the picture is NOT the row's: it predates it (`boot.js fit()`, in the first commit) and stays. `hub_presence.js` still looks `#openToggle` up when no `button` is
+passed; it finds none.
+
+What each test that drove the row became:
+
+| Old (where) | Now |
+|---|---|
+| H1 `the hub links to online play` (page test, `hub`) | H1: the main menu has PLAY ONLINE and `index.html` has none of the four ids. Browser: BH1-BH4, BI1 |
+| A1, A2 the switch says Open: off / on (page test, `presence`) | A1, A2 read the OPEN TO BATTLES row (`toggleState`) |
+| every `#openToggle.click()` (12 places: A, PB, C, D, E, G, UX, UO3) | `hubSwitch(page)`: PLAY ONLINE, the cursor on OPEN TO BATTLES, A, back to the screen the session was on |
+| H320 / H390 the switch shares the link's row on a phone | removed (no row). BV1, BV2: a 390 px phone taps every row |
+| UD1-UD6 a click on the switch asks the disclosure | the same cases, through `hubSwitch`. Browser: BO1-BO8; Node: O9-O16 |
+| UM1, UM2 the focus of the HTML switch after a mouse click / under the keyboard; mutant M16 | meaningless (no button on the hub). UM1 is now "the picture follows the presence service whoever switched it"; M16 breaks `svc.onChange(onPresence)` in `online_ctl.js` |
+| UW1, UW2, UN1, UN1b the switch's tooltip, live region, constant accessible name, the offline tooltip; mutants M20, M23 | the row: its two lines name the name AND the online record (UW1, M23 on `WORDS.openOff`); the live region still says so (UW2, M24 unchanged); ONE label whatever the state, the value carries it, also for a screen reader (UN1, M20 on the row's label); offline is said in the row (UN1b) |
+| UH1, UH1b the switch is invisible before the module has mounted; UH2 it is gone when the module cannot load; mutants M17, M18 | UH1: the row says OFF and nothing is listed; UH1b: a press made then is NOT lost (M18 on `hub_presence.js toggle`); UH2: the row says it could not load and cannot be pressed (M17 on the row's `disabled`) |
+| UR4 / UR5 mount the DOM dialogs by hand on `#openToggle` | the same, on a button the test makes |
+| OXT4 the static title of the switch in `index.html`; mutant X22 | OXT4 reads the row's words in the served `js/online_hub.js`; X22 breaks them |
+| audiobar M20 (the hub gives back the row's margins on a 568 px phone) | removed with the rule. `phone` passes without it: the row took the room |
+| audiobar M22 (the prompt's obstacle list) | the `from` string follows the list |
+| hub-return W14 and its mutant (the lone link during boot) | W14: no frame shows an online row under the header during boot. Its mutant now puts an HTML row of online links back into `index.html` (the CSS rule it removed is gone) |
+| hub-return W11 (a key pressed while loading runs no effect) | the same, not counting the app's own `data` effect (a data refresh returns it, no key does) |
+| autoplay: clicks `#playFriend` | the experiment puts a plain link of its own on the page |
+| center test CB (`#openToggle.click()` on the hub) | `window.__arenaHub.presence.toggle()` (CENTER's file: one line) |
+| page test M14 (no disclosure on the first switch-on, in `presence_boot.js toggle()`) | the hub no longer calls that function (it was the HTML button's): M14 breaks `hub_presence.js turnOn`, which decides it for the row |
+
+The counts the tests read from the docs are unchanged: `presenceui` 36 and `onlineux` 22 (`ONLINE.md`, `README.md`), hub-return 19 module + 23 page = 42 (`README.md`): each mutant that stood on the HTML
+row was re-homed, none dropped. The one exception is the audiobar suite's M20: that suite now breaks things 43 ways, and `README.md` still says 44 (no test reads that number; the line is not this
+track's to rewrite).
+
+### Known limits (measured or read, not fixed here)
+
+* A row of the menu is 12 logical px: 20 css px on a 390 px phone (BV2), the main menu's own spacing. The on-screen pad walks the rows, and its A presses the one under the cursor.
+* The ninth row (BACK) is below the eight shown: a touch-only player reaches it with the on-screen pad (or presses the on-screen B, which does the same).
+* The first BATTLE ANYONE notice is seven pages with the five default servers. B is NO from any of them.
+* A page opened at `#online` with a room in its address shows the plain menu for the moment it takes the ctl to load, then the invite screen.
+* The hub cannot know that `sessionStorage` is blocked before it tries: the storage question appears after the press, not before.
+* The battle page's fallback questions (`?online=1&ask=host` / `ask=quick`) and its CHANGE TEAM row are BATTLE's and were not in this tree: here the page with `ask=` is the plain panel (it starts nothing).
+* `README.md` lines 4, 40 and 113 still describe the row under the picture and the Trainer Center page (add-only rule): they are stale until the merge rewrites them.
+
+### Tests (2026-11-18, this tree)
+
+```bash
+node tools/pokemonarena_hub_online_test.mjs --unit            # 187 passed (about two seconds): the model, the renderer, the ctl and the shell's hunk in Node, on a real hub model and the real ROM
+node tools/pokemonarena_hub_online_test.mjs --unit --mutants  # + 94 source mutants (online_hub.js, online_ctl.js, online_screen.js, hub_model.js), each killed by the case it names
+node tools/pokemonarena_hub_online_test.mjs --browser         # 54 passed, real Chrome, eight sessions (html open address blocked invite anyone ask devices; name some to run a subset)
+node tools/pokemonarena_hub_online_test.mjs --update          # rewrites pokemonarena/online_hub.golden.json (hashes only)
+```
+
+The browser part has no mutants of its own: every guard it relies on is one of the Node mutants, or one of the page test's (`presenceui --mutants`: M16, M17, M18, M20, M23; `onlineux --mutants`: X22).

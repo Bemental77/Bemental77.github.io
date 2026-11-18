@@ -65,7 +65,9 @@ async function experiment(page, base, R) {
   await page.navigate(base + '/pokemonarena/'); await hubReady(page); await sleep(400);
   const m = {};
   m.hubFresh = await page.eval(PROBE);
-  const c = await L.elementCentre(page, '#playFriend'); await page.click(c.x, c.y);
+  // (the hub has no HTML link to a battle page any more: PLAY ONLINE is a row of the picture. The experiment is about the BROWSER, so it puts a plain link of its own on the page and clicks that)
+  await page.eval(`(() => { const a = document.createElement('a'); a.id = 'expLink'; a.href = '${BAT}'; a.textContent = 'link'; a.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:9999;padding:8px;background:#fff;color:#000'; document.body.appendChild(a); return true; })()`);
+  const c = await L.elementCentre(page, '#expLink'); await page.click(c.x, c.y);
   await page.waitFor('location.pathname.endsWith("battle.html")', { timeoutMs: 30000 }); await sleep(1200);
   m.afterLink = await page.eval(PROBE);
   await page.navigate(base + '/pokemonarena/'); await hubReady(page); await sleep(400);

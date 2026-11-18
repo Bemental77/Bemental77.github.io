@@ -50,9 +50,6 @@ body[data-state="boot"] .audiobar, body[data-state="error"] .audiobar { visibili
   .audiobar .ab-parts { flex: 1 1 auto; }
   .audiobar .ab-vol { flex: 1 1 auto; width: auto; min-width: 0; }
   .ab-val { display: block; }
-  /* The hub's header is a row taller here. A 568 px phone has no spare room (the touch pad would end 3 px below the screen), so the band between the header and the picture gives
-     back what it can: the link row's own 16 px margins (the page's 8 px gap stays). */
-  body[data-pad="on"][data-layout="portrait"] #onlineLink { margin-block: 0; }
 }
 /* the battle page's header already has two rows on a phone: the bar goes in the first, between the way back and Fullscreen (which have the room) */
 @media (max-width: 480px) and (min-height: 501px) {

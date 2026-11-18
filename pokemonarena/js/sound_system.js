@@ -218,7 +218,7 @@ export function createSoundSystem(opts = {}) {
     if (win && typeof win.addEventListener === 'function') win.addEventListener('resize', placePrompt);
   }
   // ---- where the prompt sits: a spot where it covers nothing the player needs ----
-  const PROMPT_OBSTACLES = ['canvas', '#dpad', '#ab', '#onlineLink', '#keys', '#romStatus', '#note', '.ab-float'];      // the picture, the touch pad (both clusters), the hub's link to the online lobby, the footer lines, the audio bar while it floats beside the exit-fullscreen button (in the header it is one of the header's own children, added below)
+  const PROMPT_OBSTACLES = ['canvas', '#dpad', '#ab', '#keys', '#romStatus', '#note', '.ab-float'];      // the picture, the touch pad (both clusters), the footer lines, the audio bar while it floats beside the exit-fullscreen button (in the header it is one of the header's own children, added below)
   const PROMPT_FOOTERS = ['#keys', '#romStatus', '#note'];                                    // the dim lines under the page: the cheapest things to cover when nothing is free
   function rectOf(el) {
     try { const r = el.getBoundingClientRect(); if (!(r.width > 0 && r.height > 0)) return null; const cs = win.getComputedStyle(el); return cs.display === 'none' || cs.visibility === 'hidden' ? null : r; } catch (_e) { return null; }
@@ -238,7 +238,7 @@ export function createSoundSystem(opts = {}) {
     const p = S.prompt;
     if (!p || p.hidden || !win || !doc) return;
     const vw = doc.documentElement.clientWidth, vh = win.innerHeight, G = 8, PAD = 2;
-    const obs = [], wts = []; let canvasPage = false;          // wts: what covering each costs. The picture costs 30, the header's controls 20, a touch pad cluster or the hub's lobby link 10, a dim footer line 1: on a page too full for a free spot the pill goes over the cheapest thing, and never over the picture while anything else will do
+    const obs = [], wts = []; let canvasPage = false;          // wts: what covering each costs. The picture costs 30, the header's controls 20, a touch pad cluster 10, a dim footer line 1: on a page too full for a free spot the pill goes over the cheapest thing, and never over the picture while anything else will do
     for (const sel of PROMPT_OBSTACLES) { const el = doc.querySelector(sel); const r = el ? rectOf(el) : null; if (r) { obs.push(r); wts.push(sel === 'canvas' ? 30 : sel === '.ab-float' ? 20 : PROMPT_FOOTERS.includes(sel) ? 1 : 10); if (sel === 'canvas') canvasPage = true; } }
     const head = doc.getElementById('top'); const headBox = head ? rectOf(head) : null; const kids = [];
     if (head) for (const k of Array.from(head.children)) { const r = ownRect(k); if (r) { obs.push(r); wts.push(20); kids.push(r); } }
@@ -265,9 +265,6 @@ export function createSoundSystem(opts = {}) {
         if (canvasPage) { const cv = doc.querySelector('canvas'), cr = cv ? rectOf(cv) : null; if (cr) cands.push([(vw - pw) / 2, cr.bottom + G]); }
         if (canvasPage) cands.push([(vw - pw) / 2, lowest + G]);
         cands.push([(vw - pw) / 2, vh - ph - G], [G, vh - ph - G], [vw - pw - G, vh - ph - G], [G, (vh - ph) / 2], [vw - pw - G, (vh - ph) / 2]);
-        // beside the hub's link to the online lobby: that row is only as wide as its buttons, so the room on either side of it is free. (A small desktop window has no other free spot once the
-        // audio bar takes the header's free gap, which used to be the last resort below.)
-        { const lk = doc.querySelector('#onlineLink'), lr = lk ? rectOf(lk) : null; if (lr) cands.push([lr.left - G - pw, lr.top + (lr.height - ph) / 2], [lr.right + G, lr.top + (lr.height - ph) / 2]); }
         if (withHeader && gap && headBox && gap.w - 2 * G >= pw) cands.push([gap.x + G + (gap.w - 2 * G - pw) / 2, headBox.top + (headBox.height - ph) / 2]);       // LAST RESORT: it floats between the title and the buttons, which looks like part of the header
         for (const [cx, cy] of cands) {
           const box = { left: cx, top: cy, right: cx + pw, bottom: cy + ph };

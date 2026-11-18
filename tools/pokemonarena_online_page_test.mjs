@@ -20,6 +20,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { withBrowser } from './headless_cdp.mjs';
 import { loadStack } from './pokemonarena_netmatch_lib.mjs';
+import { MAIN_LABELS } from '../pokemonarena/js/hub_model.js';          // the hub's main menu, as the picture draws it (H1)
 import { PROTO } from '../pokemonarena/js/netmatch.js';          // the protocol version the pages speak (2 since the 6v6 lead preview): the messages these cases forge by hand carry it, so they are refused for what they say, not for their version
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -730,7 +731,7 @@ async function groupLobby(S) {
 
 async function groupHub() {
   const html = await (await fetch(`${ORIGIN}/pokemonarena/index.html`)).text();
-  ok(/id="playFriend"[^>]*href="\/pokemonarena\/battle\.html\?online=1"/.test(html), 'H1 the hub links to online play', '');
+  ok(!/id="(onlineLink|playFriend|trainerCenter|openToggle)"/.test(html) && /<canvas id="hub"/.test(html) && MAIN_LABELS.includes('PLAY ONLINE'), 'H1 the hub leads to online play from its PICTURE: PLAY ONLINE is a row of the main menu, and the HTML row of links that stood under the picture is gone', '');
   const bh = await (await fetch(BASE)).text();
   ok(/\/lib\/netplay\.js\?v=[0-9a-f]{8}/.test(bh), 'H2 battle.html loads the netplay engine with a version stamp', '');
 }
@@ -1344,7 +1345,10 @@ async function openHub(page, extra = '') {
   await page.waitFor('window.__arenaHub && window.__arenaHub.state === "ready" && window.__arenaPresence', { timeoutMs: 120000 });
 }
 const seedProfile = (page, trainerName) => page.eval('(async () => { const { openStore } = await import("/pokemonarena/js/store.js"); const st = await openStore(); const c = await st.createProfile({ trainerName: ' + JSON.stringify(trainerName) + ' }); await st.setActiveId(c.id); await st.close(); return c.id; })()');
-const toggleState = (p) => p.eval('({ pressed: document.getElementById("openToggle").getAttribute("aria-pressed"), text: document.getElementById("openToggle").textContent, stored: localStorage.getItem("arena.open") })');
+// OPEN TO BATTLES IS A ROW OF THE HUB'S PLAY ONLINE MENU (js/online_hub.js): the HTML switch #openToggle is gone. toggleState: what the row says, what the presence service says, what is stored.
+// hubSwitch: press the row as a player does (open PLAY ONLINE, put the cursor on OPEN TO BATTLES, A) and go back to the screen the session was on.
+const toggleState = (p) => p.eval('(() => { const H = window.__arenaHub, r = H.model.apps.online.allRows().find((x) => x.id === "open"); return { pressed: String(!!H.presence && H.presence.isOn()), text: r ? r.label + " " + r.value : null, stored: localStorage.getItem("arena.open") }; })()');
+const hubSwitch = (p) => p.eval('(() => { const H = window.__arenaHub, was = H.model.path(); if (was !== "online") H.goto("online"); H.model.apps.online.select("open"); H.press("a"); if (was !== "online") H.goto(was); return true; })()');
 // THE HUB ASKS IN THE PICTURE (js/hub_presence.js: "<name> wants to battle you" and the first-time disclosure are the hub's dialog layer, drawn from the ROM; there is no DOM dialog on the hub page).
 // These read and drive the question through window.__arenaHub, the way a pad does: A turns the page, the d-pad moves the highlight, B is NO. (The same questions on the BATTLE page are still the
 // DOM dialogs #challenge / #openInfo, and its sessions read those.) THE HUB'S CLOCK ONLY RUNS IN THE TAB THAT IS IN FRONT (a question listens 36 frames after it appears), so a session brings the
@@ -1376,11 +1380,12 @@ async function groupPresence(S) {
     await seedProfile(hub, 'HUBHERO');
     await openHub(hub, '&openchal=5000');
     const t0 = await toggleState(hub);
-    ok(t0.pressed === 'false' && t0.text === 'Open: off' && t0.stored === null, 'A1 the hub starts closed: the switch says Open: off and nothing is stored', J(t0));
-    await hub.eval('document.getElementById("openToggle").click()');
+    ok(t0.pressed === 'false' && t0.text === 'OPEN TO BATTLES OFF' && t0.stored === null, 'A1 the hub starts closed: the OPEN TO BATTLES row of PLAY ONLINE says OFF and nothing is stored', J(t0));
+    await hubSwitch(hub);
     await hub.waitFor('window.__arenaPresence.isOn() && window.__arenaPresence.presence', { timeoutMs: 30000 });
+    await hub.waitFor('window.__arenaHub.apps.state().online.open === "on"', { timeoutMs: 10000 }).catch(() => {});
     const t1 = await toggleState(hub);
-    ok(t1.pressed === 'true' && t1.text === 'Open: on' && t1.stored === '1', 'A2 switching it on says so, and remembers it', J(t1));
+    ok(t1.pressed === 'true' && t1.text === 'OPEN TO BATTLES ON' && t1.stored === '1', 'A2 switching it on (A on the row) says so in the picture, and remembers it', J(t1));
     await openPanel(ch, '&openchal=5000');
     await ch.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
     const row = await residentRow(ch);
@@ -1420,7 +1425,7 @@ async function groupPresence(S) {
     await hub.navigate(ORIGIN + '/pokemonarena/?net=local');
     await seedProfile(hub, 'HUBHERO');
     await openHub(hub, '&openchal=20000');
-    await hub.eval('document.getElementById("openToggle").click()');
+    await hubSwitch(hub);
     await hub.waitFor('window.__arenaPresence.isOn() && window.__arenaPresence.presence', { timeoutMs: 30000 });
     await openPanel(ch, '&openchal=20000');
     await ch.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
@@ -1504,7 +1509,7 @@ async function groupPresence(S) {
   await withBrowser({ port: CDP0 + 21, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (hub) => {
     const c1 = await hub.openTab({ width: 900, height: 760 }), c2 = await hub.openTab({ width: 900, height: 760 });
     await openHub(hub, '&openchal=20000');
-    await hub.eval('document.getElementById("openToggle").click()');
+    await hubSwitch(hub);
     await hub.waitFor('window.__arenaPresence.isOn() && window.__arenaPresence.presence', { timeoutMs: 30000 });
     await openPanel(c1, '&openchal=20000'); await openPanel(c2, '&openchal=20000');
     await c1.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
@@ -1534,7 +1539,7 @@ async function groupPresence(S) {
   await withBrowser({ port: CDP0 + 22, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (hub) => {
     const ch = await hub.openTab({ width: 900, height: 760 });
     await openHub(hub, '&openchal=1500');
-    await hub.eval('document.getElementById("openToggle").click()');
+    await hubSwitch(hub);
     await hub.waitFor('window.__arenaPresence.isOn() && window.__arenaPresence.presence', { timeoutMs: 30000 });
     await openPanel(ch, '&openchal=1500');
     await ch.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
@@ -1552,7 +1557,7 @@ async function groupPresence(S) {
   await withBrowser({ port: CDP0 + 23, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (hub) => {
     const ch = await hub.openTab({ width: 900, height: 760 });
     await openHub(hub);
-    await hub.eval('document.getElementById("openToggle").click()');
+    await hubSwitch(hub);
     await hub.waitFor('window.__arenaPresence.isOn() && window.__arenaPresence.presence', { timeoutMs: 30000 });
     await openPanel(ch);
     await ch.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
@@ -1561,7 +1566,7 @@ async function groupPresence(S) {
     ok(t.pressed === 'true' && t.stored === '1', 'E1 a reload keeps the switch on', J(t));
     await ch.waitFor('window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 20000 });
     ok(true, 'E2 and the hub player is on the board again', '');
-    await hub.eval('document.getElementById("openToggle").click()');
+    await hubSwitch(hub);
     const t0 = Date.now();
     await ch.waitFor('!window.__arenaOnline.board().some((g) => g.h)', { timeoutMs: 8000 });
     const t2 = await toggleState(hub);
@@ -1605,7 +1610,7 @@ async function groupPresence(S) {
   await withBrowser({ port: CDP0 + 25, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (hub) => {
     const raw = await hub.openTab({ width: 900, height: 760 });
     await openHub(hub, '&openchal=20000');
-    await hub.eval('document.getElementById("openToggle").click()');
+    await hubSwitch(hub);
     await hub.waitFor('window.__arenaPresence.isOn() && window.__arenaPresence.presence', { timeoutMs: 30000 });
     const sid = await hub.eval('window.__arenaPresence.lobbies.sid');
     await raw.navigate(BASE + '?online=1&net=local' + ANIM);
@@ -1629,13 +1634,8 @@ async function groupPresence(S) {
     ok(!(await hubAsked(hub)) && hub.errors.length === 0, 'G3 a challenge with no one-time key (an old client, or a forger) asks nothing: there would be no private way to answer it', J(hub.errors).slice(0, 200));
   });
 
-  // H: the switch on a phone
-  for (const [w, h] of [[320, 568], [390, 844]]) await withBrowser({ port: CDP0 + 26 + (w === 390 ? 1 : 0), width: w, height: h, mobile: true, lock: false, args: NO_THROTTLE }, async (hub) => {
-    await openHub(hub);
-    const m = await hub.eval('(() => { const a = document.getElementById("playFriend").getBoundingClientRect(), b = document.getElementById("openToggle").getBoundingClientRect(); return { aTop: a.top, bTop: b.top, aH: a.height, bH: b.height, bW: b.width, right: Math.max(a.right, b.right), left: Math.min(a.left, b.left), vw: innerWidth, over: document.documentElement.scrollWidth - document.documentElement.clientWidth }; })()');
-    ok(Math.abs(m.aTop - m.bTop) < 2 && m.bH >= 44 && m.bW >= 44 && m.left >= 0 && m.right <= m.vw && m.over <= 0, 'H' + w + ' on a ' + w + ' px phone the switch shares the link\'s row, is at least 44 css px, and nothing overflows', J(m));
-    await shot(hub, 'P_phone_' + w);
-  });
+  // (H320 / H390 measured the HTML switch beside the Play online link on a phone. Both are gone: the switch is a row of the picture, and tools/pokemonarena_hub_online_test.mjs taps it on a
+  //  390 px phone, session "devices": BV1, BV2.)
 }
 
 /* ---------------------------------------------------------------------------------------------- the profile: an online battle is kept in the trainer's career */
@@ -2221,18 +2221,18 @@ async function uiCross(c) {
     ok(await uiUntil(cpu, 'window.__arenaBattle.controlsOpen === false && document.getElementById("controlsDialog").hidden', 3000), 'UB3 B then closes Controls and the battle runs again', J(await cpu.eval('window.__arenaBattle.controlsOpen')));
     // UX: tab A turns the switch off; the other two tabs follow and the board loses all three
     await uiFront(a);
-    await a.eval('document.getElementById("openToggle").click()');
+    await hubSwitch(a);
     const gone = await uiUntil(b, '!window.__arenaPresence.isOn() && window.__arenaPresence.presence === null && window.__arenaPresence.lobbies === null', 5000)
       && await uiUntil(cpu, '!window.__arenaPresence.isOn() && window.__arenaPresence.presence === null && window.__arenaPresence.lobbies === null', 5000);
     const live1 = await uiLive(w);
-    const st = [await b.eval('document.getElementById("openToggle").getAttribute("aria-pressed")'), await a.eval('localStorage.getItem("arena.open")')];
+    const st = [await b.eval('String(window.__arenaHub.presence.isOn())'), await a.eval('localStorage.getItem("arena.open")')];
     ok(gone && live1.length === 0 && st[0] === 'false' && st[1] === null, 'UX1 switching Open off in one tab takes the listing down in the other hub tab and in the CPU battle too (and the board is empty)', J({ gone, live1, st }));
     // and on again: they follow that too
-    await a.eval('document.getElementById("openToggle").click()');
+    await hubSwitch(a);
     const back = await uiUntil(b, 'window.__arenaPresence.isOn() && window.__arenaPresence.presence', 8000) && await uiUntil(cpu, 'window.__arenaPresence.isOn() && window.__arenaPresence.presence', 8000);
     await sleep(800);
     ok(back && (await uiLive(w)).length === 3, 'UX2 switching it on again lists all three again', J(await uiLive(w)));
-    await a.eval('document.getElementById("openToggle").click()');
+    await hubSwitch(a);
     ok(await uiUntil(w, 'Object.keys(window.__live).length === 0', 5000), 'UX3 and off again empties the board', J(await uiLive(w)));
     ok(uiErrs(a, b, cpu, w).length === 0, 'UX4 no page errors', J(uiErrs(a, b, cpu, w)).slice(0, 300));
   });
@@ -2282,7 +2282,7 @@ async function uiRefresh(c) {
     // mount and asks in a DOM dialog; mounting it AGAIN disposes the first of those: still ONE dialog in the document, not two
     await hub.eval(`(async () => {
       const m = await import('/pokemonarena/js/presence_boot.js'), n = await import('/pokemonarena/js/uinav.js'), H = window.__arenaHub;
-      window.__mountDom = () => m.mountPresence({ win: window, doc: document, pack: H.pack, input: H.input, enableDomNav: n.enableDomNav, navigate: () => {}, button: document.getElementById('openToggle') });
+      window.__mountDom = () => m.mountPresence({ win: window, doc: document, pack: H.pack, input: H.input, enableDomNav: n.enableDomNav, navigate: () => {}, button: document.getElementById('testOpen') || (() => { const b = document.createElement('button'); b.id = 'testOpen'; b.type = 'button'; b.style.display = 'none'; document.body.appendChild(b); return b; })() });
       window.__mountDom();
       return true; })()`);
     await uiUntil(hub, 'window.__arenaPresence.isOn() && window.__arenaPresence.presence', 8000);
@@ -2301,8 +2301,8 @@ async function uiRefresh(c) {
     await uiUntil(hub, uiDlgGone(), 3000);
     // dispose: no dialog, no listing, and the switch is inert again
     await hub.eval('window.__arenaPresence.dispose()');
-    const d = await hub.eval('({ roots: document.querySelectorAll("#challenge").length, attr: document.getElementById("openToggle").dataset.presence || null, vis: getComputedStyle(document.getElementById("openToggle")).visibility, hook: !!window.__arenaPresence })');
-    ok(d.roots === 0 && d.attr === null && d.vis === 'hidden' && d.hook === false && (await uiUntil(w, 'Object.keys(window.__live).length === 0', 4000)), 'UR5 dispose removes the dialog, takes the listing down and makes the switch inert again', J(d));
+    const d = await hub.eval('({ roots: document.querySelectorAll("#challenge").length, attr: document.getElementById("testOpen").dataset.presence || null, hook: !!window.__arenaPresence })');
+    ok(d.roots === 0 && d.attr === null && d.hook === false && (await uiUntil(w, 'Object.keys(window.__live).length === 0', 4000)), 'UR5 dispose removes the dialog, takes the listing down and makes the switch inert again', J(d));
     ok(uiErrs(hub, w).length === 0, 'UR6 no page errors', J(uiErrs(hub, w)).slice(0, 300));
   });
 }
@@ -2401,8 +2401,7 @@ async function uiDisclosure(c) {
     await uiWatcher(w, c.origin);
     await uiFront(hub); await hub.eval('window.__padConnect()'); await sleep(250);
     const state = () => hub.eval('({ on: window.__arenaPresence.isOn(), stored: localStorage.getItem("arena.open"), seen: localStorage.getItem("arena.open.seen"), paused: window.__arenaHub.dialog.isOpen() || window.__arenaHub.dialogOpen(), shown: (() => { const d = window.__arenaHub.dialog.current(); return !!d && d.id === "presence:disclosure"; })(), board: !!window.__arenaPresence.lobbies })');
-    const pt = await uiCenter(hub, '#openToggle');
-    await hub.click(pt.x, pt.y);
+    await hubSwitch(hub);
     const shown = await uiUntil(hub, HUB_Q(HQ_DISC), 3000);
     const s1 = await state();
     await shot(hub, 'U_disclosure');
@@ -2414,8 +2413,7 @@ async function uiDisclosure(c) {
     await shot(hub, 'U_disclosure_question');
     await uiPad(hub, 'b');
     ok(await uiUntil(hub, HUB_Q_GONE(HQ_DISC), 3000) && (await state()).on === false && (await state()).seen === null && (await state()).paused === false && (await state()).board === false, 'UD2 NO (the pad\'s B) leaves the switch off, remembers nothing, publishes nothing, and gives the page back', J(await state()));
-    const pt2 = await uiCenter(hub, '#openToggle');
-    await hub.click(pt2.x, pt2.y);
+    await hubSwitch(hub);
     const asked2 = await uiUntil(hub, HUB_Q(HQ_DISC), 3000);
     ok(asked2 && (await hubQ(hub)).page === 0, 'UD3 it asks again next time, from its first page (NO is not remembered)', '');
     await hubYes(hub);
@@ -2423,11 +2421,9 @@ async function uiDisclosure(c) {
     const s4 = await state();
     ok(s4.stored === '1' && s4.seen === '1' && s4.shown === false && s4.paused === false && (await uiUntil(w, 'Object.keys(window.__live).length === 1', 6000)), 'UD5 and remembers that the player was told, and the listing is on the board', J({ s4, live: await uiLive(w) }));
     // off, on: not asked again
-    let pt3 = await uiCenter(hub, '#openToggle');
-    await hub.click(pt3.x, pt3.y);
+    await hubSwitch(hub);
     await uiUntil(hub, '!window.__arenaPresence.isOn()', 5000);
-    pt3 = await uiCenter(hub, '#openToggle');
-    await hub.click(pt3.x, pt3.y);
+    await hubSwitch(hub);
     const again = await uiUntil(hub, 'window.__arenaPresence.isOn()', 5000);
     ok(again && (await state()).shown === false, 'UD6 switching it off and on again does not ask a second time', J(await state()));
     // a stored "on" that nobody was ever told about is not honoured: clear the memory of having been told, reload
@@ -2438,21 +2434,15 @@ async function uiDisclosure(c) {
     ok(s7.on === false && s7.stored === null, 'UD7 a stored "on" the player was never told about does not list them: it stays off and forgets the switch', J(s7));
     ok(uiErrs(hub, w).length === 0, 'UD8 no page errors', J(uiErrs(hub, w)).slice(0, 300));
   });
-  // UM: the mouse leaves nothing focused on the switch; the keyboard keeps its focus
+  // UM: (UM1 / UM2 were about the focus of the HTML switch after a mouse click and under the keyboard; there is no such button on the hub any more.) What is left to prove here is that THE PICTURE
+  // FOLLOWS THE PRESENCE SERVICE whoever switched it (another tab, the Trainer Center): the row says ON and the main menu reads PLAY ONLINE: OPEN
   await withBrowser({ port: c.cdp(3), width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (hub) => {
     await hub.navigate(c.origin + '/pokemonarena/?net=local');
     await uiHubReady(hub);
-    const pt = await uiCenter(hub, '#openToggle');
-    await hub.click(pt.x, pt.y);
-    await uiUntil(hub, 'window.__arenaPresence.isOn()', 8000);
-    const af = await hub.eval('({ id: document.activeElement && document.activeElement.id, canvas: document.activeElement === window.__arenaHub.canvas })');
-    await uiEnter(hub); await sleep(300);
-    const pressed = await hub.eval('document.getElementById("openToggle").getAttribute("aria-pressed")');
-    ok(af.id !== 'openToggle' && af.canvas && pressed === 'true', 'UM1 after a mouse click the switch does not keep the focus (the next Enter acts on the menu, it does not toggle the public listing again)', J({ af, pressed }));
-    await hub.eval('document.getElementById("openToggle").focus()');
-    await uiEnter(hub); await sleep(400);
-    const kb = await hub.eval('({ pressed: document.getElementById("openToggle").getAttribute("aria-pressed"), focus: document.activeElement && document.activeElement.id })');
-    ok(kb.pressed === 'false' && kb.focus === 'openToggle', 'UM2 a keyboard player who focused it and pressed Enter toggles it and keeps the focus there', J(kb));
+    await uiUntil(hub, 'window.__arenaHub.apps.state().online.open === "off"', 8000);
+    await hub.eval('window.__arenaPresence.setOn(true)');
+    const told = await uiUntil(hub, '(() => { const H = window.__arenaHub, r = H.model.apps.online.allRows().find((x) => x.id === "open"), m = H.view().menu.rows.find((x) => x.id === "online"); return r.value === "ON" && m.label === "PLAY ONLINE: OPEN"; })()', 5000);
+    ok(told, 'UM1 switched on from outside the row, the OPEN TO BATTLES row says ON and the main menu reads PLAY ONLINE: OPEN: the picture follows the presence service', J(await toggleState(hub)));
   });
 }
 
@@ -2463,21 +2453,22 @@ async function uiWords(c) {
   await withBrowser({ port: c.cdp(2), width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (hub) => {
     await hub.navigate(c.origin + '/pokemonarena/?net=local');
     await uiHubReady(hub);
-    const html = await (await fetch(c.origin + '/pokemonarena/index.html')).text();
-    const staticTitle = (html.match(/id="openToggle"[^>]*title="([^"]*)"/) || [])[1] || '';
-    const read = () => hub.eval('(() => { const b = document.getElementById("openToggle"); return { title: b.title, label: b.getAttribute("aria-label"), pressed: b.getAttribute("aria-pressed"), text: b.textContent }; })()');
-    const off = await read(), axOff = await uiAx(hub, '#openToggle');
-    ok(/list your trainer name and online record on public servers/.test(off.title) && /first time/.test(off.title) && !/asks you first/.test(off.title) && off.title === staticTitle,
-      'UW1 after mount the switch\'s LIVE off-state tooltip names the trainer name AND the online record, says it asks the FIRST time (it asks once), and is the same text as index.html carries', J({ live: off.title, staticTitle }).slice(0, 500));
-    const says = await hub.eval('(async () => { await window.__arenaPresence.setOn(true); return { live: document.getElementById("live").textContent, title: document.getElementById("openToggle").title }; })()');
-    ok(/trainer name and online record/.test(says.live) && /trainer name and online record/.test(says.title), 'UW2 switching on says, in the live region and in the tooltip, that the trainer name AND the online record are listed', J(says));
-    const on = await read(), axOn = await uiAx(hub, '#openToggle');
-    ok(axOff.name === 'Open to battles' && axOn.name === 'Open to battles' && axOff.pressed === 'false' && axOn.pressed === 'true' && off.text !== on.text && on.label === 'Open to battles',
-      'UN1 the hub switch has ONE accessible name ("Open to battles") whatever its state, and aria-pressed carries the state (the printed text still changes: ' + off.text + ' -> ' + on.text + ')', J({ axOff, axOn, off, on }));
-    // brokers that cannot be reached: the name stays, the tooltip (the description) says it
+    await uiUntil(hub, 'window.__arenaHub.apps.state().online.open === "off"', 8000);
+    // the switch is the OPEN TO BATTLES row of PLAY ONLINE: what the picture says with the cursor on it (the two lines under the list), and what a screen reader is told
+    const read = () => hub.eval('(() => { const H = window.__arenaHub; if (H.model.path() !== "online") H.goto("online"); H.model.apps.online.select("open"); const v = H.view(), r = v.menu.rows[v.menu.cursor]; return { label: r.label, value: r.value, help: v.msg.join(" "), said: H.model.speak(v) }; })()');
+    const off = await read();
+    ok(/name and online record/.test(off.help) && /anyone can challenge you/.test(off.help), 'UW1 the OPEN TO BATTLES row says, under the list, that switching it on lists the name AND the online record, for anyone to challenge', J(off));
+    const says = await hub.eval('(async () => { await window.__arenaPresence.setOn(true); return { live: document.getElementById("live").textContent }; })()');
+    await uiUntil(hub, 'window.__arenaHub.apps.state().online.open === "on"', 5000);
+    const on = await read();
+    ok(/trainer name and online record/.test(says.live) && /You are listed/.test(on.help), 'UW2 switching on says, in the live region, that the trainer name AND the online record are listed, and the row says the player is listed', J({ says, on }));
+    ok(off.label === 'OPEN TO BATTLES' && on.label === 'OPEN TO BATTLES' && off.value === 'OFF' && on.value === 'ON' && /OPEN TO BATTLES OFF\./.test(off.said) && /OPEN TO BATTLES ON\./.test(on.said),
+      'UN1 the row has ONE name ("OPEN TO BATTLES") whatever its state, and its value carries the state (OFF -> ON), in the picture and for a screen reader', J({ off, on }));
+    // brokers that cannot be reached: the name stays, and the row says nobody can see the listing
     await hub.eval('(() => { window.__arenaPresence.lobbies.status = () => "down"; return window.__arenaPresence.setOn(true); })()');
-    const dn = await read(), axDn = await uiAx(hub, '#openToggle');
-    ok(dn.text === 'Open: on, offline' && /no public server can be reached/.test(dn.title) && axDn.name === 'Open to battles' && axDn.pressed === 'true', 'UN1b with no broker reachable the name is still the same, and the tooltip says nobody can see the listing', J({ dn, axDn }));
+    await uiUntil(hub, 'window.__arenaHub.apps.state().online.open === "offline"', 5000);
+    const dn = await read();
+    ok(dn.label === 'OPEN TO BATTLES' && dn.value === 'ON' && /no public server can be/.test(dn.help) && /nobody can see you/.test(dn.help), 'UN1b with no broker reachable the name is still the same, and the row says nobody can see the listing', J(dn));
   });
 }
 
@@ -2592,12 +2583,12 @@ async function uiBattleBtn(c) {
       // a tab that was loaded with the switch OFF follows it going ON in another tab (the hub's), and OFF again
       const b = await a.openTab(vp);
       await b.navigate(c.origin + '/pokemonarena/?net=local'); await uiHubReady(b);
-      await b.eval('document.getElementById("openToggle").click()');
+      await hubSwitch(b);
       const follow = await uiUntil(a, 'window.__arenaPresence.isOn() && window.__arenaPresence.presence', 10000);
       const fb = await a.eval('document.getElementById("openBtn").getAttribute("aria-pressed")');
       await sleep(800);
       const live3 = await uiLive(w);
-      await b.eval('document.getElementById("openToggle").click()');
+      await hubSwitch(b);
       const unfollow = await uiUntil(a, '!window.__arenaPresence.isOn() && window.__arenaPresence.presence === null', 8000);
       ok(follow && fb === 'true' && live3.length === 2 && unfollow, 'UO3 a CPU battle loaded with the switch OFF follows it going ON in another tab (the button, the listing: two on the board) and OFF again', J({ follow, fb, live3, unfollow }));
       // the online page and an error screen never show the button (and take no room)
@@ -2628,11 +2619,13 @@ async function uiHidden(c) {
     await withBrowser({ port: c.cdp(0), width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (hub) => {
       await hub.navigate(slow.url + '/pokemonarena/?net=local');
       await hub.waitFor('window.__arenaHub && window.__arenaHub.state === "ready"', { timeoutMs: 120000 });
-      const pre = await hub.eval(`(() => { const b = document.getElementById('openToggle'); const r = b.getBoundingClientRect(); const e = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); return { vis: getComputedStyle(b).visibility, hit: e && e.id, mounted: !!window.__arenaPresence, attr: b.dataset.presence || null }; })()`);
-      ok(!pre.mounted && pre.vis === 'hidden' && pre.hit !== 'openToggle' && pre.attr === null, 'UH1 before the module has mounted the switch is invisible and cannot be hit or focused (a press then was silently dropped)', J(pre));
-      await uiUntil(hub, 'window.__arenaPresence', 20000);
-      const post = await hub.eval(`(() => { const b = document.getElementById('openToggle'); return { vis: getComputedStyle(b).visibility, attr: b.dataset.presence }; })()`);
-      ok(post.vis === 'visible' && post.attr === 'ready', 'UH1b and once it has mounted the switch is there (negative control: the rule hides only the unmounted state)', J(post));
+      // (the switch is the OPEN TO BATTLES row of the picture: there is no HTML button to hide. Before the presence code has loaded the row says OFF and nothing is listed; a press made then is kept)
+      const pre = await hub.eval(`(() => { const H = window.__arenaHub; H.goto('online'); H.model.apps.online.select('open'); const r = H.model.apps.online.allRows().find((x) => x.id === 'open'); H.press('a'); return { mounted: !!window.__arenaPresence, value: r.value, disabled: !!r.disabled, stored: localStorage.getItem('arena.open') }; })()`);
+      ok(!pre.mounted && pre.value === 'OFF' && pre.disabled === false && pre.stored === null, 'UH1 before the presence code has loaded the OPEN TO BATTLES row says OFF, and nothing is listed or stored', J(pre));
+      const onLater = await uiUntil(hub, 'window.__arenaPresence && window.__arenaPresence.isOn() && window.__arenaHub.apps.state().online.open === "on"', 20000);
+      const post = await hub.eval(`(() => { const H = window.__arenaHub, r = H.model.apps.online.allRows().find((x) => x.id === 'open'); return { value: r.value, on: !!window.__arenaPresence && window.__arenaPresence.isOn() }; })()`);
+      ok(onLater && post.value === 'ON' && post.on === true, 'UH1b and the press made then is NOT LOST: once the code has loaded the switch goes on and the row says ON (a press on the old HTML switch before it was wired was silently dropped)', J(post));
+      await hub.eval('window.__arenaPresence.setOn(false)');
       // the CPU battle's Open button: its room is held from the moment the battle is up, but it is invisible, and cannot be hit, until the module has mounted and wired it
       await hub.navigate(slow.url + '/pokemonarena/battle.html?net=local&anim=0');
       await hub.waitFor('window.__arenaBattle && window.__arenaBattle.state === "ready"', { timeoutMs: 120000 });
@@ -2647,8 +2640,8 @@ async function uiHidden(c) {
       await hub.navigate(broken.url + '/pokemonarena/?net=local');
       await hub.waitFor('window.__arenaHub && window.__arenaHub.state === "ready"', { timeoutMs: 120000 });
       await sleep(1500);
-      const gone = await hub.eval(`(() => { const b = document.getElementById('openToggle'); return { display: getComputedStyle(b).display, hidden: b.hidden, mounted: !!window.__arenaPresence }; })()`);
-      ok(gone.hidden === true && gone.display === 'none' && gone.mounted === false, 'UH2 when presence_boot.js cannot load, the switch is GONE (it used to stay on screen as a dead "Open: off": .textbtn\'s display beat [hidden])', J(gone));
+      const gone = await hub.eval(`(() => { const H = window.__arenaHub; H.goto('online'); H.model.apps.online.select('open'); const before = H.appEffects.length; H.press('a'); const v = H.view(), r = v.menu.rows[v.menu.cursor]; return { value: r.value, disabled: !!r.disabled, help: v.msg.join(' '), pressed: H.appEffects.length - before, mounted: !!window.__arenaPresence, status: H.presence ? H.presence.status() : null }; })()`);
+      ok(gone.disabled === true && gone.value === 'OFF' && /could not load/.test(gone.help) && gone.pressed === 0 && gone.mounted === false && gone.status === 'unavailable', 'UH2 when presence_boot.js cannot load, the OPEN TO BATTLES row says so and cannot be pressed (no dead switch that looks as if it worked)', J(gone));
       await hub.navigate(broken.url + '/pokemonarena/battle.html?net=local&anim=0');
       await hub.waitFor('window.__arenaBattle && window.__arenaBattle.state === "ready"', { timeoutMs: 120000 });
       await sleep(1500);
@@ -2674,15 +2667,15 @@ const UI_MUTANTS = [
   { id: 'M12', what: 'dispose() leaves the dialog in the document', file: 'js/presence_boot.js', from: 'dialog.destroy(); disclosure.destroy();', to: '', run: 'refresh', fails: 'UR5' },
   { id: 'M19', what: 'neither dispose() nor a new dialog removes the dialog of the previous mount (two #challenge in the document)', file: 'js/presence_boot.js', from: 'dialog.destroy(); disclosure.destroy();', to: '', also: [{ file: 'js/presence_boot.js', from: 'if (stale && stale.parentNode) stale.parentNode.removeChild(stale);', to: '' }], run: 'refresh', fails: 'UR4' },
   { id: 'M13', what: 'a start that was overtaken still builds its listing', file: 'js/presence_boot.js', from: 'if (disposed || mine !== gen) return false;', to: 'if (disposed) return false;', run: 'rapid', fails: 'UP1' },
-  { id: 'M14', what: 'no disclosure on the first switch-on', file: 'js/presence_boot.js', from: 'if (!on && disclosureWanted()) {', to: 'if (false) {', run: 'disclosure', fails: 'UD1' },
+  { id: 'M14', what: 'no disclosure on the first switch-on (the hub\'s OPEN TO BATTLES row asks the presence service, whose turnOn decides)', file: 'js/hub_presence.js', from: 'if (mount.isOn() || !mount.needsDisclosure()) return mount.setOn(true, { persist });', to: 'if (mount.isOn() || true) return mount.setOn(true, { persist });', run: 'disclosure', fails: 'UD1' },
   { id: 'M15', what: 'a stored "on" nobody was told about is honoured', file: 'js/presence_boot.js', from: 'if (disclosureWanted()) setOpen(storage, false); else setOn(true, { persist: false });', to: 'setOn(true, { persist: false });', run: 'disclosure', fails: 'UD7' },
-  { id: 'M16', what: 'the switch keeps the focus after a mouse click', file: 'js/presence_boot.js', from: 'if (e && e.detail > 0) {', to: 'if (false) {', run: 'disclosure', fails: 'UM1' },
-  { id: 'M17', what: 'a dead switch is not hidden when the module cannot load (the [hidden] rule is gone)', file: 'arena.css', from: '#openToggle[hidden] { display: none; }', to: '', run: 'hidden', fails: 'UH2' },
-  { id: 'M18', what: 'the switch is visible before the module has mounted', file: 'arena.css', from: '#openToggle:not([data-presence="ready"]) { visibility: hidden; }', to: '', run: 'hidden', fails: 'UH1' },
-  { id: 'M20', what: 'the hub switch\'s name changes with its state again (no constant aria-label)', file: 'js/presence_boot.js', from: "button.setAttribute('aria-label', OPEN_LABEL);", to: '', also: [{ file: 'index.html', from: ' aria-label="Open to battles" title=', to: ' title=' }], run: 'words', fails: 'UN1' },
+  { id: 'M16', what: 'the picture does not follow the presence service (the row and the main menu keep what it said when the page came up)', file: 'js/online_ctl.js', from: '      offSvc = svc.onChange(onPresence);\n', to: '      offSvc = () => {};\n', run: 'disclosure', fails: 'UM1' },
+  { id: 'M17', what: 'a switch that cannot work can still be pressed when the presence code cannot load', file: 'js/online_hub.js', from: "...(S.open === 'unavailable' ? { disabled: true } : {}) });", to: '});', run: 'hidden', fails: 'UH2' },
+  { id: 'M18', what: 'a press on OPEN TO BATTLES before the presence code has loaded is silently dropped', file: 'js/hub_presence.js', from: 'toggle() { return ready.then(() => (isOn() ? turnOff().then((off) => !off) : turnOn())); },', to: 'toggle() { if (!mount) return Promise.resolve(false); return ready.then(() => (isOn() ? turnOff().then((off) => !off) : turnOn())); },', run: 'hidden', fails: 'UH1b' },
+  { id: 'M20', what: 'the row\'s name changes with its state again (the state belongs in its value)', file: 'js/online_hub.js', from: "label: 'OPEN TO BATTLES', value: S.open === 'on' ||", to: "label: S.open === 'off' ? 'OPEN TO BATTLES' : 'OPEN', value: S.open === 'on' ||", run: 'words', fails: 'UN1' },
   { id: 'M21', what: 'the battle page\'s Open button changes its name with its state again (no constant aria-label)', file: 'js/presence_boot.js', from: "button.setAttribute('aria-label', OPEN_LABEL);", to: '', also: [{ file: 'battle.html', from: ' aria-label="Open to battles" hidden title=', to: ' hidden title=' }], run: 'battlebtn', fails: 'UN2' },
   { id: 'M22', what: 'the dialog layer takes the repeats of a held direction as steps (a key held since before the question drifts the highlight onto YES)', file: 'js/hub_dialog.js', from: "    if (info && info.repeat) return [];\n", to: '', run: 'drift', fails: 'UA5' },
-  { id: 'M23', what: 'the off-state tooltip names only the trainer name', file: 'js/presence_boot.js', from: 'list your trainer name and online record on public servers so anyone using Play online can challenge you', to: 'list your trainer name on public servers so anyone using Play online can challenge you', run: 'words', fails: 'UW1' },
+  { id: 'M23', what: 'the OPEN TO BATTLES row names only the name', file: 'js/online_hub.js', from: "openOff: ['Lists your name and online record',", to: "openOff: ['Lists your name',", run: 'words', fails: 'UW1' },
   { id: 'M24', what: 'the live-region message names only the trainer name', file: 'js/presence_boot.js', from: "const ON_SAYS = 'Open to battles. Your trainer name and online record are listed for anyone using Play online.';", to: "const ON_SAYS = 'Open to battles. Your trainer name is listed for anyone using Play online.';", run: 'words', fails: 'UW2' },
   { id: 'M25', what: 'RESET RECORD in the hub does not tell the listing', file: 'js/boot.js', from: 'if (hook.presence) hook.presence.refresh().catch(', to: 'if (false) hook.presence.refresh().catch(', run: 'record', fails: 'UQ1' },
   { id: 'M26', what: 'a store that cannot be read lists the player as "Player" with no record', file: 'js/presence_boot.js', from: 'if (r.ok && trainerKey(r.trainer) !== trainerKey(trainer))', to: 'if (trainerKey(r.ok ? r.trainer : null) !== trainerKey(trainer))', run: 'record', fails: 'UQ2' },
@@ -3041,10 +3034,10 @@ async function uxText(c) {
     ok(t.privShown && t.priv.includes('connects to ' + t.brokers + ' third-party MQTT brokers (') && t.brokers >= 2 && t.priv.includes('shiftr.io') && t.priv.includes('hivemq.com') && t.priv.includes('cdnjs.cloudflare.com') && /IP address/.test(t.priv) && /trainer name/.test(t.priv) && /online record/.test(t.priv) && /private game with a code is never listed/.test(t.priv), 'OXT2 the Open games list says, on screen, that opening the panel connects to public brokers and loads a script from a CDN, and what listing a game or challenging publishes (name AND online record); the number and names of the brokers are the ones the page dials', t.priv);
     ok(t.boxShown && /trainer name/.test(t.off) && /online record/.test(t.off) && /Other players see/.test(t.off), 'OXT3 the Battle anyone card (visible, not a tooltip) says what other players see: trainer name and online record', t.off);
     ok(!(await p.eval('!!document.getElementById("olPublic")')), 'OXT3b there is no switch that lists a room made for a friend: a room with a code is private', '');
-    // the hub's switch: its static title (before the module repaints it) names the record as well
-    const html = await (await fetch(c.origin + '/pokemonarena/index.html')).text();
-    const title = (html.match(/id="openToggle"[^>]*title="([^"]*)"/) || [])[1] || '';
-    ok(/trainer name and online record/.test(title), 'OXT4 the hub\'s Open switch names the online record in its title as well as the name', title);
+    // the hub's switch is a row of its picture: the words of that row (js/online_hub.js) name the record as well as the name
+    const words = await (await fetch(c.origin + '/pokemonarena/js/online_hub.js')).text();
+    const line = (words.match(/openOff: \[([^\]]*)\]/) || [])[1] || '';
+    ok(/name and online record/.test(line), 'OXT4 the hub\'s OPEN TO BATTLES row names the online record as well as the name', line);
     ok(p.errors.length === 0, 'OXT5 no page errors', J(p.errors).slice(0, 200));
   });
 }
@@ -3072,7 +3065,7 @@ const UX_MUTANTS = [
   { id: 'X19', what: 'the panel says only choices travel, straight to the friend', file: 'js/online.js', from: 'Your teams stay in your browser until a battle starts; then the team you play and your choices go to the other player, directly when your browsers can reach each other and through a public relay when they cannot.', to: 'Your teams stay in your browser; only your choices travel, straight to your friend.', run: 'text', fails: 'OXT1' },
   { id: 'X20', what: 'the Play online page says nothing about the public servers', file: 'js/online.js', from: "text: LEDE }), ui.openPrivacy);", to: "text: LEDE }));", run: 'text', fails: 'OXT2' },
   { id: 'X21', what: 'the Battle anyone card names the trainer name but not the record', file: 'js/online.js', from: 'Other players see your trainer name and your online record (wins and losses).', to: 'Other players see your trainer name.', run: 'text', fails: 'OXT3' },
-  { id: 'X22', what: 'the hub\'s switch title names only the trainer name', file: 'index.html', from: 'list your trainer name and online record on public servers', to: 'list your trainer name on public servers', run: 'text', fails: 'OXT4' },
+  { id: 'X22', what: 'the hub\'s OPEN TO BATTLES row names only the name', file: 'js/online_hub.js', from: "openOff: ['Lists your name and online record',", to: "openOff: ['Lists your name',", run: 'text', fails: 'OXT4' },
 ];
 const UX_SESSIONS = { join: uxJoin, quick: uxQuick, challenge: uxChallenge, cancel: uxCancel, focus: uxFocus, relist: uxRelist, names: uxNames, rec: uxRec, resume: uxResume, giveup: uxGiveUp, text: uxText };
 

@@ -458,7 +458,7 @@ async function groupWarm(origin) {
     // reveal instead; the speed budget lives in W7b.)
     const c4 = contract(w4);
     ok(c4.panel.length === 0 && w4.firstHub !== null, 'W13 at 4x slower CPU (a stand-in for a phone) the hub still comes up from the stored copy, with the panel visible for no longer than the return ran past the 400 ms reveal (+ one frame): ' + c4.frames + ' frames, ' + c4.span + ' ms of ' + c4.allowed + ' allowed', J(c4));
-    ok(w4.linkFrames === 0, 'W14 and until the hub is up the page does not show the Play online link on its own on an empty screen (it looked like a glitch): ' + w4.linkFrames + ' frames', J({ linkFrames: w4.linkFrames }));
+    ok(w4.linkFrames === 0, 'W14 and until the hub is up nothing stands on its own under the header (the HTML row of online links is gone: PLAY ONLINE is a row of the picture): ' + w4.linkFrames + ' frames', J({ linkFrames: w4.linkFrames }));
     await shot(page, 'warm_390_x4_ready');
   });
 }
@@ -543,7 +543,7 @@ async function groupEarlyKey(origin) {
     await page.eval('document.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); true');
     await page.waitFor('window.__arenaHub && window.__arenaHub.state === "ready"', { timeoutMs: 90000 });
     await sleep(400);                       // a queued key would have been replayed by now
-    const s = await page.eval('({ hash: location.hash, screen: window.__arenaHub.view().screen, path: window.__arenaHub.model.path(), cursor: window.__arenaHub.view().menu ? window.__arenaHub.view().menu.cursor : null, effects: window.__arenaHub.effects.slice(), navigated: window.__arenaHub.navigated || null, hist: history.length })');
+    const s = await page.eval('({ hash: location.hash, screen: window.__arenaHub.view().screen, path: window.__arenaHub.model.path(), cursor: window.__arenaHub.view().menu ? window.__arenaHub.view().menu.cursor : null, effects: window.__arenaHub.effects.filter((t) => t !== "data"), navigated: window.__arenaHub.navigated || null, hist: history.length })');          // ("data": what the PLAY ONLINE app returns from every data refresh to wake its ctl; no key causes it)
     ok(during === 'boot', 'W11a the key really was pressed while the first visit was loading (the hub reported state boot at that moment)', String(during));
     ok(s.hash === '' && s.screen === 'main' && s.path === 'main' && s.cursor === 0 && s.effects.length === 0 && s.navigated === null && s.hist === histBefore, 'W11 a key pressed while the first visit was still loading is dropped (not queued): the hub comes up on the main menu with the cursor on the first row, no screen opened, no effect run, no page left, the history unchanged', J(s));
     // the control: the SAME key, once the hub is up, DOES open Quick Battle -- so the absence above is something this page could have shown
@@ -737,8 +737,8 @@ const BROWSER_GROUPS = { warm: groupWarm, earlykey: groupEarlyKey, reduced: grou
 
 /* ------------------------------------------------------------------------------------------------ page mutants */
 const PAGE_MUTANTS = [
+  { id: 'an HTML row of online links is back under the picture (it shows on the empty page during boot)', file: 'index.html', from: '  <p id="note" class="warn" hidden role="status"></p>', to: '  <p id="onlineLink"><a class="textbtn" href="/pokemonarena/battle.html?online=1">Play online</a></p>\n  <p id="note" class="warn" hidden role="status"></p>', groups: ['warm'] },
   { id: 'the loading panel appears at once again', file: 'arena.css', from: 'body[data-state="boot"] #boot { visibility: hidden; animation: arena-boot-in 0s linear 0.4s forwards; }', to: '', groups: ['warm'] },
-  { id: 'the lone Play online link shows during boot', file: 'arena.css', from: 'body[data-state="boot"] #onlineLink { visibility: hidden; }', to: '', groups: ['warm'] },
   { id: 'the stored ROM is never recalled', file: 'js/romfetch.js', from: 'const hit = await readCachedRom(opts);', to: 'const hit = null;', groups: ['warm'] },
   { id: 'a downloaded ROM is never stored', file: 'js/romfetch.js', from: 'if (persist) writeCachedRom(bytes, opts).catch(() => { /* a copy that could not be kept costs the next visit a download, nothing else */ });', to: '', groups: ['warm'] },
   { id: 'the re-check is never scheduled', file: 'js/boot.js', from: 'window.requestAnimationFrame(() => window.setTimeout(recheck, 0));', to: '', groups: ['corrupt'] },

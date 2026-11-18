@@ -134,7 +134,7 @@ async function main() {
   // The picture takes the room it is given (screenfit.js fitPicture): a phone held upright runs it edge to edge, fullscreen gives it the whole viewport.
   // The old rule here was a whole scale only (floor), which left a 390 px phone a 324 px picture and a 360 px phone a 244 px one.
   function fit() {
-    hook.scale = fitPicture({ doc: document, win: window, canvas, top: els.top, padA: els.padA, padB: els.padB, touchPad, hint: document.body.dataset.state === 'ready' ? (touchPad ? 44 : stackBelow(window, [document.getElementById('onlineLink'), els.status, els.keys])) : 0 });
+    hook.scale = fitPicture({ doc: document, win: window, canvas, top: els.top, padA: els.padA, padB: els.padB, touchPad, hint: document.body.dataset.state === 'ready' ? (touchPad ? 44 : stackBelow(window, [els.status, els.keys])) : 0 });
   }
   window.addEventListener('resize', fit);
   window.addEventListener('orientationchange', fit);
@@ -696,12 +696,12 @@ async function main() {
     if (openFx.length) run(openFx);
     openProfiles();                                  // the team list fills in when the store answers; the menu is usable at once
     loadTower().then((m) => { if (m) refreshData(); });          // the Tower's code loads behind the menu (the hub itself carries no engine); its rows fill in when it has
-    // OPEN TO BATTLES (hub_presence.js: the page's ONE presence service, which mounts presence_boot.js): the switch beside Play online, and "<name> wants to battle you" whatever the player is doing,
-    // asked IN THE PICTURE by the dialog layer (run() hands its answer back, setDialog() says when a DOM panel covers the picture). Loaded after the menu is up, so it can never delay or break it.
-    // The hub's apps reach the same service through hubPresence(env).
-    const noSwitch = (e) => { console.warn('[presence] not available', e); const b = $('openToggle'); if (b) b.hidden = true; };      // arena.css gives #openToggle[hidden] its own display:none: .textbtn's display would otherwise win and leave a dead switch
+    // OPEN TO BATTLES (hub_presence.js: the page's ONE presence service, which mounts presence_boot.js): "<name> wants to battle you" whatever the player is doing, asked IN THE PICTURE by the
+    // dialog layer (run() hands its answer back, setDialog() says when a DOM panel covers the picture). Loaded after the menu is up, so it can never delay or break it. THE SWITCH IS A ROW OF THE
+    // PICTURE (PLAY ONLINE's OPEN TO BATTLES; that app's ctl reaches the same service through hubPresence(env)): there is no HTML button, so the service is handed none.
+    const noSwitch = (e) => { console.warn('[presence] not available', e); };          // (the service then answers 'unavailable': the row says so and cannot be switched)
     import('./hub_presence.js').then((m) => {
-      hook.presence = m.hubPresence({ win: window, doc: document, hook, model, pack, ui, navigate, input, storage, session, button: $('openToggle'), focusHome: focusCanvas, panelOpen: () => dialogOpen, redraw: () => { dirty = true; } });
+      hook.presence = m.hubPresence({ win: window, doc: document, hook, model, pack, ui, navigate, input, storage, session, button: null, focusHome: focusCanvas, panelOpen: () => dialogOpen, redraw: () => { dirty = true; } });
       return hook.presence.ready.then((ok) => { if (!ok) noSwitch('presence_boot.js did not load'); });
     }).catch(noSwitch);
     document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshData(); });
