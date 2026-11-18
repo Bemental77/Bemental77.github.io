@@ -952,10 +952,11 @@ hidden view has no rows: equivalent); COPY / SHARE from a real controller (not t
 ```bash
 node tools/pokemonarena_battle_ask_test.mjs --mutants                     # 14 passed, 10 mutants
 node tools/pokemonarena_online_view_test.mjs --mutants                    # 69 passed, 44 mutants
-node tools/pokemonarena_online_page_test.mjs                              # see the report of this fix for the last full run's numbers
-node tools/pokemonarena_online_page_test.mjs screens --mutants            # 27 mutants
-node tools/pokemonarena_online_page_test.mjs presenceui --mutants         # 39 mutants (ONLINE.md states it)
-node tools/pokemonarena_online_page_test.mjs tokens --mutants             # 7 mutants
+node tools/pokemonarena_online_page_test.mjs                              # 529 passed, 0 failed (1092 s), on 9ed36aaf
+node tools/pokemonarena_online_page_test.mjs screens --mutants            # 85 passed: 58 cases and 27/27 mutants killed
+node tools/pokemonarena_online_page_test.mjs presenceui --mutants         # 39 mutants (ONLINE.md states it). Run with ARENA_UI=cross,battlerow,hidden: all 17 of those sessions' mutants killed (the hub sessions' 22 were not re-run)
+node tools/pokemonarena_online_page_test.mjs tokens --mutants             # 39 passed, 7/7 mutants killed
+# also green on 9ed36aaf: pokemonarena_apps_test 363, tower_page_test 186, battle_page_test 176, hub_return_test 92 (+32 units), tower_test 304, scene_test 41, presence_test 140, hub_presence_test 117, netmatch 333, openlobby 144, online_prefs 35
 ```
 
 FOREIGN hunks of this fix: `js/scene.js` (the row, 4 lines), `tools/pokemonarena_tower_test.mjs` Q34 and `tools/pokemonarena_tower_page_test.mjs` (one line each: they named `#openBtn`).
