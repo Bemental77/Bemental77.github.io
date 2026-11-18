@@ -893,8 +893,8 @@ The counts are what each command prints as "passed". The battle-page sessions of
 
 ```bash
 node tools/pokemonarena_online_view_test.mjs --mutants                    # 62 passed, 36 mutants: the screens in Node with the real ROM renderer (see its header)
-node tools/pokemonarena_online_page_test.mjs                              # 527 passed, 20 groups (profile hub lobby match leaving rejoin resume timeout easyjoin screens refusals teams lead layout open openlayout presence presenceui onlineux tokens)
-node tools/pokemonarena_online_page_test.mjs screens --mutants            # 73 passed with them: 52 cases and 21 mutants (new group: SC1-SC13, sessions bare ask copy back input battle; ARENA_SC=<session,...> picks some)
+node tools/pokemonarena_online_page_test.mjs                              # 528 passed, 20 groups (profile hub lobby match leaving rejoin resume timeout easyjoin screens refusals teams lead layout open openlayout presence presenceui onlineux tokens)
+node tools/pokemonarena_online_page_test.mjs screens --mutants            # 75 passed with them: 53 cases and 22 mutants (new group: SC1-SC13, sessions bare ask copy back input battle; ARENA_SC=<session,...> picks some)
 node tools/pokemonarena_online_page_test.mjs onlineux tokens --mutants    # 18 + 6 mutants (was 22 + 6: X06-X08 went with the list, X20 with the page's foot; X04, X05, X10-X13, X21, T04-T06 re-homed)
 node tools/pokemonarena_online_page_test.mjs open --mutants               # 10 mutants, unchanged strings
 node tools/pokemonarena_presence_test.mjs --mutants                       # 140 passed, 67 mutants (its 12 online.js mutants still apply)
