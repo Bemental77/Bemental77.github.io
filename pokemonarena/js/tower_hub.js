@@ -124,8 +124,10 @@ export function speakTower(v) {
     if (r) parts.push('Achievement ' + (t.abs + 1) + ' of ' + t.total + ': ' + r.name + ', ' + ['', 'green', 'blue', 'purple', 'gold'][r.grade] + ', ' + (r.at === null ? 'not earned yet' : 'earned') + '.');
     if (msg) parts.push(msg);
   } else {
-    // the Tower home: the status window is not text for a screen reader, so the floor and the retries are said here
-    if (t.kind === 'tower' && t.status) parts.push('Floor ' + t.status.floor + ' of ' + t.status.floors + '. ' + (t.status.retry ? retryWords(t.status.retry) : '') + (t.status.lives > 0 ? ' Extra lives: ' + t.status.lives + '.' : ''));
+    // the Tower home: the status window is not text for a screen reader, so the floor and the retries are said here. ONCE: where the row's message already carries the retry sentence (the RETRY FLOOR row:
+    // "The climb is saved on floor 5. 2 of 3 retries left here, 1 used."), the status does not say the same sentence before it
+    const said = t.kind === 'tower' && t.status && t.status.retry ? retryWords(t.status.retry) : '';
+    if (t.kind === 'tower' && t.status) parts.push(('Floor ' + t.status.floor + ' of ' + t.status.floors + '. ' + (said && !msg.includes(said) ? said : '') + (t.status.lives > 0 ? ' Extra lives: ' + t.status.lives + '.' : '')).replace(/\s+/g, ' ').trim());
     if (msg) parts.push(msg);
   }
   if (t.balls) parts.push('Buffs: ' + t.balls.map((b, i) => (i === t.cursor ? 'selected ' : '') + b.rarity + ' ' + b.name + ': ' + b.effectText).join('; ') + '.');
@@ -145,8 +147,11 @@ export function retryLines(rt) {
   if (!rt) return [];
   if (!hasRetries(rt)) return ['NO RETRIES'];
   const first = rt.scope === 'none' ? 'RETRIES NO LIMIT' : rt.cap > 9 ? 'RETRIES ' + rt.left + '/' + rt.cap : 'RETRIES LEFT ' + rt.left + '/' + rt.cap;
-  return [first, 'RETRIES USED ' + rt.used];
+  return [first, usedLine(rt.used)];
 }
+/** The status window's line for the retries a climb has used. Three digits fit beside the words (measured with the ROM's font: 'RETRIES USED 999' is exactly the window's 74 pixels); a count past that, which
+ *  no stored run can hold (one run counts at most 300), is shown as 'RETRIES 999+' instead of being drawn past the window's edge. */
+const usedLine = (n) => (n > 999 ? 'RETRIES 999+' : 'RETRIES USED ' + n);
 /** One message line: how many retries are left where, and how many the climb has used ("2 of 3 retries left here, 4 used."). */
 export function retryWords(rt) {
   if (!rt) return '';

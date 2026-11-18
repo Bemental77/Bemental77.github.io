@@ -19,7 +19,9 @@
 // RETRIES (2026-11-17) ARE OPTIONAL KEYS, NOT A NEW VERSION. A record written before they existed has none of them and reads as 0 retries; a format that was won before they existed reads as won with 0
 // (fewestRetriesOf: a loss used to end the run, so every such win used none). The writers leave a key out while it has nothing to say, so a record that never saw a retry is, byte for byte, what the build
 // before wrote. A RUN carries no retry number at all: each lost try that cost a retry is a row of its history marked `retry: true`, and the counts are read from the rows (retriesOf / floorRetriesOf), so
-// there is nothing to forge and nothing that can disagree. TOWER.md section 11 says what a build without these keys does with a record that has them.
+// there is no second number that could disagree with the rows. THAT IS NOT TAMPER-PROOFING: a malformed edit of the rows is refused (tower.js parseRun), but an edit that leaves them self-consistent (a
+// retry row deleted, or re-filed in order under an earlier floor) cannot be told from a genuine run, in a browser that holds no secret (TOWER.md section 9, "The known limit"; a stored number would not
+// change that). TOWER.md section 11 says what a build without these keys does with a record that has them.
 //
 // UNKNOWN FIELDS are never dropped: they go to `tower._unknown`, as everywhere in the profile. A field that cannot be repaired is replaced by its empty value and the raw value is kept in the bag by
 // profile.js (normalizeTower returns it in `rejected`), so a damaged record costs the player that one field, never the whole climb.

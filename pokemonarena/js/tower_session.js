@@ -14,6 +14,8 @@
 //   * A fight begins when the player makes the first choice of it (the team preview, or the first move): the run is marked `fighting`. Reloading the battle page resumes it. Arriving at a floor whose fight is
 //     marked, any other way (the tab was closed, the address typed again), means the earlier fight was LEFT: that counts as a loss on that floor (an Extra Life, if held, is spent; else it costs a retry, and
 //     ends the run when none is left). Leaving a fight is never free; looking at a floor and leaving before choosing anything costs nothing and writes nothing.
+//     A HISTORY STEP ONTO THE PAGE OF ANOTHER TRY (the browser's Back out of a retry lands on what lies behind it, which can be the battle page of the try that was lost before it) is neither: that page is
+//     not the fight's own, so it does not resume it, and nothing was left for good, so nothing is counted ('elsewhere': reduceBeginFloor); Forward is the fight again, where it was.
 //   * A fight ends: a win opens the offer (or wins the run on the top floor). A LOSS LEAVES THE RUN ON THE SAME FLOOR with everything it holds: it spends an Extra Life if one is held, else it counts a
 //     RETRY while one is left (cfg.retriesPerFloor / cfg.retriesPerRun: three per floor), and only a loss with neither ends the run. A result is applied ONCE: the same result sent twice, or for another
 //     floor, or for another TRY of the floor (`tries`: tower_record.js tryNumber, the lives spent + the retries counted when the fight began), changes nothing. So a lost try can never be counted twice.
@@ -104,17 +106,25 @@ export function reduceStart(tower, { pack, seed, format, team = null, now = 0, c
 /**
  * The battle screen for `floor` of the run `seed` is about to come up. -> { applied, status, ... }
  *   status 'ok'         the floor is the current one and no fight was marked: nothing is written (the fight is marked at the player's first choice: reduceMarkFight)
- *   status 'resume'     a fight is marked and this is a reload / history step (navType): it goes on, nothing is written
+ *   status 'resume'     a fight is marked and this is a reload / history step (navType) onto THE PAGE OF THAT FIGHT: it goes on, nothing is written
+ *   status 'elsewhere'  a fight is marked and this is a reload / history step onto the page of ANOTHER TRY of the floor (`openedTry` is not the try being fought): the fight is under way on another page.
+ *                       Nothing is written: this page neither resumes that fight nor counts it as left
  *   status 'abandoned'  a fight is marked and this is a fresh arrival: the earlier fight was left, so it counted as a loss (written); `next` says what follows
  *   status 'stale'      the record is not waiting for that fight (another floor, the offer, no run, another run): nothing is written
+ * `openedTry` is the try of the floor THE PAGE WAS OPENED AS (the battle page: the try in its address; a host with no such thing leaves it out, and every history step is then the fight's own page, as before).
+ * WHY IT IS NEEDED: a retry is another page than the try it follows, so the page BEHIND a retry in the tab's history can be the lost try's. Reached by the browser's Back in the middle of the retry, that page
+ * used to take the fight under way for its own ("resume"), find nothing to resume it from (the tab's saved battle was kept under the address of the page that fought), and count the fight as LEFT: Back cost a retry at once,
+ * and ended the climb on the last try, with no question asked, while Forward would have resumed the fight untouched.
  */
-export function reduceBeginFloor(tower, { pack, floor, seed, navType = 'navigate', now = 0, cfg = CONFIG }) {
+export function reduceBeginFloor(tower, { pack, floor, seed, navType = 'navigate', now = 0, cfg = CONFIG, openedTry }) {
   const cur = tower.current;
   if (!cur || cur.seed !== seed) return { applied: false, status: 'stale', why: 'no such run' };
   if (cur.phase !== 'battle' || cur.floor !== floor) return { applied: false, status: 'stale', why: 'the run is not waiting for that fight', phase: cur.phase, floor: cur.floor };
   if (!parseRun(cur, { pack: null, cfg }).ok) return { applied: false, status: 'stale', why: 'the run cannot be read' };          // a stored run that passes the shallow check but not the deep parser never opens a fight (the hub offers to drop it)
   if (cur.fighting) {
-    if (navType === 'reload' || navType === 'back_forward') return { applied: false, status: 'resume', run: cur };
+    const byHistory = navType === 'reload' || navType === 'back_forward';
+    if (byHistory && openedTry !== undefined && openedTry !== tryNumber(cur)) return { applied: false, status: 'elsewhere', why: 'the fight under way is another try of this floor', run: cur, tries: tryNumber(cur) };
+    if (byHistory) return { applied: false, status: 'resume', run: cur };
     const lost = reduceFinishFloor(tower, { floor, seed, result: { floor, result: 'l', turns: 0, faints: 0 }, pack, now, cfg, attempt: cur.attempt >>> 0, tries: tryNumber(cur) });          // (on behalf of the fight that was left)
     return { ...lost, status: 'abandoned' };
   }
@@ -140,6 +150,8 @@ export function reduceMarkFight(tower, { floor, seed, attempt, tries }) {
  * The fight of `floor` ended. `result` = match_stats' summary (viewSide 0) or { floor, result: 'w'|'l'|'d'|'f', turns, faints }. -> { tower, applied, run, events, next, newIds, finished, retries } | { applied: false, why }
  * `next`: { step: 'offer' | 'retry' | 'over' | 'won', floor } (a 'retry' also says `via`: 'life' or 'retry'); `retries`: retryInfo of the run as the result left it (what the page tells the player).
  * `tries` names the try of the floor the result is for: a result of another try is refused, which is what makes a lost try count ONCE (the first loss moves the run on to the next try).
+ * IT IS OPTIONAL HERE AND MUST NOT BE LEFT OUT BY A HOST: a result that names no try is applied to whatever try is current, so the same loss sent twice would count twice. Every page gets its results'
+ * try from startTowerFloor (its finish() and markFight() carry it); a host that fights a floor goes through that, never through finishFloor on its own (TOWER.md section 11, "Known and left").
  */
 export function reduceFinishFloor(tower, { floor, seed, result, pack = null, now = 0, cfg = CONFIG, attempt, tries }) {
   const cur = tower.current;
@@ -259,12 +271,16 @@ function newAttempt(nonce, now) {
  *   spec    the battle to build (towerFloorSpec); build it with createMatchController({ ...spec, validate: spec.validate }) and the scene
  *   markFight  () -> Promise: call it ONCE, at the player's first choice of the fight (ctl.onLocalChoice): from then on leaving the fight counts as a loss
  *   finish  (result) -> Promise<{ applied, next, newIds, run }>: hand it the finished match (match_stats' summary, or { result: 'f' } for a fight that was left); it is applied once
- * `status`: 'ok' | 'resume' (a reload of a fight under way) | 'abandoned' (the earlier fight was left and counted as a loss: `next` says what follows, there is no spec) | 'stale' | 'none'
+ *   stillWaiting(run)  -> Promise<boolean>: is the record STILL waiting, with no fight begun, for the very try `run` is on? (What RETRY FLOOR asks before it opens that try: tower_fight.js onResult.)
+ * `status`: 'ok' | 'resume' (a reload of a fight under way) | 'elsewhere' (a history step onto the page of another try than the one being fought: nothing is written, there is no spec) |
+ *           'abandoned' (the earlier fight was left and counted as a loss: `next` says what follows, there is no spec) | 'stale' | 'none'
+ * `openedTry`: the try of the floor the page was opened as (see reduceBeginFloor); the try that is FOUGHT is always the run's own (`tries` in the answer).
  */
-export async function startTowerFloor({ pack, persist, floor, runId, navType = 'navigate', now = () => Date.now(), cfg = CONFIG, nonce = null }) {
+export async function startTowerFloor({ pack, persist, floor, runId, navType = 'navigate', now = () => Date.now(), cfg = CONFIG, nonce = null, openedTry }) {
   const s = createTowerSession({ pack, persist, now, cfg });
-  const b = await s.beginFloor({ floor, seed: runId, navType });
+  const b = await s.beginFloor({ floor, seed: runId, navType, openedTry });
   if (!b || b.status === 'stale') return { ok: false, status: 'stale', why: b ? b.why : 'no answer' };
+  if (b.status === 'elsewhere') return { ok: false, status: 'elsewhere', why: b.why, tries: b.tries };
   if (b.status === 'abandoned') return { ok: false, status: 'abandoned', applied: b.applied, next: b.next || null, newIds: b.newIds || [], retries: b.retries || null, why: 'the earlier fight of this floor was left, which counts as a loss' };
   const tower = await s.read();
   const cur = tower.current;
@@ -275,7 +291,10 @@ export async function startTowerFloor({ pack, persist, floor, runId, navType = '
   // ... and THE TRY IT IS: the try number the run had when this page opened the floor. The mark and the result both name it, so once a loss of this try has been counted (the run is then on the next try)
   // nothing this page sends again, and nothing a page that opened the same try sends late, can be applied.
   const tries = tryNumber(cur), attempt = b.status === 'resume' ? (cur.attempt >>> 0) : newAttempt(nonce, now);
-  return { ok: true, status: b.status, run: cur, spec, tag: spec.tower.tag, attempt, tries, markFight: () => s.markFight({ floor, seed: runId, attempt, tries }), finish: (result) => s.finishFloor({ floor, seed: runId, result, attempt, tries }) };
+  // (stillWaiting: a result screen can outlive its moment: it stays in the tab's history, and a browser may bring it back whole. Its RETRY FLOOR opens a try afresh, and a fresh arrival at a fight that is
+  //  under way counts that fight as left; so the button first asks whether the try it would open is still waiting, untouched.)
+  const stillWaiting = (run) => s.read().then((tw) => { const c = tw && tw.current; return !!c && !!run && c.seed === run.seed && c.phase === 'battle' && c.floor === run.floor && c.fighting !== true && tryNumber(c) === tryNumber(run); });
+  return { ok: true, status: b.status, run: cur, spec, tag: spec.tower.tag, attempt, tries, markFight: () => s.markFight({ floor, seed: runId, attempt, tries }), finish: (result) => s.finishFloor({ floor, seed: runId, result, attempt, tries }), stillWaiting };
 }
 
 /* ---------------------------------------------------------------------------------------------- what the screens show */

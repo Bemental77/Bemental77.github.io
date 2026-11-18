@@ -11,6 +11,10 @@
 //            the LAST RUN (with its retries) and ACHIEVEMENTS screens; the profile's career record is byte-identical to before the climb; a plain Quick Battle in the same browser plays EXACTLY the battle it played before
 //   desktop  1280x800, keyboard + the synthetic controller: a mid-fight RELOAD resumes the floor (and the floor counts once); the offer by CONTROLLER; a fight LEFT by a typed address is a lost try (it costs
 //            one retry and the run goes on); hostile Tower addresses are refused and write nothing; NEW RUN from the hub gives the run under way up (counted, with its retry) and opens floor 1 of a new one
+//   history  1280x800: THE BROWSER'S BACK AND FORWARD IN THE MIDDLE OF A RETRY (the review of 2026-11-17: Back out of a retry cost a retry at once, and ended the climb on the last try). A retry opened from the
+//            hub (Back past the hub lands on the LOST try's battle page: "Another try of this floor", nothing counted); a retry opened by RETRY FLOOR on the result screen (it REPLACES the lost try's page,
+//            so Back is the hub); the last try with TWO pages of it in the history, their addresses spelled differently (Back onto the other one RESUMES the fight there). At each: nothing is counted, the
+//            climb does not end, Forward resumes the fight at the same battle state; a page that opens another try than its address names puts the try into its address
 //   residual  1280x800: START, START, B, NEW RUN, START in one tick makes ONE profile and ONE run; LEAVE TOWER before any choice costs NOTHING (the same run still waits); TWO TABS on one floor (the second is
 //            told it is a duplicate, and RELOADED it does not take over the first's fight: the fight counts as left, one retry); three reloads at #tower-last add nothing to the history, B, B still ends on the
 //            main menu, a Back arrival keeps Forward
@@ -440,6 +444,107 @@ try {
     await hubReady(page);
     const t5 = await tw(page, pid);
     ok(!!t5.current && t5.current.seed === t4.current.seed && t5.current.floor === 1 && t5.current.history.length === 0 && t5.current.fighting === false && t5.runs === 1 && J(t5.last) === J(tGave.last) && (await where(page)) === 'tower' && (await labelsOf(page))[0] === 'FIGHT: FLOOR 1', tag + 'leaving at once (no choice made) COSTS NOTHING: the new run still waits on floor 1 (it used to be dropped), nothing is counted, and the hub offers FIGHT: FLOOR 1', J({ cur: t5.current && t5.current.floor, runs: t5.runs }));
+    ok(errsOf(page).filter((e) => !/status of (4\d\d)|Failed to load resource/.test(e)).length === 0, tag + 'no console errors', errsOf(page).slice(0, 2).join(' | '));
+  });
+
+  /* ================================================================================================================ history */
+  // THE BROWSER'S BACK AND FORWARD IN THE MIDDLE OF A RETRY (the review of 2026-11-17 found that Back out of a retry cost a retry at once, and ended the climb on the last try: the page before a retry in the
+  // tab's history was the LOST try's battle page, which took the fight under way for its own, found nothing saved under its own address and counted the fight as left). Three ways a retry is reached, and at each
+  // one the fight is left by the browser's Back and come back to by Forward: NOTHING may be counted, and the fight must go on where it was.
+  await session('history: Back and Forward in the middle of a retry', { width: 1280, height: 800, port: cdp++ }, async (page) => {
+    const tag = 'history: ';
+    await openHub(page);
+    const seeded = await ev(page, SEED_TEAM('BROCK', TEAM)); const pid = seeded.id;
+    ok((await ev(page, START_RUN(pid, seeded.team, SEED_B, '3v3'))).applied, tag + 'a run starts');
+    const rows = (t) => (t && t.current ? t.current.history.map((h) => h.result + (h.retry ? '*' : h.life ? '+' : '')).join('') : null);
+    const begin = async () => { const m = await ev(page, DRIVE("a.mode === 'action' && a.ctl.turn >= 1")); await until(async () => { const t = await tw(page, pid); return t.current && t.current.fighting; }); await sleep(300); return m; };
+    const lose = async (n) => { await ev(page, ASK('forfeit')); await ev(page, ANSWER(true)); await finish(page); return until(async () => { const t = await tw(page, pid); return t.current && t.current.history.length === n && !t.current.fighting ? t : null; }); };
+    const info = () => ev(page, `(() => { const a = ${B}; return a ? { state: a.state, status: a.tower ? a.tower.status : null, tries: a.tower && a.tower.spec ? a.tower.spec.tower.tries : null, restored: a.resume ? a.resume.restored : null, refused: a.towerRefused || null, search: location.search, nav: (performance.getEntriesByType('navigation')[0] || {}).type, hash: a.ctl ? a.ctl.battle.hash() : null } : null; })()`);
+    const stored = async () => { const r = await ev(page, READ(pid)); return J([r.rev, r.tower]); };
+    const onHub = `location.pathname.endsWith('/pokemonarena/') && window.__arenaHub && ${HUB}.state === 'ready'`;
+    const onBattle = `location.pathname.endsWith('battle.html') && window.__arenaBattle && (${B}.state === 'ready' || ${B}.state === 'error')`;
+    const tryOf = (search) => { const m = /[?&]try=(\d+)(&|$)/.exec(search || ''); return m ? Number(m[1]) : 0; };
+    // ONE STEP through the tab's history (n = -1: the browser's Back, 1: Forward). -> where it landed: { hub | battle, try (of a battle page's address), fresh (the page was LOADED AGAIN: a new document) }.
+    // A battle page is always loaded again here (the dev server's no-store headers keep the back / forward cache out of this rig); the hub's own screens are entries of one document.
+    const go = async (n) => {
+      const before = await ev(page, `(window.__stale = 1, location.href)`);
+      await ev(page, `history.go(${n}); true`);
+      await page.waitFor(`window.__stale === undefined || location.href !== ${J(before)}`, { timeoutMs: 30000 });
+      await page.waitFor(`(${onHub}) || (${onBattle})`, { timeoutMs: 90000 });
+      await sleep(400);
+      const at = await ev(page, `({ path: location.pathname, search: location.search, fresh: window.__stale === undefined })`);
+      const hub = at.path.endsWith('/pokemonarena/');
+      if (hub) await hubReady(page);
+      return { hub, battle: !hub, try: hub ? null : tryOf(at.search), fresh: at.fresh, search: at.search };
+    };
+    // Back (or Forward) until a battle page is reached: the hub's screens in between are stepped over (the hub seeds a screen opened by address with the entries it would have been walked through)
+    const toBattlePage = async (n) => { for (let i = 1; i <= 5; i++) { const at = await go(n); if (at.battle) return { ...at, steps: i }; } return { battle: false, steps: -1, try: null }; };
+    const result = (label) => ev(page, `(() => { const a = ${B}, i = a.view().result.options.indexOf(${J(label)}); if (i < 0) return 'no ' + ${J(label)}; a.scene.choose.result(i); return 'ok'; })()`);
+    const hubMsg = async (at) => (at.hub ? page.eval(`${HUB}.model.view().msg`) : null);
+    await key(page, 'down'); await key(page, 'down'); await key(page, 'a'); await sleep(300);
+    await key(page, 'a');
+    ok((await toBattle(page)) === 'ready' && (await begin()) === 'action', tag + 'FIGHT opens floor 1 and it is begun');
+
+    // ---- 1. THE RETRY IS OPENED FROM THE HUB: the lost try's battle page stays in the tab's history, behind the hub
+    const l1 = await lose(1);
+    ok(rows(l1) === 'l*', tag + 'the first try is lost: one retry counted', rows(l1));
+    ok((await result('BACK TO TOWER')) === 'ok', tag + 'BACK TO TOWER is on the result screen');
+    await page.waitFor(onHub, { timeoutMs: 60000 }); await hubReady(page);
+    ok((await labelsOf(page))[0] === 'RETRY FLOOR 1', tag + 'the hub offers RETRY FLOOR 1', J(await labelsOf(page)));
+    await key(page, 'a');
+    await page.waitFor(`${onBattle} && /[?&]try=1(&|$)/.test(location.search)`, { timeoutMs: 90000 });
+    ok((await begin()) === 'action', tag + 'the retry (try 1) opens from the hub and is begun');
+    const a1 = await info(), s1 = await stored();
+    const back1 = await toBattlePage(-1);                                         // BACK, past the hub, onto the battle page of the LOST try
+    const b1 = await info(), s1b = await stored(), body1 = await ev(page, 'document.body.innerText');
+    ok(back1.battle && back1.try === 0 && back1.fresh && b1.nav === 'back_forward' && b1.state === 'error' && !!b1.refused && b1.refused.status === 'elsewhere', tag + 'the browser\'s BACK, past the hub, lands on the LOST try\'s battle page, which says it is an earlier try: it neither takes the fight under way for its own nor counts it as left', J([back1, b1]));
+    ok(s1b === s1 && /Nothing was counted/.test(body1), tag + 'NOTHING WAS COUNTED by that Back (the profile is the same revision, value for value, and the fight is still marked), and the page says so', body1.replace(/\s+/g, ' ').slice(0, 200));
+    const fwd1 = await toBattlePage(1);                                           // FORWARD, past the hub: the page of the fight
+    const c1 = await info();
+    ok(fwd1.battle && fwd1.try === 1 && c1.state === 'ready' && c1.status === 'resume' && c1.restored === true && c1.hash === a1.hash && (await stored()) === s1, tag + 'FORWARD is the fight again, RESUMED at the very state it was left in (same battle hash), with nothing written', J([fwd1, c1]));
+
+    // ---- 2. THE RETRY IS OPENED BY "RETRY FLOOR" ON THE RESULT SCREEN: it takes the lost try's place in the history, so Back from it is the hub (as from a first try)
+    const l2 = c1.state === 'ready' ? await lose(2) : null;
+    ok(rows(l2) === 'l*l*', tag + 'that try is lost too: two retries counted', String(rows(l2)));
+    const len2 = await ev(page, 'history.length');
+    ok((await result('RETRY FLOOR')) === 'ok', tag + 'RETRY FLOOR is on the result screen');
+    await page.waitFor(`${onBattle} && /[?&]try=2(&|$)/.test(location.search)`, { timeoutMs: 90000 });
+    ok((await ev(page, 'history.length')) === len2, tag + 'RETRY FLOOR REPLACES the lost try\'s page in the tab\'s history (its length stays ' + len2 + '): the page before a retry is never the battle that was just lost', String(await ev(page, 'history.length')));
+    ok((await begin()) === 'action', tag + 'try 2 is begun');
+    const a2 = await info(), s2 = await stored();
+    const back2 = await go(-1);                                                   // BACK: the hub
+    const msg2 = await hubMsg(back2);
+    ok(back2.hub && (await where(page)) === 'tower' && J(msg2) === J(['You left a fight unfinished.', 'That costs 1 of the 1 retry left.']) && (await stored()) === s2, tag + 'BACK in the middle of that retry is the hub\'s Tower screen, which says what leaving the fight would cost; nothing is counted', J([back2, msg2]));
+    const fwd2 = await go(1);                                                     // FORWARD: the fight
+    const c2 = await info();
+    ok(fwd2.battle && fwd2.try === 2 && c2.state === 'ready' && c2.status === 'resume' && c2.restored === true && c2.hash === a2.hash && (await stored()) === s2, tag + 'FORWARD resumes the retry where it was (same battle hash), with nothing written', J([fwd2, c2]));
+
+    // ---- 3. THE LAST TRY, and TWO PAGES OF ONE TRY. A page reached again with no fight marked opens the try the run is on and puts that try into its own address; so the tab's history can hold two pages
+    //         of the last try whose addresses are spelled differently. The fight is begun on one; Back in the middle of it must not end the climb, wherever it lands.
+    const l3 = c2.state === 'ready' ? await lose(3) : null;
+    ok(rows(l3) === 'l*l*l*', tag + 'the third try is lost: the floor\'s three retries are counted', String(rows(l3)));
+    const s3r = await stored();
+    const old3 = await toBattlePage(-1);                                          // BACK past the hub, with NO fight marked: the first try's page (its address names no try)
+    const r3a = await info();
+    ok(old3.battle && r3a.state === 'ready' && r3a.status === 'ok' && r3a.tries === 3 && /[?&]try=3(&|$)/.test(r3a.search) && (await stored()) === s3r, tag + 'with no fight marked, the first try\'s page reached by Back opens the try the run is on (the LAST try), writes nothing, and PUTS THAT TRY INTO ITS OWN ADDRESS (try=3)', J([old3, r3a]));
+    const new3 = await toBattlePage(1);                                           // FORWARD past the hub: the page of the try that was just lost
+    const r3 = await info(), bar3 = await barOf(page);
+    ok(new3.battle && r3.state === 'ready' && r3.status === 'ok' && r3.tries === 3 && /[?&]try=3(&|$)/.test(r3.search) && r3.search !== r3a.search && !!bar3 && /RETRIES 0\/3$/.test(bar3.text) && (await stored()) === s3r, tag + 'and so does the page of the try that was just lost, reached by Forward (RETRIES 0/3): two pages of the last try, their addresses spelled differently, nothing written', J([r3a.search, r3.search]));
+    ok((await begin()) === 'action', tag + 'the last try is begun on that page');
+    const a3 = await info(), s3 = await stored();
+    await ev(page, `window.__stale = 1; true`); await page.send('Page.reload', {});
+    await page.waitFor(`window.__stale === undefined && ${onBattle}`, { timeoutMs: 90000 });
+    const r3b = await info();
+    ok(r3b.state === 'ready' && r3b.status === 'resume' && r3b.restored === true && r3b.hash === a3.hash && (await stored()) === s3, tag + 'a reload in the middle of it resumes it (the page knows itself for a page of the fight\'s try by the address it gave itself)', J(r3b));
+    const back3 = await go(-1);                                                   // BACK: the hub
+    const msg3 = await hubMsg(back3), t3h = await tw(page, pid);
+    ok(back3.hub && J(msg3) === J(['You left a fight unfinished.', 'No retry is left: the climb ends.']) && !!t3h.current && t3h.runs === 0 && t3h.last === null && (await stored()) === s3, tag + 'BACK IN THE MIDDLE OF THE LAST TRY DOES NOT END THE CLIMB: the hub says what leaving would cost, and the run is still under way', J({ back3, msg3, cur: !!t3h.current, runs: t3h.runs }));
+    const back3b = await toBattlePage(-1);                                        // BACK again, past the hub: the OTHER page of the last try
+    const b3 = await info(), t3b = await tw(page, pid);
+    ok(back3b.battle && b3.search === r3a.search && b3.state === 'ready' && b3.status === 'resume' && b3.restored === true && b3.hash === a3.hash && !!t3b.current && t3b.current.fighting === true && t3b.runs === 0 && (await stored()) === s3, tag + 'and BACK again, onto the OTHER page of the last try (another spelling of the address), RESUMES THE FIGHT there at the same battle state: the saved battle belongs to the fight, not to an address (kept under the address, this page found nothing and ENDED THE CLIMB: "No retry was left, so the run is over")', J([back3b, b3]));
+    const fwd3 = await toBattlePage(1);                                           // FORWARD, past the hub: the page the fight was begun on
+    const c3 = await info(), t3c = await tw(page, pid);
+    ok(fwd3.battle && c3.search === r3.search && c3.state === 'ready' && c3.status === 'resume' && c3.restored === true && c3.hash === a3.hash && rows(t3c) === 'l*l*l*' && t3c.runs === 0 && (await stored()) === s3, tag + 'FORWARD resumes the last try on the page it was begun on; the climb still has its three retries, counted once each', J([fwd3, c3]));
     ok(errsOf(page).filter((e) => !/status of (4\d\d)|Failed to load resource/.test(e)).length === 0, tag + 'no console errors', errsOf(page).slice(0, 2).join(' | '));
   });
 

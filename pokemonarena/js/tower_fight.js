@@ -2,8 +2,10 @@
 // what to do at each step (what the result buttons say, what happens when a button is chosen, what to write on the status line, what the recap's RECORD page says). battle_boot.js (battle.html?tower=1) is a thin
 // wrapper over this; the hub, when it hosts the fight in its own page, calls the same thing with callbacks that mount and unmount instead of navigating.
 //
-//   const f = await createTowerFight({ pack, persist, floor, runId, navType, nav: { toTower(), toHub(), retry(run) }, now, nonce, onDuplicate });
-//   if (!f.ok) { /* f.status 'stale' | 'abandoned' | 'error', f.message: show it, offer f.nav.toTower */ }
+//   const f = await createTowerFight({ pack, persist, floor, runId, navType, openedTry, nav: { toTower(), toHub(), retry(run) }, now, nonce, onDuplicate });
+//   if (!f.ok) { /* f.status 'stale' | 'abandoned' | 'elsewhere' | 'error', f.message: show it, offer f.nav.toTower */ }
+//                          (`openedTry`: the try of the floor the page was opened as, for a host whose pages have addresses: a history step onto the page of an EARLIER try than the one being fought is
+//                          'elsewhere', and writes nothing: tower_session.js reduceBeginFloor. `f.tries` is the try this page hosts.)
 //   f.spec                 -> the battle to build (tower_session.js towerFloorSpec); f.tag -> what a saved battle must agree with (battle_resume.js); f.attempt -> this page's identity for the fight (a saved battle must carry it too:
 //                          a tab that is not the one that marked the fight cannot resume it)
 //   f.bar()                -> the status line text ("TOWER  FLOOR 7/30  Hiker Marco  BUFFS 4  RETRIES 2/3": the retries left of the cap, on this floor or on the climb)
@@ -16,7 +18,8 @@
 //   f.onMatchEnd(info)     -> the finished battle (scene hooks.onMatchEnd / watchEngine): applied to the run ONCE; returns a promise
 //   f.leaveUnrestorable()  -> a reload found this floor's fight marked but nothing to resume it from: it counts as LEFT (a loss), never a free restart. -> Promise<{ message }>
 //   f.recap()              -> what the recap's RECORD page shows once the result is written ({ state: 'tower', ... })
-//   f.onResult(choice)     -> a result button was chosen: waits for the write (at most 1.5 s), then navigates
+//   f.onResult(choice)     -> a result button was chosen: waits for the write (at most 1.5 s), then navigates. RETRY FLOOR opens the next try only while the run still waits for it with no fight begun
+//                          (a result screen that is still about after another page began that try goes to the Tower instead: it must never leave a fight under way without a word)
 //   f.onQuit()             -> the player leaves the fight (LEAVE TOWER). Before the first choice it costs nothing and NOTHING IS WRITTEN: the run waits for the fight as before. After it, it is a lost try: an
 //                          Extra Life is spent if held, else a retry is counted, else the run ends. Then it navigates to the Tower.
 // A LOSS NO LONGER ENDS THE CLIMB AT ONCE (TOWER.md, the decision of 2026-11-17): the run stays on the floor and the try is counted, exactly once, because every result names the try it is for.
@@ -44,18 +47,20 @@ function refusal(f) {
     if (n === 'retry' && f.next.via === 'retry') return ('You left the last fight of this floor, so it counted as a loss and cost one retry. ' + leftWords(rt)).trim() + ' The climb is saved: go back to the Tower to try the floor again.';
     return 'You left the last fight of this floor, so it counted as a loss.' + (n === 'retry' ? ' An Extra Life was spent: the floor is yours to try again.' : '');
   }
+  // a history step (the browser's Back, a reload) onto the page of ANOTHER try than the one being fought (the lost try's page, behind a retry): this page is not that fight's, so it neither resumes it nor counts it as left
+  if (f.status === 'elsewhere') return 'This page was opened as another try of this floor (an earlier one, if your browser\'s Back brought you here). The fight you are in is open on another page: go forward in your browser, or find its tab, to carry on with it. Nothing was counted. Opening the floor again from the Tower would leave that fight; the Tower says what that costs.';
   if (f.status === 'stale') return 'The run is not waiting for this fight. If you just played it, its result is already counted; it may also have moved on, ended, or be another run. Go back to the Tower to see where it stands.';
   return 'This Tower fight could not start: ' + String(f.why || 'unknown problem') + '.';
 }
 
-export async function createTowerFight({ pack, persist, floor, runId, navType = 'navigate', nav, now = () => Date.now(), cfg = CONFIG, nonce = null, onDuplicate = null }) {
-  const f = await startTowerFloor({ pack, persist, floor, runId, navType, now, cfg, nonce });
+export async function createTowerFight({ pack, persist, floor, runId, navType = 'navigate', nav, now = () => Date.now(), cfg = CONFIG, nonce = null, onDuplicate = null, openedTry }) {
+  const f = await startTowerFloor({ pack, persist, floor, runId, navType, now, cfg, nonce, openedTry });
   if (!f.ok) return { ok: false, status: f.status, why: f.why, next: f.next || null, retries: f.retries || null, message: refusal(f), nav };
   const spec = f.spec, lives0 = spec.tower.lives, rt0 = spec.tower.retries;          // (the lives and the retries as this try began: what a loss of THIS fight will cost)
   const st = { ended: false, result: null, applied: null, promise: null, choice: null, marked: false, duplicate: false };
 
   const fight = {
-    ok: true, status: f.status, run: f.run, spec, tag: f.tag, attempt: f.attempt, nav, state: st,          // (`attempt`: this page's identity for the fight; the battle page keeps it in its tab-local resume record, see battle_resume.js)
+    ok: true, status: f.status, run: f.run, spec, tag: f.tag, attempt: f.attempt, tries: f.tries, nav, state: st,          // (`attempt`: this page's identity for the fight; the battle page keeps it in its tab-local resume record, see battle_resume.js. `tries`: the try of the floor this page hosts; the battle page keeps its address on it)
     bar() {
       const t = spec.tower;
       const retries = !hasRetries(rt0) ? '' : rt0.scope === 'none' ? '  RETRIES USED ' + rt0.used : '  RETRIES ' + rt0.left + '/' + rt0.cap;
@@ -147,7 +152,13 @@ export async function createTowerFight({ pack, persist, floor, runId, navType = 
       fight.whenSettled(() => {
         if (choice === 'BACK TO HUB') { nav.toHub(); return; }
         const a = st.applied;
-        if (choice === 'RETRY FLOOR' && a && a.applied && a.next.step === 'retry') { nav.retry(a.run); return; }
+        if (choice === 'RETRY FLOOR' && a && a.applied && a.next.step === 'retry') {
+          // A RESULT SCREEN CAN OUTLIVE ITS MOMENT (it stays in the tab's history, and a browser may bring the page back whole, buttons and all). By then the try this button would open may be under way on
+          // another page, or over: opening it afresh would count that fight as LEFT, with no question asked. So the button opens the try only while the run still waits for it, untouched; otherwise it
+          // goes to the Tower, which shows where the climb stands (and says what a fight that was left would cost before anything is counted).
+          f.stillWaiting(a.run).then((yes) => yes, () => false).then((yes) => { if (yes) nav.retry(a.run); else nav.toTower(null); });
+          return;
+        }
         nav.toTower(a && a.applied ? a.next.step : null);
       });
     },

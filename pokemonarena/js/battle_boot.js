@@ -37,12 +37,12 @@ import { createStyleSettings, parseStyleQuery } from './style_settings.js';     
 import { prewarmSystem, trainerChoices } from './anim_sys.js';
 import { matchFromSummary, onlineMatchId } from './career_stats.js';  // ST1: the finished match as the career wants it (and the id of a battle against a person)
 import { cleanName } from './netmatch.js';                              // an online opponent's name as the career keeps it (the same reduction the match used)
-import { createResumeStore, resumeKey, navigationType } from './battle_resume.js';       // W1 fix D11: a reload mid-battle resumes it
+import { createResumeStore, resumeKey, resumeKeyOfTag, adoptRecord, navigationType } from './battle_resume.js';       // W1 fix D11: a reload mid-battle resumes it
 import { parseOnlineQuery, createOnline } from './online.js';                         // two players, one battle (netmatch.js + lib/netplay.js); see ONLINE.md
 import { engineFingerprint } from './online_match.js';
 import { fitScale, fitPicture, createFullscreen, PROMPT_ROOM } from './screenfit.js';
 import { summarizeMatch } from './match_stats.js';                      // the Tower hears the match the moment the engine ends it (tower_fight.js watchEngine), so it needs the same summary the scene makes
-import { parseTowerParams, returnToTower, returnToHub, launchFloorBattle, HUB_PAGE_URL, TOWER_HUB_URL } from './tower_launch.js';       // the Tower's addresses (light: strings only; the Tower's logic is loaded only when the address is a Tower one)       // the picture fills its room; the Fullscreen switch
+import { parseTowerParams, returnToTower, returnToHub, launchFloorBattle, searchForTry, HUB_PAGE_URL, TOWER_HUB_URL } from './tower_launch.js';       // the Tower's addresses (light: strings only; the Tower's logic is loaded only when the address is a Tower one)       // the picture fills its room; the Fullscreen switch
 
 export { GBA_FPS };
 const STEP_MS = 1000 / GBA_FPS;
@@ -246,6 +246,8 @@ async function main() {
 
   /* ---- navigation after the result screen ---- */
   const navigate = (url) => { if (typeof window.__arenaNavigate === 'function') window.__arenaNavigate(url); else location.assign(url); };
+  // ... and the navigation that TAKES THIS PAGE'S PLACE in the tab's history (a Tower floor's RETRY FLOOR: the page before a retry must never be the battle that was just lost; tower_launch.js says why)
+  const navigateReplacing = (url) => { if (typeof window.__arenaNavigate === 'function') window.__arenaNavigate(url, { replace: true }); else location.replace(url); };
   function rematchUrl(newSeed) {
     const u = new URL(location.href);
     u.searchParams.set('seed', String(newSeed >>> 0));
@@ -349,11 +351,15 @@ async function main() {
       if (towerStore.status.notSaved) { towerError('This browser is not keeping your profile, so a Tower run cannot be kept between pages. Allow site storage and try again.', 'The Tower needs storage'); return null; }
       const profileId = tw.profileId || await towerStore.getActiveId();
       if (!profileId) { towerError('The Tower keeps its run in a trainer profile, and there is none yet. Start a run from the hub.'); return null; }
-      const nv = { toTower: (step) => returnToTower({ navigate, step }), toHub: () => returnToHub({ navigate }), retry: (run) => launchFloorBattle(run, { navigate, profileId }) };
-      const f = await fightMod.createTowerFight({ pack: packRef, persist: ses.storePersist(towerStore, profileId), floor: tw.floor, runId: tw.run, navType: navigationType(), nav: nv, nonce: freshSeed,
+      const nv = { toTower: (step) => returnToTower({ navigate, step }), toHub: () => returnToHub({ navigate }), retry: (run) => launchFloorBattle(run, { navigate: navigateReplacing, profileId }) };
+      // (openedTry: the try this page's address names. A reload or a history step onto the page of an EARLIER try than the one being fought is not that fight's page: it writes nothing: tower_session.js reduceBeginFloor)
+      const f = await fightMod.createTowerFight({ pack: packRef, persist: ses.storePersist(towerStore, profileId), floor: tw.floor, runId: tw.run, navType: navigationType(), openedTry: tw.tries, nav: nv, nonce: freshSeed,
         onDuplicate: () => { hook.towerDuplicate = true; towerError('This floor is already being fought in another tab or window. That fight is the one that counts, and this page cannot finish it. Close this page and go back to the Tower.', 'Already being fought'); } });
       hook.towerProfile = profileId;
-      if (!f.ok) { hook.towerRefused = { status: f.status, why: f.why, next: f.next }; towerError(f.message, f.status === 'abandoned' ? 'The last fight was left' : undefined); return null; }
+      if (!f.ok) { hook.towerRefused = { status: f.status, why: f.why, next: f.next }; towerError(f.message, f.status === 'abandoned' ? 'The last fight was left' : f.status === 'elsewhere' ? 'Another try of this floor' : undefined); return null; }
+      // THE ADDRESS NAMES THE TRY THIS PAGE HOSTS. The try that is fought is the run's own; when the address named another one (a reload at a lost result opens the NEXT try under the lost try's address), the
+      // address is put right at once: a later reload or Back / Forward step onto this page knows it for a page of the fight's try by its address (`openedTry` above), and only such a page resumes the fight.
+      try { const fixed = searchForTry(location.search, f.tries); if (fixed !== null) history.replaceState(history.state, '', location.pathname + fixed + location.hash); } catch (_e) { /* the address stays as it was: a reload of this page then reads as another try's page, which writes nothing */ }
       return f;
     } catch (e) { towerError('The Tower could not be opened: ' + String(e && e.message ? e.message : e).slice(0, 80)); return null; }
   }
@@ -521,7 +527,11 @@ async function main() {
       // D11: a RELOAD (or a back / forward step) of a battle that was under way replays the human's saved choices into the controller, proves the result is the saved state, and lets
       // the scene play the history at speed and silently; anything doubtful starts the battle from the team preview as before (hook.resume.reason says why). A fresh visit never resumes.
       let store = null; try { store = window.sessionStorage; } catch (_e) { store = null; }
-      resumeStore = createResumeStore({ storage: store, key: resumeKey(location.pathname, location.search), seed: spec.seed, tag: towerFight ? towerFight.tag : undefined, attempt: towerFight ? towerFight.attempt : undefined });
+      // A Tower floor's saved battle is kept under the FIGHT's identity (its tag: the run, the floor, the try, the buffs), not under this page's address: every entry of the tab's history that is a page of
+      // that try then finds it, however its address is spelled (battle_resume.js resumeKeyOfTag). One saved under the address by the build before is carried over once (adoptRecord).
+      const addrKey = resumeKey(location.pathname, location.search), fightKey = towerFight ? resumeKeyOfTag(towerFight.tag) : addrKey;
+      if (towerFight) adoptRecord(store, fightKey, addrKey);
+      resumeStore = createResumeStore({ storage: store, key: fightKey, seed: spec.seed, tag: towerFight ? towerFight.tag : undefined, attempt: towerFight ? towerFight.attempt : undefined });
       const rs = resumeStore.restore({ ctl, makeCtl, navType: navigationType() });
       ctl = rs.ctl; hook.resume = rs.info; resuming = rs.info.restored;
       // A Tower fight that was marked, reloaded, and has NOTHING TO RESUME FROM (no saved choices, or they no longer replay) was left: it counts as a loss. It is never a free restart at the preview.

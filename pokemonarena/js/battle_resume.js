@@ -6,6 +6,7 @@
 // builds a fresh controller, replays the saved choices into it, proves the result is the saved state (same hash, same turn), and only then lets the scene play the
 // history at speed. Any doubt (a refused choice, a different hash, junk in the store, no storage at all) discards the record and starts the battle from the preview, as
 // before. A fresh visit of the same address (typing it, following a link) does NOT resume: only a reload or a back / forward step does.
+// (A TOWER FLOOR's saved battle is kept under the fight's tag instead of the page's address: resumeKeyOfTag below says why.)
 //
 //   const store = createResumeStore({ storage: sessionStorage, key: resumeKey(location.pathname, location.search), seed });
 //   const { ctl, info } = store.restore({ ctl: startedCtl, makeCtl, navType: navigationType() });   // info.restored / info.reason
@@ -23,6 +24,29 @@ export const RESUME_VERSION = 1;
 export const RESUME_MAX_CHOICES = 4000;
 
 export const resumeKey = (pathname, search) => 'arena.resume:' + String(pathname) + String(search);
+/**
+ * The key of a saved battle that belongs to a FIGHT and not to an address: a Tower floor's, kept under its tag (the run, the floor, the try, the buffs held). A Tower fight can be reached again through more
+ * than one entry of the tab's history (the page that opened the try, a page that was reloaded into it), and their addresses need not be spelled alike; kept under the address, the saved battle was found by
+ * one of them only, and the other, finding nothing, counted the fight as left. (A regular battle IS its address: its seed is in it, and it keeps resumeKey.) Never the same string as a resumeKey: that one
+ * goes on with a path, which begins with a slash.
+ */
+export const resumeKeyOfTag = (tag) => 'arena.resume:' + String(tag);
+/**
+ * Carry a saved battle over from the key it used to be kept under (`oldKey`: the page's address, where the build before kept a Tower fight's) to `key`, once: only when nothing is under `key` yet. The old
+ * entry is removed either way. What is carried is not believed: restore() still checks its seed, its tag and its attempt. -> true when a record was carried over. Never throws.
+ */
+export function adoptRecord(storage, key, oldKey) {
+  if (!storage || key === oldKey) return false;
+  try {
+    const old = storage.getItem(oldKey);
+    if (old === null || old === undefined) return false;
+    const has = storage.getItem(key);
+    storage.removeItem(oldKey);
+    if (has !== null && has !== undefined) return false;
+    storage.setItem(key, old);
+    return true;
+  } catch (_e) { return false; }
+}
 
 const isChoice = (c) => !!c && typeof c === 'object' && !Array.isArray(c) && typeof c.kind === 'string' && c.kind.length > 0 && c.kind.length <= 16;
 

@@ -97,7 +97,8 @@ const capOfRetries = (v) => (v === null ? null : Number.isInteger(v) && v >= 0 ?
  *   used      retries counted over the whole climb          onFloor   retries counted on the floor the run is on (0 again on every new floor)
  *   left      how many more lost tries the run can take before a loss ends it (never more than TOWER_LIMITS.retriesMax in all)
  *   cap, scope  the cap that `left` is counted against and what it covers: 'floor' (N per floor), 'run' (N for the whole climb), or 'none' (no cap: cap is null)
- * Everything is read from the run's own history (a lost try that cost a retry is a row marked `retry`): no number is stored, so none can be forged.
+ * Everything is read from the run's own history (a lost try that cost a retry is a row marked `retry`): no number is stored beside the rows, so none can disagree with them. The rows themselves are the
+ * player's own data: parseRun refuses a malformed edit of them, and cannot tell a self-consistent one (a retry row deleted) from a genuine run (TOWER.md section 9, "The known limit").
  */
 export function retryInfo(run, cfg = CONFIG) {
   const used = retriesOf(run), onFloor = floorRetriesOf(run), perFloor = capOfRetries(cfg.retriesPerFloor), perRun = capOfRetries(cfg.retriesPerRun);

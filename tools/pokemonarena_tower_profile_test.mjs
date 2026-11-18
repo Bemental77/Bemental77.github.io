@@ -389,6 +389,13 @@ async function suite(S, tag, opt = {}) {
     const tamper = async (fn) => { const env = P.buildExport({ ...clone(R0), rev: 6 }, { deps: { now: () => NOW } }); fn(env.profile.tower); const r = await P.parseExport(P.serializeExport(env), {}); return !r.ok && r.code === 'import.checksum'; };
     const caught = [await tamper((tw) => { tw.retries = 0; }), await tamper((tw) => { tw.fewestRetries['3v3'] = 0; }), await tamper((tw) => { tw.last.retries = 0; }), await tamper((tw) => { tw.current.history.shift(); }), await tamper((tw) => { delete tw.retries; })];
     ok(!io && caught.every(Boolean), t('R3 a profile with retries exports and imports back unchanged (plain and gzip), and THE EXPORT CHECKSUM COVERS THEM: lowering the total, the fewest or the last run\'s count in the file, or taking the lost try out of the run, is caught'), io || J(caught));
+    // ... and what the checksum is NOT: a secret. The same edit made to the profile itself and exported again by the game's own code is a file like any other, and it imports with the retry gone. This is the
+    // KNOWN LIMIT of TOWER.md section 9 (the Tower test's R19b pins the parser's side of it): a self-consistent edit of a run's rows cannot be told from a genuine run in the browser.
+    { const edited = clone(R0); edited.tower.current.history = edited.tower.current.history.filter((h) => !(h.result === 'l' && h.retry === true));
+      let rIn = { ok: false, code: 'not exported' };
+      try { const reb = await P.exportBytes({ ...edited, rev: 6 }, { gzip: false, deps: { now: () => NOW } }); rIn = await P.parseExport(reb.bytes, {}); } catch (e) { rIn = { ok: false, code: 'export threw: ' + String(e && e.message ? e.message : e).slice(0, 80) }; }
+      ok(T.retriesOf(R0.tower.current) === 1 && rIn.ok && !rIn.problems.length && T.parseRun(rIn.profile.tower.current).ok && T.retriesOf(rIn.profile.tower.current) === 0, t('R3b (the known limit, pinned) the checksum is a plain hash, not a secret: the lost try taken out of the run IN THE PROFILE, then exported again by the game\'s own code, is a file that imports and reads back as a run with no retry counted (what the checksum catches is a file edited after it was exported: R3)'), rIn.ok ? String(T.retriesOf(rIn.profile.tower.current)) : String(rIn.code));
+    }
     // import new / replace / merge
     const incoming = clone(R0); incoming.rev = 0; incoming.id = 'p_incoming';
     const existing = clone(FIX.tower); existing.rev = 4; existing.tower.retries = 2; existing.tower.fewestRetries = { '3v3': 5, '6v6': null };

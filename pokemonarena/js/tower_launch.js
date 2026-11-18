@@ -8,8 +8,13 @@
 //   returnToTower({ navigate })                        -> back to the hub's Tower screens
 //   towerBattleHref(run, { profileId }) / parseTowerParams(URLSearchParams)   the address contract: battle.html?tower=1&floor=N&run=<run seed>[&try=<try number>][&p=<profile id>]
 // THE TRY NUMBER (tower_record.js tryNumber: the Extra Lives spent + the retries counted) is in the address so that every try of a floor has its OWN address: RETRY FLOOR is then a real navigation to another
-// page (not the same address again), and the tab's saved battle, which is kept under the address, is never the lost try's. The build before retries wrote the lives spent as `life=K`, which for a run with no
-// retry is the same number: `life` is still read (and still checked) when there is no `try`. The fight's logic never trusts either: it takes the try from the run itself (tower_session.js startTowerFloor).
+// page (not the same address again). (The tab's saved battle is not kept under the address: a Tower fight's is kept under the fight's own tag, battle_resume.js resumeKeyOfTag.) The build before retries wrote the lives spent as `life=K`, which for a run with no
+// retry is the same number: `life` is still read (and still checked) when there is no `try`. The fight's logic never takes the try it FIGHTS from the address: that comes from the run itself (tower_session.js
+// startTowerFloor). What the address's try does say is WHICH PAGE THIS IS (`openedTry`): a page reached again through the tab's history (Back, Forward, a reload) while a fight is under way is that fight's own
+// page only if its address names the fight's try; the page of an earlier try, which is what lies behind a retry in the history, is not, and neither resumes that fight nor counts it as left. For that to hold
+// the address must always name the try the page hosts, so:
+//   * a page that opens another try than its address names (a reload at a lost result opens the NEXT try) puts that try into its address (searchForTry; the page's history.replaceState);
+//   * RETRY FLOOR on the result screen REPLACES the lost try's page in the history (the page hands launchFloorBattle a navigate that replaces), so Back from a retry is the hub, as from a first try.
 
 import { BATTLE_PAGE } from './editor_links.js';
 import { CONFIG } from './tower_config.js';
@@ -58,7 +63,21 @@ export function parseTowerParams(q, cfg = CONFIG) {
   return { ok: true, tower: { floor, run, tries: has('try') ? tries : life, profileId } };
 }
 
-/** Go and fight the floor the run is waiting for. `navigate(url)` is the page's navigation. Returns the address. */
+/**
+ * The query string of a Tower fight's address with its try set to `tries` (the try the page really hosts): -> '?tower=1&...' to put in the address bar, or null when the address already names that try (or is not
+ * a Tower fight's address at all). Everything else in the address is kept as it is; the older `life` goes, because `try` is what is written now.
+ */
+export function searchForTry(search, tries, cfg = CONFIG) {
+  let q;
+  try { q = new URLSearchParams(search || ''); } catch (_e) { return null; }
+  const p = parseTowerParams(q, cfg);
+  if (!p.ok || !p.tower || !Number.isInteger(tries) || tries < 0 || tries > 1000 || p.tower.tries === tries) return null;
+  q.delete('life');
+  if (tries > 0) q.set('try', String(tries)); else q.delete('try');
+  return '?' + q.toString();
+}
+
+/** Go and fight the floor the run is waiting for. `navigate(url)` is the page's navigation (RETRY FLOOR on a result screen hands in one that REPLACES the history entry: see the head of this file). Returns the address. */
 export function launchFloorBattle(run, { navigate, profileId = null, cfg = CONFIG } = {}) {
   const url = towerBattleHref(run, { profileId, cfg });
   if (typeof navigate !== 'function') throw new TypeError('launchFloorBattle needs navigate(url)');
