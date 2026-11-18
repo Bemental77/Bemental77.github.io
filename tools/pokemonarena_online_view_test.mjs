@@ -60,6 +60,7 @@ const SCREENS = {
   quick_open: { ...QUICK_OPEN, ...say('Nobody was waiting, so your game is open: anyone who picks BATTLE ANYONE can join it.') },
   guest_join: { ...GUEST_WAIT, ...say('Connecting to the room K7Q2P...') },
   guest_slow: { ...GUEST_WAIT, since: 15000, ...say('Connecting to the room K7Q2P...') },
+  starting: { ...ASK_HOST, starting: true, ready: false, team: null },
   asking: { stage: 'asking', role: 'guest', since: 4000, cancel: { shown: true, label: 'Cancel' }, ...say('Asked HUBHERO to battle. Waiting for an answer...') },
   resuming: { stage: 'resuming', role: 'host', since: 500, ...say('Picking your battle up again...') },
 };
@@ -138,6 +139,9 @@ async function suite(V, D, who) {
     ok(view({ ...HOST_OPEN, cancel: { shown: false, label: 'Close the room' } }).rows.every((r) => r.id !== 'cancel'), T('W9 the way out is a row only while the wait can still be given up'), '');
     ok(view({ ...HOST_OPEN, played: true, stage: 'handshake' }).screen === 'hidden' && view({ stage: 'playing' }).screen === 'hidden' && view({ stage: 'failed' }).screen === 'hidden' && view({ stage: 'left' }).screen === 'hidden', T('W10 a battle (also the handshake of a rematch), the error screen and a page that is leaving have no online screen'), '');
     ok(view({ ...HOST_WAIT, codeShown: false }).code === '' && view({ ...HOST_OPEN, codeShown: false }).rows.every((r) => !/copy/.test(r.id)), T('W11 a room\'s code is on the screen only once the room is open'), '');
+    const sg = view({ ...ASK_HOST, starting: true, ready: false, team: null }), sj = view({ starting: true, ...say('Checking your team...') });
+    ok(sg.screen === 'wait' && sg.kind === 'starting' && sg.rows.length === 0 && sg.title === 'Getting ready...' && sg.who === 'You\'re hosting' && sg.steps.length === 0 && sg.code === '' && sg.elapsed === '' && sj.screen === 'wait' && sj.who === 'You\'re joining, room K7Q2P' && sj.status.text === 'Checking your team...' && view({ ...ASK_QUICK, starting: true }).who === 'Battle anyone', T('W13 while a token of the hub is starting something the screen says what is starting (no rows), never the question the address would ask without the token'), J([sg.screen, sg.kind, sg.who, sj.who]));
+    ok(view({ ...ASK_HOST, starting: true, ...say('The team code could not be read.', true) }).kind === 'ask-host' && view({ ...ASK_HOST, starting: false }).kind === 'ask-host' && view({ ...HOST_OPEN, starting: true }).kind === null, T('W14 a refusal ends it (the question, with the reason), and a wait that is under way is the waiting screen'), '');
     const st = V.stepsNow;
     ok(st({ stage: 'asking' }).at === 1 && st({ stage: 'searching' }).title === 'Looking for an opponent...' && st({ stage: 'open', role: 'host', invite: true, room: 'X' }).steps[1] === 'They join' && st({ stage: 'handshake', role: 'guest', room: 'X' }).at === 1 && st({ stage: 'resuming' }).steps.length === 2, T('W12 the steps of each kind of wait'), '');
   }
@@ -246,7 +250,7 @@ async function suite(V, D, who) {
   {
     const a = V.speakOnline(view(SCREENS.host_open), 0), b = V.speakOnline(view({ ...SCREENS.host_open, since: 99000 }), 0), c = V.speakOnline(view(SCREENS.host_open), 2), d = V.speakOnline(view({}), 1);
     ok(a === b && !/\d:\d\d/.test(a), T('S1 the words leave out the running clock (a live region would read it out every second)'), a);
-    ok(/You're hosting, room K7Q2P/.test(a) && /Waiting for your friend to join/.test(a) && /Step 2 of 4: Friend joins/.test(a) && /ROOM CODE K 7 Q 2 P/.test(a) && /COPY LINK, 1 of 3/.test(a) && /CLOSE THE ROOM, 3 of 3/.test(c), T('S2 they say who, what, the step, the code letter by letter, the sentence and the highlighted row'), a);
+    ok(!/Step/.test(V.speakOnline(view({ ...ASK_HOST, starting: true }), 0)) && /You're hosting, room K7Q2P/.test(a) && /Waiting for your friend to join/.test(a) && /Step 2 of 4: Friend joins/.test(a) && /ROOM CODE K 7 Q 2 P/.test(a) && /COPY LINK, 1 of 3/.test(a) && /CLOSE THE ROOM, 3 of 3/.test(c), T('S2 they say who, what, the step, the code letter by letter, the sentence and the highlighted row'), a);
     ok(/YOU'RE INVITED TO A BATTLE/.test(d) && /ROOM K7Q2P/.test(d) && /TEAM RED - Sun team/.test(d) && /CHANGE TEAM, 2 of 3/.test(d) && V.speakOnline(view({ stage: 'playing' }), 0) === '', T('S3 a confirm screen says its heading, its lines, its words and the row; a hidden screen says nothing'), d);
   }
 }
@@ -276,6 +280,8 @@ const MUTANTS = [
   { id: 'hint-for-listed', file: 'online_view.js', from: "st === 'waiting' && s.role === 'guest' && !s.listedName) v.hint", to: "st === 'waiting' && s.role === 'guest') v.hint", fails: 'W7' },
   { id: 'rows-when-connected', file: 'online_view.js', from: "if (st !== 'handshake' && st !== 'resuming') {", to: 'if (true) {', fails: 'W8' },
   { id: 'cancel-always', file: 'online_view.js', from: "if (v.cancel.shown) v.rows.push({ id: 'cancel'", to: "if (true) v.rows.push({ id: 'cancel'", fails: 'W9' },
+  { id: 'starting-asks', file: 'online_view.js', from: "const starting = st === 'setup' && !!s.starting && !(s.status && s.status.bad), setup = st === 'setup' && !starting;", to: "const starting = false, setup = st === 'setup';", fails: 'W13' },
+  { id: 'refusal-hidden-by-starting', file: 'online_view.js', from: "const starting = st === 'setup' && !!s.starting && !(s.status && s.status.bad), setup = st === 'setup' && !starting;", to: "const starting = st === 'setup' && !!s.starting, setup = st === 'setup' && !starting;", fails: 'W14' },
   { id: 'rematch-shows-screen', file: 'online_view.js', from: 'going = UNDER_WAY.includes(st) && !s.played,', to: 'going = UNDER_WAY.includes(st),', fails: 'W10' },
   { id: 'code-before-open', file: 'online_view.js', from: "code: going && s.codeShown && s.room ? s.room : '',", to: "code: going && s.room ? s.room : '',", fails: 'W11' },
   { id: 'no-wrap', file: 'online_view.js', from: "if (action === 'down') return setCursor(v, (cursor + 1) % n);", to: "if (action === 'down') return setCursor(v, Math.min(n - 1, cursor + 1));", fails: 'P1' },

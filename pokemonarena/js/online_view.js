@@ -13,10 +13,12 @@
 //                'ignored'    an Accept address without its token (a link from anywhere, Back, a restored tab): the words say so                    BACK
 //   wait       something is under way: who the player is in it, what is happening now, the numbered steps, one sentence, how long this step has taken; for the host the room code LARGE with
 //              COPY LINK / SHARE / COPY CODE; and the way out (CLOSE THE ROOM / STOP LOOKING / CANCEL) until the other player is connected. Nothing can be pressed once connected.
+//              While a token of the hub is starting something (view.kind 'starting': the teams are being read and checked) it is the same screen with no rows: who the player will be in it,
+//              GETTING READY..., and never the question the address would ask without the token.
 //   hidden     a battle (or the error screen) has the page.
 //
 // THE SNAPSHOT (online.js snapshot())
-//   { stage, role, room, codeShown, open, quick, invite, admitted, defecting, listedName, played (a battle of this page has been mounted), status: { text, bad }, since (ms this stage has
+//   { stage, role, room, codeShown, open, quick, invite, admitted, defecting, listedName, played (a battle of this page has been mounted), starting (a token of the hub is starting something), status: { text, bad }, since (ms this stage has
 //     lasted, or null), board (the address named no room and no role), ask ('host' | 'quick' | null: what a board page asks), ignored, ready (the team list is loaded), canGo, canQuick,
 //     cancel: { shown, label }, link, canShare, copied ('link' | 'code' | null), team: { key, label, size } | null, name, fmt, bar }
 // THE VIEW
@@ -41,6 +43,7 @@ export const WORDS = Object.freeze({
   quickLede: 'Get matched with whoever is looking now. Other players see your trainer name and your online record.',
   ROWS: Object.freeze({ go: 'JOIN THE BATTLE', open: 'OPEN THE ROOM', yes: 'YES', team: 'CHANGE TEAM', back: 'BACK', copyLink: 'COPY LINK', share: 'SHARE', copyCode: 'COPY CODE', copied: 'COPIED' }),
   codeFriend: 'ROOM CODE', codeAnyone: 'CODE FOR A FRIEND',
+  starting: 'Getting ready...',
 });
 
 /** Who the player is in what is under way (`role`), what is happening now (`title`), and the numbered steps with the one it is at. s: the snapshot (stage, role, room, open, quick, invite, admitted, defecting, listedName). */
@@ -66,14 +69,16 @@ export function stepsNow(s) {
 
 /** The view of a snapshot (the header says what each is). Never throws on a snapshot online.js makes; changes nothing. */
 export function onlineView(s) {
-  const st = s.stage, setup = st === 'setup', going = UNDER_WAY.includes(st) && !s.played, board = !!s.board;
+  const st = s.stage, going = UNDER_WAY.includes(st) && !s.played, board = !!s.board;
+  // a token of the hub is starting something: not a question (it would be the one the token answers), until a refusal says why it did not start
+  const starting = st === 'setup' && !!s.starting && !(s.status && s.status.bad), setup = st === 'setup' && !starting;
   const ms = going && s.since !== null && s.since !== undefined ? Math.max(0, s.since) : null;
   const role = s.role === 'host' ? 'host' : s.role === 'guest' ? 'guest' : 'either';
   // the invite (the link, the code large) is for a PRIVATE room a friend is coming to; a game waiting for anyone shows its code as a fallback, under a label that says so
   const friendRoom = s.role === 'host' && !s.open && !s.quick;
   const R = WORDS.ROWS;
   const v = {
-    screen: setup ? 'confirm' : going ? 'wait' : 'hidden', kind: null, stage: st, role,
+    screen: setup ? 'confirm' : going || starting ? 'wait' : 'hidden', kind: starting ? 'starting' : null, stage: st, role,
     heading: '', lede: '', ask: '', info: [], who: '', title: '', steps: [], at: 0,
     status: { text: (s.status && s.status.text) || '', bad: !!(s.status && s.status.bad) },
     hint: '', elapsed: ms === null ? '' : fmtClock(ms),
@@ -106,6 +111,9 @@ export function onlineView(s) {
       v.heading = WORDS.ignored;
       v.rows = [{ id: 'back', label: R.back }];
     }
+  } else if (starting) {
+    v.who = s.role === 'guest' ? 'You\'re joining' + (s.room ? ', room ' + s.room : '') : s.ask === 'quick' ? 'Battle anyone' : 'You\'re hosting';
+    v.title = WORDS.starting;
   } else if (going) {
     const n = stepsNow(s);
     v.who = n.role; v.title = n.title; v.steps = n.steps.slice(); v.at = n.at;
@@ -270,5 +278,5 @@ export function speakOnline(v, cursor = 0) {
   const row = v.rows[cursor] ? ' ' + v.rows[cursor].label + ', ' + (cursor + 1) + ' of ' + v.rows.length + '.' : '';
   const says = sentencesOf(v).map((p) => p.text).join(' ');
   if (v.screen === 'confirm') return [v.heading + '.', v.info.map((l) => [l.label, l.value, l.right].filter(Boolean).join(' ')).join('. ') + (v.info.length ? '.' : ''), says].filter(Boolean).join(' ') + row;
-  return [v.who + '.', v.title, 'Step ' + (v.at + 1) + ' of ' + v.steps.length + ': ' + (v.steps[v.at] || '') + '.', v.code ? v.codeLabel + ' ' + v.code.split('').join(' ') + '.' : '', says].filter(Boolean).join(' ') + row;
+  return [v.who + '.', v.title, v.steps.length ? 'Step ' + (v.at + 1) + ' of ' + v.steps.length + ': ' + (v.steps[v.at] || '') + '.' : '', v.code ? v.codeLabel + ' ' + v.code.split('').join(' ') + '.' : '', says].filter(Boolean).join(' ') + row;
 }
