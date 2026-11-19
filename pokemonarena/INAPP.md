@@ -1782,3 +1782,19 @@ Branch `prof-keys` (2026-11-18). Decision 6 of the contract, exactly: **M = A, N
   O mutes / unmutes), `pokemonarena_sound_page_test.mjs` (O mutes, says O; O, M, N typed into a text field are letters), `pokemonarena_battle_page_test.mjs` (above),
   `pokemonarena_apps_test.mjs` (typing "zxwasdmpno" into an entry; a question over an entry drops M, N, Z; a control copy whose capture lets M / N through fails the typing
   check), `pokemonarena_devices_test.mjs` (Reset keyboard gives M first).
+
+### INTEGRATION: as pushed (2026-11-18)
+
+The contract's APP row was built as two tracks: **APP-UI** (`js/trainer_hub.js`, `trainer_screen.js`, `trainer_ctl.js`, `trainer_geom.js`, the registry lines, `trainer.golden.json`,
+`tools/pokemonarena_trainer_test.mjs`) and **APP-SHELL** (the menu row, the first-visit opening in `boot.js`, the title side, `tools/headless_cdp.mjs`'s seed, the builder's NEW TRAINER,
+the Center's LOOK, `tools/pokemonarena_trainer_page_test.mjs`). The five branches were merged into `inapp-profile` in the order prof-shell, prof-app, prof-schema, prof-keys,
+prof-battle; the only conflicts were the add-only sections of this file and `README.md` (both sides kept). Pushed to prod as `5a30fee9..6ddd4cd4`.
+
+`tools/pokemonarena_apps_test.mjs` was edited at the merge (the one edit of that suite in this wave): its registry checks asked for EXACTLY the three apps and the old main menu; they now ask
+for online, center and builder FIRST (and one lazy ctl per registered app), and for the menu with TRAINER CARD after TEAM BUILDER.
+
+Run on the merged tree before the push (all 0 failures): `pokemonarena_trainer_card_test.mjs` 38, `pokemonarena_trainer_test.mjs` 46, `pokemonarena_battle_trainer_test.mjs` 21,
+`pokemonarena_trainer_page_test.mjs` 38 (real Chrome: empty, later, back, phone, off, address, builder, center), `pokemonarena_battle_trainer_page_test.mjs` 12, `pokemonarena_hub_test.mjs` 212,
+`pokemonarena_apps_test.mjs` 365, `pokemonarena_netmatch_test.mjs --mutants` 344 and 45/45 mutants, `pokemonarena_input_test.mjs --unit` 364, `pokemonarena_builder_test.mjs --no-mutants` 45.
+**Not run on the merged tree before the push:** the journey, online page, Tower page, Center, devices, fullscreen and full anim_scene suites, the planned review pass (a data-safety lens
+and a screenshot lens), real phones, Safari, Firefox.
