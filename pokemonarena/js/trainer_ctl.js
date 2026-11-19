@@ -114,6 +114,7 @@ export function createCtl(env) {
     effect(eff) {
       switch (eff && eff.type) {
         case 'opened': hand(); env.redraw(); return refreshTrainers();
+        case 'data': return refreshTrainers();
         case 'later': try { if (env.session) env.session.setItem(LATER.key, LATER.value); } catch (_e) { /* storage refused: asked again next time */ } return undefined;
         case 'save': return save(eff);
         case 'update': return update(eff);
