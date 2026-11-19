@@ -1576,6 +1576,7 @@ already holds a `card` keeps it when it is a well-formed card, otherwise the val
 `repairCard` (each repaired key is a `repaired` problem `profile.card` at `card.<key>` carrying `was`), a missing / non-object card becomes the empty card, and unknown keys inside a card go to
 `card._unknown` (a non-object `_unknown` is wrapped, as everywhere). `createProfile({ ..., card })` merges `card` over the empty card and throws `ProfileError` (`profile.card`) for a bad value or an unknown key.
 Export / import / `planImport` carry the card as they carry `trainerName` and `avatar`: `new` and `replace` take the file's, `merge` keeps the profile's own. The older migrations are unchanged.
+`withStoredRecord(mine, stored)` (the Team Builder's KEEP MINE after another tab or app saved first) now carries the STORED card along with the stored battle and Tower records: the builder never edits the card, so keeping its edits cannot undo a card the trainer app wrote in the meantime.
 A stored v5 profile is upgraded the first time this build loads it (`store.loadProfile`: the v5 document goes to the history ring with reason `migration`), as every older upgrade was.
 **An older build given a v6 profile** (a tab still running the schema-5 code, or a cached copy) opens it **read-only** (`migrateProfile`: newer than current): it shows it, never writes it, never
 down-converts it; `saveProfile` / `recordMatch` / `towerUpdate` / `deleteProfile` refuse it with `ReadOnlyError`. A reload with the new build makes it writable again.
