@@ -24,9 +24,10 @@
 import { APP as ONLINE } from './online_hub.js';
 import { APP as CENTER } from './center_hub.js';
 import { APP as BUILDER } from './builder_hub.js';
+import { APP as TRAINER } from './trainer_hub.js';
 
 /** The apps the hub hosts, in no particular order (the main menu decides what leads where). */
-export const APPS = Object.freeze([ONLINE, CENTER, BUILDER]);
+export const APPS = Object.freeze([ONLINE, CENTER, BUILDER, TRAINER]);
 
 /** Every method the hub calls on an app's model (onDialog is optional and so not listed). */
 export const APP_METHODS = Object.freeze(['parent', 'enter', 'leave', 'press', 'hit', 'pointer', 'rects', 'tick', 'view', 'onData', 'wantsText', 'type', 'speak', 'title', 'state']);
