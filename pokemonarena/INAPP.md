@@ -1565,3 +1565,49 @@ card keys in `card._unknown`; export / import / merge carry it. `cardOf(profile)
 
 Every working rule of "Working rules that are the same for every track" above holds (LF, pathspec commits, `git ls-files | wc -l`, nothing ROM-derived committed, headless muted Chrome
 through `tools/headless_cdp.mjs` only, ONE browser suite of yours at a time and only above 3500 MB free, a named check and a source mutant for every new guard, never push, never `git stash`).
+
+### APP-UI: as built
+
+The hub app `trainer` (`js/trainer_hub.js` model, `js/trainer_screen.js` renderer, `js/trainer_ctl.js` ctl, `js/trainer_geom.js` the shared geometry), registered with one line in each of
+`hub_apps.js`, `hub_app_screens.js`, `hub_app_ctls.js`. `trainer_figures.js FRONT_EXCLUDE = [67, 78, 137, 138, 139]` (from a contact sheet of every front choice: 67 Twins and 78 Young
+Couple are two people; 137, 138 'Spirit' and 139 lie beyond `speciesgfx.js TRAINER_FRONT_COUNT` (134), so `trainerFront` throws on them).
+
+**Paths.** `trainer` (parent `main`): THE TRAINER CARD of the active trainer; the card IS the menu: its parts NAME / LOOK / PORTRAIT / FIGURE / PARTNER are highlighted by the d-pad (up / down
+between the name, the pictures and the chips, to the nearest across; left / right along a row, wrapping) or a hover, and A / a tap opens `trainer-edit` on that part; the chip row under it is
+SWITCH (only with two trainers or more: a ROM window listing them) / NEW TRAINER / BACK. No trainer: "NO TRAINER YET", NEW TRAINER / BACK. A read-only trainer: A on a part is refused in
+words. `trainer-new` (parent `trainer`): the new-trainer screens, the step is state. `trainer-edit` (parent `trainer`): one part again; opened by its address with nothing in hand it steps back
+to the card.
+
+**The steps** (every one opens on a default, so A, A, A ... makes a trainer; B = the step before):
+WELCOME (the hub's dialog layer over the terrain with the default partner standing: LET'S GO / LATER; B = LATER; the screen asks itself when the dialog layer refused the question) ->
+NAME (NEW NAME = the shared text entry, charset `name`, max 10; then the presets GOLD / ETHAN / LYRA / KRIS; a typed or pre-schema-6 name is a row of its own; the side window shows the
+battle figure) -> LOOK (`world.ow.avatars`, 8 x 2 a page, the highlighted one walks in place; default: this browser's stored look, else `pickLook(avatars, seed)`) -> BATTLE FIGURE (the
+front pictures of `frontChoices`, three a page, the class on a chip; default picture 71, the ROM's player-like PKMN Trainer, else the first) -> FIGURE FROM BEHIND (`backChoices`, read every
+time) -> PORTRAIT (the 52 heads; default 0) -> PARTNER (a list of the pack's legal species with the front sprite beside it; row 0 is SEARCH (also Y): a text entry, charset `search`,
+max 12, matching anywhere in the name; default: the day's mascot) -> THE CARD ("Is this right?" YES / CHANGE; CHANGE moves the highlight onto the card's parts: A on one opens that step
+and its A comes back to the card; the figure goes through its two pictures). Pickers: left / right one thing (a held repeat stops at the ends), up / down a row (lists: wrap), L / R a page
+(lists: also left / right), the wheel, the two page chips in the title strip, taps (a hover highlights, a click takes).
+
+**The model's public methods** (beyond the hub's): `welcome({ kind: 'new' | 'back', name, profileId? })` (the shell, before `goto('trainer-new')`: 'new' CREATES, 'back' UPDATES the named
+(else active) profile, pre-filled with its values read LIVE, so a store list that arrives after the screens opened is used; the question is armed with `DIALOG_ARM_TICKS`; LATER goes to
+`main`), `begin(kind)` (the card's NEW TRAINER: 'another', not armed, LATER goes back); the ctl's door: `setChoices`, `setSeed`, `setMascot`, `setStoredLook`, `setTrainers`,
+`saved(result)` (-> effects: back on ok; on a failure `WORDS.failed[why]` stays in the message box and the screen stays; why = readonly | notsaved | conflict | invalid | nostore | failed),
+`saving()`, `failed(why)`, `draft()` (tests). `onData()` returns `{ app: 'trainer', type: 'data' }` only once the ctl has handed a list (an unloaded ctl stays unloaded).
+
+**Effects** (`app: 'trainer'`): `opened { path }`, `later { kind }`, `save { mode: 'create' | 'update', profileId, name, avatar: { kind: 'preset', id }, card: { made: true, look, front,
+back, partner } }`, `update { profileId, field, patch }` (patch: `{ name }`, `{ avatar }` or `{ card: {...} }`; an edit that changes nothing is no effect, just back), `switch { id }`,
+`data`. A refusal plays `se_failure` (`{ type: 'sfx' }`); the ctl plays `se_success` after a save.
+
+**The ctl.** `trainer_store.js` only: `createTrainer` / `updateTrainer` / `setActiveTrainer` / `listTrainers`; its codes map to the model's words (`trainer_ctl.js WHY`). After a write:
+the look to `localStorage['arena.avatar']` (`center_look.js saveLook`; for an edit only when it is the active trainer's), `env.refreshData()`, the success sound, then `saved()`.
+Storage keys: `sessionStorage['arena.welcome'] = 'later'` (LATER), `localStorage['arena.avatar']` (the look). The choices: `choicesOf(rom, pack)` (looks, fronts with their class
+spelt for the ROM font: `{PK}{MN}` -> PKMN, the sex signs as tokens; backs; 52 heads; legal species); the mascot: `hub_data.js pickMascot(pack, today)`.
+
+**Known limits.** `tools/pokemonarena_apps_test.mjs` pins EXACTLY three apps (lines 163, 639, 1142): with `trainer` registered it fails those 5 checks (164 passed, 5 failed, `--unit`), and
+this track may not edit it. The record line on the card is hub data's `BATTLES n` (`listTrainers` carries no stats). The welcome's words and the presets are this site's, set in the ROM font.
+
+**Tests (2026-11-18, this tree).** `node tools/pokemonarena_trainer_test.mjs --mutants`: 43 Node checks passed, 27 / 27 source mutants killed (families R W A B K N P C E F G Z: the registry,
+the welcome, A-through into a memory store through the real ctl and `trainer_store.js`, B on every step, every picker's keys / taps / wheel / paging, the name entry, the search, the card
+step, the card screen and editor, every refusal in words, 32 screens against `pokemonarena/trainer.golden.json` (hashes only) with every text measured in its room at the longest values
+(ten of the widest character the `name` charset accepts, the longest species and class), a random walk of 3000 inputs). `TRAINER_SHOTS=<dir>` writes those screens as PNG to look at.
+Browser: not run by this track (the page test is APP-SHELL's).
