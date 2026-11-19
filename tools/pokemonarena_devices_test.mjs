@@ -653,7 +653,7 @@ async function journeyD(dev, page) {
     await page.eval(`${HUB}.model.goto('main')`);
     await dev.press('#controlsBtn'); await waitFor(page, `${HUB}.dialogOpen()`, 8000);
     await dev.press('[data-ip="reset-keyboard"]'); await sleep(150);
-    ok((await bindings()).kbA.includes('KeyZ') && !(await bindings()).kbA.includes('KeyG'), dev.tag('D: Reset keyboard puts Z back and removes G'), J(await bindings()));
+    ok((await bindings()).kbA[0] === 'KeyM' && (await bindings()).kbA.includes('KeyZ') && !(await bindings()).kbA.includes('KeyG'), dev.tag('D: Reset keyboard puts M (first) and Z back and removes G'), J(await bindings()));
     await dev.key('esc');
   } else if (dev.family === 'gamepad') {
     await page.eval(`${HUB}.canvas.focus()`);

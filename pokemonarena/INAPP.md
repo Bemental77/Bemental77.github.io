@@ -1749,3 +1749,36 @@ and its header line. `scene.js` also gained `trainerInfo()` (read only: the name
 
 **Known limits:** a CPU / team battle waits for the profile read before its scene (one IndexedDB read; capped at 1.5 s); the name in an online battle is the match name, so a player who typed another
 name online sees that one; a reloaded online battle draws the default foe and back figure (nothing is added to the reload record).
+
+### KEYS: as built
+
+Branch `prof-keys` (2026-11-18). Decision 6 of the contract, exactly: **M = A, N = B, first**; the mute shortcut moved to **O**.
+
+* **The defaults** (`js/input.js DEFAULT_KEYS`): `a = M, Z, Enter, Space, NumpadEnter`, `b = N, X, Backspace, Escape`. The first key of a list is the one `glyph()` names, so
+  `hints.js` (the line under the picture, hub and battle page), "Press M to continue" (INPUT.md's snippet) and the Controls panel all say M / N. Z / X, Enter / Space and
+  Backspace / Esc still work everywhere. The Controls panel's Reset keyboard gives M / N back (`bindings.reset` empties the overrides). The hub's and the battle page's static
+  hint lines and canvas labels (index.html, battle.html) name M / N first and say Z / X, Enter / Backspace work too.
+* **The mute key is O** (`input.js MUTE_KEY = 'KeyO'`, handled by `sound_system.js`; the toast says "Sound muted (O)", the audio bar's button "Mute (O)"). Why O: no default
+  binding uses it; it is not next to N / M (the A / B hand) nor to W A S D / Q E / Z X C V (the other hand); it is not the name of a button (A B X Y L R), so "O" in a hint cannot be
+  read as one; "sound On / Off". It sits between I (Select) and P (Start), the two least-pressed actions: a stray O only toggles the sound and says so.
+* **M can never mute, by construction**: `bindings.get()` reports the WHOLE effective table (the defaults included, `effKb`), and the shortcut yields to any key in it. So a
+  player who binds O to an action gets the action (theirs wins), and another layout's "o" on a key the game uses (Dvorak types o on S, the d-pad's down) moves instead of muting.
+* **Stored bindings** (`arena.bindings` keeps only the actions a player changed): a player who saved their own A or B keeps it (glyph Z / X then); a player on the default A / B
+  gets M / N. NEW RULE in `effKb`: a DEFAULT key the player's own saved list of ANOTHER action holds is left out of the default's list, so a player who had bound M or N to an
+  action while they were free keeps it and M / N do not press two actions; an action whose defaults would all be taken keeps them (it must stay reachable).
+* **The open music list** (`audiobar.js`) keeps M and N from the page behind it like Z / X; only Esc and O pass.
+* **Text entry**: `boot.js`'s capture types m, n and o as letters, and a question over a text entry drops them (unchanged code; proved by the apps test, below). This file's
+  older lines "Z is not A, X is not B there" ("The dialog layer") and "M does not mute" ("The app interface") still hold; read them as "M / N / Z / X are letters there".
+* **The battle page** uses the same input layer (`battle_boot.js createInput()`): M / N act as A / B there (battle page test: M on RUN opens the forfeit question, N cancels it,
+  the hint line names M and N). No other listener on the hub or the battle page reads N or M: every `keydown` listener in `js/` was read (audiobar's list and Esc, boot.js's text
+  capture and its no-input-layer fallback, which now maps m / n too, presence_boot / controls_dialog / sound_panel Esc, builder_ctl / editor_app Ctrl+Z / Ctrl+Y).
+* **AZERTY**: bindings are physical positions (`KeyboardEvent.code`), so on AZERTY the A key is the one printed "," and `glyph()` says "," through the browser's layout map; the
+  static lines say M until the first key press rewrites them (`watchHints`). The same was true of Z (printed W) before.
+* **Texts changed**: hub_model.js SOUND help ("The O key mutes on any page."), sound_panel.js tip, input_panel.js note, audiobar.js titles / toast, sound_system.js toast,
+  index.html / battle.html, INPUT.md (the table, a paragraph under it, the glyph example, the music list), README.md ("Keyboard:", the Sound lines), boot.js comments.
+  The ABOUT pages name no key (checked).
+* **Tests**: `pokemonarena_input_test.mjs` (12 `keys/*` checks, 7 `keys-*` source mutants; the old default oracles updated), `pokemonarena_sound_test.mjs` (5 "mute key"
+  steps through the real input layer, mutants K1-K6), `pokemonarena_audiobar_test.mjs` (M45-M48), `pokemonarena_hub_test.mjs` (M on SOUND opens the panel and does not mute;
+  O mutes / unmutes), `pokemonarena_sound_page_test.mjs` (O mutes, says O; O, M, N typed into a text field are letters), `pokemonarena_battle_page_test.mjs` (above),
+  `pokemonarena_apps_test.mjs` (typing "zxwasdmpno" into an entry; a question over an entry drops M, N, Z; a control copy whose capture lets M / N through fails the typing
+  check), `pokemonarena_devices_test.mjs` (Reset keyboard gives M first).
