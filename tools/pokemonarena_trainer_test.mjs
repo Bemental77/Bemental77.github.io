@@ -539,7 +539,7 @@ async function runNode(jsDir, verbose) {
     const many = []; for (let i = 0; i < 10; i++) many.push(prof('p' + i, LONG_NAME.slice(0, 10 - (i % 3)), { card: made }));
     m = mk({ state: 'ready', activeId: 'p3', profiles: many }, { list: true }); m.hub.goto('trainer'); { const c = m.hub.rects().find((x) => x.kind === 'chip' && x.id === 'switch'); m.hub.pointer({ kind: 'move', x: c.x + 3, y: c.y + 3 }); } look('card-switch-chip', m); m.hub.press('a'); if (m.st().card.sw === null) bad.push('the switch list did not open'); look('card-switch', m); for (let i = 0; i < 8; i++) m.hub.press('down'); look('card-switch-scrolled', m);
     // the editor
-    m = mk({ state: 'ready', activeId: 'p1', profiles: [prof('p1', 'RED', { card: made })] }); m.hub.goto('trainer'); focus(m, 'figure'); m.hub.press('a'); look('edit-figure', m); m.hub.press('a'); look('edit-back', m);
+    m = mk({ state: 'ready', activeId: 'p1', profiles: [prof('p1', 'RED', { card: made })] }, { list: true }); m.hub.goto('trainer'); focus(m, 'figure'); m.hub.press('a'); look('edit-figure', m); m.hub.press('a'); look('edit-back', m);
     // with no ROM choices yet (the ctl still loading)
     m = visit('new', null, { choices: false }); answer(m.hub, 0); m.hub.press('a'); look('loading', m);
     return bad.length ? J(bad) : true;
