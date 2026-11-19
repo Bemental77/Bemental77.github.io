@@ -1221,17 +1221,18 @@ async function typingFacts(page) {
   await key(page, 'a'); await sleep(200);                                                      // Enter on NAME
   const r = { opened: await page.eval(`${HUB}.wantsText()`) };
   await page.eval(`window.__nav.length = 0`);
-  for (const ch of 'zxwasdmp') await letter(page, ch);
+  for (const ch of 'zxwasdmpno') await letter(page, ch);                                       // M and N are the keyboard's A and B, O the mute key (2026-11-18): here they are letters
   await sleep(120);
   r.entry = await entryOf(page); r.path = await where(page); r.sound = await page.eval(`${HUB}.sound.on()`); r.navs = (await navs(page)).length; r.wants = await page.eval(`${HUB}.wantsText()`);
+  await named(page, 'back'); await named(page, 'back'); await sleep(60);                        // "no" deleted again: the steps after this one start from "zxwasdmp"
   return r;
 }
 const TYPING_CHECKS = (r) => [
   ['Enter on NAME opens the text entry', r.opened === true],
-  ['Z X W A S D M P are typed as letters: the field reads "zxwasdmp"', !!r.entry && r.entry.value === 'zxwasdmp'],
-  ['none of them was a button: the entry is still open (X is not B), the key cursor has not moved (W A S D are not the d-pad), nothing was typed by A (Z is not A)', r.wants === true && !!r.entry && r.entry.row === 0 && r.entry.col === 0 && r.entry.value.length === 8],
-  ['the screen has not changed and nothing navigated (P is not START, X did not go back)', r.path === 'builder' && r.navs === 0],
-  ['M did not mute the sound', r.sound === true],
+  ['Z X W A S D M P N O are typed as letters: the field reads "zxwasdmpno"', !!r.entry && r.entry.value === 'zxwasdmpno'],
+  ['none of them was a button: the entry is still open (N and X are not B), the key cursor has not moved (W A S D are not the d-pad), nothing was typed by A (M and Z are not A)', r.wants === true && !!r.entry && r.entry.row === 0 && r.entry.col === 0 && r.entry.value.length === 10],
+  ['the screen has not changed and nothing navigated (P is not START, N and X did not go back)', r.path === 'builder' && r.navs === 0],
+  ['O (the mute key) did not mute the sound', r.sound === true],
 ];
 
 // what "two moves back to back end on the second" and "a letter does not answer a question that covers a text entry" mean, as functions, so the second control session can show that they fail
@@ -1245,10 +1246,11 @@ const NAV_OK = (r) => r.path === 'quick' && r.hash === '#quick' && J(r.hist) ===
 async function coveredFacts(page, base) {
   await boot(page, '#builder', base); await key(page, 'a'); await sleep(200);
   await page.eval(`${HUB}.dialog.open(${YESNO({ app: 'builder', id: 'keep', choice: { options: ['YES', 'NO'], cursor: 0 } })})`); await sleep(80);
-  await letter(page, 'z'); await sleep(200);
+  for (const ch of 'mnz') await letter(page, ch);                                             // M (the keyboard's A), N (its B), Z (A too): each one a letter of the word, none an answer
+  await sleep(200);
   return page.eval(`({ open: ${HUB}.dialog.isOpen(), dropped: ${HUB}.dropped | 0, wants: ${HUB}.wantsText(), under: ${HUB}.model.textUnder() })`);
 }
-const COVERED_OK = (r) => r.open === true && r.dropped === 1 && r.under === true;
+const COVERED_OK = (r) => r.open === true && r.dropped === 3 && r.under === true;
 
 let server = null, stubOv = null, stubTmp = null;
 try {
@@ -1400,7 +1402,7 @@ try {
     ok((await where(page)) === 'builder' && (await hash(page)) === '#builder' && (await navs(page)).length === 1, tag + 'a click on TEAM BUILDER opens the builder screen in the picture (nothing navigated)');
     const tf = await typingFacts(page);
     for (const [n, c] of TYPING_CHECKS(tf)) ok(c === true, tag + 'typing: ' + n, J(tf));
-    ok((await page.eval(`${HUB}.typed`)) === 8, tag + 'typing: eight keys went to the model as text', String(await page.eval(`${HUB}.typed`)));
+    ok((await page.eval(`${HUB}.typed`)) === 12, tag + 'typing: twelve keys went to the model as text (ten letters, two Backspaces)', String(await page.eval(`${HUB}.typed`)));
     same = await sameAsNode(page);
     ok(same.ok, tag + 'the canvas equals Node\'s render of the text entry (the keys, the field, the caret)', J(same));
     await shot(page, 'apps_keys_3_entry');
@@ -1768,8 +1770,19 @@ try {
       ok((await boot(page, '', ov.url)) === 'ready', tag + 'the hub boots (a copy of the game whose keyboard capture is switched off)');
       const r = await typingFacts(page);
       const failed = TYPING_CHECKS(r).filter(([, c]) => c !== true).map(([n]) => n);
-      ok(r.opened === true && failed.length >= 2 && !(r.entry && r.entry.value === 'zxwasdmp'), tag + 'without the capture the typing checks FAIL (' + failed.length + ' of them: the keys act as buttons again), so those checks can fail', J(r));
+      ok(r.opened === true && failed.length >= 2 && !(r.entry && r.entry.value === 'zxwasdmpno'), tag + 'without the capture the typing checks FAIL (' + failed.length + ' of them: the keys act as buttons again), so those checks can fail', J(r));
     } finally { ov.stop(); try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_e) { /* ignore */ } }
+    // a capture that leaves the keyboard's A and B (M and N, 2026-11-18) to the input layer: the typing checks must fail on exactly those two letters
+    const tmpB = fs.mkdtempSync(path.join(os.tmpdir(), 'arena-apps-ctlmn-'));
+    const dB = stubbedCopy(tmpB);
+    mutateFile(dB, 'js/boot.js', "    else if (typeof key === 'string' && key.length === 1) input = { text: key };", "    else if (typeof key === 'string' && key.length === 1 && key !== 'm' && key !== 'n') input = { text: key };");
+    const ovB = await startOverlay({ dir: dB, port: L.PORT + 15, upstream: BASE });
+    try {
+      ok((await boot(page, '', ovB.url)) === 'ready', tag + 'the hub boots (a copy whose capture lets M and N through as buttons)');
+      const r = await typingFacts(page);
+      const failed = TYPING_CHECKS(r).filter(([, c]) => c !== true).map(([n]) => n);
+      ok(failed.includes('Z X W A S D M P N O are typed as letters: the field reads "zxwasdmpno"'), tag + 'with M and N left to the input layer (the keyboard\'s A and B) the check "M and N are typed as letters" FAILS, so it can fail', J({ failed, r }));
+    } finally { ovB.stop(); try { fs.rmSync(tmpB, { recursive: true, force: true }); } catch (_e) { /* ignore */ } }
   });
 
   /* ---------------------------------------------------------------------------------------- negative control 2: the page's history wiring and its covered-entry rule switched off */
@@ -1785,7 +1798,7 @@ try {
     try {
       const bad = { nav: await navFacts(page, ov.url), covered: await coveredFacts(page, ov.url) };
       ok(!NAV_OK(bad.nav) && bad.nav.path === 'main', tag + 'with the landing of its own step back taken for the browser\'s Back, the page ends on the main menu instead of QUICK BATTLE: the navigation check FAILS there, so it can fail', J(bad.nav));
-      ok(!COVERED_OK(bad.covered) && bad.covered.open === false, tag + 'without the covered-entry rule the Z of the word being typed ANSWERS the question (it is A): that check FAILS there, so it can fail', J(bad.covered));
+      ok(!COVERED_OK(bad.covered) && bad.covered.open === false, tag + 'without the covered-entry rule the M of the word being typed ANSWERS the question (it is A): that check FAILS there, so it can fail', J(bad.covered));
     } finally { ov.stop(); try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_e) { /* ignore */ } }
   });
 } finally {
