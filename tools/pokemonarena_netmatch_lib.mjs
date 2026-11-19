@@ -35,7 +35,8 @@ export function rngBytes(seed) {
 
 /**
  * opts: seedBase, fmt ('3v3' | '6v6'), teamA / teamB (ARENA1 codes; default random teams), nameA / nameB, limits, mutate(player, which) to wrap a side,
- *       aiLevelA / aiLevelB, fpA / fpB (fingerprint overrides), romA / romB, autoplay (default true)
+ *       aiLevelA / aiLevelB, fpA / fpB (fingerprint overrides), romA / romB, autoplay (default true),
+ *       figA / figB (the hello's optional battle figure, `mine.fig`; absent = none), netmatchA / netmatchB (another netmatch.js module for that seat: an OLDER build's, to prove the two still play)
  */
 export async function makeRig(S, opts = {}) {
   const { netmatch, om, pack, ai } = S;
@@ -56,7 +57,9 @@ export async function makeRig(S, opts = {}) {
     const P = { role, side, name, code, log: [], notices: [], ends: [], phases: [], judged, ai: ai.createAi({ pack, level: (role === 'host' ? opts.aiLevelA : opts.aiLevelB) || 'normal', seed: 31 * (i + 1) + seedBase }), chose: 0 };
     const peerRole = role === 'host' ? 'guest' : 'host';
     P.crashes = 0;
-    P.make = () => netmatch.createNetMatch({
+    const nmMod = (role === 'host' ? opts.netmatchA : opts.netmatchB) || netmatch;
+    const fig = role === 'host' ? opts.figA : opts.figB;
+    P.make = () => nmMod.createNetMatch({
       role, room: opts.room || 'ROOM' + seedBase, now: () => clock.t, randomBytes: rngBytes(seedBase * 7919 + i * 104729 + 13 + P.crashes * 7), limits: opts.limits,
       send: (msg) => {
         let m = JSON.parse(JSON.stringify(msg));
@@ -68,7 +71,7 @@ export async function makeRig(S, opts = {}) {
         wire.q[peerRole].push(m);
         return true;
       },
-      mine: { rom: (role === 'host' ? opts.romA : opts.romB) || romSha, fp: (role === 'host' ? opts.fpA : opts.fpB) || fp, rs: judged.rs || rs, name, team: code, size: judged.size || 0, fmt: role === 'host' ? fmt : undefined },
+      mine: { rom: (role === 'host' ? opts.romA : opts.romB) || romSha, fp: (role === 'host' ? opts.fpA : opts.fpB) || fp, rs: judged.rs || rs, name, team: code, size: judged.size || 0, fmt: role === 'host' ? fmt : undefined, ...(fig !== undefined ? { fig } : {}) },
       judge: async (card) => { const j = await om.judgeTeamCode(card.team, pack); P.theirs = j; return j; },
       makeController: ({ seed, mySide, fmt: f, names }) => { P.mc = { seed, names, fmt: f }; return om.buildNetController({ pack, mySide, seed, fmt: f, names, mine: P.judged, theirs: P.theirs }); },
       on: {

@@ -35,6 +35,7 @@ import { judgeTeamCode, randomTeamCode, buildNetController, engineFingerprint } 
 import { createNetMatch, cleanName, NAME_MAX, PROTO } from './netmatch.js';
 import { PINNED } from './rom.js';
 import { isId } from './profile.js';
+import { cardOf } from './trainer_card.js';                          // INAPP.md TRAINER: the trainer's card (its battle figure goes in the hello: netmatch.js `fig`)
 import { navigationType } from './battle_resume.js';
 import { createOpenLobbies, createLocalBus, createMqttBus, ROOM_RE, MQTT_LIB } from './openlobby.js';
 import { createChallenge, createAcceptor, takeAcceptToken, takeMeetToken, takeStartToken, startPlan, admission, canSeal, ACCEPT_MAX_AGE_MS, TIMING as PRESENCE_TIMING } from './presence.js';
@@ -295,21 +296,23 @@ export function createOnline(cfg) {
   async function gatherTeams() {
     const out = [];
     if (cfg.teamParam) out.push({ key: 'url', label: 'The team in the address', code: cfg.teamParam, size: 6 });
-    let name = '';
+    let name = '', active = null;          // active: the trainer of a team that is not a saved one (random, the address's): the active profile, as the name above
     try {
       const store = await openStore();
       try {
         const hub = await readHubData(store, pack);
         const profiles = hub.profiles.slice().sort((a, b) => (a.id === hub.activeId ? -1 : 0) - (b.id === hub.activeId ? -1 : 0));
-        for (const p of profiles) for (const t of p.teams) if (t.legal) out.push({ key: 'saved:' + p.id + ':' + t.id, label: p.name + ' - ' + t.name + ' (' + t.size + ')', profileId: p.id, teamId: t.id, size: t.size, trainer: p.name });
+        for (const p of profiles) for (const t of p.teams) if (t.legal) out.push({ key: 'saved:' + p.id + ':' + t.id, label: p.name + ' - ' + t.name + ' (' + t.size + ')', profileId: p.id, teamId: t.id, size: t.size, trainer: p.name, card: cardOf(p) });
         const act = profiles.find((p) => p.id === hub.activeId) || profiles[0];
-        if (act) name = act.name;
+        if (act) { name = act.name; active = { profileId: act.id, name: act.name, card: cardOf(act) }; }
       } finally { try { await store.close(); } catch (_e) { /* ignore */ } }
     } catch (_e) { /* no profiles in this browser: a random team (and one in the address) still works */ }
     out.push({ key: 'random', label: 'A random team (6 Pokemon)', size: 6 });
-    return { choices: out, name };
+    return { choices: out, name, active };
   }
 
+  /** The hello's battle figure (netmatch.js `fig`): the trainer card's FRONT, or nothing. -> { fig } | {} */
+  const figOf = (tr) => { const f = tr && tr.card ? cardOf({ card: tr.card }).front : null; return Number.isInteger(f) ? { fig: f } : {}; };
   async function teamCodeOf(choice) {
     if (choice.key === 'url') return { ok: true, code: choice.code };
     if (choice.key === 'random') { const a = new Uint32Array(1); win.crypto.getRandomValues(a); try { return { ok: true, code: await randomTeamCode(pack, a[0]) }; } catch (e) { return { ok: false, message: 'A random team could not be made (' + (e && e.message ? e.message : e) + ').' }; } }
@@ -343,7 +346,9 @@ export function createOnline(cfg) {
     if (!mine.ok) { release(); say(mine.message, true); return null; }
     // THE PROFILE: the one that owns the chosen SAVED team. A random, pasted or address team has no owner here (the career write finds the profile itself, the active one by default), so it carries no
     // record: nothing of any profile is published beside a name for a team that is not one's own, and the store is not opened for it at all
-    return { mine, tc, name, release, profileId: choice.profileId || null, rec: tc.rec || null };
+    // THE TRAINER who plays (INAPP.md TRAINER decision 3): the owner of the saved team, else the active profile (whose name the form was filled with). Its card's FRONT is the battle figure the other page draws
+    const trainer = choice.profileId ? { profileId: choice.profileId, name: choice.trainer || null, card: choice.card || null } : state.activeTrainer || null;
+    return { mine, tc, name, release, profileId: choice.profileId || null, rec: tc.rec || null, trainer };
   }
   /** The online record [wins, losses] of the profile that owns the saved team the player chose (read from the store teamCodeOf has open), or null when there is none or no online battle yet. */
   async function onlineRecOf(store, profileId) {
@@ -377,7 +382,7 @@ export function createOnline(cfg) {
   });
   /** Everything is decided: open the session. open = this host's game is listed; quick = it was opened by Find a battle; listed = the board entry a guest is joining. */
   function launch({ role, room, p, fmt, open, quick, listed, invite }) {
-    state.role = role; state.mine = p.mine; state.name = p.name; state.fmt = fmt; state.myTeamCode = p.tc.code; state.profileId = p.profileId || null; state.rec = p.rec || null;
+    state.role = role; state.mine = p.mine; state.name = p.name; state.fmt = fmt; state.myTeamCode = p.tc.code; state.profileId = p.profileId || null; state.rec = p.rec || null; state.trainer = p.trainer || null;
     state.open = !!open; state.quick = !!quick; state.listed = listed || null; state.admitted = false; state.admittedId = null; state.defecting = false; state.invite = invite || null; openText = ''; openLead = '';
     if (role === 'host') room = room || Netplay().makeCode(5, 'pokemonarena');
     state.room = room;
@@ -782,7 +787,7 @@ export function createOnline(cfg) {
     if (acceptor) { acceptor.stop(); acceptor = null; }
     if (asking) { const a = asking; asking = null; a.cancel(); }
     state.session = null; state.nm = null; state.stage = 'setup'; state.open = false; state.quick = false; state.listed = null; state.admitted = false; state.admittedId = null; state.defecting = false; state.invite = null; relisting = false;
-    state.profileId = null; state.rec = null;          // (the next launch() sets both from the team it is given: nothing of the attempt that just ended may be read as the next one's)
+    state.profileId = null; state.rec = null; state.trainer = null;          // (the next launch() sets both from the team it is given: nothing of the attempt that just ended may be read as the next one's)
     // A page that was opened as the BOARD (?online=1) and then joined a listed game had its address rewritten to ?np=ROOM&join=1 by launch() (so a reload finds the room). The join has ended without a match (Cancel, a game that
     // never answered, one that was taken) and the page is the board again: a reload of that address would open the join-by-code form with the dead room filled in and no board, so the plain address comes back.
     if (query.role === null && !query.room) { try { win.history.replaceState(null, '', boardAddress(win.location.href)); } catch (_e) { /* the address stays as it was */ } }
@@ -800,7 +805,7 @@ export function createOnline(cfg) {
     const nm = state.nm = createNetMatch({
       role, room, limits: query.limits, now,
       send: (msg) => { try { return !!state.session._send(msg); } catch (_e) { return false; } },
-      mine: { rom: PINNED.sha256, fp: cfg.fingerprint, rs: mineCard.rs, name: state.name, team: teamCode, size: mineCard.size, fmt: state.fmt },
+      mine: { rom: PINNED.sha256, fp: cfg.fingerprint, rs: mineCard.rs, name: state.name, team: teamCode, size: mineCard.size, fmt: state.fmt, ...figOf(state.trainer) },
       judge: async (card) => { const j = await judgeTeamCode(card.team, pack); theirs = j; if (j && j.ok) state.oppTeamCode = j.code; return j; },
       makeController: ({ seed, mySide, fmt, names }) => buildNetController({ pack, mySide, seed, fmt, names, mine: mineCard, theirs }),
       on: {
@@ -833,7 +838,7 @@ export function createOnline(cfg) {
     state.matches++;
     closeLobbies();
     const nm = state.nm;
-    const info = { mySide: nm.mySide, names: nm.names.slice(), myName: nm.myName, oppName: nm.oppName, seed: nm.seed, fmt: nm.fmt, mn: nm.mn, room: state.room, role: nm.role, resumed: !!nm.resumed };
+    const info = { mySide: nm.mySide, names: nm.names.slice(), myName: nm.myName, oppName: nm.oppName, oppFig: Number.isInteger(nm.oppFig) ? nm.oppFig : null, seed: nm.seed, fmt: nm.fmt, mn: nm.mn, room: state.room, role: nm.role, resumed: !!nm.resumed };
     state.info = info;
     state.stage = 'playing';
     paint();
@@ -972,6 +977,7 @@ export function createOnline(cfg) {
     state.stage = 'resuming'; state.role = rec.role; state.room = rec.room; state.name = rec.myName; state.fmt = rec.fmt;
     state.myTeamCode = rec.myTeam; state.oppTeamCode = rec.oppTeam;
     state.profileId = isId(rec.profileId) ? rec.profileId : null;
+    state.trainer = state.profileId ? { profileId: state.profileId, name: null, card: null } : null;          // (the record carries no card: a reloaded battle draws the default back figure; its opening is replayed unseen)
     // the player this host had let in: a reloaded host lets them (and only them) back in without a prompt (startSession). A record from the build before has none: the first to knock is let in.
     if (rec.role === "host" && typeof rec.admittedId === "string" && rec.admittedId.length > 0 && rec.admittedId.length <= 128) { state.admittedId = rec.admittedId; state.admitted = true; }          // the profile this battle is written to when it ends (a record from an older build, or a damaged one, has none: the career then finds the team's owner itself)
     say('Picking your battle up again...');
@@ -989,8 +995,8 @@ export function createOnline(cfg) {
 
   /** The page is at its question (or starts what a token of the hub asked for): the teams it can play are read, the form is filled from the preferences. Nothing is dialled here: the board waits for YES. */
   async function setupForm() {
-    const { choices, name } = await gatherTeams();
-    state.choices = choices;
+    const { choices, name, active } = await gatherTeams();
+    state.choices = choices; state.activeTrainer = active;
     let saved = ''; try { saved = win.localStorage.getItem(LS_NAME) || ''; } catch (_e) { /* ignore */ }
     // a remembered name is one the player GAVE (prepare() keeps no other): it is theirs, and stays when the team changes. With none, the name is the trainer who owns the team that is pre-selected
     // (the first saved team is the active profile's, but not when that profile has no legal team, or the address brings a team of its own).
@@ -1049,7 +1055,9 @@ export function createOnline(cfg) {
   /** The open games this page can play (the board's list without the ones on another build), as plain data: [{ room, who, fmt, rec, h }]. [] when the page is not on the board. */
   const board = () => (lobbies ? lobbies.list().filter((g) => g.compatible).map((g) => ({ room: g.room, who: g.name, fmt: g.fmt, rec: g.rec || null, h: !!g.h })) : []);
   // (flashNow: the one-line notice the bar would show this instant, '' when there is none; the page test reads it)
-  const api = { begin, onResult, leaveToHub, state, nm: () => state.nm, session: () => state.session, flash, flashNow: () => (flashText && now() < flashUntil ? flashText : ''), renderBar, lobbies: () => lobbies, board, watchBoard,
+  /** INAPP.md TRAINER: the trainer this page plays as, for the battle's own picture (battle_boot.js): { profileId, name, card } or null (no profile in this browser). `card` is null after a reload. */
+  const trainer = () => (state.trainer ? { profileId: state.trainer.profileId, name: state.trainer.name, card: state.trainer.card ? cardOf({ card: state.trainer.card }) : null } : null);
+  const api = { begin, onResult, leaveToHub, state, trainer, nm: () => state.nm, session: () => state.session, flash, flashNow: () => (flashText && now() < flashUntil ? flashText : ''), renderBar, lobbies: () => lobbies, board, watchBoard,
     view, act, setForm, startAs, go, quick, cancel: cancelAsk, copyLink, copyCode, share, changeTeam, back,
     joinListed: (x) => { const g = gameOf(x); return g ? joinListed(g) : undefined; }, challengeResident: (x) => { const g = gameOf(x); return g ? challengeResident(g) : undefined; },
     /** A game of the board, by its room: join it, or ask its owner when it is a resident (a player who is open from the hub). */

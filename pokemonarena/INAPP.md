@@ -1611,3 +1611,43 @@ the welcome, A-through into a memory store through the real ctl and `trainer_sto
 step, the card screen and editor, every refusal in words (a store that keeps nothing: a notice says the trainer is for this visit only), 32 screens against `pokemonarena/trainer.golden.json` (hashes only) with every text measured in its room at the longest values
 (ten of the widest character the `name` charset accepts, the longest species and class), a random walk of 3000 inputs). `TRAINER_SHOTS=<dir>` writes those screens as PNG to look at.
 Browser: not run by this track (the page test is APP-SHELL's).
+
+### BATTLE: as built
+
+The battle page shows THE TRAINER (decision 3). Built on `prof-battle` (commits `c5b7d6c2` and after), merged with SCHEMA's first commit (`274cd156`) to play real schema-6 profiles.
+
+**Who fights.** One lookup, the career's own (`battle_boot.js fighterId`, which `recordCareer` now calls too): the profile that owns the team in the address, else the store's active profile; a
+Tower fight: its run's profile (`hook.towerProfile`); an online battle: the trainer `online.js` already reads with the teams (the owner of the chosen saved team, else the active profile, from
+the hub-data read it made anyway: `online.trainer()`). No new storage key, no new store open beyond one read before a CPU / team / Tower scene (`readTrainer`, given up after 1.5 s: the page then
+plays as before, 'You' and the ROM's default figure).
+
+| What | How | Where |
+|---|---|---|
+| the NAME | `trainerShown(profile, backs).name`: the profile's `trainerName` (trimmed, at most 10), else `'You'`. Online: the name the player plays under in this match (`info.myName`: the profile's name unless they typed another; what the other page shows for them), `'You'` with no profile | `battle_boot.js` -> `createScene({ playerName })` |
+| the BACK figure | `card.back` when `trainer_figures.js backChoices(rom)` holds it, else nothing (null: the ROM's default); the scene hands it to every ROM run as the save block's gender byte | `opts.playerBack` (scene.js, ahead of `playerGender`) -> `ctx.gender` -> `battle_sys.js seed()` |
+| an online opponent's FRONT figure | their hello's `fig` (`netmatch.js`, optional) -> `trainerForFront(rom, fig)`: when that is a ROM trainer, the scene's foe trainer for the opening and ids 8 / 9; else the CPU level's pick as before | `info.oppFig` -> `foeTrainerFor` -> `opts.foeTrainer` |
+| the Tower and the CPU | keep their ROM foe trainers (the level's pick); only the name and the back figure are the profile's | |
+
+**The back figures, measured (the investigation the contract asked for).** The ROM's battle code draws the player's back picture from the save block's gender byte, and it draws ANY index of its
+back table from it. Run in Node with the real ROM (the trainer intro, system id 1, `battle_sys.js SystemRun`, the byte written after `seed()`; scratch probe, 8 runs, every 4th frame searched over
+the whole screen for every frame of every `speciesgfx.js trainerBack(rom, i)` picture in its own palette, 5-bit exact on every opaque pixel): index `i` drew ONLY picture `i`'s frames, standing at
+(48, 48) from frame 44 to 188 exactly where 0 and 1 stand, then its throw frames moving left (46, 36, 17, -2, -21, -31) at the same frames as 0 and 1; every index left the rest of the picture
+(x < 120 and 40 <= y < 112 masked) identical to index 0 on all 93 sampled frames, and the same final frame. The idle frame is each picture's own (frame 3 for 0, 1, 4, 5, 6, 7; frame 0 for 2 and 3, which
+have 5 frames): the ROM uses each picture's own animation table. So `backChoices(rom)` is `[0..7]` on this ROM (`[0, 1]` on a ROM whose trainer table is not found), and
+`battle_sys.js` writes any index `0 <= i < TRAINER_BACK_COUNT` (anything else is 0, never read past the table). `tools/pokemonarena_battle_trainer_test.mjs` B pins it at frame 100.
+
+**The hello's figure** (`netmatch.js`, the ONLY change there): `hello { ..., fig? }`, an integer `0..FIG_MAX` (255). `checkMessage` accepts it absent or valid and still checks everything it
+checked (a bad one is refused as `figure`); a page sends it only when its own is valid; the receiver keeps it as `nm.oppFig` (null when none came). It is not in the battle state, the hash,
+the commit-reveal or the reload record, and `PROTO` stays 2: netmatch case T plays the `aaed76b3` netmatch.js (no figure) in either seat against this one, both ways round. A page RELOADED into an
+online battle has no `oppFig` (the record does not change) and draws the default foe; its opening is replayed unseen anyway.
+
+**The name in the sentences.** Read every reader of `playerName`: `scene.js ownerName` (the player's side of `{35}`: only "`<mon>` went back to `<name>!`" uses it), the `{23}` role (no
+catalog string uses it), the result screen's row label (`mineLabel`, upper case, small font at x 8) and the recap's labels (YOUR TEAM's header cell 76 px, MOVES 104 px, COMPARE 58 px). With a name
+each reads right as it is ("Feraligatr went back to Casey!"); the ROM fonts set every letter at 6 px (normal) / 5 px (small), so 10 of the widest letters are 60 / 50 px: the sentence wraps inside
+the 204 px message line, the row label fits the screen, every recap cell holds it without a cut. Nothing was re-worded; with no profile the words are those of before (the Node goldens unchanged).
+
+**FOREIGN hunks:** `js/battle_sys.js` (the gender byte takes any back index: 1 line + its comment, and `TRAINER_BACK_COUNT` imported from `speciesgfx.js`); `trainer_figures.js` only `backChoices`
+and its header line. `scene.js` also gained `trainerInfo()` (read only: the name, the back figure and the foe trainer the ROM runs are handed; the page tests read it).
+
+**Known limits:** a CPU / team battle waits for the profile read before its scene (one IndexedDB read; capped at 1.5 s); the name in an online battle is the match name, so a player who typed another
+name online sees that one; a reloaded online battle draws the default foe and back figure (nothing is added to the reload record).

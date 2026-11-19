@@ -7,7 +7,7 @@
 //
 //   frontChoices(rom) -> [{ pic, trainerId, cls }]   every distinct front picture a ROM trainer uses, by picture index, with the FIRST trainer id that uses it and that trainer's class name
 //   trainerForFront(rom, pic) -> trainer id | 0     the id a battle is handed to show `pic` (0: none; the battle keeps its own choice)
-//   backChoices(rom) -> [index]                    the back pictures the player's own battles can show. [0, 1] (the save block's two genders) until the battle work proves more (BATTLE track)
+//   backChoices(rom) -> [index]                    the back pictures the player's own battles can show: every one of the ROM's back table (0..7) on this ROM (BATTLE track, measured: see backChoices)
 //   FIGURE_DEFAULT = { front, back }               what an unchosen card shows
 //
 // Nothing ROM-derived is written here: offsets, strides and names of classes only. Pure ES module (browser + Node): no DOM, no clock, no storage. The ROM bytes are handed in; the lists are
@@ -56,5 +56,13 @@ export function trainerForFront(rom, pic) {
   const hit = frontChoices(rom).find((c) => c.pic === pic);
   return hit ? hit.trainerId : 0;
 }
-/** The back pictures the player's own battle can show (see the header). */
-export function backChoices(_rom) { return [0, 1]; }
+/** The back pictures the player's own battle can show (see the header). The ROM's battle code draws the player's back picture from the save block's gender byte, and it draws ANY index of its
+ *  back table from it, not only the two genders: measured on this ROM (INAPP.md "BATTLE: as built" of the TRAINER section) by running the ROM's own trainer intro with the byte at 0..7: each index
+ *  drew exactly the frames of speciesgfx.js trainerBack(rom, i) with its own palette (standing, the throw, sliding out), at the positions 0 and 1 use, and nothing else of the picture changed.
+ *  tools/pokemonarena_battle_trainer_test.mjs B pins it. A ROM this was not measured on (no trainer table found: frontChoices is empty) keeps the two genders. */
+export function backChoices(rom) {
+  if (!frontChoices(rom).length) return [0, 1];
+  const out = [];
+  for (let i = 0; i < 8; i++) out.push(i);          // 8 = speciesgfx.js TRAINER_BACK_COUNT, the ROM back table (the test compares the two)
+  return out;
+}

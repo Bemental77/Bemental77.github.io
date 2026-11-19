@@ -16,8 +16,11 @@
 // THE PROTOCOL (every message is { t:'lsarena', v:2, k:<kind>, mn:<match number>, ... }; mn counts rematches). Version 2 is the build in which a 6v6 battle opens with a LEAD
 // preview (each player chooses which Pokemon is sent out first): a round like the 3v3 team preview, committed and revealed together, so the version moved on and a page on the
 // older build is refused by name (checkMessage 'version'), where it would otherwise have waited for a choice the other build never asks for.
-//   hello   both    { rom, fp, rs, name, team, fmt? }  who I am, my team code, the host's format. Refused by NAME on a different ROM, a different
+//   hello   both    { rom, fp, rs, name, team, fmt?, fig? }  who I am, my team code, the host's format. Refused by NAME on a different ROM, a different
 //                    engine (fp = a fingerprint of a fixed battle), different rules, a team that is not legal, or a team too small for the format.
+//                    fig (OPTIONAL, 2026-11-18, INAPP.md TRAINER): the trainer's battle figure, a ROM trainer FRONT picture index 0..FIG_MAX (trainer_card.js card.front), what the OTHER page
+//                    draws as its foe. Absent = that page keeps its own choice. It is presentation only: not in the battle state, its hash, the commit-reveal or the reload record,
+//                    and PROTO did not move for it (a page from before it ignores the field; one that sends none is simply shown the default).
 //   seedc   host    { c }   commitment to the host's half of the battle seed:  sha256(ctx|seed|a|nonce)
 //   seedb   guest   { b }   the guest's half, in the clear (it was chosen without knowing a)
 //   seedr   host    { a, n } the opening of the commitment. seed = mix(a, b). Neither player can steer the dice: the host is bound to a before it sees b,
@@ -42,6 +45,7 @@ import { decodeChoice, encodeChoice } from './engine.js';
 export const PROTO = 2;          // 1 = the build without the 6v6 lead preview; the stored reload record carries the same number (a record of another version is not resumed)
 export const MSG = 'lsarena';
 export const NAME_MAX = 10;
+export const FIG_MAX = 255;      // the largest trainer front picture index a hello's `fig` may name (trainer_card.js CARD_LIMITS.front); which pictures exist is the receiving page's business
 export const LIMITS = Object.freeze({ team: 1100, name: 40, str: 64, early: 64, rounds: 5000 });
 export const DEFAULTS = Object.freeze({
   turnMs: 120000,     // one decision, counted from "their screen can take a choice"
@@ -80,6 +84,7 @@ export function checkMessage(m) {
       if (!HEX64.test(String(m.rom))) return 'rom';
       if (!isStr(m.fp, LIMITS.str) || !isStr(m.rs, LIMITS.str) || !isStr(m.name, LIMITS.name) || !isStr(m.team, LIMITS.team)) return 'hello fields';
       if (!(m.fmt === undefined || m.fmt === null || m.fmt === '6v6' || m.fmt === '3v3')) return 'format';
+      if (!(m.fig === undefined || isInt(m.fig, 0, FIG_MAX))) return 'figure';          // optional: absent, or a picture index
       return null;
     case 'seedc': return HEX64.test(String(m.c)) ? null : 'seedc';
     case 'seedb': return isU32(m.b) ? null : 'seedb';
@@ -132,6 +137,7 @@ export function createNetMatch(opts) {
     phase: 'idle',            // idle | hello | judging | seed | start | playing | over | failed | closed
     mn: 1,                    // match number (rematches)
     ctl: null, error: null, result: null, link: 'up', opp: null, oppName: null, names: null, seed: undefined,
+    oppFig: null,             // the other player's battle figure from their hello (an index 0..FIG_MAX), or null: they sent none (an older page), or this page was reloaded into the match
     fmt: isHost ? (opts.mine.fmt === '3v3' ? '3v3' : '6v6') : null,
   };
   let theirHello = null, helloMsg = null, helloAt = 0;
@@ -173,6 +179,7 @@ export function createNetMatch(opts) {
     const c = opts.mine;
     helloMsg = mk('hello', { rom: c.rom, fp: c.fp, rs: c.rs, name: c.name, team: c.team });
     if (isHost) helloMsg.fmt = nm.fmt;
+    if (isInt(c.fig, 0, FIG_MAX)) helloMsg.fig = c.fig;          // only a valid one is sent: a hello this page sends always passes checkMessage on the other side
     helloAt = now();
     setPhase('hello');
     emit(helloMsg);
@@ -204,6 +211,7 @@ export function createNetMatch(opts) {
     nm.names = [hostName, guestName];
     nm.oppName = isHost ? guestName : hostName;
     nm.myName = isHost ? hostName : guestName;
+    nm.oppFig = isInt(m.fig, 0, FIG_MAX) ? m.fig : null;
     nm.opp = { name: nm.oppName, rs: j.rs, size: j.size, judged: j };
     beginSeed();
   }

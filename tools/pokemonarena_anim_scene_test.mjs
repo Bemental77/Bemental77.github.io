@@ -587,6 +587,18 @@ async function core(M, opts = {}) {
         t('system: cpu level ' + lv + ': the opening uses a ROM trainer of that level (' + intro.trainer + ' of ' + pools[lv].join('/') + ') and the player\'s back sprite is F', pools[lv].includes(intro.trainer) && intro.gender === 'F' && intro.trainer > 1, JSON.stringify({ t: intro.trainer, g: intro.gender }));
         t('system: cpu level ' + lv + ': the same trainer for the whole battle (ids 8 / 9), ids 2..7 stay wild-style and carry the gender', tr.every((x) => x.ctx.trainer === intro.trainer) && st.calls.sysStarts.slice(1).filter((x) => x.id < 8).every((x) => x.ctx.trainer === 0 && x.ctx.gender === 'F'), tr.map((x) => x.ctx.trainer).join(','));
       }
+      // TRAINER (INAPP.md, 2026-11-18): opts.playerBack (a ROM back picture index) takes the place of playerGender; opts.foeTrainer (a ROM trainer id) the place of the CPU level's pick
+      {
+        const { st } = await runWith({ trainerChoices: pools, cpuLevel: 'normal', playerGender: 'F', playerBack: 5, foeTrainer: 77 });
+        const intro = st.calls.sysStarts[0].ctx, later = st.calls.sysStarts.slice(1);
+        t('system: TRAINER back-figure: playerBack 5 reaches the opening and every event as the gender byte (ahead of playerGender F)', intro.gender === 5 && later.length > 0 && later.every((x) => x.ctx.gender === 5), JSON.stringify([intro.gender, later.map((x) => x.ctx.gender).slice(0, 4)]));
+        t('system: TRAINER foe-figure: foeTrainer 77 is the opening\'s trainer and that of ids 8 / 9, ahead of the CPU level\'s pick', intro.trainer === 77 && later.filter((x) => x.id >= 8).every((x) => x.ctx.trainer === 77) && later.filter((x) => x.id < 8).every((x) => x.ctx.trainer === 0), JSON.stringify([intro.trainer, later.filter((x) => x.id >= 8).map((x) => x.ctx.trainer)]));
+        const bad = await runWith({ trainerChoices: pools, cpuLevel: 'normal', playerGender: 'F', playerBack: 8, foeTrainer: 0 });
+        const bi = bad.st.calls.sysStarts[0].ctx;
+        t('system: TRAINER back-figure: a back index outside the ROM table (8) is not handed over: playerGender F stays; foe-figure: a foe trainer of 0 leaves the level\'s pick', bi.gender === 'F' && pools.normal.includes(bi.trainer), JSON.stringify({ g: bi.gender, t: bi.trainer }));
+        const none = await runWith({ playerBack: -1, foeTrainer: 2.5 }), ni = none.st.calls.sysStarts[0].ctx;
+        t('system: TRAINER: a negative back index and a fractional foe trainer are ignored (the ROM defaults stay)', ni.gender === undefined && ni.trainer === undefined, JSON.stringify({ g: ni.gender, t: ni.trainer }));
+      }
       const base = await runWith({}), s0 = base.st.calls.sysStarts[0].ctx;
       t('system: without trainer choices the engine\'s own default trainer is kept (no trainer / gender in the opening ctx; ids 8 / 9 say 1)', s0.trainer === undefined && s0.gender === undefined && base.st.calls.sysStarts.filter((x) => x.id >= 8).every((x) => x.ctx.trainer === 1), JSON.stringify({ t: s0.trainer, g: s0.gender }));
       const a1 = await runWith({ trainerChoices: pools, cpuLevel: 'normal' }), a2 = await runWith({ trainerChoices: pools, cpuLevel: 'normal' });
@@ -1332,8 +1344,12 @@ if (process.env.ARENA_SKIP_MUTANTS !== '1') {
     ['scene.js', 'SYSTEM/prepare: the hit / faint hooks fire again when a step restarts', (s) => s.replace("if (hooks.onHit && !st.restarted)", 'if (hooks.onHit)')],
     ['scene.js', 'SYSTEM: the trainer picture ignores the CPU level (always the easy list)', (s) => s.replace('pickTrainer(opts.trainerChoices, opts.cpuLevel, A.seed)', "pickTrainer(opts.trainerChoices, 'easy', A.seed)")],
     ['scene.js', 'SYSTEM: the trainer of the later events is not the opening\'s (a second pick)', (s) => s.replace('trainer: id >= 8 ? (trainerId() > 1 ? trainerId() : 1) : 0,', 'trainer: id >= 8 ? (pickTrainer(opts.trainerChoices, opts.cpuLevel, A.seed + A.n) || 1) : 0,')],
-    ['scene.js', 'SYSTEM: the player\'s gender is not given to the opening', (s) => s.replace("opts.playerGender === 'F' || opts.playerGender === 'M' ? { gender: opts.playerGender } : {}, opts.sysClock", '{}, opts.sysClock')],
-    ['scene.js', 'SYSTEM: the player\'s gender is not given to the events', (s) => s.replace("    if (opts.playerGender === 'F' || opts.playerGender === 'M') ctx.gender = opts.playerGender;\n", '')],
+    ['scene.js', 'SYSTEM: the player\'s gender is not given to the opening', (s) => s.replace("playerBack !== undefined ? { gender: playerBack } : {}, opts.sysClock", '{}, opts.sysClock')],
+    ['scene.js', 'SYSTEM: the player\'s gender is not given to the events', (s) => s.replace("    if (playerBack !== undefined) ctx.gender = playerBack;\n    if (opts.sysClock) ctx.clock", '    if (opts.sysClock) ctx.clock')],
+    ['scene.js', 'TRAINER: the player\'s back figure (opts.playerBack) is ignored, only playerGender is read', (s) => s.replace('const playerBack = Number.isInteger(opts.playerBack) && opts.playerBack >= 0 && opts.playerBack < TRAINER_BACK_COUNT ? opts.playerBack : ', 'const playerBack = ')],
+    ['scene.js', 'TRAINER: a back figure outside the ROM\'s back table is handed to the ROM', (s) => s.replace('opts.playerBack >= 0 && opts.playerBack < TRAINER_BACK_COUNT ? opts.playerBack', 'opts.playerBack >= 0 ? opts.playerBack')],
+    ['scene.js', 'TRAINER: the foe trainer the page chose (opts.foeTrainer) is ignored, the CPU level picks', (s) => s.replace('(trainerMemo = foeTrainerOk(opts.foeTrainer) ? opts.foeTrainer : pickTrainer(', '(trainerMemo = pickTrainer(')],
+    ['scene.js', 'TRAINER: a foe trainer of 0 (none known) is handed to the ROM instead of the CPU level\'s pick', (s) => s.replace('const foeTrainerOk = (t) => Number.isInteger(t) && t > 0 && t <= 0xffff;', 'const foeTrainerOk = (t) => Number.isInteger(t);')],
     ['scene.js', 'SYSTEM: the scene draws its own Pokemon and healthboxes over the system run', (s) => s.replace('if (sys) v.fxSys = true;', '')],
     ['anim_sys.js', 'SYSTEM: the run is drawn WITH its own text boxes (BG0 on, doubled text)', (s) => s.replace('export const LAYERS_NO_TEXT = 0x1e;', 'export const LAYERS_NO_TEXT = 0x1f;')],
     ['scene.js', 'poison damage drains first and prints afterwards (the old order)', (s) => { const NL = String.fromCharCode(10) + '      '; const a = "qMsg(e.src === 'brn' ? 'hurt.brn' : e.src === 'fbt' ? 'hurt.frb' : 'hurt.psn', roles(e.s));" + NL + "qAnim('status', e.src === 'brn' ? STATUS.BRN : e.src === 'fbt' ? STATUS.FRZ : STATUS.PSN, e.s, e.s);" + NL + 'drain();'; const b = "qAnim('status', e.src === 'brn' ? STATUS.BRN : e.src === 'fbt' ? STATUS.FRZ : STATUS.PSN, e.s, e.s);" + NL + 'drain();' + NL + "qMsg(e.src === 'brn' ? 'hurt.brn' : e.src === 'fbt' ? 'hurt.frb' : 'hurt.psn', roles(e.s));"; return s.replace(a, b); }],

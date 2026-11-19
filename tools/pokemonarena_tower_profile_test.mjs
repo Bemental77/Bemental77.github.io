@@ -32,8 +32,9 @@ async function loadStack(dir, bust) {
   const [P, ST, R, SS, T, HD, A] = await Promise.all(['profile.js', 'store.js', 'tower_record.js', 'tower_session.js', 'tower.js', 'hub_data.js', 'career_stats.js'].map((f) => imp(dir, f, bust)));
   return { P, ST, R, SS, T, HD, A };
 }
-const FIX = { v1full: readFx('profile-v1-full.json'), v1fullExp: readFx('profile-v1-full.expected-v5.json'), v1bad: readFx('profile-v1-bad.json'), v1badExp: readFx('profile-v1-bad.expected-v5.json'), v2: readFx('profile-v2-current.json'), v2exp: readFx('profile-v2-current.expected-v5.json'),
-  v3: readFx('profile-v3-current.json'), v4: readFx('profile-v4-current.json'), cur: readFx('profile-v5-current.json'), tower: readFx('profile-v5-tower.json'), fut: readFx('profile-v6-future.json') };
+// schema 6 (the trainer card, 2026-11-18): `cur` / `tower` are the CURRENT fixtures (the v5 ones plus the empty card, derived by editing the JSON); `v5` / `v5tower` are the stored v5 documents; `fut` is one past current (7)
+const FIX = { v1full: readFx('profile-v1-full.json'), v1fullExp: readFx('profile-v1-full.expected-v6.json'), v1bad: readFx('profile-v1-bad.json'), v1badExp: readFx('profile-v1-bad.expected-v6.json'), v2: readFx('profile-v2-current.json'), v2exp: readFx('profile-v2-current.expected-v6.json'),
+  v3: readFx('profile-v3-current.json'), v4: readFx('profile-v4-current.json'), v5: readFx('profile-v5-current.json'), v5tower: readFx('profile-v5-tower.json'), cur: readFx('profile-v6-current.json'), tower: readFx('profile-v6-tower.json'), fut: readFx('profile-v7-future.json') };
 const NOW = 1700000999999;
 let counter = 0;
 const deps = () => ({ now: () => NOW, randomBytes: (n) => Uint8Array.from({ length: n }, (_, i) => (i * 37 + (++counter) * 11 + 5) & 255) });
@@ -54,13 +55,13 @@ async function suite(S, tag, opt = {}) {
 
   /* P. the schema, the migration, the repair */
   if (grp('P')) {
-    ok(P.SCHEMA_VERSION === 5 && typeof P.MIGRATIONS[4] === 'function' && Object.keys(P.MIGRATIONS).join() === '1,2,3,4', t('P1 the current schema is 5 and there is a migration out of every older one (1, 2, 3 and 4)'), String(P.SCHEMA_VERSION));
+    ok(P.SCHEMA_VERSION === 6 && typeof P.MIGRATIONS[4] === 'function' && Object.keys(P.MIGRATIONS).join() === '1,2,3,4,5', t('P1 the current schema is 6 (the Tower came with 5, the trainer card with 6) and there is a migration out of every older one (1, 2, 3, 4 and 5)'), String(P.SCHEMA_VERSION));
     const fresh = P.createProfile({ trainerName: 'ASH' }, deps());
     ok(J(fresh.tower) === J(EMPTY()) && P.checkProfile(fresh).length === 0 && P.checkProfile({ ...fresh, tower: undefined }).some((x) => x.code === 'profile.tower') && P.checkProfile({ ...fresh, tower: { ...EMPTY(), runs: -1 } }).some((x) => x.code === 'profile.tower'), t('P2 a new profile starts with an empty Tower record, and a profile without one (or with a bad one) is not well formed'), J(P.checkProfile({ ...fresh, tower: undefined })));
     // v4 -> v5
     const o4 = open(FIX.v4);
     ok(o4.ok && o4.migratedFrom === 4 && o4.changed === true && !o4.readOnly && !o4.problems.length && !o4.quarantined.length && canon(o4.profile) === canon(FIX.cur), t('P3 a stored v4 profile comes up as the v5 fixture, value for value (nothing repaired, nothing set aside)'), J({ ok: o4.ok, mf: o4.migratedFrom, p: o4.problems.length }));
-    const back = clone(o4.profile); delete back.tower; back.schemaVersion = 4;
+    const back = clone(o4.profile); delete back.tower; delete back.card; back.schemaVersion = 4;          // (and what v6 adds)
     ok(canon(back) === canon(FIX.v4), t('P4 take away what v5 adds and put back the version: what is left is the v4 document, value for value (every battle record, team and Pokemon kept)'), '');
     const m4 = P.MIGRATIONS[4], input = clone(FIX.v4), copy = clone(input), once = m4(input);
     ok(canon(input) === canon(copy) && once.schemaVersion === 5 && J(once.tower) === J(EMPTY()) && canon(m4({ ...clone(once), schemaVersion: 4 })) === canon(once), t('P5 the v4 -> v5 migration is pure (it never writes its input) and a fixed point (run on its own output it changes nothing)'), '');
@@ -71,8 +72,8 @@ async function suite(S, tag, opt = {}) {
     ok(canon(keep.tower) === canon(FIX.tower.tower) && !junkWhy, t('P6 a v4 document that already has a well-formed `tower` keeps it; anything else under that name is kept in the unknown bag and the record starts empty'), junkWhy);
     for (const [k, doc, want] of [['v1full', FIX.v1full, FIX.v1fullExp], ['v2', FIX.v2, FIX.v2exp], ['v3', FIX.v3, FIX.cur]]) { const o = open(doc); ok(o.ok && canon(o.profile) === canon(want) && J(o.profile.tower) === J(EMPTY()), t('P7 a stored ' + k + ' profile comes up as its golden v5 profile, with an empty Tower record'), k); }
     const ob = open(FIX.v1bad); ok(ob.ok && canon(ob.profile) === canon(FIX.v1badExp.profile) && J(ob.profile.tower) === J(EMPTY()), t('P8 the damaged v1 fixture still opens to its golden v5 profile (the records set aside are the same ones)'), '');
-    const oldBuild = P.migrateProfile(clone(FIX.cur), { 1: P.MIGRATIONS[1], 2: P.MIGRATIONS[2], 3: P.MIGRATIONS[3] }, 4), fut = P.migrateProfile(clone(FIX.fut));
-    ok(oldBuild.ok && oldBuild.readOnly === true && oldBuild.steps === 0 && oldBuild.from === 5 && canon(oldBuild.profile) === canon(FIX.cur) && fut.readOnly === true && fut.from === 6 && open(FIX.fut).readOnly === true && canon(open(FIX.fut).profile) === canon(FIX.fut), t('P9 a build that only knows v4 opens a v5 profile read-only and untouched; this build does the same for a v6 one'), J({ ro: oldBuild.readOnly, from: oldBuild.from }));
+    const oldBuild = P.migrateProfile(clone(FIX.v5), { 1: P.MIGRATIONS[1], 2: P.MIGRATIONS[2], 3: P.MIGRATIONS[3] }, 4), fut = P.migrateProfile(clone(FIX.fut));
+    ok(oldBuild.ok && oldBuild.readOnly === true && oldBuild.steps === 0 && oldBuild.from === 5 && canon(oldBuild.profile) === canon(FIX.v5) && fut.readOnly === true && fut.from === 7 && open(FIX.fut).readOnly === true && canon(open(FIX.fut).profile) === canon(FIX.fut), t('P9 a build that only knows v4 opens a v5 profile read-only and untouched; this build does the same for a v7 one'), J({ ro: oldBuild.readOnly, from: oldBuild.from }));
     // the populated fixture is a fixed point; repair
     const op = open(FIX.tower);
     ok(op.ok && !op.changed && op.migratedFrom === null && !op.problems.length && canon(op.profile) === canon(FIX.tower) && P.checkProfile(op.profile).length === 0, t('P10 a profile with a populated Tower record (a run under way, the last run, unknown fields) opens unchanged'), J(op.problems.slice(0, 2)));
@@ -186,7 +187,7 @@ async function suite(S, tag, opt = {}) {
       await adapter.transact(['profiles'], 'readwrite', (tx) => tx.put('profiles', clone(FIX.v4)));
       const up = await store.towerUpdate(FIX.v4.id, (tower) => ({ tower: { ...tower, runs: 1 } }));
       const l = await store.loadProfile(FIX.v4.id), h = await store.listHistory(FIX.v4.id);
-      ok(up.ok && l.profile.schemaVersion === 5 && l.profile.tower.runs === 1 && statsOf(l.profile) === statsOf(FIX.v4) && h.length === 1 && h[0].reason === 'migration', t('S7 a stored v4 profile is upgraded the first time a Tower step touches it (the v4 document goes to history), and the step is then applied; its battle record comes through unchanged'), J(h));
+      ok(up.ok && l.profile.schemaVersion === 6 && l.profile.tower.runs === 1 && statsOf(l.profile) === statsOf(FIX.v4) && h.length === 1 && h[0].reason === 'migration', t('S7 a stored v4 profile is upgraded the first time a Tower step touches it (the v4 document goes to history), and the step is then applied; its battle record comes through unchanged'), J(h));
     }
     {
       const { store } = await mem('rest');
@@ -372,9 +373,9 @@ async function suite(S, tag, opt = {}) {
     const withRetries = () => { const d = clone(FIX.tower), tw = d.tower; tw.retries = 9; tw.fewestRetries = { '3v3': 2, '6v6': null }; tw.last.retries = 3;
       tw.current.history.unshift({ floor: 1, result: 'l', turns: 4, faints: 3, flawless: false, boss: false, comeback: false, sweep: false, closest: null, retry: true }); return d; };
     const R0 = withRetries(), o0 = open(R0), sum0 = o0.ok ? SS.summarizeTower(o0.profile.tower, pack) : null;
-    ok(P.SCHEMA_VERSION === 5 && R.TOWER_VERSION === 1 && P.checkProfile(R0).length === 0 && o0.ok && !o0.changed && o0.migratedFrom === null && !o0.problems.length && canon(o0.profile) === canon(R0) && T.parseRun(o0.profile.tower.current).ok && T.retriesOf(o0.profile.tower.current) === 1 && J(T.checkTower(o0.profile.tower)) === '[]' && sum0.record.retries === 9 && J(sum0.record.fewestRetries) === J({ '3v3': 2, '6v6': null }) && sum0.last.retries === 3 && sum0.run.retry.used === 1 && sum0.run.retry.left === 3, t('R1 a profile whose Tower record has retries (a total, a fewest per format, a last run with some, a run whose history marks a lost try) is a well-formed schema-5 profile with a version-1 record: it opens unchanged, nothing is repaired, and the run under way is a run'), J({ ok: o0.ok, ch: o0.changed, p: o0.problems.slice(0, 2) }));
+    ok(P.SCHEMA_VERSION === 6 && R.TOWER_VERSION === 1 && P.checkProfile(R0).length === 0 && o0.ok && !o0.changed && o0.migratedFrom === null && !o0.problems.length && canon(o0.profile) === canon(R0) && T.parseRun(o0.profile.tower.current).ok && T.retriesOf(o0.profile.tower.current) === 1 && J(T.checkTower(o0.profile.tower)) === '[]' && sum0.record.retries === 9 && J(sum0.record.fewestRetries) === J({ '3v3': 2, '6v6': null }) && sum0.last.retries === 3 && sum0.run.retry.used === 1 && sum0.run.retry.left === 3, t('R1 a profile whose Tower record has retries (a total, a fewest per format, a last run with some, a run whose history marks a lost try) is a well-formed schema-6 profile (schema 5 of the Tower plus the card) with a version-1 record: it opens unchanged, nothing is repaired, and the run under way is a run'), J({ ok: o0.ok, ch: o0.changed, p: o0.problems.slice(0, 2) }));
     // OLD DATA: every fixture written before retries existed reads as 0 retries, and reading it writes no new key
-    const oldDocs = [['v5 with a climb', FIX.tower], ['v5 empty', FIX.cur], ['v4', FIX.v4], ['v3', FIX.v3], ['v1', FIX.v1full]]; let oldWhy = '';
+    const oldDocs = [['v5 with a climb', FIX.v5tower], ['v5 empty', FIX.v5], ['v6 with a climb', FIX.tower], ['v4', FIX.v4], ['v3', FIX.v3], ['v1', FIX.v1full]]; let oldWhy = '';
     for (const [name, doc] of oldDocs) {
       const o = open(doc); if (!o.ok) { oldWhy = oldWhy || name + ' did not open'; continue; }
       const tw = o.profile.tower, sm = SS.summarizeTower(tw, pack);
@@ -463,8 +464,8 @@ const MUTANTS = [
   { id: 'migrate-loses-junk', why: 'a junk `tower` of a v4 document is thrown away instead of kept', file: 'profile.js', from: 'bagSet(o, key, o.tower); o.tower = emptyTower();', to: 'o.tower = emptyTower();', groups: ['P'] },
   { id: 'migrate-says-v4', why: 'the migration forgets to say schema 5', file: 'profile.js', from: 'o.schemaVersion = 5;\n  if (hasOwn.call(o, \'tower\')) {', to: 'o.schemaVersion = 4;\n  if (hasOwn.call(o, \'tower\')) {', groups: ['P'] },
   { id: 'migrate-writes-input', why: 'the migration writes into its input', file: 'profile.js', from: 'function migrate4to5(d) {\n  const o = clone(d);', to: 'function migrate4to5(d) {\n  const o = d;', groups: ['P'] },
-  { id: 'migrate-key-ignores-the-bag', why: 'the junk `tower` is filed under a name the player\'s own unknown value already holds (and overwrites it)', file: 'profile.js', from: '(isObj(o._unknown) && hasOwn.call(o._unknown, key)) || hasOwn.call(o, key)', to: 'hasOwn.call(o, key)', groups: ['D'] },
-  { id: 'migrate-key-ignores-a-root-key', why: 'the junk `tower` is filed under a name a stray top-level key of the file already holds (and that key\'s value is lost)', file: 'profile.js', from: '(isObj(o._unknown) && hasOwn.call(o._unknown, key)) || hasOwn.call(o, key)', to: '(isObj(o._unknown) && hasOwn.call(o._unknown, key))', groups: ['D'] },
+  { id: 'migrate-key-ignores-the-bag', why: 'the junk `tower` is filed under a name the player\'s own unknown value already holds (and overwrites it)', file: 'profile.js', from: "(isObj(o._unknown) && hasOwn.call(o._unknown, key)) || hasOwn.call(o, key); i++) key = 'v4Tower_' + i;", to: "hasOwn.call(o, key); i++) key = 'v4Tower_' + i;", groups: ['D'] },          // (the v5 -> v6 migration's loop has the same text: the mutant names v4Tower to hit this one)
+  { id: 'migrate-key-ignores-a-root-key', why: 'the junk `tower` is filed under a name a stray top-level key of the file already holds (and that key\'s value is lost)', file: 'profile.js', from: "(isObj(o._unknown) && hasOwn.call(o._unknown, key)) || hasOwn.call(o, key); i++) key = 'v4Tower_' + i;", to: "(isObj(o._unknown) && hasOwn.call(o._unknown, key)); i++) key = 'v4Tower_' + i;", groups: ['D'] },
   { id: 'migrate-key-takes-the-second-name-always', why: 'every junk `tower` goes under v4Tower_2', file: 'profile.js', from: "let key = 'v4Tower';", to: "let key = 'v4Tower_2';", groups: ['P', 'D'] },
   { id: 'rejected-bag-uncapped', why: 'what the repair hands back is parked in the bag whatever its size', file: 'profile.js', from: 'const bag = capBag(mergeBag(prior, rej ? { towerRejected: rej } : null));', to: 'const bag = mergeBag(prior, rej ? { towerRejected: tw.rejected } : null);', groups: ['D'] },
   { id: 'rejected-merged-whole', why: 'the reject joins the bag whole, so a huge one pushes the record\'s own older unknown values out before it goes itself', file: 'profile.js', from: 'rej = fitRejected(tw.rejected, prior)', to: 'rej = tw.rejected', groups: ['D'] },
@@ -481,7 +482,7 @@ const MUTANTS = [
   { id: 'normalize-resets-tower', why: 'opening a profile throws its Tower record away', file: 'profile.js', from: '    out.tower = tw.value;\n', to: '    out.tower = emptyTower();\n', groups: ['P'] },
   { id: 'normalize-loses-rejected', why: 'a damaged Tower value is not kept in the bag', file: 'profile.js', from: 'const bag = capBag(mergeBag(prior, rej ? { towerRejected: rej } : null));', to: 'const bag = capBag(mergeBag(prior, null));', groups: ['P'] },
   { id: 'check-ignores-tower', why: 'a profile with a bad Tower record is well formed', file: 'profile.js', from: "for (const why of checkTowerShape(p.tower).slice(0, 3)) add('profile.tower', 'tower', 'tower: ' + why);", to: '', groups: ['P'] },
-  { id: 'create-without-tower', why: 'a new profile has no Tower record', file: 'profile.js', from: 'identity: emptyIdentity(), tower: emptyTower(),\n  };', to: 'identity: emptyIdentity(),\n  };', groups: ['P'] },
+  { id: 'create-without-tower', why: 'a new profile has no Tower record', file: 'profile.js', from: 'identity: emptyIdentity(), tower: emptyTower(),\n', to: 'identity: emptyIdentity(),\n', groups: ['P'] },          // (schema 6 put the card on the next line)
   { id: 'merge-overwrites-tower', why: 'a merge replaces the active profile\'s Tower record with the file\'s', file: 'profile.js', from: "  report.record = 'kept-local';", to: "  p.tower = clone(incoming.tower);\n  report.record = 'kept-local';", groups: ['X'] },
   { id: 'replace-keeps-local-tower', why: 'a replace keeps the old Tower record', file: 'profile.js', from: "    report.record = 'replaced';\n    report.tower = 'replaced';", to: "    p.tower = clone(existing.tower);\n    report.record = 'replaced';\n    report.tower = 'replaced';", groups: ['X'] },
   { id: 'new-drops-tower', why: 'a new profile from a file does not carry the file\'s Tower record', file: 'profile.js', from: "    p.id = newId('p', d);\n    p.rev = 0;", to: "    p.tower = emptyTower();\n    p.id = newId('p', d);\n    p.rev = 0;", groups: ['X'] },
