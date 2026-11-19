@@ -425,6 +425,19 @@ async function runNode(jsDir, verbose) {
       return list.find((t) => t.id === a.id).name === 'ROSSO' && list.find((t) => t.id === a.id).active && !list.find((t) => t.id === b.id).active && env.session.getItem('arena.welcome') === 'later' ? true : J([list, env.session.map]);
     } finally { await M.done(); }
   });
+  await check('E9 a data refresh asks a LOADED ctl to read the trainers again (another tab renamed one: the card shows it); before the ctl has handed a list, a refresh asks nothing (the ctl stays unloaded)', async () => {
+    const M = await memStore();
+    try {
+      const a = await TST.createTrainer(M.store, { name: 'RED', card: { made: true } });
+      const m = mk(await HD.readHubData(M.store, pack));
+      const quiet = m.hub.setData(await HD.readHubData(M.store, pack)).filter((e) => e.app === 'trainer');
+      const env = ctlFor(m, M.store); await env.ctl.refresh(); m.hub.goto('trainer');
+      await TST.updateTrainer(M.store, a.id, { name: 'ROSSO' });          // (another tab)
+      const fx = m.hub.setData(await HD.readHubData(M.store, pack)).filter((e) => e.app === 'trainer');
+      for (const e of fx) await env.ctl.effect(e);
+      return quiet.length === 0 && fx.length === 1 && fx[0].type === 'data' && m.hub.view().trainer.card.name === 'ROSSO' ? true : J([quiet, fx, m.hub.view().trainer.card]);
+    } finally { await M.done(); }
+  });
 
   /* ---------------------------------------------------------------------------------------------- F: failures */
   await check('F1 every refusal of a save is said in the picture and the screen stays (read-only, not saved, a conflict, refused, no storage, anything else)', () => {
@@ -571,6 +584,8 @@ const NODE_MUTANTS = [
   { id: 'M23', file: 'trainer_figures.js', from: 'export const FRONT_EXCLUDE = Object.freeze([67, 78, 137, 138, 139]);', to: 'export const FRONT_EXCLUDE = Object.freeze([67, 78, 137, 139]);', fails: 'G1' },
   { id: 'M25', file: 'trainer_hub.js', from: "        if (it.id === 'new') return openName(host);\n", to: '', fails: 'N1' },
   { id: 'M26', file: 'trainer_ctl.js', from: '    if (ok) env.sound.sfx(\'se_success\');', to: '', fails: 'A2' },
+  { id: 'M27', file: 'trainer_hub.js', from: "    onData() { return S.trainers ? [{ app: ID, type: 'data' }] : []; },", to: '    onData() { return []; },', fails: 'E9' },
+  { id: 'M28', file: 'trainer_hub.js', from: "    onData() { return S.trainers ? [{ app: ID, type: 'data' }] : []; },", to: "    onData() { return [{ app: ID, type: 'data' }]; },", fails: 'E9' },
 ];
 async function runMutants() {
   let killed = 0, ran = 0;

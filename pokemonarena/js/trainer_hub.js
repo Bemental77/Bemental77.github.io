@@ -13,10 +13,11 @@
 //   trainer-edit   ONE choice again, opened from the card (which one is state: S.edit). A keeps it (an 'update' effect), B cancels. Opened by its address with no choice: steps back to the card
 //
 // THE PUBLIC METHOD THE SHELL CALLS (before it opens 'trainer-new' on a first visit):
-//   welcome({ kind: 'new' | 'back', name })   'new': nobody is here yet (a new trainer is CREATED); 'back': the active profile is from before schema 6 (its name, portrait, teams and record are
-//                                              kept: the screens open PRE-FILLED and UPDATE it). The next enter('trainer-new') uses it once. The welcome question is then ARMED
-//                                              (hub_dialog.js DIALOG_ARM_TICKS: the A that was on its way to the main menu does not answer it). Without it 'trainer-new' greets an 'another'
-//                                              trainer (the card's NEW TRAINER, the Team Builder's NEW TRAINER): CREATED, not armed. -> nothing
+//   welcome({ kind: 'new' | 'back', name, profileId? })   'new': nobody is here yet (a new trainer is CREATED); 'back': a profile from before schema 6 (`profileId`, else the active one: its
+//                                              name, portrait, teams and record are kept: the screens open PRE-FILLED, reading its values live, and UPDATE it). The next enter('trainer-new') uses
+//                                              it once. The welcome question is then ARMED (hub_dialog.js DIALOG_ARM_TICKS: the A that was on its way to the main menu does not answer it), and
+//                                              its LATER goes HOME (ctx.go('main')). Without it 'trainer-new' greets an 'another' trainer (the card's NEW TRAINER, the Team Builder's NEW TRAINER):
+//                                              CREATED, not armed, LATER goes back where it was opened from. -> nothing
 //   begin(kind)                                the same for 'another' (what the card's NEW TRAINER does before it goes)
 //
 // THE CTL'S DOOR (trainer_ctl.js; a Node test plays the ctl)
@@ -28,6 +29,7 @@
 //   saved(result)         a save finished: { ok: true } | { ok: false, why: 'readonly' | 'notsaved' | 'conflict' | 'invalid' | 'nostore' | 'failed', message? } -> effects (env.run): on ok the
 //                         screen goes back (the card, or where NEW TRAINER was opened from); on a failure the words stay in the message box and the screen stays
 //   saving()              is a save under way?
+//   failed(why)           something outside a save was refused (SWITCH TRAINER): WORDS.failed[why] in the message box until the next input
 //
 // EFFECTS (app: 'trainer', carried out by trainer_ctl.js)
 //   { type: 'opened', path }                                              one of the app's screens was entered (also a move between two of them)
@@ -35,6 +37,7 @@
 //   { type: 'save', mode: 'create' | 'update', profileId, name, avatar, card }     the new-trainer screens' YES (card.made = true; avatar { kind: 'preset', id })
 //   { type: 'update', profileId, field, patch }                           the editor's A: patch = updateTrainer's ({ name } | { avatar } | { card: { ... } })
 //   { type: 'switch', id }                                                SWITCH TRAINER chose another trainer
+//   { type: 'data' }                                                      (from onData, once the ctl has handed the store's list) read the trainers again
 // A press decides its own sound only for a refusal ({ type: 'sfx', key: 'se_failure' }); everything else is the hub's menu sound.
 
 import { createEntrySlot } from './textentry.js';
@@ -712,7 +715,8 @@ function createTrainerHub(ctx) {
     press, hit: (path, x, y) => hit(path, x, y) || null, pointer, rects,
     tick() { return []; },
     view, speak,
-    onData() { return []; },
+    /** A data refresh (another tab, another app wrote a trainer): a ctl that has handed the store's list (so it is loaded) is asked to read it again. Before that, nothing (the ctl stays unloaded). */
+    onData() { return S.trainers ? [{ app: ID, type: 'data' }] : []; },
     onDialog(id, value) {
       if (id !== DIALOG_ID || !S.wiz || S.wiz.step !== 'welcome' || ctx.path() !== 'trainer-new') return [];
       S.input++;
