@@ -24,14 +24,20 @@ screen: `navigator.keyboard.getLayoutMap()` is used for labels when the browser 
 | down | down | Down, S | 13 |
 | left | left | Left, A | 14 |
 | right | right | Right, D | 15 |
-| a | confirm | Z, Enter, Space, Num Enter | 0 (Xbox) / 1 (Nintendo) |
-| b | back | X, Backspace, Esc | 1 (Xbox) / 0 (Nintendo) |
+| a | confirm | M, Z, Enter, Space, Num Enter | 0 (Xbox) / 1 (Nintendo) |
+| b | back | N, X, Backspace, Esc | 1 (Xbox) / 0 (Nintendo) |
 | x | info | C | 2 (Xbox) / 3 (Nintendo) |
 | y | filter | V | 3 (Xbox) / 2 (Nintendo) |
 | l | previous tab / page | Q, Page Up | 4, 6 |
 | r | next tab / page | E, Page Down | 5, 7 |
 | start | menu | P | 9 |
 | select | toggle info | I | 8 |
+
+**M = A and N = B come first** (2026-11-18, for the right hand: B on the left of A as on the console, the left hand on W A S D; the site's GBA page uses the same
+two keys). The first key of a list is the one `glyph()` names, so every hint says M / N; Z / X, Enter / Space and Backspace / Esc stay as alternates. A player who
+had saved their own A or B keeps it, and a player who had bound M or N to another action keeps that too: a default key the player gave to another action is left out
+of the default's list (`input.js effKb`), so no key ever presses two actions. **The mute key is O** (`input.js MUTE_KEY`, handled by `sound_system.js`): it was M
+until M became A; no default binding uses O, and a player who binds O to an action gets the action instead.
 
 Mouse: hover moves a canvas cursor, left click = click, **right click on a registered canvas = B** (the context menu is suppressed
 there and only there), the wheel steps menus up and down. Touch: on-screen pads (`bindPad`), and a tap on a registered canvas is a
@@ -61,7 +67,7 @@ const input = createInput({ /* all optional, all injectable for tests */
 | `isDown(action)` | is the action held by ANY holder. A and B never auto-repeat, so "hold A to type faster" is `input.isDown('a')` |
 | `held` | array of held action names |
 | `lastSource` / `sourceKnown` | `'keyboard' \| 'mouse' \| 'touch' \| 'gamepad'` and whether any real input has happened yet |
-| `glyph(action, source?)` | label for the current source: `Z`, `Click`, `A button`, `Cross`, `+` ... follows rebinding and the controller family |
+| `glyph(action, source?)` | label for the current source: `M`, `Click`, `A button`, `Cross`, `+` ... follows rebinding and the controller family |
 | `pads` | connected controllers: `{ index, id, family, layout, mapping, standard, buttons }` |
 | `registerPointerTarget(el, opts)` -> unregister | see below |
 | `bindPad(el, action)` -> unbind | see below |
@@ -167,7 +173,7 @@ menu or YES-NO box, or on the picture above the move menu: a tap is B, so touch 
 move menu: a click reads the highlighted move's description, the keyboard's C / the controller's X). ST1 added `'recap'` (the RECAP chip of the result screen, `index` -1: the cursor ring there runs RECAP, then the options), and on the recap screen `'recap-prev'`, `'recap-back'`, `'recap-next'` (its three buttons) and `'recap-page'` (anywhere else above them: a click is A, a right click is B, the wheel turns pages); the hub's RECORD screen has its own `hit()` kinds (`'rec-prev'`, `'rec-back'`, `'rec-next'`, `'rec-trainer-prev'`, `'rec-trainer-next'`, `'rec-reset'`, `'rec-yes'`, `'rec-no'`, `'rec-page'`). The scene maps `pointer move` to the cursor, `pointer click` to cursor + A, and the wheel to up / down;
 right click arrives as the ordinary `b` action.
 
-The existing `boot.js` bindings are a subset of the defaults (arrows, Z / Enter / Space = A, X / Backspace / Escape = B, hold A / B
+The existing `boot.js` bindings are a subset of the defaults (arrows, M / Z / Enter / Space = A, N / X / Backspace / Escape = B, hold A / B
 to speed text up), so replacing its own `keydown` code with `input.on('action', ...)` and `input.isDown('a')` loses nothing.
 
 ### DOM page (hub, editor, settings)
@@ -206,7 +212,7 @@ Skipped: `[data-nav-skip]`, `[inert]`, `[hidden]`, `disabled` (and inside a disa
 `display:none`, `visibility:hidden` and zero-size elements. A modal dialog (`aria-modal="true"`, `data-nav-modal`, or an open
 `<dialog>` shown with `showModal()`) confines directions, L / R and Tab to itself. B closes a dialog by CLICKING its `data-nav-close` button (or one labelled Close / Cancel / Dismiss / Back / X); a dialog with none gets a synthetic Escape keydown instead, which, if it reached the input layer, would feed it a key whose keyup never comes and leave B held for good. So a dialog either carries `data-nav-close` (the Controls dialog, the Sound panel, the on-screen keyboard, the Open-to-battles dialogs' Not now and Cancel) or has a button labelled Close / Cancel / Dismiss / Back / X (the Team Builder's sheets: "Close <title>"), or closes on that Escape itself at the DOCUMENT in the capture phase and stops it there, before the input layer (a listener on the window) can see it. The audio bar's music list is the one dialog that does the last: it has no close button, and `audiobar.js` takes the synthetic Escape (`preventDefault` + `stopPropagation`), closes the list and returns the focus to the music button. A new dialog needs one of the three. "The topmost dialog" and "the modal" are the LAST ones in document order, so a dialog shown over another is moved to the end of `<body>` when it opens.
 
-**The audio bar's music list** (`audiobar.js`) is a modal dialog (`role="dialog" aria-modal="true"`) holding a radio group, and it follows the game's key promise "arrows or WASD move". Keyboard: the four arrows AND the keys the player's bindings give the d-pad (W A S D by default; `sys.keyDirection` in `sound_system.js` asks the input layer, so a rebinding is followed: with Up moved from W to U, U moves up and W does nothing) step through the songs and pick each as they go; Home / End jump to the first / last; Tab stays inside; Esc closes it and returns the focus to the music button; every other key (Z, X, Backspace, PageUp / PageDown ...) is kept from the page behind it with `stopPropagation`, and so are the direction keys, which belong to the list while it is open. Controller: on the Team Builder the page-wide layer scopes itself to the open list (`aria-modal`): the d-pad moves the focus, A picks the focused song, B closes the list (the synthetic Escape above). The hub's own input ignores the pad while any dialog is up (its dialog counter, told by `sys.menuDialog`), so on the hub the list gets a layer of its own (`sys.dialogNav` -> `enableDomNav(list)`, disabled again when the list closes) with the same d-pad / A / B and the same return of the focus. A pad cannot OPEN the list on the hub: the header buttons are out of its reach.
+**The audio bar's music list** (`audiobar.js`) is a modal dialog (`role="dialog" aria-modal="true"`) holding a radio group, and it follows the game's key promise "arrows or WASD move". Keyboard: the four arrows AND the keys the player's bindings give the d-pad (W A S D by default; `sys.keyDirection` in `sound_system.js` asks the input layer, so a rebinding is followed: with Up moved from W to U, U moves up and W does nothing) step through the songs and pick each as they go; Home / End jump to the first / last; Tab stays inside; Esc closes it and returns the focus to the music button; every other key (M, N, Z, X, Backspace, PageUp / PageDown ...) is kept from the page behind it with `stopPropagation` (only O, the mute key, and Esc pass), and so are the direction keys, which belong to the list while it is open. Controller: on the Team Builder the page-wide layer scopes itself to the open list (`aria-modal`): the d-pad moves the focus, A picks the focused song, B closes the list (the synthetic Escape above). The hub's own input ignores the pad while any dialog is up (its dialog counter, told by `sys.menuDialog`), so on the hub the list gets a layer of its own (`sys.dialogNav` -> `enableDomNav(list)`, disabled again when the list closes) with the same d-pad / A / B and the same return of the focus. A pad cannot OPEN the list on the hub: the header buttons are out of its reach.
 
 **Keyboard inside fields.** The layer never takes a key that a text field, `<select>`, range or radio group needs: arrow keys there
 belong to the browser (a number field's spinner, a select's options). Escape lets go of such a field (focus is released, the
@@ -262,7 +268,7 @@ Show the pad block when the primary pointer is coarse (`matchMedia('(pointer: co
 import { createInput } from './js/input.js';
 const input = createInput();
 const speed = () => (input.isDown('a') || input.isDown('b') ? 'fast' : 'normal');   // "hold A or B to speed text up"
-const confirmHint = () => 'Press ' + input.glyph('a') + ' to continue';             // Z, Click, A button, Cross ...
+const confirmHint = () => 'Press ' + input.glyph('a') + ' to continue';             // M, Click, A button, Cross ...
 input.on('source', () => { document.getElementById('hint') && (document.getElementById('hint').textContent = confirmHint()); });
 ```
 

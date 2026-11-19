@@ -44,14 +44,21 @@ export const TIMING = Object.freeze({
 /* ------------------------------------------------------------------------------------------- default bindings */
 
 // Keyboard (KeyboardEvent.code). Shift-free: nothing needs a modifier.
+// A = M and B = N COME FIRST (2026-11-18, the owner: "controls can be updated for keyboard with n/m for ergonomics"): the right hand rests on them, B on the left of A
+// as on the console, with the left hand on W A S D; the site's GBA page has the same layout (gba/gbaWasm/dist/input_controller.js Mapping_Action_A 'm', _B 'n'). The FIRST
+// key of a list is the one glyph() names, so every on-screen hint says M / N; Z / X, Enter / Space and Backspace / Escape stay as alternates.
 export const DEFAULT_KEYS = Object.freeze({
   up: Object.freeze(['ArrowUp', 'KeyW']), down: Object.freeze(['ArrowDown', 'KeyS']),
   left: Object.freeze(['ArrowLeft', 'KeyA']), right: Object.freeze(['ArrowRight', 'KeyD']),
-  a: Object.freeze(['KeyZ', 'Enter', 'Space', 'NumpadEnter']), b: Object.freeze(['KeyX', 'Backspace', 'Escape']),
+  a: Object.freeze(['KeyM', 'KeyZ', 'Enter', 'Space', 'NumpadEnter']), b: Object.freeze(['KeyN', 'KeyX', 'Backspace', 'Escape']),
   x: Object.freeze(['KeyC']), y: Object.freeze(['KeyV']),
   l: Object.freeze(['KeyQ', 'PageUp']), r: Object.freeze(['KeyE', 'PageDown']),
   start: Object.freeze(['KeyP']), select: Object.freeze(['KeyI']),
 });
+// THE MUTE KEY (sound_system.js): not one of the twelve actions, so NO default binding may use it (a key that is also an action's is the action's, and the mute
+// shortcut yields to it). It was M until M became A; O is free, is not next to N / M or to W A S D, and is not a button's name (A B X Y L R) in a hint. A player
+// who binds O to an action gets the action: theirs wins.
+export const MUTE_KEY = 'KeyO';
 
 // Gamepad, W3C Standard layout button indexes. The face buttons depend on the controller family (see padLayoutFor).
 const PAD_COMMON = Object.freeze({
@@ -346,7 +353,11 @@ export function createInput(opts = {}) {
   let kbOv = {}, padOv = {}, layoutSel = 'auto', storeStatus = storage ? 'default' : 'absent', storeProblems = [], persisted = false;
   let codeMap = new Map(), padMaps = { xbox: new Map(), nintendo: new Map() };
 
-  const effKb = (a) => (own(kbOv, a) ? kbOv[a] : DEFAULT_KEYS[a]);
+  // A DEFAULT key the player has given to ANOTHER action (one of their own saved lists holds it) is theirs and is left out of the default's list. It matters when a
+  // default GAINS a key (M and N became A and B on 2026-11-18): a player who had bound M or N to an action keeps it, and their A / B keep their other keys, instead of
+  // one key pressing two actions. An action whose defaults would ALL be taken keeps them (it must stay reachable).
+  const claimedKey = (c, a) => { for (const o of ACTIONS) if (o !== a && own(kbOv, o) && kbOv[o].includes(c)) return true; return false; };
+  const effKb = (a) => { if (own(kbOv, a)) return kbOv[a]; const l = DEFAULT_KEYS[a].filter((c) => !claimedKey(c, a)); return l.length ? l : DEFAULT_KEYS[a]; };
   const effPad = (a, layout) => (own(padOv, a) ? padOv[a] : PAD_LAYOUTS[layout][a]);
   function rebuildMaps() {
     codeMap = new Map();

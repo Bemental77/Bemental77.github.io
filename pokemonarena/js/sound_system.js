@@ -1,5 +1,5 @@
 // pokemonarena/js/sound_system.js -- the one object a page creates to get sound: the mixer (audio_mixer.js), the music director
-// (music_director.js), the SOUND panel (sound_panel.js), the header Sound button, the M key, the "press any key" prompt, the cries, and the
+// (music_director.js), the SOUND panel (sound_panel.js), the header Sound button, the mute key (O: input.js MUTE_KEY), the "press any key" prompt, the cries, and the
 // battle-page helpers (music follows the scene's mode, menu sounds, hit sounds, pause-menu ducking).
 //
 //   const sys = createSoundSystem({ page: 'hub' | 'battle' | 'editor', button, input: () => input, enableDomNav, ownNav, onPanelOpen, onPanelClose, onMenuOpen, onMenuClose, effects });
@@ -28,7 +28,7 @@
 import { createMixer } from './audio_mixer.js';
 import { createDirector, resolveKey } from './music_director.js';
 import { createSoundPanel, SOUNDTRACK_LABELS } from './sound_panel.js';
-import { isTextTarget } from './input.js';
+import { isTextTarget, codeOf, MUTE_KEY } from './input.js';
 import * as cries from './cries.js';
 import { createMenuMusic } from './menu_music.js';           // what the menus play, and the player's pick (the audio bar's music changer)
 import { mountAudioBar } from './audiobar.js';               // the volume slider / mute / music changer in every page's header
@@ -40,6 +40,10 @@ export const PROMPT_TEXT = Object.freeze({
   long: 'Click, tap or press a keyboard key to start the sound (a controller button cannot). Esc or a controller button hides this.',
   short: 'Click, tap or press a key for sound (a controller button cannot).',       // for a cramped layout: it still says what a controller visitor needs to know
 });
+// THE MUTE KEY: O (input.js MUTE_KEY). It was M until M became the keyboard's A (2026-11-18); a key bound to an action is that action's, never also the mute's.
+export { MUTE_KEY };
+export const MUTE_KEY_LABEL = 'O';
+export const muteToast = (muted) => (muted ? 'Sound muted (' + MUTE_KEY_LABEL + ')' : 'Sound on (' + MUTE_KEY_LABEL + ')');
 export const CRY_GAIN = 0.35;                         // per-cry level before the effects bus (the pages used 0.35 already)
 const DIRECTIONS = Object.freeze(['up', 'down', 'left', 'right']);
 const DEFAULT_DIRECTION_KEYS = Object.freeze({ KeyW: 'up', KeyS: 'down', KeyA: 'left', KeyD: 'right' });       // input.js DEFAULT_KEYS, used until the page's input layer is up
@@ -344,22 +348,25 @@ export function createSoundSystem(opts = {}) {
     paintPrompt();
   });
 
-  /* ---------------------------------------------------------------- the M key */
+  /* ---------------------------------------------------------------- the mute key (O) */
   function onKey(e) {
     if (S.destroyed || e.defaultPrevented || e.repeat) return;
     if (e.ctrlKey || e.metaKey || e.altKey) return;
-    if (e.code !== 'KeyM' && e.key !== 'm' && e.key !== 'M') return;
+    const code = codeOf(e);
+    if (code !== MUTE_KEY && e.key !== 'o' && e.key !== 'O') return;
     if (e.isComposing || e.keyCode === 229) return;
     const t = e.target;
     if (t && t !== doc.body && isTextTarget(t)) return;
     const inp = typeof opts.input === 'function' ? opts.input() : opts.input;
     try {
       if (inp && inp.capturing) return;                           // the Controls panel is waiting for a key to bind: that key is not ours
-      if (inp && inp.bindings) { const b = inp.bindings.get(); if (Object.values(b.keyboard).some((l) => l.includes('KeyM'))) return; }     // the player bound M to an action: theirs wins
+      // a key that is an action's is the action's: the player bound O to an action (theirs wins), or this is another layout's "o" on a key the game uses (Dvorak's S, the d-pad's down).
+      // bindings.get() reports the WHOLE effective table (the defaults too), so the M that is A by default can never mute here either.
+      if (inp && inp.bindings) { const b = inp.bindings.get(); if (Object.values(b.keyboard).some((l) => l.includes(MUTE_KEY) || (code && l.includes(code)))) return; }
     } catch (_e) { /* the input layer is optional */ }
     mixer.unlock();
     mixer.toggleMuted();
-    toast(mixer.muted() ? 'Sound muted (M)' : 'Sound on (M)');
+    toast(muteToast(mixer.muted()));
     paintButton();
   }
 

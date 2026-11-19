@@ -41,7 +41,7 @@
     </div>
 
     <div id="screenWrap">
-      <canvas id="battle" width="240" height="160" tabindex="0" hidden data-input-target aria-label="Battle screen, 240 by 160 pixels. Arrow keys move, Z or Enter confirms, X or Backspace goes back."></canvas>
+      <canvas id="battle" width="240" height="160" tabindex="0" hidden data-input-target aria-label="Battle screen, 240 by 160 pixels. Arrow keys or W A S D move, M or Enter confirms, N or Backspace goes back."></canvas>
       <!-- W1 fix A4/A5: the move menu is the one battle screen with no visible way back and no visible way to read a move; these two chips sit over the picture's top-right corner while it is open -->
       <div id="ctxchips" hidden>
         <button id="chipBack" class="chip" type="button" aria-label="Back to the action menu">&lsaquo; Back</button>
@@ -79,7 +79,7 @@
   <!-- a Tower floor's status line (js/battle_boot.js showTowerBar; only in battle.html?tower=1): the floor, the trainer, the buffs held, the lives left -->
   <p id="towerBar" role="status" hidden></p>
   <p id="note" class="dim" hidden></p>
-  <p id="keys" class="dim">Arrows or WASD move &middot; Z / Enter = A &middot; X / Backspace = B &middot; C = info &middot; P = menu &middot; hold A or B to type faster &middot; click or tap works too</p>
+  <p id="keys" class="dim">Arrows or WASD move &middot; M = A &middot; N = B &middot; Z / X and Enter / Backspace work too &middot; C = info &middot; P = menu &middot; hold A or B to type faster &middot; click or tap works too</p>
 
   <script type="module" src="/pokemonarena/js/battle_boot.js"></script>
 </body>

@@ -112,8 +112,8 @@ async function unitSuite() {
   const sig = (evs) => evs.map((e) => (e.pressed ? '+' : '-') + e.action + (e.repeat ? 'r' : '')).join(' ');
 
   /* ---------------------------------------------------------------------------------- defaults (independent oracle) */
-  const WANT_KEYS = { up: ['ArrowUp', 'KeyW'], down: ['ArrowDown', 'KeyS'], left: ['ArrowLeft', 'KeyA'], right: ['ArrowRight', 'KeyD'], a: ['KeyZ', 'Enter', 'Space', 'NumpadEnter'],
-    b: ['KeyX', 'Backspace', 'Escape'], x: ['KeyC'], y: ['KeyV'], l: ['KeyQ', 'PageUp'], r: ['KeyE', 'PageDown'], start: ['KeyP'], select: ['KeyI'] };
+  const WANT_KEYS = { up: ['ArrowUp', 'KeyW'], down: ['ArrowDown', 'KeyS'], left: ['ArrowLeft', 'KeyA'], right: ['ArrowRight', 'KeyD'], a: ['KeyM', 'KeyZ', 'Enter', 'Space', 'NumpadEnter'],
+    b: ['KeyN', 'KeyX', 'Backspace', 'Escape'], x: ['KeyC'], y: ['KeyV'], l: ['KeyQ', 'PageUp'], r: ['KeyE', 'PageDown'], start: ['KeyP'], select: ['KeyI'] };
   const WANT_PAD = { xbox: { up: [12], down: [13], left: [14], right: [15], a: [0], b: [1], x: [2], y: [3], l: [4, 6], r: [5, 7], select: [8], start: [9] },
     nintendo: { up: [12], down: [13], left: [14], right: [15], a: [1], b: [0], x: [3], y: [2], l: [4, 6], r: [5, 7], select: [8], start: [9] } };
   {
@@ -336,25 +336,57 @@ async function unitSuite() {
     { const r = rig(); r.pads.add(0, XBOX); r.win.dispatchEvent(ev('pointerdown', { pointerType: 'mouse' })); ok(r.input.pads.length === 1, 'gamepad/click-finds-an-already-exposed-pad'); }
   }
 
+  /* ---------------------------------------------------------- M = A, N = B (INAPP.md TRAINER contract, decision 6, 2026-11-18) */
+  {
+    const r = rig(); r.key('KeyM'); r.up('KeyM'); r.key('KeyN'); r.up('KeyN');
+    ok(sig(r.events) === '+a -a +b -b', 'keys/m-is-a-and-n-is-b', sig(r.events));
+    ok(M.DEFAULT_KEYS.a[0] === 'KeyM' && M.DEFAULT_KEYS.b[0] === 'KeyN' && r.input.glyph('a', 'keyboard') === 'M' && r.input.glyph('b', 'keyboard') === 'N',
+      'keys/m-and-n-come-first-so-every-hint-names-them', [M.DEFAULT_KEYS.a, M.DEFAULT_KEYS.b, r.input.glyph('a', 'keyboard'), r.input.glyph('b', 'keyboard')]);
+    const rz = rig(); for (const c of ['KeyZ', 'KeyX', 'Enter', 'Escape', 'Space', 'Backspace']) { rz.key(c); rz.up(c); }
+    ok(sig(rz.events) === '+a -a +b -b +a -a +b -b +a -a +b -b', 'keys/z-x-enter-escape-space-backspace-stay-alternates', sig(rz.events));
+    const all = Object.values(M.DEFAULT_KEYS).flat();
+    ok(M.MUTE_KEY === 'KeyO' && !all.includes(M.MUTE_KEY), 'keys/the-mute-key-is-in-no-default-binding', M.MUTE_KEY);
+    ok(new Set(all).size === all.length, 'keys/no-default-key-is-in-two-lists', all);
+    // stored bindings (arena.bindings): a player who saved their own A / B keeps them; a player on the default A / B gets M / N
+    const kept = rig({ storage: new Storage_({ 'arena.bindings': JSON.stringify({ v: 1, keyboard: { a: ['KeyZ', 'Enter'], b: ['KeyX', 'Escape'] } }) }) });
+    kept.key('KeyM'); kept.up('KeyM'); kept.key('KeyN'); kept.up('KeyN');
+    const kk = kept.input.bindings.get().keyboard;
+    ok(kept.events.length === 0 && kk.a.join() === 'KeyZ,Enter' && kk.b.join() === 'KeyX,Escape' && kept.input.glyph('a', 'keyboard') === 'Z' && kept.input.glyph('b', 'keyboard') === 'X',
+      'keys/a-saved-a-and-b-are-kept', { a: kk.a, b: kk.b, events: sig(kept.events) });
+    const other = rig({ storage: new Storage_({ 'arena.bindings': JSON.stringify({ v: 1, keyboard: { x: ['KeyC', 'KeyJ'] } }) }) });
+    ok(other.input.bindings.get().keyboard.a[0] === 'KeyM' && other.input.bindings.get().keyboard.b[0] === 'KeyN' && other.input.glyph('a', 'keyboard') === 'M',
+      'keys/a-player-on-the-default-a-and-b-gets-m-and-n', other.input.bindings.get().keyboard);
+    // a key the player had given to ANOTHER action (when M and N were free) stays theirs: one key never presses two actions
+    const claimed = rig({ storage: new Storage_({ 'arena.bindings': JSON.stringify({ v: 1, keyboard: { select: ['KeyI', 'KeyM'], l: ['KeyQ', 'KeyN'] } }) }) });
+    claimed.key('KeyM'); claimed.up('KeyM'); claimed.key('KeyN'); claimed.up('KeyN');
+    const ck = claimed.input.bindings.get().keyboard;
+    ok(sig(claimed.events) === '+select -select +l -l' && ck.a.join() === 'KeyZ,Enter,Space,NumpadEnter' && ck.b.join() === 'KeyX,Backspace,Escape' && claimed.input.glyph('a', 'keyboard') === 'Z',
+      'keys/a-default-key-the-player-gave-another-action-stays-theirs', { events: sig(claimed.events), a: ck.a, b: ck.b });
+    claimed.input.bindings.reset('keyboard');
+    ok(claimed.input.bindings.get().keyboard.a[0] === 'KeyM' && claimed.input.bindings.get().keyboard.b[0] === 'KeyN' && claimed.input.bindings.get().keyboard.select.join() === 'KeyI', 'keys/reset-keyboard-gives-m-and-n');
+    const taken = rig({ storage: new Storage_({ 'arena.bindings': JSON.stringify({ v: 1, keyboard: { x: ['KeyC', 'ArrowUp', 'KeyW'] } }) }) });
+    ok(taken.input.bindings.get().keyboard.up.join() === 'ArrowUp,KeyW', 'keys/an-action-whose-every-default-is-taken-keeps-them', taken.input.bindings.get().keyboard.up);
+  }
+
   /* ----------------------------------------------------------------------------------------- rebinding / storage */
   {
     const r = rig(); const B = r.input.bindings;
     let res = B.rebind('keyboard', 'a', 0, 'KeyG');
-    ok(res.ok && B.get().keyboard.a.join() === 'KeyG,Enter,Space,NumpadEnter', 'rebind/slot-replaced', res);
+    ok(res.ok && B.get().keyboard.a.join() === 'KeyG,KeyZ,Enter,Space,NumpadEnter', 'rebind/slot-replaced', res);
     r.key('KeyG'); ok(r.input.isDown('a'), 'rebind/new-key-takes-effect'); r.up('KeyG');
-    const m = r.mark(); r.key('KeyZ'); ok(r.since(m).length === 0, 'rebind/old-key-released-from-action'); r.up('KeyZ');
+    const m = r.mark(); r.key('KeyM'); ok(r.since(m).length === 0, 'rebind/old-key-released-from-action'); r.up('KeyM');
     res = B.rebind('keyboard', 'b', 0, 'KeyG');
     ok(!res.ok && res.reason === 'conflict' && res.conflicts.join() === 'a', 'rebind/conflict-detected', res);
-    ok(B.get().keyboard.b[0] === 'KeyX' && B.get().keyboard.a[0] === 'KeyG', 'rebind/conflict-reject-changes-nothing');
+    ok(B.get().keyboard.b[0] === 'KeyN' && B.get().keyboard.a[0] === 'KeyG', 'rebind/conflict-reject-changes-nothing');
     ok(B.conflicts('keyboard', 'b', 'KeyG').join() === 'a' && B.conflicts('keyboard', 'b', 'KeyJ').length === 0, 'rebind/conflicts-query');
     res = B.rebind('keyboard', 'b', 0, 'KeyG', { onConflict: 'swap' });
-    ok(res.ok && B.get().keyboard.b[0] === 'KeyG' && B.get().keyboard.a[0] === 'KeyX', 'rebind/swap-gives-the-other-action-the-old-key', B.get().keyboard);
+    ok(res.ok && B.get().keyboard.b[0] === 'KeyG' && B.get().keyboard.a[0] === 'KeyN', 'rebind/swap-gives-the-other-action-the-old-key', B.get().keyboard);
     res = B.rebind('keyboard', 'x', 0, 'KeyX', { onConflict: 'move' });
-    ok(res.ok && B.get().keyboard.x[0] === 'KeyX' && !B.get().keyboard.a.includes('KeyX'), 'rebind/move-takes-the-key-away', B.get().keyboard);
+    ok(res.ok && B.get().keyboard.x[0] === 'KeyX' && !B.get().keyboard.b.includes('KeyX') && !B.get().keyboard.a.includes('KeyX'), 'rebind/move-takes-the-key-away', B.get().keyboard);
     ok(!B.rebind('keyboard', 'y', 0, 'Tab').ok && !B.rebind('keyboard', 'y', 0, 'F5').ok && !B.rebind('keyboard', 'y', 0, 'ShiftLeft').ok && !B.rebind('bogus', 'y', 0, 'KeyJ').ok && !B.rebind('keyboard', 'nope', 0, 'KeyJ').ok, 'rebind/invalid-refused');
     ok(B.rebind('keyboard', 'y', 5, 'KeyJ').ok && B.get().keyboard.y.join() === 'KeyV,KeyJ', 'rebind/slot-past-end-appends');
     ok(B.remove('keyboard', 'y', 1).ok && B.get().keyboard.y.join() === 'KeyV', 'rebind/remove-slot');
-    { const rf = rig(); for (const c of ['KeyJ', 'KeyK', 'KeyL', 'KeyN', 'KeyM']) rf.input.bindings.rebind('keyboard', 'x', 9, c); const full = rf.input.bindings.rebind('keyboard', 'x', 9, 'KeyB'); ok(!full.ok && full.reason === 'full', 'rebind/list-is-capped', full); }
+    { const rf = rig(); for (const c of ['KeyJ', 'KeyK', 'KeyL', 'KeyH', 'KeyU']) rf.input.bindings.rebind('keyboard', 'x', 9, c); const full = rf.input.bindings.rebind('keyboard', 'x', 9, 'KeyB'); ok(!full.ok && full.reason === 'full', 'rebind/list-is-capped', full); }
     // persistence
     const stored = JSON.parse(r.store.getItem('arena.bindings'));
     ok(stored.v === 1 && stored.keyboard && stored.gamepad.layout === 'auto', 'rebind/persisted-versioned-schema', stored);
@@ -364,10 +396,10 @@ async function unitSuite() {
     // defaults are not written
     const r3 = rig(); ok(r3.store.getItem('arena.bindings') === null, 'rebind/defaults-write-nothing');
     r3.input.bindings.rebind('keyboard', 'a', 0, 'KeyG'); ok(r3.store.getItem('arena.bindings') !== null, 'rebind/customised-writes');
-    r3.input.bindings.rebind('keyboard', 'a', 0, 'KeyZ'); ok(r3.store.getItem('arena.bindings') === null && !r3.input.bindings.get().customized.keyboard, 'rebind/back-to-default-removes-key', r3.store.getItem('arena.bindings'));
+    r3.input.bindings.rebind('keyboard', 'a', 0, 'KeyM'); ok(r3.store.getItem('arena.bindings') === null && !r3.input.bindings.get().customized.keyboard, 'rebind/back-to-default-removes-key', r3.store.getItem('arena.bindings'));
     // reset, per device
     const r4 = rig(); r4.input.bindings.rebind('keyboard', 'a', 0, 'KeyG'); r4.input.bindings.rebind('gamepad', 'a', 0, 10); r4.input.bindings.setLayout('nintendo');
-    r4.input.bindings.reset('keyboard'); ok(r4.input.bindings.get().keyboard.a[0] === 'KeyZ' && r4.input.bindings.get().gamepad.buttons.a[0] === 10, 'rebind/reset-keyboard-only');
+    r4.input.bindings.reset('keyboard'); ok(r4.input.bindings.get().keyboard.a[0] === 'KeyM' && r4.input.bindings.get().gamepad.buttons.a[0] === 10, 'rebind/reset-keyboard-only');
     r4.input.bindings.reset('gamepad'); ok(r4.input.bindings.get().gamepad.buttons.a.join() === '0' && r4.input.bindings.layout() === 'auto' && r4.store.getItem('arena.bindings') === null, 'rebind/reset-gamepad-also-clears-layout');
     r4.input.bindings.rebind('keyboard', 'a', 0, 'KeyG'); r4.input.bindings.rebind('gamepad', 'a', 0, 10); r4.input.bindings.reset(); ok(!r4.input.bindings.get().customized.keyboard && !r4.input.bindings.get().customized.gamepad, 'rebind/reset-all');
     // gamepad rebinding takes effect
@@ -407,7 +439,7 @@ async function unitSuite() {
       ['no-version', JSON.stringify({ keyboard: { a: ['KeyG'] } })], ['version-string', JSON.stringify({ v: '1' })], ['huge', 'x'.repeat(30000)]];
     for (const [name, text] of hostile) {
       let r, threw = false; try { r = rig({ storage: new Storage_({ 'arena.bindings': text }) }); r.key('KeyZ'); r.up('KeyZ'); } catch (_e) { threw = true; }
-      ok(!threw && r.input.bindings.get().keyboard.a[0] === 'KeyZ' && !r.input.bindings.get().customized.keyboard, 'storage/hostile-' + name + '-falls-back', threw ? 'threw' : r.input.bindings.get().keyboard.a);
+      ok(!threw && r.input.bindings.get().keyboard.a[0] === 'KeyM' && !r.input.bindings.get().customized.keyboard, 'storage/hostile-' + name + '-falls-back', threw ? 'threw' : r.input.bindings.get().keyboard.a);
       if (!threw) ok(['invalid', 'default'].includes(r.input.bindings.status().status), 'storage/hostile-' + name + '-status', r.input.bindings.status());
     }
     ok(rig({ storage: new Storage_({ 'arena.bindings': JSON.stringify({ v: 2, keyboard: {} }) }) }).input.bindings.status().status === 'invalid', 'storage/wrong-version-falls-back');
@@ -416,7 +448,7 @@ async function unitSuite() {
       gamepad: { layout: 'xbox', buttons: { a: [7], b: [-1], x: [1.5], y: ['2'], l: [999], r: 'no' } } }).replace('{"v":1,', '{"v":1,"__proto__":{"polluted":true},').replace('"keyboard":{', '"keyboard":{"__proto__":{"polluted":true},').replace('"buttons":{', '"buttons":{"constructor":[1],"__proto__":[2],');
     ok(Object.prototype.hasOwnProperty.call(JSON.parse(mixed), '__proto__'), 'storage/fixture-really-has-own-proto-keys');
     const rm = rig({ storage: new Storage_({ 'arena.bindings': mixed }) }); const g = rm.input.bindings.get();
-    ok(g.keyboard.a.join() === 'KeyG' && g.keyboard.b.join() === 'KeyX,Backspace,Escape' && g.keyboard.x.join() === 'KeyC' && g.keyboard.y.join() === 'KeyV' && g.keyboard.r.join() === 'KeyE,PageDown' && g.keyboard.up.join() === 'ArrowUp', 'storage/hostile-keyboard-entries-rejected', g.keyboard);
+    ok(g.keyboard.a.join() === 'KeyG' && g.keyboard.b.join() === 'KeyN,KeyX,Backspace,Escape' && g.keyboard.x.join() === 'KeyC' && g.keyboard.y.join() === 'KeyV' && g.keyboard.r.join() === 'KeyE,PageDown' && g.keyboard.up.join() === 'ArrowUp', 'storage/hostile-keyboard-entries-rejected', g.keyboard);
     ok(g.keyboard.l.join() === 'KeyQ,PageUp', 'storage/oversized-list-rejected', g.keyboard.l);
     ok(g.gamepad.buttons.a.join() === '7' && g.gamepad.buttons.b.join() === '1' && g.gamepad.buttons.x.join() === '2' && g.gamepad.buttons.l.join() === '4,6' && g.gamepad.layout === 'xbox', 'storage/hostile-gamepad-entries-rejected', g.gamepad.buttons);
     ok(rm.input.bindings.status().status === 'repaired' && rm.input.bindings.status().problems.length >= 8, 'storage/repaired-status-lists-problems', rm.input.bindings.status());
@@ -437,9 +469,9 @@ async function unitSuite() {
   /* -------------------------------------------------------------------------------------------------- glyph by source */
   {
     const r = rig(); const gl = (a, s) => r.input.glyph(a, s);
-    ok(gl('a', 'keyboard') === 'Z' && gl('b', 'keyboard') === 'X' && gl('up', 'keyboard') === 'Up' && gl('start', 'keyboard') === 'P' && gl('l', 'keyboard') === 'Q', 'glyph/by-source');
+    ok(gl('a', 'keyboard') === 'M' && gl('b', 'keyboard') === 'N' && gl('up', 'keyboard') === 'Up' && gl('start', 'keyboard') === 'P' && gl('l', 'keyboard') === 'Q', 'glyph/by-source');
     ok(gl('a', 'mouse') === 'Click' && gl('b', 'mouse') === 'Right-click' && gl('a', 'touch') === 'A' && gl('b', 'touch') === 'B', 'glyph/mouse-and-touch');
-    ok(r.input.lastSource === 'keyboard' && gl('a') === 'Z', 'glyph/defaults-to-last-source');
+    ok(r.input.lastSource === 'keyboard' && gl('a') === 'M', 'glyph/defaults-to-last-source');
     r.win.dispatchEvent(ev('pointerdown', { pointerType: 'mouse' })); ok(r.input.lastSource === 'mouse' && gl('a') === 'Click', 'glyph/follows-last-source-mouse');
     r.win.dispatchEvent(ev('pointerdown', { pointerType: 'touch' })); ok(r.input.lastSource === 'touch' && gl('a') === 'A', 'glyph/follows-last-source-touch');
     r.pads.add(0, XBOX); r.padEvent('gamepadconnected', 0); r.at(1000); ok(gl('a', 'gamepad') === 'A button' && gl('b', 'gamepad') === 'B button' && gl('l', 'gamepad') === 'LB' && gl('start', 'gamepad') === 'Menu', 'glyph/xbox-names');
@@ -448,7 +480,7 @@ async function unitSuite() {
     r.input.bindings.rebind('keyboard', 'a', 0, 'KeyG'); ok(gl('a', 'keyboard') === 'G', 'glyph/follows-rebinding');
     r.input.bindings.rebind('gamepad', 'a', 0, 10); ok(gl('a', 'gamepad') === 'L3', 'glyph/gamepad-follows-rebinding');
     ok(gl('nope', 'keyboard') === '', 'glyph/unknown-action-empty');
-    const rz = rig({ layoutMap: new Map([['KeyZ', 'w']]) }); ok(rz.input.glyph('a', 'keyboard') === 'W', 'glyph/layout-map-azerty');
+    const rz = rig({ layoutMap: new Map([['KeyM', ',']]) }); ok(rz.input.glyph('a', 'keyboard') === ',', 'glyph/layout-map-azerty');          // AZERTY: the key where QWERTY has M prints a comma
     // lastSource follows real input
     const rs = rig(); ok(rs.input.sourceKnown === false, 'source/unknown-until-first-input'); rs.key('KeyZ'); ok(rs.input.sourceKnown === true && rs.input.lastSource === 'keyboard', 'source/keyboard');
     // lastSource starts as 'keyboard' only as a glyph default: the FIRST real input still has to be announced (uinav draws the focus ring from this event)
@@ -851,7 +883,7 @@ async function browserSuite() {
       /* ===================================================================================== group: keyboard */
       if (groupOn('keyboard')) {
         await load('?mode=canvas');
-        const WANT = { up: ['ArrowUp', 'KeyW'], down: ['ArrowDown', 'KeyS'], left: ['ArrowLeft', 'KeyA'], right: ['ArrowRight', 'KeyD'], a: ['KeyZ', 'Enter', 'Space', 'NumpadEnter'], b: ['KeyX', 'Backspace', 'Escape'], x: ['KeyC'], y: ['KeyV'], l: ['KeyQ', 'PageUp'], r: ['KeyE', 'PageDown'], start: ['KeyP'], select: ['KeyI'] };
+        const WANT = { up: ['ArrowUp', 'KeyW'], down: ['ArrowDown', 'KeyS'], left: ['ArrowLeft', 'KeyA'], right: ['ArrowRight', 'KeyD'], a: ['KeyM', 'KeyZ', 'Enter', 'Space', 'NumpadEnter'], b: ['KeyN', 'KeyX', 'Backspace', 'Escape'], x: ['KeyC'], y: ['KeyV'], l: ['KeyQ', 'PageUp'], r: ['KeyE', 'PageDown'], start: ['KeyP'], select: ['KeyI'] };
         const bad = [];
         for (const a of Object.keys(WANT)) for (const code of WANT[a]) {
           const m = await mark(); await tap(code, { hold: 25, settle: 20 });
@@ -1025,11 +1057,11 @@ async function browserSuite() {
       if (groupOn('switch')) {
         await load('?mode=canvas'); await E('document.activeElement && document.activeElement.blur()'); await E(`__synth.connect(0, ${J(XBOX_ID)})`); await sleep(120);
         const glyphs = async () => E("({ a: __input.input.glyph('a'), b: __input.input.glyph('b'), src: __input.input.lastSource })");
-        let g; await tap('ArrowRight'); let s = await st(); g = await glyphs(); ok(s.menu.cursor === 1 && g.src === 'keyboard' && g.a === 'Z', 'browser-switch/1-keyboard', { s: s.menu, g });
+        let g; await tap('ArrowRight'); let s = await st(); g = await glyphs(); ok(s.menu.cursor === 1 && g.src === 'keyboard' && g.a === 'M', 'browser-switch/1-keyboard', { s: s.menu, g });
         { const p = await gridPt(3); await hover(p.x, p.y); } s = await st(); g = await glyphs(); ok(s.menu.cursor === 3 && g.src === 'mouse' && g.a === 'Click' && g.b === 'Right-click', 'browser-switch/2-mouse-takes-over', { s: s.menu, g });
         await padTap(0, 14); s = await st(); g = await glyphs(); ok(s.menu.cursor === 2 && g.src === 'gamepad' && g.a === 'A button', 'browser-switch/3-pad-takes-over-from-the-mouse-position', { s: s.menu, g });
         await padTap(0, 12); await padTap(0, 14); s = await st(); ok(s.menu.cursor === 0, 'browser-switch/3b-pad-continues');
-        { const p = await gridPt(1); await hover(p.x, p.y); await tap('ArrowDown'); s = await st(); g = await glyphs(); ok(s.menu.cursor === 3 && g.src === 'keyboard' && g.a === 'Z', 'browser-switch/4-keyboard-continues-from-the-hovered-item', { s: s.menu, g }); }
+        { const p = await gridPt(1); await hover(p.x, p.y); await tap('ArrowDown'); s = await st(); g = await glyphs(); ok(s.menu.cursor === 3 && g.src === 'keyboard' && g.a === 'M', 'browser-switch/4-keyboard-continues-from-the-hovered-item', { s: s.menu, g }); }
         { const p = await gridPt(0); const m = await mark(); await mouse('mouseMoved', p.x, p.y); await mouse('mousePressed', p.x, p.y, { button: 'left', buttons: 1, clickCount: 1 }); await mouse('mouseReleased', p.x, p.y, { button: 'left', clickCount: 1 }); await sleep(60); s = await st(); ok(s.menu.chosen.includes('FIGHT') && s.lastSource === 'mouse', 'browser-switch/5-click-after-keyboard-and-pad'); }
         await tap('KeyZ'); s = await st(); ok(s.menu.chosen.filter((c) => c === 'FIGHT').length === 2, 'browser-switch/6-keyboard-confirm-on-the-clicked-item');
         await padDown(0, 13); await tap('ArrowRight'); await sleep(60); s = await st(); ok(s.held.includes('down'), 'browser-switch/7-a-pad-hold-survives-keyboard-input'); await padUp(0, 13); await sleep(60); ok(!(await st()).held.includes('down'), 'browser-switch/8-and-releases-on-its-own');
@@ -1221,9 +1253,9 @@ async function browserSuite() {
         await E("document.querySelector('[data-fk=\"kb-a-0\"]').scrollIntoView({ block: 'center' }); document.querySelector('[data-fk=\"kb-a-0\"]').focus()"); await tap('Enter'); await sleep(100);
         ok((await E("__input.input.capturing")) === true && (await E("document.querySelector('[data-ip=status]').textContent")).includes('Press a key'), 'rebind/enter-starts-capture-and-says-so', await E("document.querySelector('[data-ip=status]').textContent"));
         await tap('KeyG'); await sleep(120);
-        ok((await E('__input.input.bindings.get().keyboard.a.join()')) === 'KeyG,Enter,Space,NumpadEnter' && (await E('__input.input.capturing')) === false, 'rebind/key-bound', await E('__input.input.bindings.get().keyboard.a.join()'));
+        ok((await E('__input.input.bindings.get().keyboard.a.join()')) === 'KeyG,KeyZ,Enter,Space,NumpadEnter' && (await E('__input.input.capturing')) === false, 'rebind/key-bound', await E('__input.input.bindings.get().keyboard.a.join()'));
         ok((await E("document.querySelector('[data-fk=\"kb-a-0\"]').textContent")) === 'G', 'rebind/panel-shows-the-new-key');
-        { await E('__input.actions.length = 0'); await E('document.activeElement.blur()'); await tap('KeyG'); await tap('KeyZ'); ok(sigOf(await E('__input.actions.slice()')) === '+a -a', 'rebind/new-key-works-and-the-old-one-is-gone', sigOf(await E('__input.actions.slice()'))); }
+        { await E('__input.actions.length = 0'); await E('document.activeElement.blur()'); await tap('KeyG'); await tap('KeyM'); ok(sigOf(await E('__input.actions.slice()')) === '+a -a', 'rebind/new-key-works-and-the-old-one-is-gone', sigOf(await E('__input.actions.slice()'))); }
         ok((await E("JSON.parse(localStorage.getItem('arena.bindings')).keyboard.a[0]")) === 'KeyG', 'rebind/persisted-to-localStorage-arena-bindings');
         // a reserved key during capture is refused with a message and capture keeps waiting
         await E("document.querySelector('[data-fk=\"kb-y-0\"]').scrollIntoView({ block: 'center' }); document.querySelector('[data-fk=\"kb-y-0\"]').click()"); await sleep(80); await tap('F5'); await sleep(60);
@@ -1231,14 +1263,14 @@ async function browserSuite() {
         await tap('Escape'); await sleep(80); ok((await E('__input.input.capturing')) === false && (await E('__input.input.bindings.get().keyboard.y.join()')) === 'KeyV', 'rebind/escape-cancels-and-changes-nothing');
         // conflict: bind B's first key to G (already A) -> a warning with Swap / Use it here / Cancel; Swap trades them
         await E("document.querySelector('[data-fk=\"kb-b-0\"]').scrollIntoView({ block: 'center' }); document.querySelector('[data-fk=\"kb-b-0\"]').click()"); await sleep(80); await tap('KeyG'); await sleep(120);
-        ok((await E("!!document.querySelector('[data-ip=conflict]')")) === true && (await E('__input.input.bindings.get().keyboard.b[0]')) === 'KeyX', 'rebind/conflict-is-reported-and-nothing-changed', await E("document.querySelector('[data-ip=status]').textContent"));
-        { const sw = await center('[data-ip=swap]'); await click(sw.x, sw.y); await sleep(120); const k = await E('__input.input.bindings.get().keyboard'); ok(k.b[0] === 'KeyG' && k.a[0] === 'KeyX' && !(await E("!!document.querySelector('[data-ip=conflict]')")), 'rebind/swap-trades-the-two-keys', { a: k.a, b: k.b }); }
+        ok((await E("!!document.querySelector('[data-ip=conflict]')")) === true && (await E('__input.input.bindings.get().keyboard.b[0]')) === 'KeyN', 'rebind/conflict-is-reported-and-nothing-changed', await E("document.querySelector('[data-ip=status]').textContent"));
+        { const sw = await center('[data-ip=swap]'); await click(sw.x, sw.y); await sleep(120); const k = await E('__input.input.bindings.get().keyboard'); ok(k.b[0] === 'KeyG' && k.a[0] === 'KeyN' && !(await E("!!document.querySelector('[data-ip=conflict]')")), 'rebind/swap-trades-the-two-keys', { a: k.a, b: k.b }); }
         // Reset keyboard: always reachable, restores the defaults and clears storage
-        { const rk = await center('[data-ip=reset-keyboard]'); await click(rk.x, rk.y); await sleep(120); ok((await E('__input.input.bindings.get().keyboard.a[0]')) === 'KeyZ' && (await E("localStorage.getItem('arena.bindings')")) === null, 'rebind/reset-keyboard-restores-defaults-and-clears-storage', await E("localStorage.getItem('arena.bindings')")); }
+        { const rk = await center('[data-ip=reset-keyboard]'); await click(rk.x, rk.y); await sleep(120); ok((await E('__input.input.bindings.get().keyboard.a[0]')) === 'KeyM' && (await E("localStorage.getItem('arena.bindings')")) === null, 'rebind/reset-keyboard-restores-defaults-and-clears-storage', await E("localStorage.getItem('arena.bindings')")); }
         // persistence across a RELOAD (real localStorage)
         await E("document.querySelector('[data-fk=\"kb-a-1\"]').scrollIntoView({ block: 'center' }); document.querySelector('[data-fk=\"kb-a-1\"]').click()"); await sleep(80); await tap('KeyJ'); await sleep(100);
-        ok((await E('__input.input.bindings.get().keyboard.a.join()')) === 'KeyZ,KeyJ,Space,NumpadEnter', 'rebind/second-slot-bound', await E('__input.input.bindings.get().keyboard.a.join()'));
-        await load('?mode=canvas'); ok((await E('__input.input.bindings.get().keyboard.a.join()')) === 'KeyZ,KeyJ,Space,NumpadEnter' && (await E('__input.input.bindings.status().status')) === 'loaded', 'rebind/survives-a-reload', await E('__input.input.bindings.status()'));
+        ok((await E('__input.input.bindings.get().keyboard.a.join()')) === 'KeyM,KeyJ,Enter,Space,NumpadEnter', 'rebind/second-slot-bound', await E('__input.input.bindings.get().keyboard.a.join()'));
+        await load('?mode=canvas'); ok((await E('__input.input.bindings.get().keyboard.a.join()')) === 'KeyM,KeyJ,Enter,Space,NumpadEnter' && (await E('__input.input.bindings.status().status')) === 'loaded', 'rebind/survives-a-reload', await E('__input.input.bindings.status()'));
         { await E('__input.actions.length = 0'); await tap('KeyJ'); ok(sigOf(await E('__input.actions.slice()')) === '+a -a', 'rebind/the-persisted-key-works-after-the-reload'); }
         { const rk = await center('[data-ip=reset-all]'); await click(rk.x, rk.y); await sleep(100); }
         // PAD-ONLY rebinding: reach the chip with the d-pad, A starts capture, the held A is NOT captured, the next button is
@@ -1262,7 +1294,7 @@ async function browserSuite() {
         await E('__synth.disconnect(0)');
         // hostile storage in a REAL browser: defaults, no errors; and with storage absent the layer still works
         await E("localStorage.setItem('arena.bindings', '{\"v\":1,\"keyboard\":{\"a\":\"nope\",\"__proto__\":{\"x\":1}},\"gamepad\":{\"layout\":42}}')"); await load('?mode=canvas');
-        ok((await E('__input.input.bindings.get().keyboard.a.join()')) === 'KeyZ,Enter,Space,NumpadEnter' && (await E('__input.input.bindings.status().status')) === 'repaired' && (await E('({}).x')) === undefined, 'rebind/hostile-localStorage-repaired-in-a-real-browser', await E('__input.input.bindings.status()'));
+        ok((await E('__input.input.bindings.get().keyboard.a.join()')) === 'KeyM,KeyZ,Enter,Space,NumpadEnter' && (await E('__input.input.bindings.status().status')) === 'repaired' && (await E('({}).x')) === undefined, 'rebind/hostile-localStorage-repaired-in-a-real-browser', await E('__input.input.bindings.status()'));
         await E("localStorage.setItem('arena.bindings', '{{{not json')"); await load('?mode=canvas'); ok((await E('__input.input.bindings.status().status')) === 'invalid' && (await E('__input.input.bindings.get().keyboard.up[0]')) === 'ArrowUp', 'rebind/garbage-localStorage-falls-back-in-a-real-browser');
         await E("localStorage.removeItem('arena.bindings')"); await load('?mode=canvas&storage=none');
         ok((await E('__input.input.bindings.status().status')) === 'absent' && (await E('__input.input.bindings.status().hasStorage')) === false, 'rebind/storage-absent-reports-so', await E('__input.input.bindings.status()'));
@@ -1316,11 +1348,11 @@ async function browserSuite() {
         { const r = await run(snip('hold-and-glyph').code); ok(r.ok, 'doc/hold-and-glyph-runs', r);
           ok((await E('window.__snip.speed()')) === 'normal', 'doc/hold-and-glyph-normal-speed-when-nothing-is-held');
           await kdown('KeyZ'); await sleep(60); const fast = await E('window.__snip.speed()'); await kup('KeyZ'); await sleep(60);
-          ok(fast === 'fast' && (await E('window.__snip.speed()')) === 'normal' && (await E('window.__snip.confirmHint()')) === 'Press Z to continue', 'doc/hold-and-glyph-holding-A-is-fast-and-the-glyph-is-Z', { fast, hint: await E('window.__snip.confirmHint()') }); }
+          ok(fast === 'fast' && (await E('window.__snip.speed()')) === 'normal' && (await E('window.__snip.confirmHint()')) === 'Press M to continue', 'doc/hold-and-glyph-holding-A-is-fast-and-the-glyph-is-M', { fast, hint: await E('window.__snip.confirmHint()') }); }
         // 6. rebinding from code
         { const r = await run(snip('rebind-api').code); ok(r.ok, 'doc/rebind-api-runs', r);
           const rr = await E('window.__snip.r'); ok(rr[0].ok === true && rr[1].ok === false && rr[1].reason === 'conflict' && rr[1].conflicts.join() === 'a' && rr[2].ok === true, 'doc/rebind-api-results-are-what-the-comments-say', rr);
-          ok((await E('window.__snip.input.bindings.get().keyboard.a[0]')) === 'KeyZ' && (await E("localStorage.getItem('arena.bindings')")) === null, 'doc/rebind-api-reset-restores-defaults-and-clears-storage'); }
+          ok((await E('window.__snip.input.bindings.get().keyboard.a[0]')) === 'KeyM' && (await E("localStorage.getItem('arena.bindings')")) === null, 'doc/rebind-api-reset-restores-defaults-and-clears-storage'); }
       }
 
       /* ===================================================================================== group: shots */
@@ -1398,6 +1430,14 @@ const MUTANTS = [
   U('storage-list-cap-removed', IN, 'if (!Array.isArray(list) || list.length > MAX_LIST || !list.every(isBindableKey) ||', 'if (!Array.isArray(list) || !list.every(isBindableKey) ||', 'storage/oversized-list-rejected'),
   U('storage-version-check-removed', IN, "if (doc.v !== SCHEMA_VERSION) return bad('unknown version');", '', 'storage/wrong-version-falls-back'),
   U('glyph-ignores-source', IN, 'const src = source || lastSource;', "const src = 'keyboard';", 'glyph/mouse-and-touch'),
+  // M = A, N = B (the TRAINER contract's decision 6)
+  U('keys-m-not-a', IN, "a: Object.freeze(['KeyM', 'KeyZ',", "a: Object.freeze(['KeyZ',", 'keys/m-is-a-and-n-is-b'),
+  U('keys-n-not-b', IN, "b: Object.freeze(['KeyN', 'KeyX',", "b: Object.freeze(['KeyX',", 'keys/m-is-a-and-n-is-b'),
+  U('keys-m-n-after-z-x', IN, "a: Object.freeze(['KeyM', 'KeyZ', 'Enter', 'Space', 'NumpadEnter']), b: Object.freeze(['KeyN', 'KeyX',", "a: Object.freeze(['KeyZ', 'KeyM', 'Enter', 'Space', 'NumpadEnter']), b: Object.freeze(['KeyX', 'KeyN',", 'keys/m-and-n-come-first-so-every-hint-names-them'),
+  U('keys-z-dropped', IN, "a: Object.freeze(['KeyM', 'KeyZ', 'Enter',", "a: Object.freeze(['KeyM', 'Enter',", 'keys/z-x-enter-escape-space-backspace-stay-alternates'),
+  U('keys-mute-key-is-m', IN, "export const MUTE_KEY = 'KeyO';", "export const MUTE_KEY = 'KeyM';", 'keys/the-mute-key-is-in-no-default-binding'),
+  U('keys-claimed-default-kept', IN, 'const l = DEFAULT_KEYS[a].filter((c) => !claimedKey(c, a));', 'const l = DEFAULT_KEYS[a].slice();', 'keys/a-default-key-the-player-gave-another-action-stays-theirs'),
+  U('keys-claimed-empties-an-action', IN, 'return l.length ? l : DEFAULT_KEYS[a]; };', 'return l; };', 'keys/an-action-whose-every-default-is-taken-keeps-them'),
   U('destroy-leaks-keyup-listener', IN, "listen(win, 'keyup', onKeyUp, { capture: true });", "if (win) win.addEventListener('keyup', onKeyUp, { capture: true });", 'destroy/removes-every-listener'),
   U('conflict-detection-off', IN, 'for (const a of ACTIONS) if (a !== action && listOf(device, a).includes(value)) out.push(a);', 'void 0;', 'rebind/conflict-detected'),
   U('reserved-tab-bindable', IN, "const RESERVED_CODES = new Set(['Tab', ", 'const RESERVED_CODES = new Set([', 'rebind/reserved-keys-refused'),

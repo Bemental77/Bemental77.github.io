@@ -173,7 +173,7 @@ const MAIN_ITEMS = Object.freeze([
   { id: 'record', label: 'RECORD', help: ['Wins, streaks, best hits, favourites', 'and your last battles, by trainer.'] },
   { id: 'import', label: 'IMPORT SAVE', help: ['Bring Pokemon from your own', 'SoulGold save file. It stays here.'] },
   { id: 'controls', label: 'CONTROLS', help: ['Mouse, keyboard, controller and', 'touch all work. Change the keys here.'] },
-  { id: 'sound', label: 'SOUND', help: ['Volume, music, effects, soundtrack.', 'The M key mutes on any page.'] },
+  { id: 'sound', label: 'SOUND', help: ['Volume, music, effects, soundtrack.', 'The O key mutes on any page.'] },
   { id: 'about', label: 'ABOUT', help: ['How the Arena works, and where your', 'profile and teams are kept.'] },
 ]);
 export const MAIN_LABELS = Object.freeze(MAIN_ITEMS.map((i) => i.label));
