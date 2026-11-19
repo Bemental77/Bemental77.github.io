@@ -144,7 +144,7 @@ async function runChecks(dir, groups) {
     });
     await t('A. a screen that closes takes its text entry and its pop-up with it', async () => {
       const W = await seeded([{ mons: ['Pikachu'] }]);
-      await W.toRow('new'); await W.press('a');
+      await W.press('right'); await W.toPop('rename'); await W.press('a');          // (the trainer's RENAME: the list's own NEW TRAINER entry is gone, it is the trainer app's screens now)
       const typing = W.hub.wantsText() && W.st().entry !== null;
       await W.arrive('main'); const gone = W.st().entry === null; await W.goto('builder');
       const closed = !W.hub.wantsText() && !W.view().entry;
@@ -230,15 +230,20 @@ async function runChecks(dir, groups) {
       const W = await mk(); await W.open();
       return W.path() === 'builder' && J(W.rows().map((r) => r.id)) === J(['new', 'back']) && W.b().kind === 'trainers' && /No trainer yet/.test(msg(W)) && W.b().tag === null && W.st().phase === 'ready';
     }, async () => 'x');
-    await t('B. NEW TRAINER opens the text entry (ten characters, the name keys), and the name typed makes a profile in the STORE, makes it the active one and shows its teams', async () => {
-      const W = await mk(); await W.open(); await W.press('a');
-      const e = W.view().entry, wants = W.hub.wantsText();
-      await W.type('WWWWWWWWWWWW'); const cut = W.view().entry.value;
-      for (let i = 0; i < 10; i++) await W.type({ key: 'backspace' });
-      await W.enter('Ash');
-      const list = await W.store.listProfiles(), act = await W.store.getActiveId();
-      return wants && e.max === 10 && e.charset === 'name' && e.title === 'TRAINER NAME?' && cut === 'WWWWWWWWWW' && list.length === 1 && list[0].trainerName === 'Ash' && act === list[0].id
-        && W.path() === 'builder-teams' && /Profile created/.test(msg(W)) && W.profile().trainerName === 'Ash' && J(W.hub.trail()) === J(['builder', 'builder-teams']);
+    await t('B. NEW TRAINER opens the trainer app\'s NEW TRAINER screens (trainer-new) on top of the list, with no text entry of the builder\'s own and nothing asked of the store; B there comes back to the list', async () => {
+      const W = await mk(); await W.open(); const fx = await W.press('a');
+      const opened = W.path() === 'trainer-new' && J(W.hub.trail()) === J(['builder', 'trainer-new']) && W.view().app === 'trainer' && !W.st().entry && fx.every((e) => e.app !== 'builder' || e.type !== 'profile-create');
+      W.run(W.hub.back()); await W.idle();
+      return opened && W.path() === 'builder' && W.b().kind === 'trainers' && (await W.store.listProfiles()).length === 0;
+    }, async () => 'x');
+    await t('B. a trainer made while the builder is open (by the NEW TRAINER screens, or in another tab) is picked up at the next data refresh: the list reads it, it is the ACTIVE one, and it is open', async () => {
+      const W = await seeded([{ mons: ['Pikachu'] }]);
+      const red = W.profile().id, made = await W.store.createProfile({ trainerName: 'ASH' }); await W.store.setActiveId(made.id);
+      await W.refreshData(); await W.idle();
+      const rs = W.b().list.rows, act = rs.find((r) => r.tag === 'ACTIVE');
+      const W2 = await seeded([{ mons: ['Pikachu'] }]); const before = W2.log.effects.length; await W2.refreshData(); await W2.idle();
+      const quiet = !W2.log.effects.slice(before).some((e) => e.app === 'builder' && e.type === 'sync') && W2.profile().trainerName === 'RED';
+      return W.path() === 'builder' && W.profile().id === made.id && W.profile().trainerName === 'ASH' && act && act.pid === made.id && rs.some((r) => r.pid === red) && quiet;
     }, async () => 'x');
     await t('B. the profile being edited is marked ACTIVE; A on it shows its teams with no store call; A on another trainer asks the ctl to open it (flush, load, make it active)', async () => {
       const W = await mk(); const blue = await seed(W.store, W.deps, 'BLUE', [{ mons: ['Gengar'] }]); const red = await seed(W.store, W.deps, 'RED', [{ mons: ['Pikachu'] }, {}]);
@@ -749,9 +754,8 @@ async function runChecks(dir, groups) {
     await t('G. storage that could not be opened: the builder says so and edits nothing; a store that keeps nothing: the tag reads NOT SAVED and a notice says the work lives in memory', async () => {
       const W = await mk({ noStore: true }); await W.goto('builder');
       const a = W.st().phase === 'nostore' && /Storage could not be opened/.test(msg(W)) && W.b().kind === 'wait'; await W.press('a'); await W.press('b');
-      const V = await mk({ durable: false }); await V.open();
+      const V = await mk({ durable: false }); await seed(V.store, V.deps, 'Ash'); await V.open();
       const d = V.hub.view().dialog; for (let i = 0; i < 40; i++) V.run(V.hub.tick()); await V.press('a'); await V.press('a'); await V.press('a');
-      await V.press('a'); await V.enter('Ash');
       return a && W.path() === 'main' && d && d.id === 'builder:not-kept' && /not keeping your profiles/.test(d.lines.join(' ')) && V.profile() && V.st().tag === 'NOT SAVED' && /Not saved\./.test(V.hub.speak(V.view()));
     }, async () => 'x');
     await t('G. the kit makes every ROM string drawable: all ' + pack.items.length + ' item names and descriptions, every ability line, species, move and nature name measure in the ROM font without a throw and without a character lost to "?" (the raw strings do throw)', async () => {
@@ -1263,7 +1267,7 @@ async function catalogue(dir) {
   const slot = async (W, i) => { const r = W.hub.rects()[i]; W.run(W.hub.pointer({ kind: 'move', x: r.x + 40, y: r.y + 8 })); };
   const mk = (o) => makeWorld({ dir, ...(o || {}) });
   const W0 = await mk(); W0.hub.goto('builder'); add('wait boot', W0);
-  const W1 = await mk(); await W1.open(); add('trainers none', W1); await W1.press('a'); add('new trainer entry', W1);
+  const W1 = await mk(); await W1.open(); add('trainers none', W1);
   const W = await mk();
   await seed(W.store, W.deps, 'BLUE', [{ mons: ['Gengar'] }]);
   await seed(W.store, W.deps, 'RED', [{ name: 'KANTO', mons: ['Pikachu', 'Charizard', 'Snorlax', 'Gengar', 'Mewtwo', 'Lapras'] }, { name: 'CHAMPS', then: CHAMP, mons: ['Pikachu', 'Sandy Shocks'] }, { name: 'EMPTY' }]);
@@ -1596,6 +1600,11 @@ const MUTANTS = [
   { group: 'A', file: 'builder_hub.js', name: 'a screen whose team is gone is shown anyway', find: "      if (!team()) return 'builder-teams';\n", replace: '', expect: 'whose team is gone' },
   { group: 'A', file: 'builder_hub.js', name: 'a screen whose Pokemon is gone is shown anyway', find: "      if (d.need === 'mon' && !mon()) return 'builder-team';\n", replace: '', expect: 'whose team is gone' },
   { group: 'A', file: 'builder_hub.js', name: 'a closed screen keeps its text entry', find: "      entry.close(); popup.close();                                     // a screen that closes", replace: "      popup.close();                                     // a screen that closes", expect: 'takes its text entry and its pop-up with it' },
+  // ---- ONE way to make a trainer (INAPP.md TRAINER decision 4): NEW TRAINER is the trainer app's screens; the builder follows a trainer made there
+  { group: 'B', file: 'builder_home.js', name: 'NEW TRAINER opens nothing', find: "const newTrainer = () => X.go('trainer-new');", replace: 'const newTrainer = () => [];', expect: 'NEW TRAINER opens the trainer app' },
+  { group: 'B', file: 'builder_hub.js', name: 'a data refresh never asks the ctl to follow a trainer made elsewhere', find: "return fresh || moved ? [{ app: ID, type: 'sync' }] : [];", replace: 'return [];', expect: 'a trainer made while the builder is open' },
+  { group: 'B', file: 'builder_hub.js', name: 'every data refresh asks the ctl to follow (a refresh after the builder\'s own save would reload the profile)', find: "return fresh || moved ? [{ app: ID, type: 'sync' }] : [];", replace: "return [{ app: ID, type: 'sync' }];", expect: 'a trainer made while the builder is open' },
+  { group: 'B', file: 'builder_ctl.js', name: 'the sync reads the list but does not open the active trainer', find: "if (active && (!S || S.profile.id !== active) && list.some((t) => t.id === active && !t.unreadable)) {", replace: 'if (false) {', expect: 'a trainer made while the builder is open' },
   { group: 'A', file: 'builder_hub.js', name: 'a closed screen keeps its question', find: "      for (const id of asks.keys()) ctx.dialog.close(id);\n", replace: '', expect: 'leaving closes the builder\'s own question' },
   { group: 'A', file: 'builder_hub.js', name: 'A acts under an unread note', find: 'if (m.first && m.page < m.pages.length - 1) { S.pager = { key: m.key, page: m.page + 1 }; return out([]); }', replace: '', expect: 'A reads a long note to its end' },
   { group: 'A', file: 'builder_hub.js', name: 'the list under a pop-up hears the presses', find: 'const pfx = popup.press(action); if (pfx) { dropStale(); return out(pfx); }', replace: 'popup.press(action);', expect: 'a pop-up menu takes every press' },
@@ -1678,7 +1687,6 @@ const MUTANTS = [
   { group: 'G', file: 'builder_ctl.js', name: 'the focus of another profile is put back', find: "if (at && S && at.profileId === S.profile.id) app.setFocus(at);", replace: '', expect: 'the focus is kept for the tab' },
   { group: 'G', file: 'builder_ctl.js', name: 'a store that keeps nothing is not said', find: "if (store.status.notSaved && !warned && dialog()) {", replace: 'if (false) {', expect: 'a notice says the work lives in memory' },
   { group: 'B', file: 'builder_ctl.js', name: 'a deleted trainer stays loaded', find: "closeQuestions(); app.setEditor(null); }\n      await store.deleteProfile(id);", replace: 'closeQuestions(); }\n      await store.deleteProfile(id);', expect: 'leaves no one ACTIVE' },
-  { group: 'B', file: 'builder_ctl.js', name: 'a new profile is not opened', find: "if (r.ok) { app.note('Profile created.'); run(app.showTeams()); } else app.note(r.message, true);", replace: "if (r.ok) { app.note('Profile created.'); } else app.note(r.message, true);", expect: 'makes a profile in the STORE' },
   // ---- stage 2: the MOVES tab and the move picker
   { group: 'H', file: 'builder_moves.js', name: 'an empty slot does not open the picker', find: "if (r.row.empty) return openPicker(mon().moves.length);", replace: 'if (r.row.empty) return [];', expect: 'A on the first empty slot opens the move picker' },
   { group: 'H', file: 'builder_moves.js', name: 'a "-" slot asks for a slot the reducer would refuse', find: "if (r.row.empty) return openPicker(mon().moves.length);", replace: 'if (r.row.empty) return openPicker(r.row.slot);', expect: 'A on the first empty slot opens the move picker' },

@@ -33,7 +33,9 @@
 // EFFECTS (app: 'builder', carried out by builder_ctl.js)
 //   { type: 'opened', path, at, profileId }     a nested builder screen opened, or the Pokemon screen's tab changed (the ctl keeps the focus for this tab, so a reload comes back to the same team)
 //   { type: 'edited' }                           the reducer committed an edit: schedule the autosave
-//   { type: 'profile-create', name } / 'profile-open', id / 'profile-rename', id, name / 'profile-delete', id     the trainer list's actions (the store's, so the ctl's)
+//   { type: 'profile-open', id } / 'profile-rename', id, name / 'profile-delete', id     the trainer list's actions (the store's, so the ctl's). NEW TRAINER is the trainer app's screens (trainer-new)
+//   { type: 'sync' }                             a data refresh while a builder screen is open brought a trainer the list does not know (made by the NEW TRAINER screens, or in another tab), or a
+//                                                different ACTIVE one: the ctl reads the list again and opens the store's active trainer
 //   { type: 'pref', key, value }                 a per-viewer preference changed (the species picker's sort, the STATS tab's EVs / points view)
 //   { type: 'code-length', teamId } / 'code-copy', teamId / 'code-paste' / 'code-decode', text     the team code (builder_io.js): the ctl makes it, copies it, reads the clipboard, decodes, and
 //                                                answers with tell('builder-code', ...)
@@ -312,7 +314,13 @@ function createBuilderHub(ctx, reg) {
     },
     rects(path) { return entry.isOpen() ? entry.rects() : popup.isOpen() ? popup.rects() : S.phase === 'ready' && !target(path) ? screens[path].rects() : []; },
     tick(path, held) { const s = screens[path]; return s && typeof s.tick === 'function' && S.phase === 'ready' ? out(s.tick(held)) : []; },
-    onData() { return []; },
+    // (a trainer made by the NEW TRAINER screens the list opened, or in another tab, reaches the builder here: the ctl reads the list again and opens the store's active trainer)
+    onData() {
+      if (S.phase !== 'ready' || !reg.paths.includes(ctx.path()) || !S.trainers) return [];
+      const ids = ctx.profiles().map((p) => p.id), known = S.trainers.map((t) => t.id), want = ctx.activeId();
+      const fresh = ids.some((id) => !known.includes(id)), moved = !!want && ids.includes(want) && !!S.ed && S.ed.profile.id !== want;
+      return fresh || moved ? [{ app: ID, type: 'sync' }] : [];
+    },
     onDialog(id, value) { const fn = asks.get(id); if (!fn) return []; asks.delete(id); S.input++; return out(fn(value)); },
     wantsText: () => entry.isOpen(),
     type: (_path, input) => { S.input++; return out(entry.type(input) || []); },

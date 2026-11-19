@@ -23,7 +23,9 @@
 //              which it is once the screen has said its length): some browsers allow the clipboard only there. What was pasted or entered is decoded and judged (kit.decodeCode) and
 //              handed to the screen
 //   THE TEST   the test battle: flush, the codes of the team (and of the other team when one was chosen), then the battle page at editor_links.js battleUrl with a fresh seed
-// The trainer list's actions (make, open, rename another, delete a profile) are the store's, so they arrive here as effects. The tab's focus (which team / Pokemon / tab) is kept in
+// The trainer list's actions (open, rename another, delete a profile) are the store's, so they arrive here as effects. A trainer is MADE by the trainer app's NEW TRAINER screens
+// (INAPP.md TRAINER decision 4); when the hub's data then shows one the list does not know, or a different active one, the model asks for a SYNC: the list is read again and the store's
+// active trainer opened (so the player who comes back from those screens finds the trainer they made, ACTIVE). The tab's focus (which team / Pokemon / tab) is kept in
 // sessionStorage so a reload comes back to it; the species picker's sort and the STATS tab's EVs / points view are kept in localStorage under the DOM editor's keys.
 //
 // Test hook: env.hook.builder = { flush(), idle(), state(), kit() }. env.clipboard (tests) stands in for navigator.clipboard.
@@ -169,18 +171,18 @@ export function createCtl(env) {
     const max = kit.LIMITS.trainerName, why = kit.textIssue(name, max);
     return why === 'length' ? 'At most ' + max + ' characters.' : why === 'chars' ? 'Braces and control characters are not allowed.' : why ? 'That name uses a character the game font cannot draw.' : null;
   }
-  async function createProfile(name) {
-    if (!store) return;
-    const bad = nameProblem(name);
-    if (bad) { app.note(bad, true); redraw(); return; }
-    try {
+  /** The hub's data changed under an open builder (a trainer made by the NEW TRAINER screens, another tab): read the list again and open the store's active trainer when it is not the one open. */
+  async function syncActive() {
+    if (!store || !inside) return;
+    const list = await refreshTrainers();
+    let active = null; try { active = await store.getActiveId(); } catch (_e) { active = null; }
+    const S = app.editor();
+    if (active && (!S || S.profile.id !== active) && list.some((t) => t.id === active && !t.unreadable)) {
       await flush();
-      const saved = await store.createProfile({ trainerName: name });
-      const r = await loadInto(saved.id);
-      await refreshTrainers();
-      if (r.ok) { app.note('Profile created.'); run(app.showTeams()); } else app.note(r.message, true);
-    } catch (e) { app.note('Could not create the profile: ' + msgOf(e), true); }
-    sync(); tellHub();
+      const r = await loadInto(active);
+      if (!r.ok) app.note(r.message, true); else run(app.settle());
+    }
+    sync(); redraw();
   }
   async function openProfile(id) {
     if (!store) return;
@@ -365,7 +367,7 @@ export function createCtl(env) {
         case 'edited': if (conflict || stale) askConflict(); else scheduleSave(); sync(); return undefined;
         case 'opened': keepFocus(eff); return undefined;
         case 'pref': writePref(eff.key, eff.value); return undefined;
-        case 'profile-create': return serial(() => createProfile(eff.name));
+        case 'sync': return serial(syncActive);
         case 'profile-open': return serial(() => openProfile(eff.id));
         case 'profile-rename': return serial(() => renameProfile(eff.id, eff.name));
         case 'profile-delete': return serial(() => deleteProfile(eff.id));

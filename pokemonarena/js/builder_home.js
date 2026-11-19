@@ -1,12 +1,13 @@
 // pokemonarena/js/builder_home.js -- THE TEAM BUILDER, the HOME family: the two lists a player starts from.
 //
-//   builder         TRAINERS   every profile in this browser (the one being edited is marked ACTIVE), NEW TRAINER, BACK. A opens a trainer (switches to it and shows its teams); MENU
+//   builder         TRAINERS   every profile in this browser (the one being edited is marked ACTIVE), NEW TRAINER, BACK. A opens a trainer (switches to it and shows its teams); NEW TRAINER opens
+//                              the trainer app's NEW TRAINER screens (trainer-new: ONE way to make a trainer, INAPP.md TRAINER decision 4; B or the last step comes back here); MENU
 //                              (the chip, RIGHT, START or X) opens the trainer's menu: OPEN, RENAME, DELETE, and for the trainer being edited PORTRAIT, UNDO, REDO
 //   builder-teams   TEAMS      the trainer's teams (16 at most), NEW TEAM, IMPORT A CODE, UNDO, REDO, REMOVE UNUSED (only when the box holds Pokemon that are on no team), BACK. A opens a
 //                              team; MENU opens the team's menu: OPEN, RENAME, DUPLICATE, MOVE UP, MOVE DOWN, DELETE
 //
 // Pure ES module (browser + Node): no DOM, no ROM, no clock, no storage, no randomness. A screen of builder_hub.js (its header has the screen interface and what X is).
-// Team edits go through X.dispatch (the reducer); what touches the STORE (make, open, rename another, delete a profile) is an effect for builder_ctl.js.
+// Team edits go through X.dispatch (the reducer); what touches the STORE (open, rename another, delete a profile) is an effect for builder_ctl.js. A trainer is MADE by the trainer app.
 // REGISTRATION POINTS (X.ext): 'trainers.rows' (IMPORT PROFILE, IMPORT SAVE, DATA), 'trainers.menu' (PORTRAIT, UNDO, REDO; later EXPORT, IDENTITY KEY), 'teams.rows' (IMPORT A CODE, UNDO, REDO),
 // 'teams.menu'. An entry: builder_parts.js "AN EXTENSION ENTRY"; `target` is the trainer or the team the menu was opened on (null for a list's rows).
 
@@ -29,10 +30,8 @@ function trainersScreen(X) {
   const open = (id) => (id === X.activeId() ? X.go('builder-teams') : [X.eff('profile-open', { id })]);
   const nameMax = () => X.kit().LIMITS.trainerName;
 
-  function newTrainer() {
-    X.entry.open({ id: 'trainer', title: 'TRAINER NAME?', value: '', max: nameMax(), charset: 'name' }, (r) => (r.ok && r.value.trim() ? [X.eff('profile-create', { name: r.value.trim() })] : []));
-    return [];
-  }
+  // ONE WAY TO MAKE A TRAINER: the trainer app's NEW TRAINER screens, opened on top of this list (they come back here; the builder then opens the trainer made: builder_hub.js onData)
+  const newTrainer = () => X.go('trainer-new');
   function rename(t) {
     X.entry.open({ id: 'trainer', title: 'NEW NAME?', value: t.name, max: nameMax(), charset: 'name' }, (r) => {
       const name = r.ok ? r.value.trim() : '';
