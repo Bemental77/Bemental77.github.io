@@ -145,7 +145,7 @@ export function moveCursor(cur, n, cols, per, action, repeat) {
 /* ---------------------------------------------------------------------------------------------- the model */
 function createTrainerHub(ctx) {
   const S = {
-    choices: null, seed: 0, mascot: 25, storedLook: null, trainers: null,
+    choices: null, seed: 0, mascot: 25, mascotSet: false, storedLook: null, trainers: null,          // (mascotSet: the ctl said which; until then the welcome shows the hub's own)
     pending: null,            // what welcome() / begin() said, for the next enter('trainer-new')
     wiz: null,                // the new-trainer screens: { kind, mode, profileId, step, draft, cur, ret, auto, asked }
     edit: null,               // the one-choice editor: { field, profileId, i, draft, cur }
@@ -630,7 +630,7 @@ function createTrainerHub(ctx) {
   }
 
   /* -------------------------------------------------------------------------------------------- the view */
-  function screenView(path, tick) {
+  function screenView(path, tick, hubMascot) {
     if (path === 'trainer') {
       const t = active(), chips = cardChips(), focus = cardFocusNow();
       const card = t ? cardView(draftOf(t), recText(t), { readOnly: !!t.readOnly }) : null;
@@ -648,7 +648,8 @@ function createTrainerHub(ctx) {
     if (!step) return { v: { kind: 'wait', title: TITLES[path].toUpperCase(), line: '' }, msg: ['', ''] };
     if (step === 'welcome') {
       const w = S.wiz, own = welcomeAsk();
-      return { v: { kind: 'welcome', species: resolved(w.draft).partner, ask: own ? { options: WORDS.options.slice(), cursor: w.ask } : null }, msg: own ? [WORDS.askNow, WORDS.askKeys] : ['', ''] };
+      const seen = wizSeen(), species = isInt(seen.partner) ? seen.partner : S.mascotSet || !isInt(hubMascot) ? S.mascot : hubMascot;          // (the hub's mascot of the day until the ctl, which loads after the welcome opens, names it: no change of Pokemon under the player's eyes)
+      return { v: { kind: 'welcome', species, ask: own ? { options: WORDS.options.slice(), cursor: w.ask } : null }, msg: own ? [WORDS.askNow, WORDS.askKeys] : ['', ''] };
     }
     if (step === 'card') {
       const w = S.wiz, chips = confirmChips(), focus = w.cardFocus || 'yes';
@@ -672,7 +673,7 @@ function createTrainerHub(ctx) {
   }
 
   function view(path, base) {
-    const sv = screenView(path, base && base.tick);
+    const sv = screenView(path, base && base.tick, base && base.mascot ? base.mascot.species : null);
     const msg = S.saving ? WORDS.saving.slice() : S.flash ? S.flash.lines.slice() : sv.msg;
     return { ...base, screen: path, app: ID, mascot: null, menu: null, msg: [String(msg[0] || ''), String(msg[1] || '')], trainer: { ...sv.v, bad: !!(S.flash && S.flash.bad) && !S.saving }, entry: entry.view() };
   }
@@ -749,7 +750,7 @@ function createTrainerHub(ctx) {
       };
     },
     setSeed(n) { if (Number.isFinite(n)) S.seed = Math.abs(Math.floor(n)) >>> 0; },
-    setMascot(id) { if (isInt(id) && id > 0) S.mascot = id; },
+    setMascot(id) { if (isInt(id) && id > 0) { S.mascot = id; S.mascotSet = true; } },
     setStoredLook(code) { S.storedLook = typeof code === 'string' && lookId(code) !== null ? code : null; },
     setTrainers(d) {
       if (!d || !Array.isArray(d.list)) { S.trainers = null; return; }
