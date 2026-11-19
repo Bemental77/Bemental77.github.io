@@ -174,7 +174,7 @@ const GROUPS = {
       // a fresh visit: the main menu, the name and the partner, no greeting
       await openHub(page, base);
       await sleep(300);
-      const m = await page.eval(`({ path: ${H}.model.path(), plan: ${H}.welcome && ${H}.welcome.plan, name: ${H}.view().trainer, mascot: ${H}.view().mascot.species })`);
+      const m = await page.eval(`({ path: ${H}.model.path(), plan: ${H}.welcome && ${H}.welcome.plan, name: ${H}.view().trainer, mascot: (${H}.view().mascot || {}).species })`);
       ok(m.path === 'main' && m.plan === null, 'E5a the next visit lands on the MAIN MENU and nothing is asked', J(m));
       ok(m.name === 'Casey' && m.mascot === p.card.partner, 'E5 the main menu names the trainer and the PARTNER stands where the day\'s mascot stood', J({ m, partner: p.card && p.card.partner }));
       const menuControls = await controls(page);
