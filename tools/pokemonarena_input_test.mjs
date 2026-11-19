@@ -894,7 +894,7 @@ async function browserSuite() {
         }
         ok(bad.length === 0, 'browser-keyboard/every-default-binding-via-real-key-events', bad.join(' | '));
         const dp = await E('window.__dp');
-        ok(dp.filter(([c]) => c !== 'Tab').every(([, p]) => p === true) && dp.length === 23, 'browser-keyboard/consumed-keys-are-prevented-on-a-non-text-target', { n: dp.length, unprevented: dp.filter(([, p]) => !p), codes: dp.map(([c]) => c).join(',') });
+        ok(dp.filter(([c]) => c !== 'Tab').every(([, p]) => p === true) && dp.length === 25, 'browser-keyboard/consumed-keys-are-prevented-on-a-non-text-target', { n: dp.length, unprevented: dp.filter(([, p]) => !p), codes: dp.map(([c]) => c).join(',') });
         const m0 = await mark(); await tap('KeyG'); await tap('Digit1'); ok((await since(m0)).length === 0, 'browser-keyboard/unbound-keys-do-nothing');
         // OS auto-repeat (a real autoRepeat:true key event) does not drive anything; our own repeat starts at ~400 ms and runs at ~90 ms
         await E('__input.actions.length = 0');
