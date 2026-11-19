@@ -1502,3 +1502,66 @@ phone-only runs, and ten whole phone battles of the scratch probe (worst wait of
 ```bash
 node tools/pokemonarena_anim_scene_test.mjs     # 133 passed, 72/72 mutants killed (two new: SYSTEM/opening A)
 ```
+
+## TRAINER: the new-trainer screens, the trainer card, N / M (contract, 2026-11-18)
+
+The owner: "when a person navigates to the page, they are greeted with the pokemon arena app and asked to create a profile - we need an entire profile creation suite, avatar, battle
+figure, nick name, everything - everything needs to be seamless and within the pokemon arena app. controls can be updated for keyboard with n/m for ergonomics." Both rules at the top of
+this file hold: ROM art only, everything inside the 240x160 picture.
+
+### Decisions already made (do not reopen)
+
+1. **A first visit is greeted in the picture.** When the hub page is up, its data is `ready`, the open screen is `main`, and either the browser holds NO profile or the ACTIVE profile's card
+   is not `made`, the hub opens the NEW TRAINER screens (`trainer-new`) by itself. A profile from before schema 6 is offered the same screens PRE-FILLED ("welcome back"), keeping its name,
+   portrait, teams and record. The player may say LATER: remembered for the tab (`sessionStorage['arena.welcome'] = 'later'`), asked again on the next visit. Storage that is unavailable or
+   not kept (`notSaved`) never opens it (nothing could be saved). A page opened at any other address (an invite link `#online`, `#center`, `#builder` ...) is not interrupted.
+2. **The test rigs' switch:** `localStorage['arena.welcome'] === 'off'` stops the automatic opening (nothing else changes; the TRAINER CARD row and every screen still work). `tools/headless_cdp.mjs`
+   seeds it for `/pokemonarena/` pages unless `withBrowser({ welcome: true })`, so the suites written before this feature keep starting on the main menu. A player never sets it.
+3. **What a trainer chooses:** NAME (`profile.trainerName`, the in-picture keyboard, `charset: 'name'`, max 10; the ROM-style preset names are offered beside NEW NAME), LOOK (the Trainer Center's
+   walking sprite: `card.look`, a `center_look.js` code over `world.ow.avatars`), BATTLE FIGURE (`card.front`: a ROM trainer front picture from `trainer_figures.js frontChoices`, what OTHER
+   players see in an online battle and on the card; `card.back`: a ROM trainer back picture from `backChoices`, what the player sees from behind in their own battles), PORTRAIT
+   (`profile.avatar`, the ROM's 52 trainer heads, as the Team Builder's PORTRAIT), PARTNER (`card.partner`: a favourite Pokemon species; the hub's title screen shows it instead of the day's
+   mascot). Every step opens on a sensible default, so A, A, A ... makes a trainer; the last step shows the TRAINER CARD and asks to confirm.
+4. **One way to make a trainer.** The Team Builder's NEW TRAINER opens the same screens (`go('trainer-new')`) and comes back to the builder. The main menu gets a TRAINER CARD row (`trainer`):
+   the card of the active trainer, and from it every choice again (each opens its own step alone and comes back), SWITCH TRAINER (several profiles), NEW TRAINER.
+5. **The look is the trainer's.** `card.look` is the source of truth for the active trainer; `localStorage['arena.avatar']` (`center_look.js LOOK_KEY`) stays as the copy the Trainer Center
+   reads, and both are written together (the new-trainer screens, the card, and the Center's own LOOK).
+6. **Keyboard: M = A, N = B** (the site's GBA page has the same layout: `gba/gbaWasm/dist/input_controller.js` Mapping_Action_A 'm', Mapping_Action_B 'n'; B on the left of A as on the
+   console). They come FIRST in `input.js DEFAULT_KEYS` so every on-screen hint names them (`glyph`); Z / X, Enter / Space and Backspace / Escape stay as alternates. The M key is no longer
+   the mute shortcut.
+
+### The data: profile schema 6 (`js/trainer_card.js`, written with this section)
+
+```js
+profile.card = { made: false, look: null, front: null, back: null, partner: null }    // trainer_card.js header: the meaning and the shape of each key
+import { emptyCard, cardIssues, repairCard, checkCardPatch, cardOf, isMade, CARD_KEYS } from './trainer_card.js';
+```
+`MIGRATIONS[5]` adds `emptyCard()` to every profile (pure, idempotent); `checkProfile` adds `cardIssues` under the code `profile.card`; normalize repairs with `repairCard` and keeps unknown
+card keys in `card._unknown`; export / import / merge carry it. `cardOf(profile)` is how every reader reads it (an older document reads as the empty card).
+
+### The figures: `js/trainer_figures.js` (written with this section)
+
+`frontChoices(rom) -> [{ pic, trainerId, cls }]` (81 in this ROM), `trainerForFront(rom, pic) -> id | 0`, `backChoices(rom) -> [0, 1]`, `FRONT_EXCLUDE`, `FIGURE_DEFAULT`. Draw a front with
+`speciesgfx.js trainerFront(rom, pic)`, a back with `trainerBack(rom, i)` (first frame), a head with `trainerHead(rom, i)`.
+
+### The tracks
+
+| Track | Branch / worktree | Ports (server / CDP base) | Builds |
+|---|---|---|---|
+| SCHEMA | `prof-schema` / `C:/Users/Admin/Dev/wt-prof-schema` | 8141 / 9341 | profile schema 6 + its save API for the app (`js/trainer_store.js`) + every test that pinned schema 5 |
+| APP | `prof-app` / `C:/Users/Admin/Dev/wt-prof-app` | 8181 / 9381 | the hub app `trainer` (the new-trainer screens + the card), the first-visit opening, the menu row, the partner mascot, the builder's NEW TRAINER, the Center's LOOK writing the card, the `headless_cdp.mjs` seed |
+| KEYS | `prof-keys` / `C:/Users/Admin/Dev/wt-prof-keys` | 8221 / 9421 | M = A, N = B, the mute shortcut moved, every hint / doc / test that names the old keys |
+| BATTLE | `prof-battle` / `C:/Users/Admin/Dev/wt-prof-battle` | 8261 / 9461 | the battle page shows the trainer: their name in the battle's text, their back figure, and an online opponent's front figure; `backChoices` beyond [0, 1] if the ROM's code really draws them |
+
+### Who may edit what (anything not in your row: smallest hunk, listed in your report as `foreignHunks`)
+
+| Files | Owner |
+|---|---|
+| `js/profile.js`, `js/store.js`, `js/hub_data.js` (add `card` + `avatar` to each profile summary), `js/editor_state.js` (a `card` action for the builder's reducer), new `js/trainer_store.js`, `js/trainer_card.js` (bug fixes only), `tools/fixtures/pokemonarena/*` (new v6 fixtures; old ones stay), every test that pins schema 5, new `tools/pokemonarena_trainer_card_test.mjs` | SCHEMA |
+| new `js/trainer_hub.js`, `js/trainer_screen.js`, `js/trainer_ctl.js`, any new `js/trainer_*.js` except the two above; one line each in `js/hub_apps.js`, `js/hub_app_screens.js`, `js/hub_app_ctls.js`; `js/hub_model.js` (the row, the mascot), `js/hub_screen.js`, `js/boot.js` (the smallest hunks), `js/builder_home.js` / `js/builder_hub.js` (NEW TRAINER), `js/center_ctl.js` / `js/center_hub.js` (LOOK writes the card), `trainer_figures.js` `FRONT_EXCLUDE` only, `tools/headless_cdp.mjs` (the seed), `hub.golden.json`, new `tools/pokemonarena_trainer_test.mjs` + `tools/pokemonarena_trainer_page_test.mjs`, the hub / journey / builder tests where a row moved | APP |
+| `js/input.js`, `js/sound_system.js` (the mute key), `js/controls_dialog.js`, `js/input_panel.js`, `js/hints.js`, every hint text that names a key, `INPUT.md`, `tools/pokemonarena_input*.mjs` and every test that pins a default key | KEYS |
+| `js/battle_boot.js`, `js/scene.js` / `js/anim_sys.js` (the player's back figure, a foe trainer id handed in), `js/online.js` / `js/online_match.js` (the figure in the hello), `js/netmatch.js` (ONLY an optional `fig` in the hello, old peers unaffected), `trainer_figures.js` `backChoices` only, the battle-page tests | BATTLE |
+| `README.md`, `INAPP.md` | everybody, ADD-ONLY: one section `### <TRACK>: as built` at the end of this section |
+
+Every working rule of "Working rules that are the same for every track" above holds (LF, pathspec commits, `git ls-files | wc -l`, nothing ROM-derived committed, headless muted Chrome
+through `tools/headless_cdp.mjs` only, ONE browser suite of yours at a time and only above 3500 MB free, a named check and a source mutant for every new guard, never push, never `git stash`).
