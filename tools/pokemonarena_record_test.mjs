@@ -176,7 +176,7 @@ async function suite(M) {
 
   await blk('model-basic', async () => {
     let m = mk(data2());
-    const e = key(m, 'down', 'down', 'down', 'down', 'down', 'a');                  // QUICK, TEAM, PLAY ONLINE, TOWER, TEAM BUILDER, then RECORD (the sixth row since the apps joined the menu)
+    const e = key(m, 'down', 'down', 'down', 'down', 'down', 'down', 'a');          // QUICK, TEAM, PLAY ONLINE, TOWER, TEAM BUILDER, TRAINER CARD, then RECORD (the seventh row since the TRAINER CARD joined after TEAM BUILDER; the sixth since the apps joined the menu)
     add('model/the-main-menu-row-RECORD-opens-the-record-screen-and-mirrors-it-into-history', m.path() === 'record' && J(e) === J([{ type: 'screen', path: 'record' }]) && m.view().screen === 'record' ? true : J(e));
     add('model/it-opens-on-the-active-profile-page-1', R(m).trainer.name === 'RED' && R(m).index === 0 && R(m).count === 7 && R(m).page.title === 'OVERALL' ? true : J(R(m).trainer));
     add('model/the-view-is-plain-JSON-and-has-no-menu', J(JSON.parse(J(m.view()))) === J(m.view()) && m.view().menu === null && m.view().msg === null ? true : 'x');
@@ -205,7 +205,7 @@ async function suite(M) {
     add('model/DOWN puts the cursor back on the page: right turns the page again', R(m).focus === 'page' && R(m).index === 1 ? true : J([R(m).focus, R(m).index]));
     add('model/the trainer chosen here is remembered by the model', m.recordState().profileId === 'p1' ? true : J(m.recordState()));
     key(m, 'b');
-    add('model/B goes back to the main menu with the cursor on RECORD', m.path() === 'main' && m.view().menu.cursor === 5 && m.view().menu.rows[5].id === 'record' ? true : m.path());
+    add('model/B goes back to the main menu with the cursor on RECORD', m.path() === 'main' && m.view().menu.cursor === 6 && m.view().menu.rows[6].id === 'record' ? true : m.path());
     // one profile: up / down turn pages
     m = mk(data1()); m.goto('record');
     key(m, 'down', 'down');
@@ -270,7 +270,7 @@ async function suite(M) {
       add('model/the reset effect names the trainer on screen (BLUE = p2), not the first one', ef2.length === 1 && ef2[0].type === 'record-reset' && ef2[0].profileId === 'p2' ? true : J(ef2));
     }
     add('model/the win rate on OVERALL rounds half up (2 of 3 is 67%)', (() => { const q = mk({ state: 'ready', activeId: 'p1', profiles: [{ id: 'p1', name: 'RED', teams: [], record: { battles: 3, resettable: true, pages: RM.buildRecordPages({ ...stats(), wins: 2, losses: 1, draws: 0, forfeits: 0 }, names) } }] }); q.goto('record'); return /WIN RATE 67%/.test(txt(R(q).page)) ? true : txt(R(q).page); })());
-    add('model/determinism: the same keys give the same views', (() => { const run = () => { const q = mk(data2()); key(q, 'down', 'down', 'down', 'down', 'down', 'a', 'right', 'up', 'right', 'down', 'right'); return q.path() === 'record' ? J(q.view()) : 'not on the record screen ' + Math.random(); }; return run() === run() ? true : 'differs'; })());
+    add('model/determinism: the same keys give the same views', (() => { const run = () => { const q = mk(data2()); key(q, 'down', 'down', 'down', 'down', 'down', 'down', 'a', 'right', 'up', 'right', 'down', 'right'); return q.path() === 'record' ? J(q.view()) : 'not on the record screen ' + Math.random(); }; return run() === run() ? true : 'differs'; })());
     add('model/the model state exposes the record screen for the tests', (() => { const q = mk(data1()); q.goto('record'); key(q, 'right'); const s = q.state(); return s.record && s.record.page === 1 && s.record.focus === 'page' && s.path === 'record' ? true : J(s); })());
     add('model/goto(record) is a known path and a hash route', HM.PATHS.includes('record') && mk(data1()).goto('record').length === 1 ? true : J(HM.PATHS));
   });
@@ -341,8 +341,8 @@ async function suite(M) {
     const hp = crypto.createHash('sha1').update(M.HS.createHubScreen(M.B.createBattleUi(zp)).render(mm.view()).rgba).digest('hex');
     add('screen/zeroing-the-ROM-font-changes-the-record-page (the words are the ROM\'s)', base !== hf ? true : 'unchanged');
     add('screen/zeroing-the-ROM-party-menu-palette-changes-it (background and chips are the ROM\'s)', base !== hp ? true : 'unchanged'); void h0;
-    add('screen/the-menu-with-RECORD-is-eight-rows-in-the-window', (() => { const v = mk(data2()).view(); return v.menu.rows.length === 8 && v.menu.rows[5].label === 'RECORD' ? true : J(v.menu.rows.map((r) => r.label)); })());
-    add('screen/the-main-menu-help-for-RECORD-is-one-honest-sentence', (() => { const q = mk(data2()); for (let i = 0; i < 5; i++) q.press('down'); const h = q.view().msg; return /Wins, streaks/.test(h[0]) && ui.measure('normal', h[0]) <= ui.R.msg.w - 4 && ui.measure('normal', h[1]) <= ui.R.msg.w - 4 ? true : J(h); })());
+    add('screen/the-menu-with-RECORD-is-eight-rows-in-the-window', (() => { const v = mk(data2()).view(); return v.menu.rows.length === 8 && v.menu.rows[6].label === 'RECORD' ? true : J(v.menu.rows.map((r) => r.label)); })());
+    add('screen/the-main-menu-help-for-RECORD-is-one-honest-sentence', (() => { const q = mk(data2()); for (let i = 0; i < 6; i++) q.press('down'); const h = q.view().msg; return /Wins, streaks/.test(h[0]) && ui.measure('normal', h[0]) <= ui.R.msg.w - 4 && ui.measure('normal', h[1]) <= ui.R.msg.w - 4 ? true : J(h); })());
   });
   return out;
 }

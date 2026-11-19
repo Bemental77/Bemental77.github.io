@@ -333,8 +333,8 @@ try {
   await session('record: keyboard + mouse', { width: 1280, height: 800, port: cdp++ }, async (page) => {
     const tag = 'record kbd+mouse: ';
     ok((await bootHub(page)) === 'ready', tag + 'the hub is ready (no profile yet)');
-    for (let i = 0; i < 5; i++) await key(page, 'down'); await sleep(80);
-    ok((await ev(page, `${HUB}.view().menu.rows[${HUB}.view().menu.cursor].label`)) === 'RECORD', tag + 'five ArrowDown presses reach the RECORD row (after QUICK BATTLE, BATTLE WITH MY TEAM, PLAY ONLINE, TOWER and TEAM BUILDER)');
+    for (let i = 0; i < 6; i++) await key(page, 'down'); await sleep(80);
+    ok((await ev(page, `${HUB}.view().menu.rows[${HUB}.view().menu.cursor].label`)) === 'RECORD', tag + 'six ArrowDown presses reach the RECORD row (after QUICK BATTLE, BATTLE WITH MY TEAM, PLAY ONLINE, TOWER, TEAM BUILDER and TRAINER CARD)');
     await key(page, 'a'); await sleep(200);
     ok((await where(page)) === 'record' && (await page.eval('location.hash')) === '#record' && (await page.eval('document.title')) === 'Pokemon Arena - Record', tag + 'Enter opens RECORD (address #record, the title follows)');
     let r = await rec(page);

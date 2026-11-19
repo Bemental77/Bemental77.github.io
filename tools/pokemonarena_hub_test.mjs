@@ -498,8 +498,8 @@ const hv = (page) => page.eval(`${HUB}.view()`);
 const where = (page) => page.eval(`${HUB}.model.path()`);
 const cursor = (page) => page.eval(`${HUB}.view().menu ? ${HUB}.view().menu.cursor : -1`);          // the cursor's place in the rows SHOWN (the main menu shows eight of its ten)
 const mainCursor = (page) => page.eval(`${HUB}.model.state().cursor.main`);                         // ... and in ALL the rows
-// ABOUT is the tenth row and the menu shows eight: walk the cursor onto it (the window scrolls to keep it in view), by the on-screen pad or by key
-const reachAbout = async (page, how) => { for (let i = 0; i < 14 && (await mainCursor(page)) !== 9; i++) { if (how === 'pad') await tapSel(page, '#bDown'); else await key(page, 'down'); await sleep(80); } };
+// ABOUT is the eleventh row (the TRAINER CARD joined after TEAM BUILDER) and the menu shows eight: walk the cursor onto it (the window scrolls to keep it in view), by the on-screen pad or by key
+const reachAbout = async (page, how) => { for (let i = 0; i < 16 && (await mainCursor(page)) !== 10; i++) { if (how === 'pad') await tapSel(page, '#bDown'); else await key(page, 'down'); await sleep(80); } };
 const rowVal = (page, id) => page.eval(`(() => { const r = ${HUB}.view().menu.rows.find((x) => x.id === ${J(id)}); return r ? r.value : null; })()`);
 const msgOf = (page) => page.eval(`${HUB}.view().msg.join(' ')`);
 const shot = async (page, name) => { await page.screenshot(path.join(OUT, name + '.png')); return name; };
@@ -602,7 +602,7 @@ try {
     ok(/no team yet/i.test(await msgOf(page)) && (await page.eval(`${HUB}.view().menu.rows.map((r) => r.label).join()`)) === 'TEAM BUILDER,BACK', tag + 'with no profile it offers TEAM BUILDER (message: ' + await msgOf(page) + ')');
     await shot(page, 'hub_touch_3_team_empty');
     await tapSel(page, '#bB'); await sleep(120);
-    // ABOUT by tapping its window (it is the tenth row: the on-screen pad walks to it and scrolls it into the eighth place of the window)
+    // ABOUT by tapping its window (it is the eleventh row: the on-screen pad walks to it and scrolls it into the eighth place of the window)
     await reachAbout(page, 'pad'); await sleep(60);
     await tapLogical(page, `${HUB}.canvas`, 60, mainY(7)); await sleep(150);
     ok((await where(page)) === 'about', tag + 'tapping ABOUT opens it');
@@ -658,7 +658,7 @@ try {
     // mouse: hover moves the cursor without activating
     const p3 = await logicalToPage(page, `${HUB}.canvas`, 60, mainY(7));
     await moveMouse(page, p3.x, p3.y); await sleep(120);
-    ok((await cursor(page)) === 7 && (await where(page)) === 'main', tag + 'hovering the CONTROLS row (the eighth) moves the cursor and activates nothing');
+    ok((await cursor(page)) === 7 && (await where(page)) === 'main', tag + 'hovering the IMPORT SAVE row (the eighth shown) moves the cursor and activates nothing');
     ok((await page.eval(`getComputedStyle(${HUB}.canvas).cursor`)) === 'pointer', tag + 'the mouse pointer becomes a hand over a row', await page.eval(`getComputedStyle(${HUB}.canvas).cursor`));
     await clickLogical(page, `${HUB}.canvas`, 60, mainY(0)); await sleep(150);
     ok((await where(page)) === 'quick', tag + 'a click on QUICK BATTLE opens it');
@@ -675,7 +675,7 @@ try {
     await shot(page, 'hub_kbd_1_main');
     // history: screens are real history entries
     const hist0 = await page.eval('history.length');
-    await reachAbout(page, 'key');                                              // the tenth row: the window scrolls to show it
+    await reachAbout(page, 'key');                                              // the eleventh row: the window scrolls to show it
     await clickLogical(page, `${HUB}.canvas`, 60, mainY(7)); await sleep(150);   // ABOUT
     ok((await where(page)) === 'about' && (await page.eval('location.hash')) === '#about' && (await page.eval('history.state && history.state.arenaHub')) === 'about', tag + 'opening ABOUT pushes a history entry for it (#about, state arenaHub=about)');
     await page.eval('history.back()'); await sleep(250);
@@ -700,9 +700,9 @@ try {
     const L3 = await page.eval('history.length');
     ok(L3 - L2 >= 5, tag + 'control: when B pushes a new entry instead of stepping back, three round trips pile up ' + (L3 - L2) + ' entries (so the check above can fail)', L2 + ' -> ' + L3);
     await boot(page);
-    // sound: Enter on SOUND (cursor 8); double counts; persisted
+    // sound: Enter on SOUND (cursor 9); double counts; persisted
     await page.eval(`${HUB}.model.goto('main')`);
-    while ((await mainCursor(page)) !== 8) await key(page, 'down');
+    while ((await mainCursor(page)) !== 9) await key(page, 'down');
     await key(page, 'a'); await sleep(400);
     // MU3's policy: Enter on SOUND OPENS the SOUND panel (it no longer toggles); that Enter is the first gesture, so it created the page's one (fake) AudioContext
     const soundOpen = () => page.eval(`(() => { const d = document.getElementById('soundDialog'); return !!d && !d.hidden; })()`);
@@ -732,7 +732,7 @@ try {
     await page.eval(`localStorage.removeItem('arena.audio'); localStorage.setItem('arena.sound', '0')`);
     // Controls dialog by keyboard
     await boot(page);
-    while ((await mainCursor(page)) !== 7) await key(page, 'down');
+    while ((await mainCursor(page)) !== 8) await key(page, 'down');          // CONTROLS is the ninth row
     await key(page, 'a'); await page.waitFor(`${HUB}.dialogOpen()`, { timeoutMs: 8000 });
     const c3 = await cursor(page);
     ok((await page.eval(`document.getElementById('controlsDialog').getAttribute('aria-modal')`)) === 'true' && (await page.eval(`!!document.querySelector('#controlsDialog .ip')`)), tag + 'Enter on CONTROLS opens the modal dialog with the input panel');
@@ -786,7 +786,7 @@ try {
     await padPress(page, 1);
     ok((await page.eval(`window.__navTo`)) === '/', tag + 'A7: a second B leaves for the site', String(await page.eval(`window.__navTo`)));
     await page.eval(`window.__navTo = null`);
-    for (let i = 0; i < 7; i++) await padPress(page, 13);                // CONTROLS is the eighth row
+    for (let i = 0; i < 8; i++) await padPress(page, 13);                // CONTROLS is the ninth row
     await padPress(page, 0); await page.waitFor(`${HUB}.dialogOpen()`, { timeoutMs: 8000 });
     ok(true, tag + 'A on CONTROLS opens the dialog');
     await padPress(page, 1); await sleep(200);

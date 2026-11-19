@@ -188,7 +188,7 @@ async function journey(vp, port) {
     await page.navigate(BASE + '/pokemonarena/');
     await waitFor(page, `window.${HUB} && ${HUB}.state === 'ready'`);
     await page.eval(`${HUB}.pause(true); ${HUB}.setMascot(25)`);
-    ok((await hubRows()).join() === 'quick,team,online,tower,builder,record,import,controls', tag + '1 hub: the main menu shows eight of its ten rows (PLAY ONLINE, TOWER, TEAM BUILDER, RECORD and IMPORT SAVE included; SOUND and ABOUT are below the fold, the menu scrolls)', JSON.stringify(await hubRows()));
+    ok((await hubRows()).join() === 'quick,team,online,tower,builder,trainer,record,import', tag + '1 hub: the main menu shows eight of its eleven rows (PLAY ONLINE, TOWER, TEAM BUILDER, TRAINER CARD, RECORD and IMPORT SAVE included; CONTROLS, SOUND and ABOUT are below the fold, the menu scrolls)', JSON.stringify(await hubRows()));
     await shot(page, vp, 'hub_main');
 
     // ---- 2 TEAM BUILDER from the menu (a mix of devices on the desktop run: keys, then the mouse). The row opens THE TEAM BUILDER IN THE PICTURE (the hub's builder app: its own suites are
