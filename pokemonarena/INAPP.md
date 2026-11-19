@@ -1610,6 +1610,9 @@ this track may not edit it. The record line on the card is hub data's `BATTLES n
 the welcome, A-through into a memory store through the real ctl and `trainer_store.js`, B on every step, every picker's keys / taps / wheel / paging, the name entry, the search, the card
 step, the card screen and editor, every refusal in words (a store that keeps nothing: a notice says the trainer is for this visit only), 32 screens against `pokemonarena/trainer.golden.json` (hashes only) with every text measured in its room at the longest values
 (ten of the widest character the `name` charset accepts, the longest species and class), a random walk of 3000 inputs). `TRAINER_SHOTS=<dir>` writes those screens as PNG to look at.
+This tree has `prof-battle` merged (its eight back pictures are on the back step; the goldens were made after it). The same 46 checks pass on `prof-shell`'s `pokemonarena/js` with this
+track's files laid over it (`node tools/pokemonarena_trainer_test.mjs __child <dir>` -> `CHILD_FAILED []`): the goldens do not depend on whether the hub's data carries the card (the
+editor's golden scenario hands the model the store's list, as the ctl does), so APP-SHELL's note that `edit-figure` / `edit-back` change after their merge no longer holds.
 Browser: not run by this track (the page test is APP-SHELL's).
 
 ### BATTLE: as built
