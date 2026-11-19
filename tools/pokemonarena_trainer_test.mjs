@@ -481,6 +481,26 @@ async function runNode(jsDir, verbose) {
     const r = m.hub.rects().length, fx = m.hub.pointer({ kind: 'click', x: 40, y: 100 });
     return after.every(Boolean) && r === 0 && fx.length === 0 && J(m.st()) === before && J(m.hub.view().msg) === J(W.saving.slice()) ? true : J([after, r, fx, step(m)]);
   });
+  await check('F4 a browser that is not keeping profiles: the trainer is made, the screen goes back, and a notice says it is for this visit only', async () => {
+    const name = 'tt-ns-' + Math.random().toString(36).slice(2);
+    const st = await ST.openStore({ adapter: ST.createMemoryAdapter({ name, durable: false }), channel: false });
+    try {
+      const m = toCard(); const env = ctlFor(m, st); m.hub.press('a');
+      await env.ctl.effect({ app: 'trainer', type: 'save', mode: 'create', profileId: null, name: 'GOLD', avatar: { kind: 'preset', id: 0 }, card: { made: true, look: null, front: 3, back: 0, partner: 25 } });
+      const d = m.hub.dialog.current();
+      const fits = screen.widths(m.hub.view()).every((w) => w.px <= w.max);
+      return m.hub.path() === 'trainer' && d && d.id === 'notice:trainer' && J(m.hub.view().dialog.lines) === J(W.notKept.slice()) && fits && (await TST.listTrainers(st)).length === 1 ? true : J([m.hub.path(), d, screen.widths(m.hub.view())]);
+    } finally { await st.close(); ST.dropMemoryDb(name); }
+  });
+  await check('F5 SWITCH TRAINER refused by the store (the trainer is gone) is said in the picture and nothing changes', async () => {
+    const M = await memStore();
+    try {
+      const a = await TST.createTrainer(M.store, { name: 'RED', card: { made: true } });
+      const m = mk(await HD.readHubData(M.store, pack)); const env = ctlFor(m, M.store); await env.ctl.refresh(); m.hub.goto('trainer');
+      await env.ctl.effect({ app: 'trainer', type: 'switch', id: 'p_gone' });
+      return J(m.hub.view().msg) === J(W.failed.failed.slice()) && (await M.store.getActiveId()) === a.id ? true : J([m.hub.view().msg]);
+    } finally { await M.done(); }
+  });
 
   /* ---------------------------------------------------------------------------------------------- G: pictures and words */
   const widest = (chars) => { let best = chars[0], bw = 0; for (const c of chars) { const w = screen.measureFont('normal', c); if (w > bw) { bw = w; best = c; } } return best; };
@@ -595,6 +615,8 @@ const NODE_MUTANTS = [
   { id: 'M26', file: 'trainer_ctl.js', from: '    if (ok) env.sound.sfx(\'se_success\');', to: '', fails: 'A2' },
   { id: 'M27', file: 'trainer_hub.js', from: "    onData() { return S.trainers ? [{ app: ID, type: 'data' }] : []; },", to: '    onData() { return []; },', fails: 'E9' },
   { id: 'M29', file: 'trainer_hub.js', from: 'species = isInt(seen.partner) ? seen.partner : S.mascotSet || !isInt(hubMascot) ? S.mascot : hubMascot;', to: 'species = isInt(seen.partner) ? seen.partner : S.mascot;', fails: 'W8' },
+  { id: 'M30', file: 'trainer_hub.js', from: '        if (r.notSaved) ctx.notify(WORDS.notKept.slice());', to: '', fails: 'F4' },
+  { id: 'M31', file: 'trainer_ctl.js', from: '    if (!r.ok) { app.failed(whyOf(r.code)); env.redraw(); return; }', to: '    if (!r.ok) { env.redraw(); return; }', fails: 'F5' },
   { id: 'M28', file: 'trainer_hub.js', from: "    onData() { return S.trainers ? [{ app: ID, type: 'data' }] : []; },", to: "    onData() { return [{ app: ID, type: 'data' }]; },", fails: 'E9' },
 ];
 async function runMutants() {

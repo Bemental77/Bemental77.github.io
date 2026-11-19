@@ -26,7 +26,7 @@
 //   setMascot(species)    the hub's mascot of the day: the default PARTNER
 //   setStoredLook(code)   this browser's look (center_look.js loadLook): the default LOOK when there is one
 //   setTrainers({ activeId, list: [{ id, name, readOnly, avatar: { kind, id } | null, card, rec: { wins, losses } | null }] } | null)     the store's trainers (null: use hub data)
-//   saved(result)         a save finished: { ok: true } | { ok: false, why: 'readonly' | 'notsaved' | 'conflict' | 'invalid' | 'nostore' | 'failed', message? } -> effects (env.run): on ok the
+//   saved(result)         a save finished: { ok: true, notSaved? (then a notice says it is for this visit only) } | { ok: false, why: 'readonly' | 'notsaved' | 'conflict' | 'invalid' | 'nostore' | 'failed', message? } -> effects (env.run): on ok the
 //                         screen goes back (the card, or where NEW TRAINER was opened from); on a failure the words stay in the message box and the screen stays
 //   saving()              is a save under way?
 //   failed(why)           something outside a save was refused (SWITCH TRAINER): WORDS.failed[why] in the message box until the next input
@@ -102,6 +102,7 @@ export const WORDS = Object.freeze({
   switchList: Object.freeze(['Which TRAINER?', 'A: this one   B: back']),
   backRow: Object.freeze(['Back to the main menu.', 'A: back']),
   cardKeys: 'A: change it   B: back',
+  notKept: Object.freeze(['Saved for this visit only: this', 'browser is not keeping TRAINERS.']),
   failed: Object.freeze({
     readonly: Object.freeze(['This TRAINER is read-only here:', 'nothing was saved.']),
     notsaved: Object.freeze(['This browser is not keeping', 'TRAINERS: nothing was saved.']),
@@ -760,7 +761,10 @@ function createTrainerHub(ctx) {
       if (!S.saving) return [];
       S.saving = null;
       S.input++;
-      if (r && r.ok) { const p = ctx.path(); return p === 'trainer-new' || p === 'trainer-edit' ? ctx.back() : []; }
+      if (r && r.ok) {
+        if (r.notSaved) ctx.notify(WORDS.notKept.slice());          // (a browser that is not keeping profiles: the trainer lives for this visit only, and the player is told)
+        const p = ctx.path(); return p === 'trainer-new' || p === 'trainer-edit' ? ctx.back() : [];
+      }
       const why = r && WORDS.failed[r.why] ? r.why : 'failed';
       note(WORDS.failed[why], true);
       return [];
