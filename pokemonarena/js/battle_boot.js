@@ -43,6 +43,8 @@ import { createOnlinePanel, speakOnline, PANEL_ARM_MS } from './online_view.js';
 import { readBack, passThrough } from './hub_presence.js';                            // INAPP.md "Contract 6": the hub screen a battle comes back to; the test seams a hop to the hub carries (pure, strings only)
 import { engineFingerprint } from './online_match.js';
 import { fitScale, fitPicture, createFullscreen, PROMPT_ROOM } from './screenfit.js';
+import { cardOf } from './trainer_card.js';                            // INAPP.md TRAINER: the trainer's card (the back figure) of the profile that fights
+import { backChoices, trainerForFront } from './trainer_figures.js';      // ... which back pictures the ROM's battle code draws, and the ROM trainer that shows an online opponent's front figure
 import { summarizeMatch } from './match_stats.js';                      // the Tower hears the match the moment the engine ends it (tower_fight.js watchEngine), so it needs the same summary the scene makes
 import { parseTowerParams, returnToTower, returnToHub, launchFloorBattle, searchForTry, HUB_PAGE_URL, TOWER_HUB_URL } from './tower_launch.js';       // the Tower's addresses (light: strings only; the Tower's logic is loaded only when the address is a Tower one)       // the picture fills its room; the Fullscreen switch
 
@@ -90,6 +92,24 @@ export function parseBattleQuery(search) {
 }
 
 const mix = (a, b) => ((Math.imul(a ^ 0x9e3779b9, 0x85ebca6b) ^ Math.imul(b + 0x7f4a7c15, 0xc2b2ae35)) >>> 0);
+
+/* ------------------------------------------------------------------------------------------ the trainer in the battle (INAPP.md TRAINER decision 3) */
+/** The longest trainer name a battle shows (profile.js PROFILE_LIMITS.trainerName; netmatch.js NAME_MAX for an online one). */
+export const TRAINER_NAME_MAX = 10;
+/**
+ * What the battle shows of the PLAYER, from the profile that fights (or null: no profile). -> { name, back }
+ *   name: the profile's trainerName (trimmed, at most TRAINER_NAME_MAX), or 'You' when there is no profile or no usable name (the words of every battle before profiles had names).
+ *   back: the card's back picture (trainer_card.js cardOf(profile).back) when `backs` (trainer_figures.js backChoices(rom): the pictures the ROM's battle code draws) holds it,
+ *         else null: the scene is given no back figure and the ROM draws its default one (a profile from before schema 6, a card with no figure, a picture this ROM cannot draw).
+ * Pure: no ROM, no storage.
+ */
+export function trainerShown(profile, backs) {
+  const n = profile && typeof profile.trainerName === 'string' ? profile.trainerName.trim().slice(0, TRAINER_NAME_MAX).trim() : '';
+  const b = cardOf(profile).back;
+  return { name: n || 'You', back: Number.isInteger(b) && Array.isArray(backs) && backs.includes(b) ? b : null };
+}
+/** The ROM trainer id whose picture shows an ONLINE opponent's battle figure (their hello's `fig`, a front picture index), or 0: none sent, or no ROM trainer uses that picture (the page keeps its own choice). */
+export function foeTrainerFor(rom, fig) { return Number.isInteger(fig) ? trainerForFront(rom, fig) : 0; }
 
 /**
  * Decode / generate both teams and settle the rules. `pack` = tables.js pack. Returns { ok: true, spec } where spec feeds
@@ -324,6 +344,35 @@ async function main() {
   function whenCareerSettled(fn) {
     if (career.promise && career.state === 'pending') { let done = false; const go = () => { if (!done) { done = true; fn(); } }; career.promise.then(go, go); setTimeout(go, 1500); } else fn();
   }
+  /** THE PROFILE THAT FIGHTS: the one the career is written to and whose trainer the battle shows (INAPP.md TRAINER). `via` (an online battle): the profile that owns the chosen team, else the owner of
+   *  its team code; otherwise the owner of the address's team code; else the store's active profile. -> a profile id, or null */
+  async function fighterId(store, data, via) {
+    let pid = null;
+    if (via) {
+      pid = via.profileId || null;
+      if (!pid && via.teamCode) { const hit = await data.findTeamForCode(store, via.teamCode).catch(() => null); if (hit) pid = hit.profileId; }
+    } else if (params.team !== null) { const hit = await data.findTeamForCode(store, params.team); if (hit) pid = hit.profileId; }
+    if (!pid) pid = await store.getActiveId().catch(() => null);
+    return pid;
+  }
+  /** The trainer a battle against the CPU shows (trainerShown above), read once before its scene: the profile `pid` (a Tower fight's run) or the one fighterId finds. Never throws, and gives up
+   *  after TRAINER_READ_MS (a store that does not answer leaves 'You' and the ROM's default figure, as before profiles had them). */
+  const TRAINER_READ_MS = 1500;
+  async function readTrainer(pid, backs) {
+    let store = null, timer = null;
+    const read = (async () => {
+      try {
+        const [{ openStore }, data] = await Promise.all([import('./store.js'), import('./hub_data.js')]);
+        store = await openStore();
+        const id = pid || await fighterId(store, data, null);
+        const loaded = id ? await store.loadProfile(id).catch(() => null) : null;
+        return loaded && loaded.ok ? loaded.profile : null;
+      } catch (_e) { return null; } finally { if (store) { try { await store.close(); } catch (_e) { /* ignore */ } } }
+    })();
+    const profile = await Promise.race([read, new Promise((r) => { timer = setTimeout(() => r(null), TRAINER_READ_MS); })]);
+    clearTimeout(timer);
+    return trainerShown(profile, backs);
+  }
   function recordCareer(info, via) {
     career.state = 'pending';
     career.promise = (async () => {
@@ -331,12 +380,7 @@ async function main() {
       try {
         const [{ openStore }, data] = await Promise.all([import('./store.js'), import('./hub_data.js')]);
         store = await openStore();
-        let pid = null;
-        if (via) {
-          pid = via.profileId || null;
-          if (!pid && via.teamCode) { const hit = await data.findTeamForCode(store, via.teamCode).catch(() => null); if (hit) pid = hit.profileId; }
-        } else if (params.team !== null) { const hit = await data.findTeamForCode(store, params.team); if (hit) pid = hit.profileId; }
-        if (!pid) pid = await store.getActiveId().catch(() => null);
+        const pid = await fighterId(store, data, via);
         const loaded = pid ? await store.loadProfile(pid).catch(() => null) : null;
         if (!loaded || !loaded.ok || store.status.notSaved) { career.state = 'none'; scene.setCareer({ state: 'none' }); return; }
         if (loaded.readOnly) { career.state = 'none'; scene.setCareer({ state: 'none', notes: ['This profile was made by a newer', 'version of the Arena, so this battle', 'is not kept.'] }); return; }
@@ -521,9 +565,15 @@ async function main() {
         hook.seed = info.seed; hook.params.seed = info.seed;
         // a RELOADED battle: its history is already in the controller, and the scene plays it silently and at speed (the same replay the CPU battle's reload uses), then goes on live
         resuming = !!info.resumed;
+        // THE TRAINER (INAPP.md TRAINER decision 3): with a profile, the player is the name they play under in this match (the profile's trainer name unless they typed another: what the other page
+        // shows for them), and their card's back figure; without one, 'You' as before. The opponent's picture is their battle figure (their hello's fig) when this ROM has a trainer for it.
+        const me = online.trainer(), shownMe = { name: me && info.myName ? info.myName : 'You', back: me && me.card ? trainerShown({ card: me.card }, backChoices(bytes)).back : null };
+        const foeTr = foeTrainerFor(bytes, info.oppFig);
+        hook.trainer = { name: shownMe.name, back: shownMe.back, foeTrainer: foeTr || null, oppFig: Number.isInteger(info.oppFig) ? info.oppFig : null };
         scene = createScene({
           ui, pack: packRef, text, ctl: c, viewSide: info.mySide, resultOptions: resultOptionsFor(), env: info.seed % 9, textSpeed: params.speed, meta: c.netMeta.meta,
-          trainer: info.oppName, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: 'normal', clock: () => performance.now(), sound: soundApi, quitLabel: 'BACK TO HUB',
+          trainer: info.oppName, playerName: shownMe.name, ...(shownMe.back !== null ? { playerBack: shownMe.back } : {}), ...(foeTr ? { foeTrainer: foeTr } : {}),
+          trainerChoices: trainerChoicesOf(), cpuLevel: 'normal', clock: () => performance.now(), sound: soundApi, quitLabel: 'BACK TO HUB',
           anim: animCfg, animator: resuming ? null : animator, animSeed: info.seed,
           hooks: mkHooks({
             onResult: onResult,
@@ -596,7 +646,10 @@ async function main() {
         const left = await towerFight.leaveUnrestorable(); resumeStore.clear(); hook.towerRefused = { status: 'abandoned', why: 'the saved fight could not be resumed' };
         towerError(left.message, 'The last fight was left'); return;
       }
-      const sceneOpts = { ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: 'You', trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: towerFight ? 'LEAVE TOWER' : 'BACK TO HUB', leaveAsk: towerFight ? (kind, where) => towerFight.leaveAsk(kind, where) : undefined, open: towerFight ? undefined : openSwitch, anim: animCfg, style: styleCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: mkHooks({ onResult: onResult, onMatchEnd: towerFight ? towerMatchEnd : recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); if (towerFight) { towerFight.onQuit(); return; } whenCareerSettled(() => navigate(hubUrl())); } }) };
+      // THE TRAINER (INAPP.md TRAINER decision 3): the name and the back figure of the profile that fights (a Tower fight: its run's profile). The foe stays the ROM trainer of the CPU level
+      const shown = await readTrainer(towerFight ? hook.towerProfile : null, backChoices(bytes));
+      hook.trainer = { name: shown.name, back: shown.back, foeTrainer: null, oppFig: null };
+      const sceneOpts = { ui, pack: packRef, text, ctl, viewSide: 0, resultOptions: resultOptionsFor(), env: spec.seed % 9, textSpeed: params.speed, meta: spec.meta, trainer: spec.trainer, playerName: shown.name, ...(shown.back !== null ? { playerBack: shown.back } : {}), trainerChoices: trainerChoicesOf(), cpuLevel: spec.cpu, clock: () => performance.now(), sound: soundApi, quitLabel: towerFight ? 'LEAVE TOWER' : 'BACK TO HUB', leaveAsk: towerFight ? (kind, where) => towerFight.leaveAsk(kind, where) : undefined, open: towerFight ? undefined : openSwitch, anim: animCfg, style: styleCfg, animator: resuming ? null : animator, animSeed: spec.seed, hooks: mkHooks({ onResult: onResult, onMatchEnd: towerFight ? towerMatchEnd : recordCareer, onQuit: () => { if (resumeStore) resumeStore.clear(); if (towerFight) { towerFight.onQuit(); return; } whenCareerSettled(() => navigate(hubUrl())); } }) };
       // (leaveAsk: LEAVE TOWER and FORFEIT say what leaving this fight costs NOW: nothing before the first choice, an Extra Life or one of the retries left after it, the climb when none is left)
       // the result buttons are read when the result screen comes up (scene.js startResult), so a Tower floor's can follow who won
       if (towerFight) Object.defineProperty(sceneOpts, 'resultOptions', { enumerable: true, get: () => resultOptionsFor() });

@@ -62,6 +62,7 @@ import { createTypewriter, TEXT_SPEED } from './textfx.js';
 import { GENERAL, STATUS, SPECIAL, STATUS_ANIM_OF, WEATHER_ANIM_OF, statAnimArg, speciesAnimInfo, frontFrameAt, ballGfx } from './anim_mon.js';
 import { SYS, LAYERS_NO_TEXT, partySpec, eventId, sysPlayable, pickTrainer } from './anim_sys.js';
 import { summarizeMatch } from './match_stats.js';
+import { TRAINER_BACK_COUNT } from './speciesgfx.js';
 import { buildRecapPages } from './recap_model.js';
 
 export const GBA_FPS = 59.7275;
@@ -848,8 +849,12 @@ export function createScene(opts) {
   const expOf = (sp, lv) => { const g = pack.species[sp] && pack.species[sp].growthRate, row = pack.exp && pack.exp[g]; return row && row[lv] !== undefined ? row[lv] : 0; };
   const pspec = (m, o) => partySpec(m, o, expOf);
   // round 4: the foe trainer's ROM picture follows the CPU level (opts.cpuLevel, opts.trainerChoices from anim_sys.js trainerChoices(rom)) and is the same for the whole battle; the player's back sprite follows opts.playerGender
+  // TRAINER (INAPP.md, 2026-11-18): opts.foeTrainer, a ROM trainer id the page chose (an online opponent's battle figure: trainer_figures.js trainerForFront), takes the place of the CPU level's pick;
+  // opts.playerBack, a ROM trainer BACK picture index (trainer_figures.js backChoices: the save block's gender byte, which the ROM's battle code draws as that back picture), takes the place of opts.playerGender
   let trainerMemo;
-  const trainerId = () => (trainerMemo !== undefined ? trainerMemo : (trainerMemo = pickTrainer(opts.trainerChoices, opts.cpuLevel, A.seed)));
+  const foeTrainerOk = (t) => Number.isInteger(t) && t > 0 && t <= 0xffff;
+  const trainerId = () => (trainerMemo !== undefined ? trainerMemo : (trainerMemo = foeTrainerOk(opts.foeTrainer) ? opts.foeTrainer : pickTrainer(opts.trainerChoices, opts.cpuLevel, A.seed)));
+  const playerBack = Number.isInteger(opts.playerBack) && opts.playerBack >= 0 && opts.playerBack < TRAINER_BACK_COUNT ? opts.playerBack : opts.playerGender === 'F' || opts.playerGender === 'M' ? opts.playerGender : undefined;
   const SYS_KIND = { shake: 'hit', faint: 'faint', slidein: 'sendout', slideout: 'recall' };         // scene step -> system event
   const monCopy = (d) => (d ? { species: d.species, name: d.name, level: d.level, gender: d.gender, hp: d.hp, maxHp: d.maxHp, status: d.status, shiny: d.shiny } : null);
   function wireSys(run) {
@@ -946,7 +951,7 @@ export function createScene(opts) {
     const pmOther = proj ? proj[other] : undefined;
     if (pmOther ? !!pmOther.down : downNow(other)) ctx.absent = [other === viewSide ? 'player' : 'foe'];
     if (kind === 'sendout') ctx.switchIn = pspec(st.mon);
-    if (opts.playerGender === 'F' || opts.playerGender === 'M') ctx.gender = opts.playerGender;
+    if (playerBack !== undefined) ctx.gender = playerBack;
     if (opts.sysClock) ctx.clock = opts.sysClock;
     return ctx;
   }
@@ -1022,13 +1027,13 @@ export function createScene(opts) {
   function startSysIntro(st) {
     st.n = 0; st.msg = 0; st.tw = null; st.hold = 0; st.waitN = 0; st.shown = null; st.keyLeft = 0; st.msgQ = []; st.fb = false; st.ackA = false; st.ackGap = 0; st.kind = 'system'; st.id = SYS.introTrainer; st.run = null; st.P = null;
     if (sysOn(SYS.introTrainer)) {
-      const ctx = Object.assign({ foe: pspec(st.foe), player: pspec(st.player), environment: opts.env | 0, keys: null, seed: animMix(A.seed, ++A.n), maxFrames: SYS_MAX }, trainerId() > 1 ? { trainer: trainerId() } : {}, opts.playerGender === 'F' || opts.playerGender === 'M' ? { gender: opts.playerGender } : {}, opts.sysClock ? { clock: opts.sysClock } : {});
+      const ctx = Object.assign({ foe: pspec(st.foe), player: pspec(st.player), environment: opts.env | 0, keys: null, seed: animMix(A.seed, ++A.n), maxFrames: SYS_MAX }, trainerId() > 1 ? { trainer: trainerId() } : {}, playerBack !== undefined ? { gender: playerBack } : {}, opts.sysClock ? { clock: opts.sysClock } : {});
       st.P = newPrep(SYS.introTrainer, ctx, false);
       if (st.P) {
         if (st.P.run) beginIntro(st, st.P.run);
         // the first events of the battle start from these two Pokemon at full HP: pre-roll that state while the opening plays (same ctx as the events, so the first hit of turn 1 finds it cached)
         const wctx = { foe: pspec(st.foe), player: pspec(st.player), environment: opts.env | 0, trainer: 0, seed: sysSeed(), maxFrames: SYS_MAX };
-        if (opts.playerGender === 'F' || opts.playerGender === 'M') wctx.gender = opts.playerGender;
+        if (playerBack !== undefined) wctx.gender = playerBack;
         if (opts.sysClock) wctx.clock = opts.sysClock;
         newPrep('battle', wctx, true);
         return;
