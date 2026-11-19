@@ -1611,3 +1611,50 @@ the welcome, A-through into a memory store through the real ctl and `trainer_sto
 step, the card screen and editor, every refusal in words, 32 screens against `pokemonarena/trainer.golden.json` (hashes only) with every text measured in its room at the longest values
 (ten of the widest character the `name` charset accepts, the longest species and class), a random walk of 3000 inputs). `TRAINER_SHOTS=<dir>` writes those screens as PNG to look at.
 Browser: not run by this track (the page test is APP-SHELL's).
+
+### APP-SHELL: as built
+
+The shell's half of the TRAINER (decisions 1, 2, 4, 5 and the menu row). Every piece is in a file the APP row gives the shell; nothing of the trainer app's own files was edited.
+
+**The main menu** (`hub_model.js`). A TRAINER CARD row (`id: 'trainer'`, opens the path `trainer`; help "Your trainer: name, look, battle / figure, portrait and partner.") stands RIGHT AFTER
+TEAM BUILDER: the five rows above it, and QUICK BATTLE under the cursor at the start, keep their places (the tests and the hands that walk to them by position), it is among the eight rows shown
+without scrolling, and it sits beside the other row about the player's trainer. The menu has eleven rows now; RECORD is the seventh, CONTROLS the ninth, ABOUT the eleventh.
+**The title side.** The ACTIVE trainer (`activeOf(profiles, activeId)`: the store's active id, else the only profile there is) is the title screen's: its `card.partner` stands where the day's
+mascot stood (on every screen the mascot stood on: the main menu, QUICK BATTLE, ABOUT; MY TEAM still shows the team's lead) when the ROM can draw it (`createHubModel({ hasSpecies })`; boot.js
+passes the pack's legal species), and its name is drawn under POKeMON ARENA in a small ROM font (`view.trainer` on the main menu's view; `GEOM.titleNamed`: the title window grows upwards
+to x 148 y 78 w 84 h 28, just under the mascot; a ten-letter name fits, measured). `setData` now keeps each profile's `card` (`cardOf`) and `avatar`, so `ctx.profiles()` hands the apps
+the card; `hub.active()` is a copy of the active trainer `{ id, name, readOnly, card, avatar }` for the ctls (the Center's look).
+
+**The first-visit opening** (decision 1). `hub_model.js welcomePlan(data, { openedAt, path, later, off, stored })` is the rule, pure: `null`, `{ kind: 'new' }` (no profile) or `{ kind: 'back',
+name, profileId }` (the active profile's card is not made). It asks: the data `ready`, not `notSaved`, the store open; the page OPENED at the main menu and still on it; sessionStorage
+`arena.welcome` not `later`; localStorage `arena.welcome` not `off`; a read-only active profile is not greeted. `boot.js greet(d)` asks it ONCE per page load, at the first data refresh,
+calls `hub.apps.trainer.welcome({ kind, name, profileId })` and runs `hub.goto('trainer-new')` (trail `['trainer', 'trainer-new']`). `window.__arenaHub.welcome = { plan, opened }` is the
+test hook. `WELCOME_KEY = 'arena.welcome'` (hub_model.js).
+
+**The test rigs' switch** (decision 2). `tools/headless_cdp.mjs` exports `WELCOME_KEY` and `WELCOME_SEED` (a script: on a `/pokemonarena/` page, while the key is unset, localStorage
+`arena.welcome = 'off'`; never throws) and every `Page` installs it before each document (`Page.addScriptToEvaluateOnNewDocument` in `init()`) unless `withBrowser({ welcome: true })`;
+a second tab (`openTab`) inherits the choice; `headless_cdp_multi.mjs` pages are seeded (they are made through the same `Page`). Arena browser suites that launch Chrome some other way: only
+`tools/pokemonarena_idb_smoke_test.mjs` (its restart launcher), and it opens `pokemonarena/dev/idb_smoke.html`, never the hub, so it needs no seed (grep of `tools/pokemonarena_*.mjs` and
+`tools/*arena*` for `spawn(CHROME` / `--remote-debugging-port` / puppeteer).
+
+**One way to make a trainer** (decision 4). The Team Builder's NEW TRAINER (`builder_home.js`) is `X.go('trainer-new')`; its own name entry, the `profile-create` effect and the ctl's
+`createProfile` are gone. When the hub's data then shows a trainer the builder's list does not know, or a different active one, while a builder screen is open, `builder_hub.js onData()` asks
+for `{ app: 'builder', type: 'sync' }` and `builder_ctl.js syncActive()` reads the list again and opens the store's active trainer (no refresh of its own: no loop). Coming back from the
+screens (B, or YES) re-enters the builder, whose `enter` loads the store's active trainer anyway: the player finds the trainer made, ACTIVE, on the list.
+
+**The look is the trainer's** (decision 5, `center_ctl.js`). `myLook()`: the active trainer's `card.look` when the ROM has that sprite (copied to `arena.avatar`), else `arena.avatar`, else
+one picked and kept in the browser only (a look nobody chose is not written on a card). The Center's LOOK (`{ app: 'center', type: 'look' }`) writes `arena.avatar` AND the active trainer's
+`card.look` (`trainer_store.js updateTrainer(store, id, { card: { look } })`), then `env.refreshData()`; `__arenaHub.center.state().lookWrite` says how the last card write went.
+
+**The ripple** (deliberate): `pokemonarena_hub_test.mjs` (eleven rows; CONTROLS / SOUND / ABOUT one further down in the browser sessions; new checks and 14 mutants for the row, the partner,
+the name, `welcomePlan`, `active()`), `pokemonarena_record_test.mjs` and `pokemonarena_stats_page_test.mjs` (RECORD is the seventh row), `pokemonarena_journey_test.mjs` and
+`pokemonarena_devices_test.mjs` (the row lists), `pokemonarena_builder_test.mjs` (NEW TRAINER opens trainer-new; a sync check and three mutants; the RENAME entry stands in for the old one; a
+not-kept store is seeded directly; the old name-entry picture dropped), `pokemonarena_builder_page_test.mjs` (its three sessions make their trainers through the NEW TRAINER screens: keys,
+taps, a controller). `hub.golden.json` (`--update`): `main-0`, `main-sound`, `main-scrolled`, `main-online-row`, `dialog-yesno-main`, `dialog-notice-more` changed (the TRAINER CARD row,
+and the fixture's active trainer RED is now named under the title), `main-trainer-partner`, `main-no-trainer`, `main-trainer-row` are new. `builder.golden.json`: `new trainer entry`
+removed. `pokemonarena_apps_test.mjs` and its fixtures are untouched.
+
+**Known limits.** `pokemonarena_apps_test.mjs --unit` pins exactly three apps (APP-UI's note above): red with `trainer` registered, by the registration, not by the shell. Because the shell
+now hands the apps the card, `trainer.golden.json`'s `edit-figure` and `edit-back` (the editor opens on the trainer's own figure) change on a tree with this branch: APP-UI's
+`pokemonarena_trainer_test.mjs --update` after the merge. The greeting is decided once, at the first data refresh: a player who moves off the main menu before the store answers is not greeted
+on that visit.
