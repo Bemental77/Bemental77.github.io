@@ -1609,7 +1609,7 @@ name / avatar / card). An ok result carries `notSaved: true` when the browser ke
 `profile-v2-current` `.expected-v6.json`, and `profile-v7-future.json` (the newer-build fixture now). The v5 fixtures stay and now exercise the 5 -> 6 migration; `profile-v6-future.json` stays too (it is
 a damaged v6 document now, used by nobody of this track).
 
-**Tests**: `node tools/pokemonarena_trainer_card_test.mjs [--mutants] [--browser]`: 37 Node checks (the card, the migration, the editor action, the hub data, the save API on a memory store), 52 source
+**Tests**: `node tools/pokemonarena_trainer_card_test.mjs [--mutants] [--browser]`: 38 Node checks (the card, the migration, KEEP MINE, the editor action, the hub data, the save API on a memory store), 54 source
 mutants each killed by a NAMED check, and with `--browser` group B in a real headless muted Chrome against real IndexedDB (ARENA_PORT 8141 / ARENA_CDP 9341): a stored v5 profile upgraded once (history
 `migration`), not again after a reload, the save API there, and the REAL hub page upgrading a v5 profile in the real `pokemonarena` database once. The profile / career / tower_profile / record / editor suites
 now pin schema 6.
