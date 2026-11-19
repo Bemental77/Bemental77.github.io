@@ -160,7 +160,7 @@ function checkHost(K) {
   const { f, t } = tester(), { HM, HA } = K;
   const mkFakes = () => { const A = fakeApp('alpha', ['alpha', 'alpha-two'], { 'alpha-two': 'alpha' }), B = fakeApp('beta', ['beta'], { beta: 'alpha-two' }); return { A, B, m: HM.createHubModel({ mascot: 25, apps: [A.desc, B.desc], measureFont: (font, s) => (font === 'small' ? 5 : 6) * s.length }) }; };
   // ---- the default registry
-  t('registry: the hub hosts online, center and builder, and their paths are hub paths the address may name', () => J(HA.APPS.map((a) => a.id)) === J(['online', 'center', 'builder']) && ['online', 'center', 'builder'].every((p) => HM.PATHS.includes(p) && HA.APP_PATHS.includes(p)) && HA.APP_PATHS.every((p) => HM.PATHS.includes(p)) && J(HA.APP_PATHS) === J(HA.pathsOf(HA.APPS)) && HA.appOfPath('online').id === 'online' && HA.appOfPath('main') === null, () => J(HM.PATHS));
+  t('registry: the hub hosts online, center and builder (first, in that order; the TRAINER wave added trainer after them), and their paths are hub paths the address may name', () => J(HA.APPS.map((a) => a.id).slice(0, 3)) === J(['online', 'center', 'builder']) && ['online', 'center', 'builder'].every((p) => HM.PATHS.includes(p) && HA.APP_PATHS.includes(p)) && HA.APP_PATHS.every((p) => HM.PATHS.includes(p)) && J(HA.APP_PATHS) === J(HA.pathsOf(HA.APPS)) && HA.appOfPath('online').id === 'online' && HA.appOfPath('main') === null, () => J(HM.PATHS));
   t('registry: the three lists (models, renderers, ctls) name the same apps', () => J(Object.keys(K.AS.APP_SCREENS).sort()) === J(HA.APPS.map((a) => a.id).sort()) && J(Object.keys(K.AC.APP_CTLS).sort()) === J(HA.APPS.map((a) => a.id).sort()) && Object.values(K.AS.APP_SCREENS).every((x) => typeof x === 'function') && Object.values(K.AC.APP_CTLS).every((x) => typeof x === 'function'));
   t('registry: the default registry passes its own rules', () => HA.checkRegistry(HA.APPS, ['main', 'quick', 'team', 'record', 'about', 'tower', 'tower-new'], () => 'main').length === 0, () => J(HA.checkRegistry(HA.APPS, ['main'], () => 'main')));
   t('registry: every app model the default hub makes has every method of the contract', () => { const m = HM.createHubModel({ mascot: 25 }); return HA.APPS.every((d) => HA.checkApp(d, m.apps[d.id]).length === 0) && HA.APP_METHODS.length === 15; });
@@ -636,7 +636,7 @@ async function checkStubs(K) {
   }
   t('purity: the registry, the dialog layer, the menu, the text entry and every stub\'s model and renderer touch no DOM, storage, network, clock, timer or randomness, and import nothing lazily', () => dirty.length === 0, () => dirty.join('; '));
   const ctlText = strip(fs.readFileSync(path.join(K.dir, 'hub_app_ctls.js'), 'utf8'));
-  t('ctls are lazy: hub_app_ctls.js only names the files inside functions (no static import), one per app', () => !/^\s*import\s/m.test(ctlText) && (ctlText.match(/\(\) => import\('\.\/[a-z]+_ctl\.js'\)/g) || []).length === 3);
+  t('ctls are lazy: hub_app_ctls.js only names the files inside functions (no static import), one per app', () => !/^\s*import\s/m.test(ctlText) && (ctlText.match(/\(\) => import\('\.\/[a-z]+_ctl\.js'\)/g) || []).length === (ctlText.match(/^\s*[a-z][a-z0-9]*: \(\) => import/gm) || []).length && (ctlText.match(/^\s*[a-z][a-z0-9]*: \(\) => import/gm) || []).length >= 3);
   return f;
 }
 
@@ -1139,7 +1139,7 @@ async function mutantStack(mu) {
 let REAL = null;
 try {
   REAL = await loadStack(flatTree('arena-apps-real-'));
-  ok(STUB_FILES.every((f) => fs.readFileSync(path.join(REAL.dir, f), 'utf8') === fs.readFileSync(path.join(STUB_DIR, f), 'utf8')) && REAL.HA.APPS.map((a) => a.id).join() === 'online,center,builder', 'the tree under test is the game\'s js/ with the nine placeholder files of the fixture laid over it, and the registry still names online, center, builder', REAL.HA.APPS.map((a) => a.id).join());
+  ok(STUB_FILES.every((f) => fs.readFileSync(path.join(REAL.dir, f), 'utf8') === fs.readFileSync(path.join(STUB_DIR, f), 'utf8')) && REAL.HA.APPS.map((a) => a.id).slice(0, 3).join() === 'online,center,builder', 'the tree under test is the game\'s js/ with the nine placeholder files of the fixture laid over it, and the registry still names online, center, builder', REAL.HA.APPS.map((a) => a.id).join());
   for (const [fam, check] of Object.entries(FAMILIES)) {
     let real; try { real = await check(REAL); } catch (err) { real = ['the checks threw: ' + (err && err.stack ? err.stack.split('\n').slice(0, 3).join(' | ') : err)]; }
     ok(real.length === 0, fam + '. ' + FAMILY_NAMES[fam] + ': every check passes', real.slice(0, 6).join(' ;; '));
