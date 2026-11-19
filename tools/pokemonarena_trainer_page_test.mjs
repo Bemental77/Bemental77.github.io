@@ -162,9 +162,11 @@ const GROUPS = {
       t = await tr(page);
       ok(typing && typed === 'Casey' && t.wiz.draft.name === 'Casey' && t.wiz.step === 'look', 'E3 NEW NAME opens the in-picture keyboard; the name is TYPED on the real keyboard (M and N are letters there) and Enter keeps it', J({ typing, typed, wiz: t.wiz }));
       // every other step opens on a default: M, M, M ...
-      for (const step of ['look', 'front', 'back', 'portrait', 'partner']) await stepPast(page, step, () => press(page, 'm'));
+      // (the PARTNER: one down from the default, the day's mascot, so that the main menu's partner can be told from the mascot it replaces)
+      for (const step of ['look', 'front', 'back', 'portrait', 'partner']) await stepPast(page, step, async () => { if (step === 'partner') await press(page, 'down'); await press(page, 'm'); });
       t = await tr(page);
-      ok(t.wiz.step === 'card' && t.wiz.focus === 'yes', 'E4a every step opens on a default, so M M M ... reaches the TRAINER CARD, asking YES', J(t.wiz));
+      const dayMascot = await page.eval(`(async () => { const HD = await import('/pokemonarena/js/hub_data.js'); return HD.pickMascot(${H}.pack, Math.floor(Date.now() / 86400000)); })()`);
+      ok(t.wiz.step === 'card' && t.wiz.focus === 'yes' && Number.isInteger(t.wiz.draft.partner) && t.wiz.draft.partner !== dayMascot, 'E4a every step opens on a default, so M M M ... reaches the TRAINER CARD, asking YES (the partner taken one below the day\'s mascot)', J({ wiz: t.wiz, dayMascot }));
       await shot(page, 'trainer_E4_card');
       const draft = await page.eval(`${H}.model.app('trainer').draft()`);
       await press(page, 'm', 300);
@@ -176,7 +178,7 @@ const GROUPS = {
       await sleep(300);
       const m = await page.eval(`({ path: ${H}.model.path(), plan: ${H}.welcome && ${H}.welcome.plan, name: ${H}.view().trainer, mascot: (${H}.view().mascot || {}).species })`);
       ok(m.path === 'main' && m.plan === null, 'E5a the next visit lands on the MAIN MENU and nothing is asked', J(m));
-      ok(m.name === 'Casey' && m.mascot === p.card.partner, 'E5 the main menu names the trainer and the PARTNER stands where the day\'s mascot stood', J({ m, partner: p.card && p.card.partner }));
+      ok(m.name === 'Casey' && m.mascot === p.card.partner && m.mascot !== dayMascot, 'E5 the main menu names the trainer and the PARTNER stands where the day\'s mascot stood', J({ m, partner: p.card && p.card.partner, dayMascot }));
       const menuControls = await controls(page);
       ok(greetedControls === menuControls, 'E1c everything the greeting asked was in the picture: the page showed the same controls while greeting as on the main menu (no form, field, button or dialog of its own)', J({ greetedControls, menuControls }));
       await shot(page, 'trainer_E5_main');

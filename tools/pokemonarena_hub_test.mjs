@@ -154,6 +154,8 @@ function checkModel(M) {
   m = mk({ hasSpecies: (id) => id !== 9 }); m.setData(two()); t('title: a partner the ROM cannot draw (hasSpecies false) keeps the day\'s mascot', m.view().mascot.species === 25);
   m = mk(); m.setData({ state: 'ready', activeId: null, profiles: [] }); t('title: with no trainer there is no name and the mascot is the day\'s', m.view().trainer === null && m.view().mascot.species === 25);
   m = mk(); m.setData({ state: 'ready', activeId: null, profiles: [{ id: 'p1', name: 'RED', teams: [], card: card({ partner: 6 }) }] }); t('title: with no active id the only trainer there is counts as the active one', m.view().trainer === 'RED' && m.view().mascot.species === 6);
+  m = mk(); m.setData({ ...two(), profiles: two().profiles.map((p) => ({ ...p, avatar: { kind: 'preset', id: 7 } })) });
+  { const a = m.active(); if (a && a.card) a.card.look = 'wzzzzzz'; t('active(): the ACTIVE trainer\'s id, name, card and portrait as the last data refresh had them, a COPY (what a ctl reads: the Center\'s look)', !!a && a.id === 'p2' && a.name === 'BLUE' && !!a.card && a.card.partner === 9 && a.avatar.id === 7 && m.active().card.look === null && mk().active() === null, J(m.active())); }
   m = mk(); m.setData(FAKE); press(m, 'down', 'a'); m.setData({ ...FAKE, profiles: FAKE.profiles.map((p) => ({ ...p, card: card({ partner: 6 }) })) }); t('title: MY TEAM still shows the team\'s lead, not the partner', m.view().mascot.species === 25, J(m.view().mascot));
   // THE FIRST-VISIT OPENING (welcomePlan): the rule boot.js asks once, after the first data refresh
   const W0 = { openedAt: 'main', path: 'main', later: null, off: null, stored: true };
@@ -296,6 +298,7 @@ const MUTANTS = [
   { name: 'welcome: an invite link is interrupted', find: "if (o.openedAt !== 'main' || o.path !== 'main') return null;", replace: "if (o.path !== 'main') return null;", expect: 'a page opened at any other address' },
   { name: 'welcome: storage that is not kept still greets', find: "if (!data || data.state !== 'ready' || data.notSaved || !o.stored) return null;", replace: "if (!data || data.state !== 'ready') return null;", expect: 'storage that is not kept' },
   { name: 'welcome: a read-only profile is greeted', find: 'if (!p || p.readOnly || cardOf(p).made) return null;', replace: 'if (!p || cardOf(p).made) return null;', expect: 'a read-only active profile' },
+  { name: 'active() hands out the model\'s own object', find: 'return p ? JSON.parse(JSON.stringify({ id: p.id, name: p.name, readOnly: p.readOnly, card: p.card, avatar: p.avatar })) : null;', replace: 'return p ? p : null;', expect: 'active(): the ACTIVE trainer' },
   { name: 'IMPORT SAVE row is dropped from the main menu', find: "  { id: 'import', label: 'IMPORT SAVE',", replace: "  { id: 'importX', label: 'IMPORT SAVE',", expect: 'IMPORT SAVE navigates to the team builder save-import screen' },
 ];
 {
