@@ -15,6 +15,11 @@
 //   node tools/pokemonarena_trainer_card_test.mjs             the cases
 //   node tools/pokemonarena_trainer_card_test.mjs --mutants   ALSO break trainer_card.js / profile.js / store.js / hub_data.js / editor_state.js / trainer_store.js one guard at a time
 //                                                             (in a temp copy of pokemonarena/js); every break must fail one of the NAMED checks it lists
+//   node tools/pokemonarena_trainer_card_test.mjs --browser   ALSO group B, in a REAL headless muted Chrome (tools/headless_cdp.mjs, throwaway profile) against REAL IndexedDB:
+//                      B1 a stored v5 profile is upgraded to 6 ONCE by store.js (the v5 document to history as "migration"), teams / box / record / Tower kept;
+//                      B2 after a reload it is NOT migrated again; B3 trainer_store.js writes its card there and createTrainer makes a new trainer active;
+//                      B4 the REAL hub page (/pokemonarena/) upgrades a v5 profile in the real 'pokemonarena' database once, and a reload of the hub does not again.
+//                      Starts tools/devserver.mjs on ARENA_PORT (default 8141; refuses to run if something already listens there) and Chrome on ARENA_CDP (default 9341).
 // Pure ASCII. Writes only a temp copy of pokemonarena/js (for the mutants).
 import fs from 'node:fs';
 import os from 'node:os';
@@ -26,6 +31,7 @@ const root = path.resolve(here, '..');
 const SRC = path.join(root, 'pokemonarena', 'js');
 const FX = path.join(here, 'fixtures', 'pokemonarena');
 const WANT_MUTANTS = process.argv.includes('--mutants');
+const WANT_BROWSER = process.argv.includes('--browser');
 
 let results = [];
 const J = (x) => JSON.stringify(x);
@@ -467,8 +473,54 @@ async function runMutants() {
   return out;
 }
 
+/* ------------------------------------------------------------------------------------------------ B: real IndexedDB in a real Chrome */
+async function browserSuite() {
+  const net = await import('node:net'), { spawn } = await import('node:child_process'), { withBrowser } = await import('./headless_cdp.mjs');
+  const PORT = Number(process.env.ARENA_PORT || 8141), CDP = Number(process.env.ARENA_CDP || 9341), BASE = 'http://localhost:' + PORT;
+  const listening = (p) => new Promise((res) => { const s = net.connect(p, '127.0.0.1'); s.once('connect', () => { s.destroy(); res(true); }); s.once('error', () => res(false)); });
+  if (await listening(PORT)) { results.push({ name: 'B0 the devserver port is free', ok: false, detail: 'something already listens on ' + PORT + ' (a stale server would make this test read another tree); set ARENA_PORT' }); return; }
+  const server = spawn(process.execPath, [path.join(here, 'devserver.mjs')], { cwd: root, env: { ...process.env, PORT: String(PORT) }, stdio: 'ignore', windowsHide: true });
+  try {
+    for (let i = 0; i < 80 && !(await listening(PORT)); i++) await new Promise((r) => setTimeout(r, 150));
+    await withBrowser({ port: CDP, width: 960, height: 640 }, async (page) => {
+      const V5 = clone(FIX.v5), DBN = 'tc-browser-' + Date.now().toString(36);
+      await page.navigate(BASE + '/pokemonarena/js/trainer_card.js');          // any page of the origin: the store is imported into it
+      const run = (body) => page.eval('(async () => { const S = await import("/pokemonarena/js/store.js"); const TS = await import("/pokemonarena/js/trainer_store.js"); ' + body + ' })()');
+      const readBack = (db, id) => 'let raw, hist; { const rb = await S.openStore({ dbName: ' + J(db) + ', channel: false }); raw = await rb.adapter.transact(["profiles"], "readonly", (tx) => tx.get("profiles", ' + J(id) + ')); hist = await rb.adapter.transact(["profileHistory"], "readonly", (tx) => tx.list("profileHistory")); await rb.close(); }';
+      const keptOf = (raw) => ['teams', 'box', 'stats', 'tower', 'identity', 'trainerName', 'avatar', 'settings', '_unknown'].filter((k) => canon(raw[k]) !== canon(V5[k]));
+      // B1
+      const b1 = await run('const store = await S.openStore({ dbName: ' + J(DBN) + ', channel: false }); await store.adapter.transact(["profiles"], "readwrite", (tx) => tx.put("profiles", ' + J(V5) + ')); const r1 = await store.loadProfile(' + J(V5.id) + '); const r2 = await store.loadProfile(' + J(V5.id) + '); const st = store.status; await store.close(); ' + readBack(DBN, V5.id) + ' return { mode: st.mode, notSaved: st.notSaved, r1: { ok: r1.ok, mf: r1.migratedFrom, rev: r1.profile && r1.profile.rev }, r2: { ok: r2.ok, mf: r2.migratedFrom, rev: r2.profile && r2.profile.rev }, raw, hist };');
+      const h1 = b1.hist.filter((h) => h.id === V5.id);
+      results.push({ name: 'B1 REAL IndexedDB: a stored v5 profile is upgraded to 6 ONCE (the v5 document to history as "migration"), with the empty card; its teams, box, record, Tower record, name and portrait are kept', ok: b1.mode === 'indexeddb' && !b1.notSaved && b1.r1.ok && b1.r1.mf === 5 && b1.r1.rev === V5.rev + 1 && b1.r2.ok && b1.r2.mf === null && b1.r2.rev === V5.rev + 1 && b1.raw.schemaVersion === 6 && J(b1.raw.card) === J({ made: false, look: null, front: null, back: null, partner: null }) && h1.length === 1 && h1[0].reason === 'migration' && canon(h1[0].doc) === canon(V5) && keptOf(b1.raw).length === 0, detail: J({ mode: b1.mode, ns: b1.notSaved, r1: b1.r1, r2: b1.r2, sv: b1.raw && b1.raw.schemaVersion, hist: h1.map((h) => [h.rev, h.reason, h.doc.schemaVersion]), changed: b1.raw ? keptOf(b1.raw) : null }) });
+      // B2: a reload, then the same database again
+      await page.navigate(BASE + '/pokemonarena/js/trainer_card.js');
+      const b2 = await run('const store = await S.openStore({ dbName: ' + J(DBN) + ', channel: false }); const r = await store.loadProfile(' + J(V5.id) + '); await store.close(); ' + readBack(DBN, V5.id) + ' return { mf: r.migratedFrom, rev: r.profile.rev, raw, hist };');
+      results.push({ name: 'B2 after a RELOAD the v6 profile is read as it is: not migrated again, the revision does not move, one history entry', ok: b2.mf === null && b2.rev === V5.rev + 1 && b2.raw.rev === V5.rev + 1 && b2.hist.filter((h) => h.id === V5.id).length === 1, detail: J({ mf: b2.mf, rev: b2.rev, hist: b2.hist.length }) });
+      // B3: the trainer app's save API on real IndexedDB
+      const b3 = await run('const store = await S.openStore({ dbName: ' + J(DBN) + ', channel: false }); const u = await TS.updateTrainer(store, ' + J(V5.id) + ', { card: { made: true, front: 4, look: "w000002" } }); const c = await TS.createTrainer(store, { name: "NEWBIE", card: { made: true } }); const act = await store.getActiveId(); const list = await TS.listTrainers(store); await store.close(); ' + readBack(DBN, V5.id) + ' await new Promise((r) => { const q = indexedDB.deleteDatabase(' + J(DBN) + '); q.onsuccess = q.onerror = q.onblocked = () => r(); }); return { u: { ok: u.ok, code: u.code }, c: { ok: c.ok, id: c.id, code: c.code }, act, list, raw, hist };');
+      results.push({ name: 'B3 REAL IndexedDB: trainer_store.js writes the card of the upgraded profile (history: migration, trainer) without touching its teams or record, and createTrainer makes a new trainer the active one', ok: b3.u.ok && b3.c.ok && b3.act === b3.c.id && b3.raw.card.made === true && b3.raw.card.front === 4 && keptOf(b3.raw).length === 0 && J(b3.hist.filter((h) => h.id === V5.id).map((h) => h.reason)) === J(['migration', 'trainer']) && b3.list.length === 2 && b3.list.some((x) => x.id === b3.c.id && x.active && x.name === 'NEWBIE'), detail: J({ u: b3.u, c: b3.c, act: b3.act, card: b3.raw && b3.raw.card, hist: b3.hist && b3.hist.map((h) => h.reason), list: b3.list }) });
+      // B4: the real hub page, the real database
+      const HV5 = { ...clone(FIX.v5), id: 'p_hubv5' };
+      await page.eval('(async () => { try { localStorage.setItem("arena.welcome", "off"); } catch (_e) {} const S = await import("/pokemonarena/js/store.js"); const store = await S.openStore({ channel: false }); await store.adapter.transact(["profiles"], "readwrite", (tx) => tx.put("profiles", ' + J(HV5) + ')); await store.setActiveId("p_hubv5"); await store.close(); return true; })()');
+      await page.navigate(BASE + '/pokemonarena/');
+      const probe = '(async () => { const S = await import("/pokemonarena/js/store.js"); ' + readBack('pokemonarena', 'p_hubv5') + ' return { sv: raw && raw.schemaVersion, rev: raw && raw.rev, raw, hist: hist.filter((h) => h.id === "p_hubv5").map((h) => ({ reason: h.reason, sv: h.doc.schemaVersion, doc: h.doc })) }; })()';
+      let hub = null;
+      for (let i = 0; i < 120; i++) { try { hub = await page.eval(probe); } catch (_e) { hub = null; } if (hub && hub.sv === 6) break; await new Promise((r) => setTimeout(r, 500)); }
+      results.push({ name: 'B4 the REAL HUB PAGE upgrades a v5 profile stored in the real "pokemonarena" database to 6 when it reads it (the v5 document to history as "migration"), keeping its teams and record', ok: !!hub && hub.sv === 6 && hub.rev === HV5.rev + 1 && hub.hist.length === 1 && hub.hist[0].reason === 'migration' && hub.hist[0].sv === 5 && canon(hub.hist[0].doc) === canon(HV5) && canon(hub.raw.teams) === canon(HV5.teams) && canon(hub.raw.stats) === canon(HV5.stats) && canon(hub.raw.box) === canon(HV5.box), detail: J(hub && { sv: hub.sv, rev: hub.rev, hist: hub.hist.map((h) => [h.reason, h.sv]) }) });
+      await page.navigate(BASE + '/pokemonarena/');
+      await new Promise((r) => setTimeout(r, 6000));          // the hub reads its data again after the ROM loads
+      const again = await page.eval(probe);
+      const title = await page.eval('document.title');
+      results.push({ name: 'B5 a RELOAD of the hub reads the upgraded profile without migrating it again (same revision, still one history entry)', ok: again.sv === 6 && again.rev === HV5.rev + 1 && again.hist.length === 1, detail: J({ sv: again.sv, rev: again.rev, hist: again.hist.length, title }) });
+    });
+  } catch (e) {
+    results.push({ name: 'B9 the browser part ran to the end', ok: false, detail: String(e && e.stack ? e.stack : e).slice(0, 400) });
+  } finally { try { process.kill(server.pid); } catch (_e) { /* gone */ } }
+}
+
 const t0 = Date.now();
 await suite(await loadStack(SRC));
+if (WANT_BROWSER) await browserSuite();
 const failed = results.filter((r) => !r.ok);
 for (const r of results) if (!r.ok || process.env.ARENA_VERBOSE) console.log((r.ok ? 'ok   ' : 'FAIL ') + r.name + (r.ok ? '' : '\n       ' + r.detail));
 console.log(`trainer card: ${results.length - failed.length} passed, ${failed.length} failed (${((Date.now() - t0) / 1000).toFixed(1)} s)`);
