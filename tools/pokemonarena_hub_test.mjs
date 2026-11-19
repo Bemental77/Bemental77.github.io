@@ -651,14 +651,18 @@ try {
     await shot(page, 'hub_kbd_3_sound_on');
     await key(page, 'esc'); await sleep(300);
     ok(!(await soundOpen()), tag + 'Esc closes the SOUND panel in one press');
-    // the M key mutes and unmutes on any page; the setting is stored as arena.audio (JSON, v:1)
-    const pressM = async () => { await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'm', code: 'KeyM', text: 'm', windowsVirtualKeyCode: 77 }); await sleep(40); await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'm', code: 'KeyM', windowsVirtualKeyCode: 77 }); await sleep(250); };
-    await pressM();
+    // the mute key, O, mutes and unmutes on any page; the setting is stored as arena.audio (JSON, v:1). M is the keyboard's A since 2026-11-18 (INAPP.md TRAINER, decision 6): it never mutes
+    const pressKey = async (k, code, vk) => { await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: k, code, text: k, windowsVirtualKeyCode: vk }); await sleep(40); await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key: k, code, windowsVirtualKeyCode: vk }); await sleep(250); };
+    const pressM = () => pressKey('m', 'KeyM', 77), pressO = () => pressKey('o', 'KeyO', 79);
+    await pressM(); await sleep(150);
+    ok((await soundOpen()) && (await page.eval(`${HUB}.sound.on()`)) === true && !JSON.parse((await page.eval(`localStorage.getItem('arena.audio')`)) || '{}').muted, tag + 'M is A: on the SOUND row it opens the SOUND panel, and it does not mute');
+    await key(page, 'esc'); await sleep(300);
+    await pressO();
     const st1 = JSON.parse((await page.eval(`localStorage.getItem('arena.audio')`)) || 'null');
-    ok(st1 && st1.v === 1 && st1.muted === true && (await page.eval(`${HUB}.sound.on()`)) === false && (await page.eval(`document.getElementById('soundBtn').textContent`)) === 'Sound: off' && (await page.eval(`${HUB}.view().menu.rows.find((r) => r.id === 'sound').label`)) === 'SOUND: OFF', tag + 'M mutes: arena.audio {v:1, muted:true}, the button and the menu row say OFF', J(st1));
-    await pressM();
+    ok(st1 && st1.v === 1 && st1.muted === true && (await page.eval(`${HUB}.sound.on()`)) === false && (await page.eval(`document.getElementById('soundBtn').textContent`)) === 'Sound: off' && (await page.eval(`${HUB}.view().menu.rows.find((r) => r.id === 'sound').label`)) === 'SOUND: OFF', tag + 'O mutes: arena.audio {v:1, muted:true}, the button and the menu row say OFF', J(st1));
+    await pressO();
     const st2 = JSON.parse((await page.eval(`localStorage.getItem('arena.audio')`)) || 'null');
-    ok(st2 && st2.muted === false && (await page.eval(`${HUB}.sound.on()`)) === true, tag + 'M again unmutes', J(st2));
+    ok(st2 && st2.muted === false && (await page.eval(`${HUB}.sound.on()`)) === true, tag + 'O again unmutes', J(st2));
     // a muted setting survives a reload (and creates no AudioContext before a gesture); the old arena.sound key is migrated once
     await page.eval(`localStorage.setItem('arena.audio', JSON.stringify({ v: 1, master: 0.7, music: 0.6, fx: 0.8, muted: true, soundtrack: 'soulgold' }))`);
     await boot(page);

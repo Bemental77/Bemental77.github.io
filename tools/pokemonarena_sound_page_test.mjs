@@ -16,7 +16,7 @@
 // SESSIONS (a fresh throwaway Chrome each)
 //   hub      (a) no AudioContext exists before the first activation; the default is sound ON; the controller-only prompt; (b) the first key creates and resumes one
 //            and the hub song starts; the panel with MOUSE: slider click, wheel, - / + with hold-to-repeat, mute, test cry, soundtrack switch, close; (f) persistence,
-//            migration of arena.sound; (h) a hidden tab; the M key
+//            migration of arena.sound; (h) a hidden tab; the mute key (O)
 //   keys     the panel with the KEYBOARD alone (Tab, arrows, Home / End, Enter, Esc)
 //   pad      (c)(d) a CONTROLLER alone: the prompt stays (a pad is not an activation), the SOUND row, every control through the d-pad + A + B, no context is created
 //   touch    the panel with TOUCH at 390x844 @3x
@@ -78,8 +78,8 @@ const active = (page) => page.eval(`(() => { const a = document.activeElement; r
 const sleepFrame = () => sleep(120);
 
 async function key(page, name, hold = 35) {
-  const K = { up: ['ArrowUp', 'ArrowUp', 38], down: ['ArrowDown', 'ArrowDown', 40], left: ['ArrowLeft', 'ArrowLeft', 37], right: ['ArrowRight', 'ArrowRight', 39], a: ['Enter', 'Enter', 13], esc: ['Escape', 'Escape', 27], tab: ['Tab', 'Tab', 9], home: ['Home', 'Home', 36], end: ['End', 'End', 35], m: ['m', 'KeyM', 77], p: ['p', 'KeyP', 80], space: [' ', 'Space', 32], b: ['Backspace', 'Backspace', 8], shift: ['Shift', 'ShiftLeft', 16] }[name];
-  const text = name === 'a' ? '\r' : name === 'space' ? ' ' : name === 'm' ? 'm' : undefined;
+  const K = { up: ['ArrowUp', 'ArrowUp', 38], down: ['ArrowDown', 'ArrowDown', 40], left: ['ArrowLeft', 'ArrowLeft', 37], right: ['ArrowRight', 'ArrowRight', 39], a: ['Enter', 'Enter', 13], esc: ['Escape', 'Escape', 27], tab: ['Tab', 'Tab', 9], home: ['Home', 'Home', 36], end: ['End', 'End', 35], m: ['m', 'KeyM', 77], o: ['o', 'KeyO', 79], n: ['n', 'KeyN', 78], p: ['p', 'KeyP', 80], space: [' ', 'Space', 32], b: ['Backspace', 'Backspace', 8], shift: ['Shift', 'ShiftLeft', 16] }[name];
+  const text = name === 'a' ? '\r' : name === 'space' ? ' ' : ['m', 'n', 'o'].includes(name) ? name : undefined;
   await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: K[0], code: K[1], windowsVirtualKeyCode: K[2], ...(text ? { text } : {}) });
   await sleep(hold);
   await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key: K[0], code: K[1], windowsVirtualKeyCode: K[2] });
@@ -232,7 +232,7 @@ async function scnPersistence(page, R, base) {
   await page.eval(`localStorage.removeItem('arena.audio')`);
 }
 
-// (h) hidden tab, the M key
+// (h) hidden tab, the mute key (O; it was M until M became the keyboard's A, 2026-11-18)
 async function scnHiddenAndM(page, R, base) {
   await page.navigate(base + '/pokemonarena/'); await hubReady(page);
   await key(page, 'down'); await page.waitFor(`window.__snd.ctxs[0] && window.__snd.ctxs[0].state === 'running' && window.__sndMusic.play.length === 1`, { timeoutMs: 8000 });
@@ -242,19 +242,19 @@ async function scnHiddenAndM(page, R, base) {
   await page.eval(`Object.defineProperty(document, 'hidden', { configurable: true, get: () => false }); document.dispatchEvent(new Event('visibilitychange'));`);
   await sleep(300);
   R.ok((await ctxState(page)) === 'running' && (await page.eval('window.__sndMusic.resume')) === 1 && (await page.eval('window.__sndMusic.play.length')) === 1, '(h) coming back resumes the context and the same song');
-  // M
+  // O (the mute key)
   await page.eval(`${HUB}.canvas.focus()`);
-  await key(page, 'm'); await sleep(250);
-  R.ok((await settings(page)).muted === true && (await page.eval(`document.getElementById('soundToast').hidden`)) === false && /muted/i.test(await page.eval(`document.getElementById('soundToast').textContent`)), '(e) the M key mutes (and says so)');
-  R.ok((await gains(page)).master === 0, 'M: the master bus is 0');
-  await key(page, 'm'); await sleep(250);
-  R.ok((await settings(page)).muted === false && (await ctxState(page)) === 'running' && near((await gains(page)).master, gainOf(0.5, 'master')), '(e) M again unmutes and restores the level (the starting master 0.5)');
-  // M does not fire inside a text field
+  await key(page, 'o'); await sleep(250);
+  R.ok((await settings(page)).muted === true && (await page.eval(`document.getElementById('soundToast').hidden`)) === false && /muted \(O\)/i.test(await page.eval(`document.getElementById('soundToast').textContent`)), '(e) the O key mutes (and says so, naming O)', await page.eval(`document.getElementById('soundToast').textContent`));
+  R.ok((await gains(page)).master === 0, 'O: the master bus is 0');
+  await key(page, 'o'); await sleep(250);
+  R.ok((await settings(page)).muted === false && (await ctxState(page)) === 'running' && near((await gains(page)).master, gainOf(0.5, 'master')), '(e) O again unmutes and restores the level (the starting master 0.5)');
+  // the mute key does not fire inside a text field (there O, M and N are letters)
   await page.eval(`(() => { const i = document.createElement('input'); i.id = 'tmpText'; i.type = 'text'; document.body.appendChild(i); i.focus(); })()`);
-  await key(page, 'm'); await sleep(150);
-  R.ok((await settings(page)).muted === false, 'M typed into a text field does not mute');
+  await key(page, 'o'); await key(page, 'm'); await key(page, 'n'); await sleep(150);
+  R.ok((await settings(page)).muted === false && (await page.eval(`document.getElementById('tmpText').value`)) === 'omn', 'O typed into a text field does not mute (O, M and N are typed there as letters)', await page.eval(`document.getElementById('tmpText').value`));
   await page.eval(`document.getElementById('tmpText').remove()`);
-  // M with the Controls panel capturing a key to bind
+  // the mute key with the Controls panel capturing a key to bind
   await page.eval(`${HUB}.canvas.focus()`);
 }
 
@@ -580,9 +580,9 @@ async function scnRealAudio(page, R, base) {
   R.ok(e1 && e1.effects >= 1, 'REAL AudioContext: a sound effect (se_select) is accepted by the real engine (effects sounding: ' + (e1 && e1.effects) + ')', J(e1));
   R.ok(cry === true && (await page.eval('window.__arenaSound.plays')) >= 1, 'REAL AudioContext: a ROM cry plays through the effects bus on the real context');
   // mute / unmute on the real context
-  await key(page, 'm'); await sleep(400);
+  await key(page, 'o'); await sleep(400);
   R.ok((await page.eval(`window.__arenaSound.ctx().state`)) === 'suspended' && (await page.eval('window.__arenaSound.state().director.paused')) === true, 'REAL AudioContext: mute suspends the real context and pauses the engine');
-  await key(page, 'm'); await sleep(600);
+  await key(page, 'o'); await sleep(600);
   R.ok((await page.eval(`window.__arenaSound.ctx().state`)) === 'running' && (await page.eval('window.__arenaSound.state().director.paused')) === false && (await page.eval('window.__arenaSound.state().director.cur.index')) === d0.cur.index, 'REAL AudioContext: unmute resumes the same song');
   R.ok(errsOf(page).filter((x) => !/favicon/.test(x)).length === 0, 'REAL AudioContext: no page or console error', J(errsOf(page)));
 }
@@ -700,7 +700,7 @@ try {
     await key(page, 'esc'); await sleep(300);
     await scenario('persistence + migration', (R) => scnPersistence(page, R, BASE));
     await fresh(page, BASE);
-    await scenario('hidden tab + M key', (R) => scnHiddenAndM(page, R, BASE));
+    await scenario('hidden tab + the mute key (O)', (R) => scnHiddenAndM(page, R, BASE));
     head('hub: the Ultra Violet ROM that cannot be loaded');
     await fresh(page, BASE);
     await scenario('UV cannot be loaded', async (R) => {

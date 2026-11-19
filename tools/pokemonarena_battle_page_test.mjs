@@ -67,7 +67,7 @@ async function logicalToPage(page, lx, ly) {
   return { x: r.x + (lx / 240) * r.w, y: r.y + (ly / 160) * r.h };
 }
 async function tapLogical(page, lx, ly, touch) { const p = await logicalToPage(page, lx, ly); if (touch) await page.tap(p.x, p.y); else await page.click(p.x, p.y); return p; }
-const KEYS = { up: ['ArrowUp', 'ArrowUp', 38], down: ['ArrowDown', 'ArrowDown', 40], left: ['ArrowLeft', 'ArrowLeft', 37], right: ['ArrowRight', 'ArrowRight', 39], a: ['Enter', 'Enter', 13], b: ['Backspace', 'Backspace', 8], start: ['p', 'KeyP', 80], x: ['c', 'KeyC', 67] };
+const KEYS = { up: ['ArrowUp', 'ArrowUp', 38], down: ['ArrowDown', 'ArrowDown', 40], left: ['ArrowLeft', 'ArrowLeft', 37], right: ['ArrowRight', 'ArrowRight', 39], a: ['Enter', 'Enter', 13], b: ['Backspace', 'Backspace', 8], start: ['p', 'KeyP', 80], x: ['c', 'KeyC', 67], m: ['m', 'KeyM', 77], n: ['n', 'KeyN', 78] };
 const key = (page, k) => page.press(KEYS[k][0], KEYS[k][1], KEYS[k][2], 25);
 
 // invariant: when the scene is idle (a menu is up), the displayed Pokemon equal the engine's
@@ -267,6 +267,10 @@ session('keys', { width: 1280, height: 800 }, async (page) => {
   ok(/give up on this battle/.test(await ev(page, `${H}.view().box.text.join(' ')`)), 'keys: the confirm shows the question text in the message box');
   await shot(page, 'keys_forfeit_confirm');
   await key(page, 'b'); ok(await mode(page) === 'action', 'keys: B cancels the confirm');
+  // M = A and N = B here too (the same input layer as the hub; INAPP.md TRAINER, decision 6), and the hint line names them
+  await key(page, 'm'); ok(await mode(page) === 'confirm', 'keys: M (the keyboard\'s A) on RUN opens the forfeit confirm');
+  await key(page, 'n'); ok(await mode(page) === 'action', 'keys: N (the keyboard\'s B) cancels it');
+  { const hint = await ev(page, `document.getElementById('keys').textContent`); ok(/\bM chooses\b/.test(hint) && /\bN goes back\b/.test(hint), 'keys: the hint line under the picture names M and N', hint); }
   await key(page, 'a');                                                         // cursor is on RUN again
   await key(page, 'up'); await key(page, 'a');                                  // YES
   const end = await untilMode(page, 'result', { max: 20000, press: true });
@@ -445,10 +449,10 @@ session('audio', { width: 1280, height: 800 }, async (page) => {
   const sc = await ev(page, `(() => { const r = document.querySelector('#soundDialog [data-snd="close"]').getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; })()`);
   await page.click(sc.x, sc.y); await sleep(300);
   ok((await ev(page, `document.getElementById('soundDialog').hidden`)) === true, 'audio: Close closes the SOUND panel');
-  // M mutes: stored as arena.audio, the button says off; a reload keeps it muted (and still creates no context before a gesture)
-  await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'm', code: 'KeyM', text: 'm', windowsVirtualKeyCode: 77 }); await sleep(40); await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'm', code: 'KeyM', windowsVirtualKeyCode: 77 }); await sleep(300);
+  // O (the mute key; M is the keyboard's A) mutes: stored as arena.audio, the button says off; a reload keeps it muted (and still creates no context before a gesture)
+  await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'o', code: 'KeyO', text: 'o', windowsVirtualKeyCode: 79 }); await sleep(40); await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'o', code: 'KeyO', windowsVirtualKeyCode: 79 }); await sleep(300);
   const st = JSON.parse((await ev(page, `localStorage.getItem('arena.audio')`)) || 'null');
-  ok(st && st.v === 1 && st.muted === true && (await ev(page, `document.getElementById('soundBtn').textContent`)) === 'Sound: off' && (await ev(page, `${H}.sound.on()`)) === false, 'audio: M mutes (arena.audio {v:1, muted:true}, the button reads "Sound: off")', JSON.stringify(st));
+  ok(st && st.v === 1 && st.muted === true && (await ev(page, `document.getElementById('soundBtn').textContent`)) === 'Sound: off' && (await ev(page, `${H}.sound.on()`)) === false, 'audio: O mutes (arena.audio {v:1, muted:true}, the button reads "Sound: off")', JSON.stringify(st));
   await open(page, '?seed=7&format=6v6');                                          // reload: still muted, no context before a gesture
   ok((await ev(page, `window.__audioLog.ctor`)) === 0 && (await ev(page, `${H}.sound.on()`)) === false, 'audio: after a reload the muted setting is kept and no AudioContext exists before a gesture');
   await key(page, 'b'); await sleep(150);                                          // (B, not A: a 6v6 battle now opens with the lead preview, where A would open its question and leave autoplay() waiting for the human's answer)
