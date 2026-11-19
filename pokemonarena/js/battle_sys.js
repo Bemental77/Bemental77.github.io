@@ -18,7 +18,7 @@ import { AnimPpu } from './anim_ppu.js';
 import { SLICE_CHECK } from './anim_cpu.js';
 import { cryFrames, songInfo, defaultIsSEPlaying } from './anim_sound.js';
 import { encodeText, decodeText } from './charset.js';
-import { speciesRecord, SPECIES_TABLE, SPECIES_STRIDE } from './speciesgfx.js';
+import { speciesRecord, SPECIES_TABLE, SPECIES_STRIDE, TRAINER_BACK_COUNT } from './speciesgfx.js';
 
 /** System-animation ids of `animator.start('system', id, ctx)`. */
 export const SYS_ID = Object.freeze({ intro: 0, introTrainer: 1, sendOutPlayer: 2, recallPlayer: 3, faintPlayer: 4, faintFoe: 5, hitPlayer: 6, hitFoe: 7, sendOutFoe: 8, recallFoe: 9 });
@@ -263,7 +263,8 @@ export class SystemRun {
     const put = (a, buf) => { for (let i = 0; i < buf.length; i++) mem.write8(a + i, buf[i]); };
     const tid = ctx.tid === undefined ? 0x2ded : ctx.tid, sid = ctx.sid === undefined ? 0xa7e3 : ctx.sid;
     // SaveBlock2: name, gender, trainer id, options (text speed fast = 1 frame per character, stereo, battle style set, battle scene on)
-    put(SYS.sb2, field(ctx.playerName || 'Nova', 8)); mem.write8(SYS.sb2 + 8, ctx.gender === 'F' || ctx.gender === 1 ? 1 : 0);
+    // (the gender byte is the index of the player's trainer BACK picture the ROM's battle code draws: 'M' 0, 'F' 1, or any index of the ROM's back table, which INAPP.md TRAINER measured pixel-exact)
+    put(SYS.sb2, field(ctx.playerName || 'Nova', 8)); mem.write8(SYS.sb2 + 8, ctx.gender === 'F' ? 1 : Number.isInteger(ctx.gender) && ctx.gender >= 0 && ctx.gender < TRAINER_BACK_COUNT ? ctx.gender : 0);
     w16(tmp, 0, tid); w16(tmp, 2, sid); put(SYS.sb2 + 0xa, tmp.subarray(0, 4));
     mem.write8(SYS.sb2 + 0x14, 0x02); mem.write8(SYS.sb2 + 0x15, 0x03);
     mem.write8(SYS.sb2 + 0x16, ctx.sb2Option16 === undefined ? 0x30 : ctx.sb2Option16); mem.write8(SYS.sb1 + 0x19c3, ctx.sb1Flag19c3 === undefined ? 0x40 : ctx.sb1Flag19c3);

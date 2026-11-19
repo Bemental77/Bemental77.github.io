@@ -25,6 +25,7 @@ import { fileURLToPath } from 'node:url';
 import { withBrowser } from './headless_cdp.mjs';
 import { loadStack } from './pokemonarena_netmatch_lib.mjs';
 import { MAIN_LABELS } from '../pokemonarena/js/hub_model.js';          // the hub's main menu, as the picture draws it (H1)
+import { frontChoices } from '../pokemonarena/js/trainer_figures.js';          // INAPP.md TRAINER: the battle figures this ROM can show (FT1-FT3)
 import { PROTO } from '../pokemonarena/js/netmatch.js';          // the protocol version the pages speak (2 since the 6v6 lead preview): the messages these cases forge by hand carry it, so they are refused for what they say, not for their version
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -1812,7 +1813,8 @@ async function groupProfile(S) {
   const pm = fs.readFileSync(path.join(root, 'pokemonarena', 'ONLINE.md'), 'utf8').match(/`profile --mutants` does the same for the write of a match the end-of-match comparison stopped, (\d+) of them/);
   ok(!!pm && Number(pm[1]) === PROFILE_MUTANTS.length, 'F25 pokemonarena/ONLINE.md states how many ways `profile --mutants` breaks the page (' + PROFILE_MUTANTS.length + ')', pm ? 'ONLINE.md says ' + pm[1] : 'the sentence is not in ONLINE.md');
   await profileDesync({ origin: ORIGIN, ok, cdp: CDP0 + 33 });
-  if (process.argv.includes('--mutants')) await profileMutants();
+  await profileTrainer({ origin: ORIGIN, ok, cdp: CDP0 + 33 });
+  if (process.argv.includes('--mutants')) { await profileMutants(); await trainerMutants(); }
 }
 
 // F22-F24. The other machine's final message names another position than this machine's engine ends in: the comparison (netmatch.js checkEnd) fails the match although it is already 'over', the
@@ -1851,6 +1853,70 @@ async function profileDesync(c) {
     const cB = await careerOf(guest);
     ok(sg.phase === 'over' && modes[1] === 'result' && cB && cB.state === 'saved' && sum(B.stats.byCpu.online) === 1 && B.stats.recent.length === 1, 'F24 control: the honest guest, whose comparison passed, DID record the same battle (so the host\'s empty record in F23 is the guard, not a rig that cannot write)', J({ phase: sg.phase, career: cB, online: B.stats.byCpu.online }));
   });
+}
+// FT1-FT3. THE TRAINER IN AN ONLINE BATTLE (INAPP.md TRAINER decision 3, "BATTLE: as built" there): two saved trainers whose cards name a battle figure (front) and a back figure. Each page shows its
+// OWN trainer (the name it plays under, its card's back figure, handed to the scene for the ROM's runs) and draws the OTHER trainer's battle figure as its foe: the other page's hello carries it
+// (netmatch.js `fig`, proved in Node with an older peer in either seat: pokemonarena_netmatch_test.mjs case T), and this page hands the scene the ROM trainer that shows it (trainer_figures.js
+// trainerForFront). c = { origin, ok, cdp }.
+const SET_CARD_JS = (id, card) => `(async () => { const S = await import('/pokemonarena/js/store.js'), T = await import('/pokemonarena/js/trainer_store.js'); const store = await S.openStore(); try { const r = await T.updateTrainer(store, ${J(id)}, { card: ${J(card)} }); return r.ok ? true : r.code; } finally { await store.close(); } })()`;
+const TRAINER_SHOWN_JS = '(() => { const B = window.__arenaBattle, i = B.scene.trainerInfo(); return { hook: B.trainer, name: i.playerName, back: i.playerBack === undefined ? null : i.playerBack, foe: i.foeTrainer }; })()';
+async function profileTrainer(c) {
+  const { ok } = c;
+  const base = c.origin + '/pokemonarena/battle.html';
+  const romBytes = fs.readFileSync(path.join(root, 'gba', 'gbaWasm', 'roms', 'Pokemon SoulGold (v1.1.1).gba'));
+  const fronts = frontChoices(new Uint8Array(romBytes.buffer, romBytes.byteOffset, romBytes.length)).filter((x) => x.trainerId > 1);
+  const figA = fronts[1], figB = fronts[fronts.length - 2];
+  await withBrowser({ port: c.cdp, width: 900, height: 760, lock: false, args: NO_THROTTLE }, async (host) => {
+    const guest = await host.openTab({ width: 900, height: 760 });
+    await openRoom(host, 'APRO5', 'host', '', base);
+    const seeded = await host.eval(SEED_PROFILES_JS([['ALICE', [['Alice Squad', ['Pikachu', 'Charizard', 'Snorlax']]]], ['BOBBY', [['Bobby Squad', ['Blastoise', 'Gengar', 'Eevee']]]]]));
+    const [pa, pb] = seeded.profiles;
+    const set = [await host.eval(SET_CARD_JS(pa.id, { made: true, back: 4, front: figA.pic })), await host.eval(SET_CARD_JS(pb.id, { made: true, back: 7, front: figB.pic }))];
+    ok(fronts.length > 4 && set[0] === true && set[1] === true, 'FT1 two saved trainers, their cards naming a battle figure (' + figA.pic + ', ' + figB.pic + ') and a back figure (4, 7)', J(set));
+    await openRoom(host, 'APRO5', 'host', '', base); await openRoom(guest, 'APRO5', 'guest', '', base);
+    await pickTeam(host, 'saved:' + pa.id + ':' + pa.teams[0]); await pickTeam(guest, 'saved:' + pb.id + ':' + pb.teams[0], 'Zed');
+    await host.eval('window.__arenaOnline.setForm({ fmt: "3v3" }); void window.__arenaOnline.go()');
+    await host.waitFor('window.__arenaOnline.view().code !== ""', { timeoutMs: 30000 });
+    await guest.eval('void window.__arenaOnline.go()');
+    await approve(host, true);
+    for (let i = 0; i < 160 && !((await phase(host)) === 'playing' && (await phase(guest)) === 'playing'); i++) await sleep(250);
+    await host.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 }); await guest.waitFor('window.__arenaBattle.state === "ready"', { timeoutMs: 30000 });
+    const [h, g] = [await host.eval(TRAINER_SHOWN_JS), await guest.eval(TRAINER_SHOWN_JS)];
+    ok(h.name === 'ALICE' && h.back === 4 && h.hook.name === 'ALICE' && g.name === 'Zed' && g.back === 7 && g.hook.back === 7, 'FT2 each page shows its OWN trainer: the name it plays under (ALICE; the typed Zed) and its card\'s back figure, handed to the scene', J([h, g]));
+    ok(h.hook.oppFig === figB.pic && g.hook.oppFig === figA.pic && h.foe === figB.trainerId && g.foe === figA.trainerId, 'FT3 each page draws the OTHER trainer\'s battle figure as its foe (their hello\'s fig, as the ROM trainer that shows it: ' + figB.trainerId + ' / ' + figA.trainerId + ')', J([h, g]));
+    ok(host.errors.length === 0 && guest.errors.length === 0, 'FT4 no page errors', J(host.errors.concat(guest.errors)).slice(0, 200));
+  });
+}
+// trainer --mutants (run with `profile --mutants`): each defect must fail the NAMED case of profileTrainer
+const TRAINER_MUTANTS = [
+  { id: 'T01', what: 'an online battle calls the player "You" whatever their trainer', file: 'js/battle_boot.js', from: "trainer: info.oppName, playerName: shownMe.name,", to: "trainer: info.oppName, playerName: 'You',", fails: 'FT2' },
+  { id: 'T02', what: 'the trainer\'s card never reaches the online page (no back figure, no figure in the hello)', file: 'js/online.js', from: "card: choice.card || null } : state.activeTrainer || null;", to: "card: null } : state.activeTrainer || null;", fails: 'FT2' },
+  { id: 'T03', what: 'the hello carries no figure', file: 'js/online.js', from: "fmt: state.fmt, ...figOf(state.trainer) },", to: "fmt: state.fmt },", fails: 'FT3' },
+  { id: 'T04', what: 'the opponent\'s figure is not handed to the scene (the CPU level picks the foe)', file: 'js/battle_boot.js', from: "...(foeTr ? { foeTrainer: foeTr } : {}),", to: '', fails: 'FT3' },
+];
+async function trainerMutants() {
+  if (REMOTE) { ok(true, 'TMUT (skipped against a deployed site)'); return; }
+  const { copyTree, mutateFile, startOverlay } = await import('./pokemonarena_overlay.mjs');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'arena-trainer-mut-'));
+  let killed = 0, ran = 0;
+  try {
+    for (const mu of TRAINER_MUTANTS) {
+      const failed = [];
+      const rec = (cond, name, detail) => { if (!cond) failed.push(name + (detail ? ' :: ' + String(detail).slice(0, 160) : '')); };
+      ran++;
+      const dir = copyTree(path.join(root, 'pokemonarena'), path.join(tmp, mu.id));
+      let ov = null;
+      try {
+        try { mutateFile(dir, mu.file, mu.from, mu.to); } catch (e) { ok(false, 'TMUT ' + mu.id + ' could not be applied', e.message); continue; }
+        ov = await startOverlay({ dir, port: PORT + 20, upstream: ORIGIN });
+        try { await profileTrainer({ origin: ov.url, ok: rec, cdp: CDP0 + 33 }); } catch (e) { failed.push('session crashed :: ' + String(e && e.message ? e.message : e).slice(0, 120)); }
+      } finally { if (ov) ov.stop(); }
+      const hit = failed.find((x) => x.startsWith(mu.fails + ' '));
+      ok(!!hit, 'TMUT ' + mu.id + ' (' + mu.what + ') fails ' + mu.fails, hit ? '' : 'it did NOT: failed cases = ' + J(failed.map((x) => x.slice(0, 60))));
+      if (hit) killed++;
+    }
+  } finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (_e) { /* ignore */ } }
+  console.log(`trainer mutants: ${killed}/${ran} killed`);
 }
 // every defect below must fail the NAMED case (the session is run against a copy of the game with only that defect in it; the same machinery as presenceui / onlineux --mutants)
 const PROFILE_MUTANTS = [

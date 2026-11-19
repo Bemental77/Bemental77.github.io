@@ -83,7 +83,7 @@ export function createCtl(env) {
     const r = eff.mode === 'update' && eff.profileId ? await updateTrainer(store, eff.profileId, input) : await createTrainer(store, input);
     if (!r || !r.ok) { env.run(app.saved({ ok: false, why: whyOf(r && r.code), message: r && r.message })); env.redraw(); return; }
     await afterWrite(eff.card && eff.card.look, true);
-    env.run(app.saved({ ok: true }));
+    env.run(app.saved({ ok: true, notSaved: !!r.notSaved }));
     env.redraw();
   }
   async function update(eff) {
@@ -94,7 +94,7 @@ export function createCtl(env) {
     let look = null;
     if (eff.patch && eff.patch.card && eff.patch.card.look) { const act = await store.getActiveId().catch(() => null); if (act === eff.profileId) look = eff.patch.card.look; }
     await afterWrite(look, true);
-    env.run(app.saved({ ok: true }));
+    env.run(app.saved({ ok: true, notSaved: !!r.notSaved }));
     env.redraw();
   }
   async function switchTo(eff) {

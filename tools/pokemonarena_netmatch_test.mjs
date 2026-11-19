@@ -17,14 +17,18 @@
 //   * a match stopped by the end-of-match comparison, even after the engine finished, is not countable    -> case K (battle_boot.js asks nm.countable() before it writes a profile)
 //   * a battle against a person is recorded once (same id after a reload, one fold per id), and a walkover
 //     is a win that is neither the fastest win nor the longest battle                                      -> case O
+//   * the hello's OPTIONAL battle figure (fig): checked when present, read by the other page, changes nothing of the battle, and a page from
+//     before it (netmatch.js at BASE_COMMIT, loaded from git) plays a new one in either seat; the reload record carries no figure           -> case T
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import { loadStack, makeRig, settle, root, rngBytes } from './pokemonarena_netmatch_lib.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const WANT_MUTANTS = process.argv.includes('--mutants');
+const BASE_COMMIT = 'aaed76b3';          // the commit the TRAINER work branched from: its netmatch.js is the OLDER page of case T (it has no figure)
 const QUIET = process.env.ARENA_QUIET === '1';
 
 let pass = 0, fail = 0;
@@ -725,6 +729,58 @@ async function suiteMain(S, label, { only } = {}) {
       ok(old.ok === false && rec.host.nm.phase === 'failed' && rec.host.nm.error && rec.host.nm.error.code === 'resume', tag('S a record saved by the older build (version 1) is refused by name, not replayed'), JSON.stringify([old.ok, rec.host.nm.phase, rec.host.nm.error]));
     }
   }
+
+  // ---- T. the trainer's battle figure in the hello (INAPP.md TRAINER decision 3): OPTIONAL, presentation only, and a page from before it plays as it did -----------------------------
+  if (run('T')) {
+    const NM = S.netmatch;
+    const hello = { t: NM.MSG, v: NM.PROTO, mn: 1, k: 'hello', rom: S.rom.PINNED.sha256, fp: 'x', rs: 'arena-gen3-standard', name: 'Ann', team: 'ARENA1.x.0000' };
+    const goodFigs = [0, 7, 99, NM.FIG_MAX], badFigs = [-1, NM.FIG_MAX + 1, 2.5, '3', null, true, [4], { n: 1 }];
+    ok(NM.FIG_MAX === 255 && NM.checkMessage(hello) === null && goodFigs.every((f) => NM.checkMessage({ ...hello, fig: f }) === null),
+      tag('T1 fig-field: a hello with no fig, or a fig 0..255, passes the field check'), JSON.stringify(goodFigs.map((f) => NM.checkMessage({ ...hello, fig: f }))));
+    ok(badFigs.every((f) => NM.checkMessage({ ...hello, fig: f }) === 'figure') && NM.checkMessage({ ...hello, fig: 3, name: '' }) === 'hello fields' && NM.checkMessage({ ...hello, fig: 3, fmt: '9v9' }) === 'format',
+      tag('T1 fig-field: any other fig is refused as "figure", and a hello WITH a valid fig is still checked for everything else'), JSON.stringify(badFigs.map((f) => NM.checkMessage({ ...hello, fig: f }))));
+    // a reference battle with no figure at all, then the same battle with figures on both sides: the figure changes nothing of the battle
+    const sameBattle = (a, b) => a.host.nm.result && b.host.nm.result && a.host.nm.result.hash === b.host.nm.result.hash && a.guest.nm.result.hash === b.guest.nm.result.hash && a.host.ctl.battle.logHash() === b.host.ctl.battle.logHash();
+    const ref = await makeRig(S, { seedBase: 71, fmt: '3v3' }); await ref.run();
+    const both2 = await makeRig(S, { seedBase: 71, fmt: '3v3', figA: 12, figB: 41 }); const done2 = await both2.run();
+    const hellos = (rig) => rig.wire.log.filter((e) => e.msg.k === 'hello').map((e) => e.from + ':' + e.msg.fig);
+    ok(done2 && finished(both2) && both2.host.nm.oppFig === 41 && both2.guest.nm.oppFig === 12, tag('T2 fig-sent: each page learns the OTHER\'s figure from its hello (host sees 41, guest sees 12)'), JSON.stringify([phasesOf(both2), both2.host.nm.oppFig, both2.guest.nm.oppFig, hellos(both2)]));
+    ok(finished(ref) && sameBattle(ref, both2) && ref.host.nm.oppFig === null && ref.guest.nm.oppFig === null, tag('T2 fig-presentation-only: the same battle (final hash, event log) with and without figures; no figure sent reads as null'), JSON.stringify([ref.host.nm.result && ref.host.nm.result.hash, both2.host.nm.result && both2.host.nm.result.hash]));
+    const one = await makeRig(S, { seedBase: 71, fmt: '3v3', figA: 12 }); await one.run();
+    ok(finished(one) && sameBattle(ref, one) && one.host.nm.oppFig === null && one.guest.nm.oppFig === 12 && !one.wire.log.some((e) => e.from === 'guest' && e.msg.k === 'hello' && 'fig' in e.msg), tag('T3 fig-optional: one side with a figure, the other with none: it plays, and the one with none is read as null'), JSON.stringify([phasesOf(one), one.host.nm.oppFig, one.guest.nm.oppFig, hellos(one)]));
+    const badOwn = await makeRig(S, { seedBase: 71, fmt: '3v3', figA: 300, figB: -2 }); await badOwn.run();
+    ok(finished(badOwn) && sameBattle(ref, badOwn) && !badOwn.wire.log.some((e) => e.msg.k === 'hello' && 'fig' in e.msg), tag('T3 fig-own-checked: a page whose own figure is not a valid index sends none (its hello would be refused), and plays'), JSON.stringify([phasesOf(badOwn), hellos(badOwn)]));
+    const forged = await makeRig(S, { seedBase: 71, fmt: '3v3', figA: 5, mutate: (P, wire) => { wire.rewrite = (from, m) => (from === 'host' && m.k === 'hello' ? { ...m, fig: 999 } : m); } });
+    await forged.run();
+    ok(forged.guest.nm.phase === 'failed' && forged.guest.nm.error.code === 'protocol' && /\(figure\)/.test(forged.guest.nm.error.message) && !forged.guest.nm.ctl, tag('T4 fig-field: a hello whose figure is out of range is refused by name and no battle is built'), JSON.stringify([forged.guest.nm.phase, forged.guest.nm.error]));
+    // AN OLDER PAGE: netmatch.js as it was before the figure (the commit the TRAINER work branched from), in the other seat
+    let OLD = null, oldWhy = '';
+    try {
+      const text = execFileSync('git', ['show', BASE_COMMIT + ':pokemonarena/js/netmatch.js'], { cwd: root, encoding: 'utf8', maxBuffer: 1 << 24 });
+      if (/fig/i.test(text)) oldWhy = 'the base netmatch.js already knows a figure';
+      else {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arena-oldnm-'));
+        for (const f of fs.readdirSync(S.dir)) { const p = path.join(S.dir, f); if (fs.statSync(p).isFile()) fs.copyFileSync(p, path.join(dir, f)); }
+        fs.writeFileSync(path.join(dir, 'netmatch.js'), text);
+        OLD = await import(pathToFileURL(path.join(dir, 'netmatch.js')).href);
+        process.on('exit', () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_e) { /* ignore */ } });
+      }
+    } catch (e) { oldWhy = 'git show ' + BASE_COMMIT + ' failed: ' + String(e && e.message ? e.message : e).slice(0, 100); }
+    ok(!!OLD && OLD.PROTO === NM.PROTO && OLD.FIG_MAX === undefined, tag('T5 old-peer: the build from before the figure (' + BASE_COMMIT + ') is loaded and speaks the same PROTO'), oldWhy || JSON.stringify(OLD && { PROTO: OLD.PROTO, FIG_MAX: OLD.FIG_MAX }));
+    if (OLD) {
+      const oldGuest = await makeRig(S, { seedBase: 71, fmt: '3v3', figA: 12, figB: 41, netmatchB: OLD }); await oldGuest.run();
+      ok(finished(oldGuest) && sameBattle(ref, oldGuest) && oldGuest.host.nm.oppFig === null && oldGuest.wire.log.some((e) => e.from === 'host' && e.msg.k === 'hello' && e.msg.fig === 12) && !oldGuest.wire.log.some((e) => e.from === 'guest' && e.msg.k === 'hello' && 'fig' in e.msg),
+        tag('T5 old-peer: an OLDER guest receives a hello with a figure, sends none, and the two play the same battle (the new host reads null)'), JSON.stringify([phasesOf(oldGuest), errCodes(oldGuest), hellos(oldGuest)]));
+      const oldHost = await makeRig(S, { seedBase: 71, fmt: '3v3', figA: 12, figB: 41, netmatchA: OLD }); await oldHost.run();
+      ok(finished(oldHost) && sameBattle(ref, oldHost) && oldHost.guest.nm.oppFig === null && oldHost.wire.log.some((e) => e.from === 'guest' && e.msg.k === 'hello' && e.msg.fig === 41),
+        tag('T5 old-peer: an OLDER host and a new guest with a figure: the same battle, and the new guest reads null'), JSON.stringify([phasesOf(oldHost), errCodes(oldHost), hellos(oldHost)]));
+      const oldRe = await makeRig(S, { seedBase: 72, fmt: '6v6', figA: 3, figB: 9, netmatchB: OLD }); await oldRe.start(); await oldRe.until(() => oldRe.host.nm.phase === 'playing' && oldRe.guest.nm.phase === 'playing');
+      for (let i = 0; i < 3; i++) await oldRe.step();
+      const c = await oldRe.crash('host');
+      for (let i = 0; i < 4000 && !finished(oldRe) && !both(oldRe).some((P) => P.nm.phase === 'failed'); i++) { if (!(await oldRe.step())) { await settle(); if (!(await oldRe.step())) break; } }
+      ok(c.ok && finished(oldRe) && !('fig' in c.rec) && !('oppFig' in c.rec) && oldRe.host.nm.oppFig === null, tag('T6 fig-not-recorded: the reload record carries no figure (unchanged), a reloaded page reads null and the match with an older peer finishes'), JSON.stringify([c.ok, phasesOf(oldRe), errCodes(oldRe), Object.keys(c.rec || {})]));
+    }
+  }
 }
 
 /* ------------------------------------------------------------------------------------------------ the mutants */
@@ -769,6 +825,13 @@ const MUTANTS = [
   { id: 'record-version-not-checked', why: 'a reload record of another protocol version is replayed', file: 'netmatch.js', from: /if \(!rec \|\| rec\.v !== PROTO \|\| rec\.role !== role/, to: 'if (!rec || rec.role !== role', cases: ['S'] },
   { id: 'net-controller-without-lead', why: 'the networked controller is built without the lead preview, so the two builds play different battles from the same page', file: 'online_match.js', from: /seed: seed >>> 0, \.\.\.formatOpts\(fmt\), names:/, to: 'seed: seed >>> 0, pick: FORMATS[fmt].pick, names:', cases: ['S'] },
   { id: 'lead-sent-plain', why: 'a lead round is sent as a plain choice, so the first player to choose shows the other their lead', file: 'netmatch.js', from: /if \(round\.need\[0\] && round\.need\[1\]\) \{\n      const nonce = hex\(rbytes\(16\)\);/, to: "if (round.need[0] && round.need[1] && round.kind !== 'preview') {\n      const nonce = hex(rbytes(16));", cases: ['S'] },
+  // the trainer's figure in the hello (case T)
+  { id: 'fig-required', why: 'a hello without a figure is refused, so a page from before the figure cannot play', file: 'netmatch.js', from: /if \(!\(m\.fig === undefined \|\| isInt\(m\.fig, 0, FIG_MAX\)\)\) return 'figure';/, to: "if (!isInt(m.fig, 0, FIG_MAX)) return 'figure';", cases: ['T'] },
+  { id: 'fig-unchecked', why: 'a figure of any shape passes the hello check', file: 'netmatch.js', from: /if \(!\(m\.fig === undefined \|\| isInt\(m\.fig, 0, FIG_MAX\)\)\) return 'figure';/, to: '', cases: ['T'] },
+  { id: 'fig-not-sent', why: 'the page\'s own figure is never put in its hello', file: 'netmatch.js', from: /if \(isInt\(c\.fig, 0, FIG_MAX\)\) helloMsg\.fig = c\.fig;/, to: '', cases: ['T'] },
+  { id: 'fig-sent-unchecked', why: 'a page sends whatever figure it was given, so an invalid one gets its own hello refused', file: 'netmatch.js', from: /if \(isInt\(c\.fig, 0, FIG_MAX\)\) helloMsg\.fig = c\.fig;/, to: 'if (c.fig !== undefined) helloMsg.fig = c.fig;', cases: ['T'] },
+  { id: 'fig-not-read', why: 'the other player\'s figure is not kept from their hello', file: 'netmatch.js', from: /nm\.oppFig = isInt\(m\.fig, 0, FIG_MAX\) \? m\.fig : null;/, to: 'nm.oppFig = null;', cases: ['T'] },
+  { id: 'fig-in-the-battle', why: 'the figure is fed into the battle (as part of a name), so a figure changes the battle state and its hash', file: 'netmatch.js', from: /const mine = cleanName\(c\.name, isHost \? 'Host' : 'Guest'\), theirs = cleanName\(m\.name, isHost \? 'Guest' : 'Host'\);/, to: "const mine = cleanName(c.name + (isInt(c.fig, 0, FIG_MAX) ? c.fig : ''), isHost ? 'Host' : 'Guest'), theirs = cleanName(m.name + (isInt(m.fig, 0, FIG_MAX) ? m.fig : ''), isHost ? 'Guest' : 'Host');", cases: ['T'] },
   { id: 'one-pokemon-still-asked-round', why: 'the engine asks a team of one for a lead, so the protocol runs a round for a choice that is not there', file: 'engine.js', from: /const one = S\.sides\[side\]\.team\.length < 2;/, to: 'const one = false;', cases: ['S'] },
 ];
 
