@@ -15,7 +15,7 @@
 // because the ROM struct order (hp, atk, def, spe, spa, spd) differs from the order every UI shows (hp, atk, def,
 // spa, spd, spe); a fixed-order array exists only inside the binary team code (teamcode.js), where the order is pinned.
 //
-// SCHEMA VERSIONS. CURRENT = 5.
+// SCHEMA VERSIONS. CURRENT = 6.
 //   v1  the draft layout written down by the planning stage (docs/gba-link-and-arena-plan.md, research finding F5):
 //       app 'arena', romHash, settings.defaultFormat, teams[].formatId, stats.byFormat, box[].ability = {slot},
 //       box[].training = {sp}, box[].provenance.saveSha, a history[] list. No UI code was released against it; it is
@@ -32,6 +32,10 @@
 //       Tower's own record and NOTHING ELSE: a Tower battle is never written into `stats` (totals, byCpu, online, recent are the regular career's), and recording a match or resetting the record never touches `tower`.
 //       The migration adds `tower` = an empty record and keeps every other value; a v4 document that already had a key of that name (it was not valid v4) keeps it in the unknown bag first. A build that only
 //       knows v4 opens a v5 document read-only. NOTE for whoever deploys this: a stored v4 profile is upgraded the first time this build loads it (the v4 one going to history), as the v3 ones were.
+//   v6  the TRAINER CARD: a top-level `card` section (trainer_card.js has its layout: made, look, front, back, partner) holding what the new-trainer screens chose beyond the name and the portrait. The migration adds
+//       `card` = the empty card (made: false, so the hub offers the new-trainer screens again, pre-filled) and keeps every other value; a v5 document that already had a `card` which is not a card (it was not valid
+//       v5) keeps it in the unknown bag first. Unknown keys INSIDE a card go to `card._unknown`. A build that only knows v5 opens a v6 document read-only until the page is reloaded with this build. NOTE for whoever
+//       deploys this: a stored v5 profile is upgraded the first time this build loads it (the v5 one going to history), as the v4 ones were.
 // MIGRATIONS are pure functions of their input (they clone first and never throw on JSON input), run in order until
 // schemaVersion == CURRENT, and the whole chain is idempotent (a current document is returned unchanged). Fields the
 // next version does not model are NOT dropped: they are moved into the unknown-field bag `_unknown`.
@@ -56,13 +60,14 @@ import { defaultCodec } from './charset.js';
 import { PINNED, sha256Hex } from './rom.js';
 import { emptyCareer, CAREER_KEYS, checkCareer, normalizeCareer, foldMatch, matchIssue, battleCount } from './career_stats.js';
 import { emptyTower, checkTowerShape, normalizeTower, capBag, fitRejected } from './tower_record.js';
+import { emptyCard, cardIssues, repairCard, CARD_KEYS } from './trainer_card.js';
 
 // ---------------------------------------------------------------------------------------------
 // constants
 // ---------------------------------------------------------------------------------------------
 
 export const APP_ID = 'pokemonarena';
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 export const EXPORT_FORMAT = 'pokemonarena-profile';
 export const EXPORT_VERSION = 1;
 export const EXPORT_MAX_BYTES = 8 * 1024 * 1024;
@@ -99,6 +104,7 @@ export const PROFILE_CODES = Object.freeze({
   'profile.stats': 'stats is not an object, or a counter is not a non-negative integer',
   'profile.identity': 'identity is not {publicKeyJwk, previousKeys}, or a JWK is not a public P-256 key',
   'profile.tower': 'tower is not a well-formed Tower record (tower_record.js)',
+  'profile.card': 'card is not a well-formed trainer card (trainer_card.js), or its _unknown is not an object',
   'profile.unknown-bag': '_unknown is present and is not an object',
   'team.shape': 'a team is not an object',
   'team.id': 'team id is not a valid identifier',
@@ -298,6 +304,7 @@ export function createProfile(init = {}, deps) {
     avatar: init.avatar || { kind: 'preset', id: 0 },
     settings: { ...defaultSettings(), ...(init.settings || {}) },
     teams: [], box: [], stats: emptyStats(), identity: emptyIdentity(), tower: emptyTower(),
+    card: init.card === undefined ? emptyCard() : isObj(init.card) ? { ...emptyCard(), ...init.card } : init.card,          // v6: what is not given is the empty card's; checkProfile below refuses a bad value or an unknown key
   };
   const bad = checkProfile(p);
   if (bad.length) throw new ProfileError('profile.invalid', 'createProfile: ' + bad.map((x) => x.code + ' ' + x.path).join(', '), bad);
@@ -434,7 +441,7 @@ export function isPublicJwk(j) {
   return j.kty === 'EC' && j.crv === 'P-256' && /^[A-Za-z0-9_-]{43}$/.test(j.x) && /^[A-Za-z0-9_-]{43}$/.test(j.y);
 }
 
-const PROFILE_KEYS = ['app', 'schemaVersion', 'id', 'rev', 'createdAt', 'updatedAt', 'romSha256', 'trainerName', 'avatar', 'settings', 'teams', 'box', 'stats', 'identity', 'tower'];
+const PROFILE_KEYS = ['app', 'schemaVersion', 'id', 'rev', 'createdAt', 'updatedAt', 'romSha256', 'trainerName', 'avatar', 'settings', 'teams', 'box', 'stats', 'identity', 'tower', 'card'];
 const SETTINGS_KEYS = ['defaultRuleset', 'animations', 'textSpeed', 'sound', 'reducedMotion', 'trainingMode', 'backupNudgeDays'];
 const STATS_KEYS = ['wins', 'losses', 'draws', 'forfeits', 'streak', 'best', 'lastMatchAt', 'byRuleset', ...CAREER_KEYS];
 const COUNTERS = ['wins', 'losses', 'draws', 'forfeits', 'streak', 'best'];
@@ -491,6 +498,8 @@ export function checkProfile(p) {
   checkStats(p.stats, add);
   checkIdentity(p.identity, add);
   for (const why of checkTowerShape(p.tower).slice(0, 3)) add('profile.tower', 'tower', 'tower: ' + why);
+  for (const x of cardIssues(p.card)) add('profile.card', x.path, x.message);
+  if (isObj(p.card) && hasOwn.call(p.card, '_unknown') && !isObj(p.card._unknown)) add('profile.card', 'card._unknown', '_unknown must be an object');
   if (containsPrivateJwk(p)) add('profile.private-key', 'identity', 'private key material is present');
   if (!Array.isArray(p.box) || p.box.length > PROFILE_LIMITS.boxMax) add('profile.box', 'box', `box must be an array of at most ${PROFILE_LIMITS.boxMax} records`);
   const ids = new Set();
@@ -619,8 +628,24 @@ function migrate4to5(d) {
   return o;
 }
 
+/** v5 -> v6: the trainer card appears, empty (made: false). Every v5 key keeps its value. A `card` that is already a well-formed card stays (the chain passes through here with the one a second run just wrote, and a
+ *  second run must change nothing); anything else under that name is kept in the unknown bag under a free name. */
+function migrate5to6(d) {
+  const o = clone(d);
+  if (!isObj(o)) return o;
+  o.schemaVersion = 6;
+  if (hasOwn.call(o, 'card')) {
+    if (cardIssues(o.card).length) {
+      let key = 'v5Card';          // a free name, as migrate4to5 does: the player's own unknown value of that name must not be written over
+      for (let i = 2; (isObj(o._unknown) && hasOwn.call(o._unknown, key)) || hasOwn.call(o, key); i++) key = 'v5Card_' + i;
+      bagSet(o, key, o.card); o.card = emptyCard();
+    }
+  } else o.card = emptyCard();
+  return o;
+}
+
 /** version -> function taking a document of that version and returning one of the NEXT version. Pure; never throws. */
-export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3, 3: migrate3to4, 4: migrate4to5 });
+export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3, 3: migrate3to4, 4: migrate4to5, 5: migrate5to6 });
 
 /**
  * Bring a stored / imported document to CURRENT.
@@ -684,6 +709,20 @@ export function normalizeProfile(input, opts = {}) {
     const bag = mergeBag(isObj(input.avatar._unknown) ? input.avatar._unknown : null, unknownOf(input.avatar, ['kind', 'id']));
     if (bag) out.avatar._unknown = bag;
   } else { out.avatar = { kind: 'preset', id: 0 }; P('repaired', 'profile.avatar', 'avatar', 'avatar was missing or invalid; set to the default'); }
+
+  // card (v6): repaired field by field (a bad field becomes its empty value, the old value reported in the problem); unknown keys go to the card's own bag
+  if (isObj(input.card)) {
+    const src = input.card, r = repairCard(src);
+    out.card = r.card;
+    for (const k of r.repaired) P('repaired', 'profile.card', 'card.' + k, `card.${k} was missing or invalid; set to ${JSON.stringify(out.card[k])}`, { was: src[k] });
+    let bag = null;
+    if (hasOwn.call(src, '_unknown')) {
+      if (isObj(src._unknown)) bag = src._unknown;
+      else { bag = {}; setOwn(bag, '_unknown', src._unknown); P('repaired', 'profile.card', 'card._unknown', '_unknown was not an object; wrapped'); }
+    }
+    bag = mergeBag(bag, unknownOf(src, CARD_KEYS));
+    if (bag && Object.keys(bag).length) out.card._unknown = bag;
+  } else { out.card = emptyCard(); P('repaired', 'profile.card', 'card', 'card was missing or not an object; set to the empty card', { was: input.card }); }
 
   // settings
   { const def = defaultSettings();
