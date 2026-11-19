@@ -160,10 +160,10 @@ async function suite(M) {
       add('data/a-profile-whose-upgrade-cannot-be-written-is-still-listed-with-its-teams-and-its-record', p3 && p3.teams.length === v3.teams.length && p3.record.battles === 5 && p3.record.resettable === true && /BATTLES 5/.test(txt(p3.record.pages[0])) && dd.state === 'ready' ? true : J(dd.profiles.map((p) => p.id)) + ' ' + dd.state);
       failing = false;
       const dd2 = await HD.readHubData(full, pack, { tzMinutes: 0 });
-      add('data/...and-once-writes-work-again-it-is-upgraded-on-the-next-read', dd2.profiles.some((p) => p.id === v3.id && p.record.battles === 5) && (await inner.transact(['profiles'], 'readonly', (tx) => tx.get('profiles', v3.id))).schemaVersion === 5 ? true : 'not upgraded'); }
+      add('data/...and-once-writes-work-again-it-is-upgraded-on-the-next-read', dd2.profiles.some((p) => p.id === v3.id && p.record.battles === 5) && (await inner.transact(['profiles'], 'readonly', (tx) => tx.get('profiles', v3.id))).schemaVersion === 6 ? true : 'not upgraded'); }
     const futP = d.profiles.find((p) => p.id === fut.id);
     add('data/a-profile-of-a-newer-build-gets-the-read-only-notice-and-no-reset', !futP || (futP.record && futP.record.resettable === false && /newer version/.test(txt(futP.record.pages[0]))) ? true : J(futP));
-    function readFut() { const f = clone(FIXREC); f.id = 'p_future'; f.schemaVersion = 6; f.stats = { surprise: 1 }; return f; }        // one past the CURRENT schema (5 since the Tower)
+    function readFut() { const f = clone(FIXREC); f.id = 'p_future'; f.schemaVersion = 7; f.stats = { surprise: 1 }; return f; }        // one past the CURRENT schema (6 since the trainer card; 5 was the Tower)
   });
 
   // ---------------------------------------------------------------------------------------------------------------------------- C. the model
@@ -398,7 +398,7 @@ const MUTANTS = [
   ['H15 a forfeit is shown as LOST in the recent list', 'record_model.js', "const RES = { w: 'WON', l: 'LOST', d: 'DRAW', f: 'QUIT' };", "const RES = { w: 'WON', l: 'LOST', d: 'DRAW', f: 'LOST' };", ['pages/recent-lists-the-five-battles-newest-first-with-QUIT-for-a-forfeit']],
   ['H16 the date ignores the time zone', 'record_model.js', "const d = new Date(ms - tzMinutes * 60000);", "const d = new Date(ms);", ['pages/dates-follow-the-time-zone-minutes-west-of-UTC (23:30 UTC on the 14th is the 14th in UTC, the 14th at -60... and the 14th 18:30 at +300)']],
   ['H17 recent pages are six to a page', 'record_model.js', "export const RECORD_RECENT_PER_PAGE = 5;", "export const RECORD_RECENT_PER_PAGE = 6;", ['pages/recent-lists-the-five-battles-newest-first-with-QUIT-for-a-forfeit', 'pages/twenty-recent-battles-are-four-pages-of-five (nothing is dropped, none is repeated)']],
-  ['H18 the hub data reader drops the record', 'hub_data.js', "out.profiles.push({ id: p.id, name: p.trainerName, readOnly: !!r.readOnly, teams, record, tower });", "out.profiles.push({ id: p.id, name: p.trainerName, readOnly: !!r.readOnly, teams, tower });", ['data/readHubData-gives-each-profile-its-record-pages-with-the-pack-names']],
+  ['H18 the hub data reader drops the record', 'hub_data.js', "readOnly: !!r.readOnly, teams, record, tower });", "readOnly: !!r.readOnly, teams, tower });", ['data/readHubData-gives-each-profile-its-record-pages-with-the-pack-names']],
   ['H19 a newer profile can be reset', 'hub_data.js', "record = r.readOnly ? { battles: 0, resettable: false, pages: buildRecordNotice('readonly') }", "record = r.readOnly ? { battles: 0, resettable: true, pages: buildRecordNotice('readonly') }", ['data/a-profile-of-a-newer-build-gets-the-read-only-notice-and-no-reset']],
 ];
 if (!process.env.ARENA_SKIP_MUTANTS) {

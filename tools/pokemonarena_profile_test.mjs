@@ -81,9 +81,9 @@ const clone = (o) => JSON.parse(JSON.stringify(o));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const readFx = (n) => JSON.parse(fs.readFileSync(path.join(FX, n), 'utf8'));
 const FIX = {
-  v1full: readFx('profile-v1-full.json'), v1fullExp: readFx('profile-v1-full.expected-v5.json'),
-  v1bad: readFx('profile-v1-bad.json'), v1badExp: readFx('profile-v1-bad.expected-v5.json'),
-  v2: readFx('profile-v2-current.json'), v2exp: readFx('profile-v2-current.expected-v5.json'), v3: readFx('profile-v3-current.json'), v4: readFx('profile-v4-current.json'), cur: readFx('profile-v5-current.json'), tower: readFx('profile-v5-tower.json'), fut: readFx('profile-v6-future.json'),
+  v1full: readFx('profile-v1-full.json'), v1fullExp: readFx('profile-v1-full.expected-v6.json'),
+  v1bad: readFx('profile-v1-bad.json'), v1badExp: readFx('profile-v1-bad.expected-v6.json'),
+  v2: readFx('profile-v2-current.json'), v2exp: readFx('profile-v2-current.expected-v6.json'), v3: readFx('profile-v3-current.json'), v4: readFx('profile-v4-current.json'), v5: readFx('profile-v5-current.json'), cur: readFx('profile-v6-current.json'), tower: readFx('profile-v6-tower.json'), fut: readFx('profile-v7-future.json'),          // schema 6 (the trainer card): cur / tower are the v5 ones plus the empty card, the newer fixture is 7
 };
 const NOW = 1700000999999;
 function detDeps(seed = 1, t0 = NOW) {
@@ -204,7 +204,7 @@ add('profile/migrate/newer-document-is-read-only-and-untouched', (c) => {
   const same = eqv(o.profile, c.FIX.fut);
   if (same !== true) return 'the newer document was altered: ' + same;
   const m = c.P.migrateProfile(clone(c.FIX.fut));
-  return m.readOnly === true && m.steps === 0 && m.from === 6 ? true : 'migrateProfile ' + J({ ro: m.readOnly, s: m.steps });       // the future fixture is schema 6 since the Tower took schema 5 (it was 5 while the career's online battles took 4)
+  return m.readOnly === true && m.steps === 0 && m.from === 7 ? true : 'migrateProfile ' + J({ ro: m.readOnly, s: m.steps });       // the future fixture is schema 7 since the trainer card took schema 6 (6 while the Tower took 5, 5 while the career's online battles took 4)
 });
 
 // ---- schema 4: a battle against a person has its own row in the record. A stored v3 profile must come up as the CURRENT fixture (v5: the v4 step, then the Tower's), value for value.
@@ -221,7 +221,7 @@ add('profile/migrate/v3-keeps-every-value', (c) => {
   const after = clone(o.profile);
   // take away what v4 adds and put back what it changes: what is left must be the v3 document, value for value (the record included)
   if (!after.stats || !after.stats.byCpu || J(after.stats.byCpu.online) !== J({ w: 0, l: 0, dr: 0, f: 0 })) return 'byCpu.online is not a zeroed record: ' + J(after.stats && after.stats.byCpu);
-  delete after.stats.byCpu.online; delete after.tower; after.schemaVersion = 3;                 // ... and what v5 adds
+  delete after.stats.byCpu.online; delete after.tower; delete after.card; after.schemaVersion = 3;                 // ... and what v5 and v6 add
   return eqv(after, before);
 });
 add('profile/migrate/v3-to-v4-is-pure-and-a-fixed-point', (c) => {
@@ -376,7 +376,7 @@ add('profile/fuzz/open-never-throws-and-output-is-valid-and-stable', (c) => {
 // ---- the shape matrix: every PROFILE_CODES code has a bad input that fires it -------------------
 const SHAPE_CASES = {
   'profile.shape': [(g) => { g.extra = 1; }, []],
-  'profile.version': [(g) => { g.schemaVersion = 6; }, []],          // one past the CURRENT schema (5)
+  'profile.version': [(g) => { g.schemaVersion = 7; }, []],          // one past the CURRENT schema (6)
   'profile.app': [(g) => { g.app = 'arena'; }, []],
   'profile.id': [(g) => { g.id = 'bad id!'; }, []],
   'profile.rom': [(g) => { g.romSha256 = 'XYZ'; }, []],
@@ -391,6 +391,7 @@ const SHAPE_CASES = {
   'profile.stats': [(g) => { g.stats.wins = -1; }, []],
   'profile.identity': [(g) => { g.identity.previousKeys = 'x'; }, []],
   'profile.tower': [(g) => { g.tower.runs = -1; }, []],
+  'profile.card': [(g) => { g.card.front = -1; }, []],
   'profile.unknown-bag': [(g) => { g._unknown = 5; }, []],
   'team.shape': [(g) => { g.teams[0] = 5; }, []],
   'team.id': [(g) => { g.teams[0].id = '!'; }, []],
@@ -584,7 +585,7 @@ add('profile/export/gzip-request-falls-back-to-plain-json-without-CompressionStr
 add('profile/export/envelope-and-file-name', async (c) => {
   const p = makeProfile(c, detDeps(3), 2, { trainerName: 'A B/C' });
   const e = c.P.buildExport(p, { deps: detDeps(1) });
-  if (e.format !== 'pokemonarena-profile' || e.exportVersion !== 1 || e.schemaVersion !== 5 || e.exportedAt !== NOW || e.romSha256 !== PINNED.sha256) return 'envelope ' + J({ ...e, profile: '...' });
+  if (e.format !== 'pokemonarena-profile' || e.exportVersion !== 1 || e.schemaVersion !== 6 || e.exportedAt !== NOW || e.romSha256 !== PINNED.sha256) return 'envelope ' + J({ ...e, profile: '...' });
   if ('rev' in e.profile) return 'rev leaked into the export';
   if (!/^sha256:[0-9a-f]{64}$/.test(e.checksum)) return 'checksum shape ' + e.checksum;
   const name = c.P.exportFileName(p, { gzip: true, now: Date.UTC(2026, 10, 1) });
@@ -625,7 +626,7 @@ const IMPORT_CASES = {
   'import.export-version-newer': async (c, p) => { const e = c.P.buildExport(p, { deps: detDeps() }); e.exportVersion = 2; return c.P.serializeExport(e); },
   'import.checksum': async (c, p) => (await exportText(c, p)).replace('"trainerName": "ASH"', '"trainerName": "ASG"'),
   'import.envelope-mismatch': async (c, p) => { const e = c.P.buildExport(p, { deps: detDeps() }); e.romSha256 = '0'.repeat(64); return c.P.serializeExport(e); },
-  'import.newer-schema': async (c, p) => { const e = c.P.buildExport(p, { deps: detDeps() }); e.profile.schemaVersion = 6; e.schemaVersion = 6; return c.P.serializeExport(rechecksum(e)); },
+  'import.newer-schema': async (c, p) => { const e = c.P.buildExport(p, { deps: detDeps() }); e.profile.schemaVersion = 7; e.schemaVersion = 7; return c.P.serializeExport(rechecksum(e)); },
   'import.private-key': async (c, p) => { const e = c.P.buildExport(p, { deps: detDeps() }); e.profile.identity.publicKeyJwk = { kty: 'EC', crv: 'P-256', x: 'A'.repeat(43), y: 'B'.repeat(43), d: 'C'.repeat(43) }; return c.P.serializeExport(e); },
   'import.invalid-profile': async (c, p) => { const e = c.P.buildExport(p, { deps: detDeps() }); e.profile.id = 'bad id!'; return c.P.serializeExport(rechecksum(e)); },
   'import.rom-mismatch': async (c, p) => { const e = c.P.buildExport(p, { deps: detDeps() }); e.profile.romSha256 = 'f'.repeat(64); e.romSha256 = 'f'.repeat(64); return c.P.serializeExport(rechecksum(e)); },
@@ -1610,7 +1611,7 @@ add('store/migration/writes-back-with-the-old-revision-kept-in-history', async (
   const { store, adapter } = await openMem(c, 'mig');
   await adapter.transact(['profiles'], 'readwrite', (tx) => tx.put('profiles', clone(c.FIX.v1full)));
   const r = await store.loadProfile('p_fixture01');
-  if (!r.ok || r.migratedFrom !== 1 || r.readOnly || r.profile.rev !== 8 || r.profile.schemaVersion !== 5) return 'load ' + J({ ok: r.ok, mf: r.migratedFrom, rev: r.profile && r.profile.rev });
+  if (!r.ok || r.migratedFrom !== 1 || r.readOnly || r.profile.rev !== 8 || r.profile.schemaVersion !== 6) return 'load ' + J({ ok: r.ok, mf: r.migratedFrom, rev: r.profile && r.profile.rev });
   const h = await store.listHistory('p_fixture01');
   if (h.length !== 1 || h[0].rev !== 7 || h[0].reason !== 'migration') return 'history ' + J(h);
   const stored = await adapter.transact(['profileHistory'], 'readonly', (tx) => tx.get('profileHistory', c.S.historyKey('p_fixture01', 7)));
@@ -1629,7 +1630,7 @@ add('store/newer-document/read-only-and-never-rewritten', async (c) => {
   const r = await store.loadProfile('p_future');
   if (!r.ok || !r.readOnly || r.migratedFrom !== null) return 'load ' + J(r).slice(0, 200);
   const list = await store.listProfiles();
-  if (!(list.length === 1 && list[0].readOnly === true && list[0].corrupt === false && list[0].schemaVersion === 6)) return 'listProfiles ' + J(list);
+  if (!(list.length === 1 && list[0].readOnly === true && list[0].corrupt === false && list[0].schemaVersion === 7)) return 'listProfiles ' + J(list);
   const forged = { ...goodProfile(c), id: 'p_future', rev: 4 };
   const e1 = await throwsKind(() => store.saveProfile(forged), 'store.read-only');
   const e2 = await throwsKind(() => store.saveProfile({ ...r.profile }), 'store.read-only');
@@ -1996,7 +1997,7 @@ add('purity/public-api-present', (c) => {
 const SRC = {};
 for (const n of ['profile', 'teamcode', 'identity', 'store']) SRC[n] = fs.readFileSync(path.join(JS, n + '.js'), 'utf8');
 const fileUrl = (n) => pathToFileURL(path.join(JS, n)).href;
-const FIXED = { './stats.js': fileUrl('stats.js'), './rules.js': fileUrl('rules.js'), './charset.js': fileUrl('charset.js'), './rom.js': fileUrl('rom.js'), './career_stats.js': fileUrl('career_stats.js'), './tower_record.js': fileUrl('tower_record.js'), './tower_config.js': fileUrl('tower_config.js') };
+const FIXED = { './stats.js': fileUrl('stats.js'), './rules.js': fileUrl('rules.js'), './charset.js': fileUrl('charset.js'), './rom.js': fileUrl('rom.js'), './career_stats.js': fileUrl('career_stats.js'), './tower_record.js': fileUrl('tower_record.js'), './tower_config.js': fileUrl('tower_config.js'), './trainer_card.js': fileUrl('trainer_card.js') };
 const dataUrl = (src) => 'data:text/javascript;base64,' + Buffer.from(src, 'utf8').toString('base64');
 function rewrite(code, map, who) {
   return code.replace(/from '(\.\/[a-z_]+\.js)'/g, (m, spec) => { if (!map[spec]) throw new Error(`${who}: no mapping for import ${spec}`); return `from '${map[spec]}'`; });
@@ -2041,7 +2042,7 @@ mut('P72 the v3 -> v4 migration forgets to say it is schema 4', 'profile', 'o.sc
 mut('P73 an existing online row is overwritten by the migration', 'profile', 'if (!rec) {', 'if (true) {', ['profile/migrate/v3-byCpu-online-already-there', 'profile/migrate/v3-to-v4-is-pure-and-a-fixed-point']);
 mut('P74 a junk online row is dropped instead of kept in the bag', 'profile', "if (hasOwn.call(o.stats.byCpu, 'online')) bagSet(o.stats, 'v3ByCpuOnline', cur);", '', ['profile/migrate/v3-byCpu-online-already-there']);
 mut('P75 the v3 -> v4 migration writes into its input', 'profile', 'function migrate3to4(d) {\n  const o = clone(d);', 'function migrate3to4(d) {\n  const o = d;', ['profile/migrate/v3-to-v4-is-pure-and-a-fixed-point']);
-mut('P76 there is no migration step from 3', 'profile', 'export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3, 3: migrate3to4, 4: migrate4to5 });', 'export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3, 4: migrate4to5 });', ['profile/migrate/v3-to-v4-golden', 'profile/import/old-schema-v3-files-are-migrated-to-v4', 'profile/migrate/v1-full-golden']);
+mut('P76 there is no migration step from 3', 'profile', 'export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3, 3: migrate3to4, 4: migrate4to5, 5: migrate5to6 });', 'export const MIGRATIONS = Object.freeze({ 1: migrate1to2, 2: migrate2to3, 4: migrate4to5, 5: migrate5to6 });', ['profile/migrate/v3-to-v4-golden', 'profile/import/old-schema-v3-files-are-migrated-to-v4', 'profile/migrate/v1-full-golden']);
 mut('P77 a build that only knows schema 3 treats a v4 document as writable', 'profile', 'to: from, steps: 0, changed: false, readOnly: true }', 'to: from, steps: 0, changed: false, readOnly: false }', ['profile/migrate/an-older-build-opens-v4-read-only']);
 mut('P78 the career keys other than the recent list are all that survive a normalisation', 'profile', 'for (const k of CAREER_KEYS) s[k] = car.value[k];', "for (const k of CAREER_KEYS) if (k !== 'recent') s[k] = car.value[k];", ['profile/export/a-record-with-online-battles-round-trips']);
 mut('P79 the v3 -> v4 migration also empties the recent battles', 'profile', "setOwn(o.stats.byCpu, 'online', { w: 0, l: 0, dr: 0, f: 0 });", "setOwn(o.stats.byCpu, 'online', { w: 0, l: 0, dr: 0, f: 0 }); o.stats.recent = [];", ['profile/migrate/v3-keeps-every-value', 'profile/migrate/v3-to-v4-golden']);
