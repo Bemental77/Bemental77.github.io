@@ -208,6 +208,15 @@ async function runNode(jsDir, verbose) {
     const fx2 = m2.hub.press('b');
     return asks && c1 === 1 && s1 === 'name' && has(fx2, (e) => e.type === 'later') && m2.hub.path() === 'main' ? true : J([asks, c1, s1, fx2]);
   });
+  await check('W8 the Pokemon standing on the welcome is the hub\'s mascot of the day until the ctl (which loads after the welcome opens) names one: no change under the player\'s eyes', () => {
+    const hub = HM.createHubModel({ mascot: 6, env: 0, measure: screen.measure, msgPx: screen.msgPx, measureFont: screen.measureFont });
+    hub.setData({ state: 'ready', activeId: null, profiles: [] });
+    hub.apps.trainer.welcome({ kind: 'new' }); hub.goto('trainer-new');
+    const before = hub.view().trainer.species;
+    hub.apps.trainer.setMascot(9);
+    const after = hub.view().trainer.species;
+    return before === 6 && after === 9 ? true : J([before, after]);
+  });
 
   /* ---------------------------------------------------------------------------------------------- A: A, A, A ... */
   const defaults = () => ({ name: TH.PRESET_NAMES[0], look: CL.pickLook(CH.looks, SEED), front: CH.fronts.some((c) => c.pic === TH.FRONT_DEFAULT_PIC) ? TH.FRONT_DEFAULT_PIC : CH.fronts[0].pic, back: CH.backs.includes(0) ? 0 : CH.backs[0], head: 0, partner: MASCOT });
@@ -585,6 +594,7 @@ const NODE_MUTANTS = [
   { id: 'M25', file: 'trainer_hub.js', from: "        if (it.id === 'new') return openName(host);\n", to: '', fails: 'N1' },
   { id: 'M26', file: 'trainer_ctl.js', from: '    if (ok) env.sound.sfx(\'se_success\');', to: '', fails: 'A2' },
   { id: 'M27', file: 'trainer_hub.js', from: "    onData() { return S.trainers ? [{ app: ID, type: 'data' }] : []; },", to: '    onData() { return []; },', fails: 'E9' },
+  { id: 'M29', file: 'trainer_hub.js', from: 'species = isInt(seen.partner) ? seen.partner : S.mascotSet || !isInt(hubMascot) ? S.mascot : hubMascot;', to: 'species = isInt(seen.partner) ? seen.partner : S.mascot;', fails: 'W8' },
   { id: 'M28', file: 'trainer_hub.js', from: "    onData() { return S.trainers ? [{ app: ID, type: 'data' }] : []; },", to: "    onData() { return [{ app: ID, type: 'data' }]; },", fails: 'E9' },
 ];
 async function runMutants() {

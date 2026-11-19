@@ -1606,7 +1606,7 @@ spelt for the ROM font: `{PK}{MN}` -> PKMN, the sex signs as tokens; backs; 52 h
 **Known limits.** `tools/pokemonarena_apps_test.mjs` pins EXACTLY three apps (lines 163, 639, 1142): with `trainer` registered it fails those 5 checks (164 passed, 5 failed, `--unit`), and
 this track may not edit it. The record line on the card is hub data's `BATTLES n` (`listTrainers` carries no stats). The welcome's words and the presets are this site's, set in the ROM font.
 
-**Tests (2026-11-18, this tree).** `node tools/pokemonarena_trainer_test.mjs --mutants`: 43 Node checks passed, 27 / 27 source mutants killed (families R W A B K N P C E F G Z: the registry,
+**Tests (2026-11-18, this tree).** `node tools/pokemonarena_trainer_test.mjs --mutants`: 44 Node checks passed, 28 / 28 source mutants killed (families R W A B K N P C E F G Z: the registry,
 the welcome, A-through into a memory store through the real ctl and `trainer_store.js`, B on every step, every picker's keys / taps / wheel / paging, the name entry, the search, the card
 step, the card screen and editor, every refusal in words, 32 screens against `pokemonarena/trainer.golden.json` (hashes only) with every text measured in its room at the longest values
 (ten of the widest character the `name` charset accepts, the longest species and class), a random walk of 3000 inputs). `TRAINER_SHOTS=<dir>` writes those screens as PNG to look at.
