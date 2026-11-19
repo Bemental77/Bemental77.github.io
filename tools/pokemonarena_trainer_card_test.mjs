@@ -403,6 +403,7 @@ const MUTANTS = [
   ['migration-no-card', 'profile.js', '  } else o.card = emptyCard();\n  return o;\n}', '  }\n  return o;\n}', ['M2', 'M4']],
   ['migration-overwrites-good-card', 'profile.js', '    if (cardIssues(o.card).length) {\n      let key', '    {\n      let key', ['M3']],
   ['migration-loses-junk-card', 'profile.js', 'bagSet(o, key, o.card); o.card = emptyCard();', 'o.card = emptyCard();', ['M3']],
+  ['migration-card-key-ignores-the-bag', 'profile.js', "(isObj(o._unknown) && hasOwn.call(o._unknown, key)) || hasOwn.call(o, key); i++) key = 'v5Card_' + i;", "hasOwn.call(o, key); i++) key = 'v5Card_' + i;", ['M3']],
   ['migration-writes-its-input', 'profile.js', 'function migrate5to6(d) {\n  const o = clone(d);', 'function migrate5to6(d) {\n  const o = d;', ['M2']],
   ['migration-says-5', 'profile.js', '  o.schemaVersion = 6;\n  if (hasOwn.call(o, \'card\')) {', '  o.schemaVersion = 5;\n  if (hasOwn.call(o, \'card\')) {', ['M2', 'M4']],
   ['check-ignores-card', 'profile.js', "  for (const x of cardIssues(p.card)) add('profile.card', x.path, x.message);\n", '', ['M6']],
