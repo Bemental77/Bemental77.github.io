@@ -1289,9 +1289,11 @@ export function recordMatch(profile, match) {
  * `mine` with the battle record AND the Tower record of `stored` (a profile as the store holds it NOW). The Team Builder never edits `stats` or `tower`, so when its save deliberately overrides the store's
  * compare-and-swap ("Keep my edits here" after another tab saved first) it must carry the record that is stored now: another tab may have written a battle (online or against the CPU)
  * in the meantime, and the copy this tab loaded long ago would erase it. Pure: neither argument is modified; the record is copied, never shared.
+ * Schema 6: the trainer CARD is carried the same way (the trainer app writes it through trainer_store.js, the Team Builder never edits it), so keeping the builder's edits cannot undo a card
+ * the player chose in the meantime.
  */
 export function withStoredRecord(mine, stored) {
-  return { ...mine, stats: clone(stored.stats), tower: stored.tower === undefined ? clone(mine.tower) : clone(stored.tower) };
+  return { ...mine, stats: clone(stored.stats), tower: stored.tower === undefined ? clone(mine.tower) : clone(stored.tower), ...(stored.card === undefined ? {} : { card: clone(stored.card) }) };
 }
 
 /** A copy of the profile with its battle record emptied (RESET RECORD). Everything else is untouched. */

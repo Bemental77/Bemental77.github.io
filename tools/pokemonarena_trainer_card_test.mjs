@@ -198,6 +198,12 @@ async function suite(X) {
     return r.ok && r.readOnly === true && canon(r.profile) === canon(doc) && f.ok && f.readOnly && f.profile.card === 'a v7 card' ? true : J([r, f.readOnly]);
   });
 
+  await check('M11 "Keep my edits here" (withStoredRecord) carries the STORED card as it carries the record: the builder\'s copy of an old card cannot undo the one chosen meanwhile; nothing is shared', () => {
+    const mine = v6({ trainerName: 'MINE' }), stored = v6({ trainerName: 'OTHER' }); stored.card = { made: true, look: 'w000004', front: 2, back: 1, partner: 25, _unknown: { z: 1 } };
+    const out = P.withStoredRecord(mine, stored);
+    return out.trainerName === 'MINE' && canon(out.card) === canon(stored.card) && out.card !== stored.card && J(mine.card) === J(C.emptyCard()) ? true : J(out.card);
+  });
+
   /* ---------------------------------------------------------------------------------------------- E: the editor's reducer */
   await check('E1 { type: card, patch } changes only the keys given, is one undo step labelled "change trainer card", and undo / redo restore the card', () => {
     let s = E.initialState(v6());
@@ -417,6 +423,8 @@ const MUTANTS = [
   ['card-code-unlisted', 'profile.js', "  'profile.card': 'card is not a well-formed trainer card", "  'profile.cardx': 'card is not a well-formed trainer card", ['M6']],
   ['repair-drops-card-bag', 'profile.js', '    if (bag && Object.keys(bag).length) out.card._unknown = bag;\n', '', ['M7', 'M9', 'S6']],
   ['repair-silent', 'profile.js', "    for (const k of r.repaired) P('repaired', 'profile.card',", "    for (const k of []) P('repaired', 'profile.card',", ['M7']],
+  ['keep-mine-drops-the-stored-card', 'profile.js', ', ...(stored.card === undefined ? {} : { card: clone(stored.card) }) };', ' };', ['M11']],
+  ['keep-mine-shares-the-card', 'profile.js', '{ card: clone(stored.card) }) };', '{ card: stored.card }) };', ['M11']],
   ['create-ignores-init-card', 'profile.js', 'card: init.card === undefined ? emptyCard() : isObj(init.card) ? { ...emptyCard(), ...init.card } : init.card,', 'card: emptyCard(),', ['M8', 'S1']],
   // store.js
   ['create-not-active', 'store.js', "      await tx.put('meta', { key: 'activeProfileId', value: s.id });\n", '', ['S1', 'S13']],
