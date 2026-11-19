@@ -5,7 +5,8 @@
 // Math.random: a seed is passed in. Nothing leaves the browser.
 //
 //   const store = await openStore();
-//   const data = await readHubData(store, pack, { towerSummary });   // { state, profiles: [{ id, name, readOnly, teams: [{ id, name, size, legal, problems, names, lead, ruleset }], record: { battles, resettable, pages }, tower }], activeId, notSaved }
+//   const data = await readHubData(store, pack, { towerSummary });   // { state, profiles: [{ id, name, avatar: { kind, id }, card, readOnly, teams: [{ id, name, size, legal, problems, names, lead, ruleset }], record: { battles, resettable, pages }, tower }], activeId, notSaved }
+//      `avatar` is the portrait (profile.avatar; { kind: 'preset', id: 0 } when a newer build's document has none this build can read) and `card` the trainer card as trainer_card.js cardOf reads it (schema 6).
 //      `towerSummary(towerRecord, pack)` (tower_session.js summarizeTower) is passed in by the page once the Tower's code has loaded, so the hub does not carry the engine just to list teams; until then `tower` is null.
 //   const r = await teamCodeFor(store, profileId, teamId); // { ok: true, code } | { ok: false, message }
 //   battleHref({ mode: 'team', code, format: '3v3', cpu: 'normal', seed })   // '/pokemonarena/battle.html?team=...'
@@ -14,6 +15,7 @@
 import { teamMons, validateMonList } from './profile.js';
 import { buildRecordPages, buildRecordNotice } from './record_model.js';
 import { battleCount } from './career_stats.js';
+import { cardOf } from './trainer_card.js';
 import { teamFromProfile, encodeTeamCode } from './teamcode.js';
 import { battleUrl, BATTLE_PAGE, FORMATS, CPU_LEVELS } from './editor_links.js';
 
@@ -37,6 +39,11 @@ export function pickMascot(pack, day) {
 }
 
 const speciesName = (pack, id) => (pack.species[id] && pack.species[id].name) || '?';
+/** The portrait of a profile as { kind, id } (a copy; the default one when the document's is not readable, as a newer build's may not be). */
+export function avatarOf(p) {
+  const a = p && p.avatar;
+  return a && typeof a === 'object' && (a.kind === 'preset' || a.kind === 'mon') && Number.isInteger(a.id) && a.id >= 0 && a.id <= 65535 ? { kind: a.kind, id: a.id } : { kind: 'preset', id: 0 };
+}
 
 /** Summaries of every readable profile: for each team its size, whether it is legal under its own ruleset, and the Pokemon names. Never throws. */
 export async function readHubData(store, pack, opts = {}) {
@@ -69,7 +76,7 @@ export async function readHubData(store, pack, opts = {}) {
       // the Tower's climb of this profile, summarised for the Tower screens (null while the Tower's code loads, or for a profile of a newer build, whose Tower record this build cannot read)
       let tower = null;
       if (!r.readOnly && typeof opts.towerSummary === 'function') { try { tower = opts.towerSummary(p.tower, pack, { saved: !out.notSaved }); } catch (_e) { tower = null; } }          // (saved: false when this browser is not keeping profiles, so the Tower never says a climb is saved when it is not)
-      out.profiles.push({ id: p.id, name: p.trainerName, readOnly: !!r.readOnly, teams, record, tower });
+      out.profiles.push({ id: p.id, name: p.trainerName, avatar: avatarOf(p), card: cardOf(p), readOnly: !!r.readOnly, teams, record, tower });
     }
     if (st.notSaved && !out.profiles.length) { out.state = 'unavailable'; out.note = 'This browser is not keeping profiles.'; }
   } catch (e) {
