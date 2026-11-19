@@ -84,8 +84,9 @@ async function openPage(page, base, which, { w = 1280, h = 800, mobile = false, 
   throw new Error('openPage ' + which + ': the document never settled (it kept being replaced after reporting ready)');
 }
 async function fresh(page, base) { await page.navigate(base + '/pokemonarena/manifest.json'); await page.eval('try { localStorage.clear(); sessionStorage.clear(); } catch (e) {}'); }
-// name -> [key, windowsVirtualKeyCode, code when it is not the key itself]. The letters are the ones the input layer maps by default: Z = A, X = B, W/S = up/down; Backspace = B; PageUp/PageDown = L/R.
-const KEYMAP = { left: ['ArrowLeft', 37], right: ['ArrowRight', 39], up: ['ArrowUp', 38], down: ['ArrowDown', 40], esc: ['Escape', 27], tab: ['Tab', 9], m: ['m', 77, 'KeyM'], enter: ['Enter', 13],
+// name -> [key, windowsVirtualKeyCode, code when it is not the key itself]. The letters are the ones the input layer maps by default: M and Z = A, N and X = B, W/S = up/down; Backspace = B; PageUp/PageDown = L/R;
+// O is the mute key (input.js MUTE_KEY; it was M until M became A, 2026-11-18).
+const KEYMAP = { left: ['ArrowLeft', 37], right: ['ArrowRight', 39], up: ['ArrowUp', 38], down: ['ArrowDown', 40], esc: ['Escape', 27], tab: ['Tab', 9], m: ['m', 77, 'KeyM'], n: ['n', 78, 'KeyN'], o: ['o', 79, 'KeyO'], enter: ['Enter', 13],
   z: ['z', 90, 'KeyZ'], x: ['x', 88, 'KeyX'], w: ['w', 87, 'KeyW'], a: ['a', 65, 'KeyA'], s: ['s', 83, 'KeyS'], d: ['d', 68, 'KeyD'], u: ['u', 85, 'KeyU'], backspace: ['Backspace', 8], pagedown: ['PageDown', 34], pageup: ['PageUp', 33] };
 async function key(page, name, hold = 35) {
   const [k, vk, code] = KEYMAP[name];
@@ -146,9 +147,10 @@ async function scnVolume(page, R, base) {
   await focusSel(page, '#abVolume'); await key(page, 'right');
   s = await mixerSettings(page);
   R.ok(s.muted === false && near(s.master, 0.45, 1e-9) && (await barInfo(page)).muted === 'false', 'volume: moving the slider up while muted unmutes (and sets the new level)', J(s));
-  // the M key follows
-  await page.eval('document.activeElement && document.activeElement.blur()'); await key(page, 'm'); await sleep(120);
-  R.ok((await mixerSettings(page)).muted === true && (await barInfo(page)).muted === 'true', 'volume: the M key mutes and the bar shows it', J(await barInfo(page)));
+  // the mute key (O) follows; the mute button names it (M is the keyboard's A now, and is not pressed here: on the hub it would choose the menu row)
+  R.ok((await barInfo(page)).mute.title === 'Mute (O)', 'volume: the mute button\'s title names the mute key, O', J((await barInfo(page)).mute));
+  await page.eval('document.activeElement && document.activeElement.blur()'); await key(page, 'o'); await sleep(120);
+  R.ok((await mixerSettings(page)).muted === true && (await barInfo(page)).muted === 'true' && (await barInfo(page)).mute.title === 'Unmute (O)', 'volume: the O key mutes and the bar shows it', J(await barInfo(page)));
   await clickSel(page, '#abMute'); await sleep(120);
   R.ok((await mixerSettings(page)).muted === false && (await barInfo(page)).mute.pressed === 'false', 'volume: the mute button unmutes', '');
   // another tab (a storage event) moves the bar
@@ -230,9 +232,15 @@ async function scnMusic(page, R, base) {
   const hubSig0 = await page.eval(`JSON.stringify(window.${HUB}.model.state())`);
   R.ok((await page.eval(`document.getElementById('abMenu').getAttribute('aria-modal')`)) === 'true' && (await page.eval(`window.${HUB}.dialogOpen()`)) === true, 'music: the open list is a modal dialog (aria-modal) and the hub knows a dialog is open (its own key and pad presses are ignored)', J(await page.eval(`[document.getElementById('abMenu').getAttribute('aria-modal'), window.${HUB}.dialogOpen()]`)));
   await focusSel(page, '#abMenu [data-pick="battle_normal"]');
-  for (const k of ['down', 'up', 'right', 'left', 'z', 'x', 'backspace', 'w', 's', 'pagedown', 'pageup']) await key(page, k);
-  R.ok(J(await page.eval('window.__seen')) === '[]', 'music: the arrows (they pick songs), Z, X, Backspace, W, S, PageDown and PageUp typed in the list never reach the page behind it (nothing on the window sees them)', J(await page.eval('window.__seen')));
+  for (const k of ['down', 'up', 'right', 'left', 'm', 'n', 'z', 'x', 'backspace', 'w', 's', 'pagedown', 'pageup']) await key(page, k);
+  R.ok(J(await page.eval('window.__seen')) === '[]', 'music: the arrows (they pick songs), M, N, Z, X, Backspace, W, S, PageDown and PageUp typed in the list never reach the page behind it (nothing on the window sees them)', J(await page.eval('window.__seen')));
   R.ok((await page.eval(`JSON.stringify(window.${HUB}.model.state())`)) === hubSig0 && !(await page.eval(`!!window.${HUB}.navigated`)), 'music: ... and the hub did not move, open a screen or navigate', hubSig0);
+  R.ok((await mixerSettings(page)).muted === false, 'music: M typed in the list did not mute (M is the keyboard\'s A, not the mute key)', J(await mixerSettings(page)));
+  // O, the mute key, is the one key (with Esc) the list lets through: it mutes, the list stays open, the hub does not move; a second O unmutes
+  await key(page, 'o'); await sleep(120);
+  const oMuted = (await mixerSettings(page)).muted, oOpen = (await menuInfo(page)).hidden === false;
+  await key(page, 'o'); await sleep(120);
+  R.ok(oMuted === true && oOpen && (await mixerSettings(page)).muted === false && (await page.eval(`JSON.stringify(window.${HUB}.model.state())`)) === hubSig0, 'music: O typed in the open list reaches the mute shortcut (mutes, and again unmutes), the list stays open and the hub does not move', J({ oMuted, oOpen }));
   // Tab stays inside the dialog; a click on its plain text keeps the focus inside it too
   for (let i = 0; i < 14; i++) await key(page, 'tab', 15);
   R.ok(await page.eval(`document.getElementById('abMenu').contains(document.activeElement)`), 'music: Tab cycles inside the open list (it never walks out into the page behind it)', await page.eval('document.activeElement && (document.activeElement.id || document.activeElement.tagName)'));
@@ -797,6 +805,11 @@ const MUTANTS = [
   { id: 'M27 a mouse click on Mute leaves the focus on the button', file: 'js/audiobar.js', from: 'if (e.detail > 0) handBack(); // a pointer click', to: '// a pointer click', run: ['focus'] },
   { id: 'M28 a released slider keeps the focus (and the arrow keys)', file: 'js/audiobar.js', from: "for (const t of ['pointerup', 'pointercancel']) range.addEventListener(t, () => { setTimeout(handBack, 0); });", to: '', run: ['focus'] },
   { id: 'M29 closing the list with a click keeps the focus on the music button', file: 'js/audiobar.js', from: 'if (menuOpen) { closeMenu(true); if (e.detail > 0) handBack(); }', to: 'if (menuOpen) { closeMenu(true); }', run: ['focus'] },
+  // ---- M = A, N = B, the mute key O (INAPP.md TRAINER, decision 6)
+  { id: 'M45 M (A) passes through the open list to the page behind it', file: 'js/audiobar.js', from: "else if (e.key === 'Escape' || codeOf(e) === MUTE_KEY || e.key === 'o' || e.key === 'O') {", to: "else if (e.key === 'Escape' || codeOf(e) === MUTE_KEY || e.key === 'o' || e.key === 'O' || e.code === 'KeyM') {", run: ['music'] },
+  { id: 'M46 the open list keeps O from the mute shortcut', file: 'js/audiobar.js', from: "else if (e.key === 'Escape' || codeOf(e) === MUTE_KEY || e.key === 'o' || e.key === 'O') {", to: "else if (e.key === 'Escape') {", run: ['music'] },
+  { id: 'M47 the mute button still names M', file: 'js/audiobar.js', from: "const MUTE_LABEL = 'O';", to: "const MUTE_LABEL = 'M';", run: ['volume'] },
+  { id: 'M48 the mute shortcut is M again', file: 'js/sound_system.js', from: "if (code !== MUTE_KEY && e.key !== 'o' && e.key !== 'O') return;", to: "if (code !== 'KeyM' && e.key !== 'm' && e.key !== 'M') return;", run: ['volume'] },
   { id: 'M30 the keys the list does not use reach the page behind it', file: 'js/audiobar.js', from: '    else e.stopPropagation();\n  }', to: '    else { /* mutant: leaks */ }\n  }', run: ['music'] },
   { id: 'M31 the hub is never told the list is open', file: 'js/audiobar.js', from: "if (typeof sys.menuDialog === 'function') sys.menuDialog(true);", to: '', run: ['music'] },
   { id: 'M32 the list is not a modal dialog for the editor\'s controller layer', file: 'js/audiobar.js', from: "'aria-modal': 'true', ", to: '', run: ['a11y'] },
