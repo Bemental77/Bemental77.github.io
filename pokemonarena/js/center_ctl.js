@@ -33,6 +33,7 @@ import { createLocalBus, createMqttBus, brokersFor, TIMING as BOARD_TIMING } fro
 import { createGrid } from './center_room.js';
 import { centerWorld } from './center_world.js';
 import { isLook, loadLook, saveLook, pickLook } from './center_look.js';
+import { updateTrainer } from './trainer_store.js';          // (the LOOK is the trainer's: it is written to the active trainer's card too)
 import { cleanName } from './netmatch.js';
 import { WORDS, DLG } from './center_hub.js';
 
@@ -85,13 +86,30 @@ export function createCtl(env) {
   /** Has this player said YES to what the Center lists? (A storage that is blocked remembers nothing: they are asked at every visit.) */
   const told = () => safe(() => !!env.storage && env.storage.getItem(CENTER_SEEN_KEY) === '1', false);
   const markTold = () => safe(() => { if (env.storage) env.storage.setItem(CENTER_SEEN_KEY, '1'); });
-  /** This browser's look: the stored one when the ROM has such a sprite, else one picked now (and kept). */
+  /** THE LOOK IS THE TRAINER'S (INAPP.md TRAINER decision 5): the ACTIVE trainer's card.look when the ROM has such a sprite (copied to this browser's stored look, which stays the Center's copy),
+   *  else this browser's stored look, else one picked now (and kept in the browser only: a look nobody chose is not written on a trainer card). */
   function myLook() {
     const seam = local ? query.get('ctrav') : null;
     if (seam && isLook(seam, room.looks)) return seam;
+    const card = safe(() => { const a = env.model.active(); return a && a.card ? a.card.look : null; }, null);
+    if (card && isLook(card, room.looks)) { if (loadLook(env.storage) !== card) saveLook(env.storage, card); return card; }
     let look = loadLook(env.storage);
     if (!look || !isLook(look, room.looks)) { look = pickLook(room.looks, env.freshSeed()); saveLook(env.storage, look); }
     return look;
+  }
+  /** The player chose a LOOK here: this browser's copy, and the active trainer's card (trainer_store.js updateTrainer: the card's look alone), then the hub reads its data again. Never throws. */
+  let lookWrite = null;          // the last card write: { id, ok, changed, code } (the test hook)
+  async function keepLook(code) {
+    saveLook(env.storage, code);
+    const a = safe(() => env.model.active(), null);
+    if (!a || a.readOnly) { lookWrite = { id: a ? a.id : null, ok: false, code: a ? 'read-only' : 'no-trainer' }; return; }
+    try {
+      const store = typeof env.whenStore === 'function' ? await env.whenStore() : null;
+      if (!store) { lookWrite = { id: a.id, ok: false, code: 'no-store' }; return; }
+      const r = await updateTrainer(store, a.id, { card: { look: code } });
+      lookWrite = { id: a.id, ok: !!r.ok, changed: !!r.changed, code: r.ok ? null : r.code };
+      if (r.ok && r.changed) await env.refreshData();
+    } catch (e) { lookWrite = { id: a.id, ok: false, code: 'store', detail: String(e && e.message ? e.message : e) }; }
   }
   /** What the room is told about this page. */
   function meNow() {
@@ -275,7 +293,7 @@ export function createCtl(env) {
   const onShow = (e) => { if (e && e.persisted && safe(() => env.model.path(), '') === 'center') enter(); };
   safe(() => { win.addEventListener('pagehide', onHide); win.addEventListener('pageshow', onShow); });
 
-  if (env.hook) env.hook.center = { state: () => ({ inside, mine, leaving, seam: seamName, net: center ? center.status() : 'off', sid: center ? center.sid : null, board: boardId, asking: !!chal, entering: !!entry, told: told(), roomError: roomError ? String(roomError.message || roomError) : null }), people: () => app.people(), me: () => app.me(), sid: () => (center ? center.sid : null), wire };
+  if (env.hook) env.hook.center = { state: () => ({ inside, mine, leaving, seam: seamName, net: center ? center.status() : 'off', sid: center ? center.sid : null, board: boardId, asking: !!chal, entering: !!entry, told: told(), roomError: roomError ? String(roomError.message || roomError) : null, lookWrite }), people: () => app.people(), me: () => app.me(), sid: () => (center ? center.sid : null), wire };
 
   return {
     enter, leave,
@@ -283,7 +301,7 @@ export function createCtl(env) {
       if (!eff) return;
       if (eff.type === 'dialog') { if (eff.id === DLG.enter) settleEntry(eff.value === 0); }          // the answer to the Center's own question (YES is option 0)
       else if (eff.type === 'moved') { if (center) center.moved(); }
-      else if (eff.type === 'look') { saveLook(env.storage, eff.code); if (center) center.update(); safe(() => svc.relist()); }
+      else if (eff.type === 'look') { const w = keepLook(eff.code); if (center) center.update(); safe(() => svc.relist()); return w; }
       else if (eff.type === 'emote') { if (center && center.emote(eff.e)) { app.myEmote(eff.e); redraw(); } }
       else if (eff.type === 'ask') ask(eff);
       else if (eff.type === 'join') goBattle(eff.room);
