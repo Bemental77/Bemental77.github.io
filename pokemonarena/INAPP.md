@@ -1658,3 +1658,50 @@ removed. `pokemonarena_apps_test.mjs` and its fixtures are untouched.
 now hands the apps the card, `trainer.golden.json`'s `edit-figure` and `edit-back` (the editor opens on the trainer's own figure) change on a tree with this branch: APP-UI's
 `pokemonarena_trainer_test.mjs --update` after the merge. The greeting is decided once, at the first data refresh: a player who moves off the main menu before the store answers is not greeted
 on that visit.
+
+### SCHEMA: as built
+
+Branch `prof-schema` (commits `274cd156` the schema and the API, `9c6327df` the ripple; the browser proof and this section after them). Everything below is in the code; `tools/pokemonarena_trainer_card_test.mjs` pins it.
+
+**Profile schema 6** (`js/profile.js`): `SCHEMA_VERSION = 6`; `MIGRATIONS[5]` = `migrate5to6` adds `card: emptyCard()` (pure: clones first; a fixed point; never throws on JSON input). A v5 document that
+already holds a `card` keeps it when it is a well-formed card, otherwise the value goes to the root unknown bag under a free name (`v5Card`, `v5Card_2`, ... as `v4Tower` did) and the card starts empty.
+`PROFILE_KEYS` has `'card'`; `checkProfile` reports `cardIssues(p.card)` and a non-object `card._unknown` under the code **`profile.card`** (in `PROFILE_CODES`). The normaliser repairs field by field with
+`repairCard` (each repaired key is a `repaired` problem `profile.card` at `card.<key>` carrying `was`), a missing / non-object card becomes the empty card, and unknown keys inside a card go to
+`card._unknown` (a non-object `_unknown` is wrapped, as everywhere). `createProfile({ ..., card })` merges `card` over the empty card and throws `ProfileError` (`profile.card`) for a bad value or an unknown key.
+Export / import / `planImport` carry the card as they carry `trainerName` and `avatar`: `new` and `replace` take the file's, `merge` keeps the profile's own. The older migrations are unchanged.
+A stored v5 profile is upgraded the first time this build loads it (`store.loadProfile`: the v5 document goes to the history ring with reason `migration`), as every older upgrade was.
+**An older build given a v6 profile** (a tab still running the schema-5 code, or a cached copy) opens it **read-only** (`migrateProfile`: newer than current): it shows it, never writes it, never
+down-converts it; `saveProfile` / `recordMatch` / `towerUpdate` / `deleteProfile` refuse it with `ReadOnlyError`. A reload with the new build makes it writable again.
+
+**`js/store.js`**: one new method, `createActiveProfile(init)`: `createProfile` + the `activeProfileId` pointer in ONE read-write transaction (a failure leaves neither). Nothing else changed.
+
+**`js/hub_data.js`**: `readHubData` profile summaries gain `avatar: { kind, id }` (`avatarOf(p)`, exported: a copy; `{ kind: 'preset', id: 0 }` when a newer build's portrait is not readable) and
+`card: cardOf(p)` (all five keys, never `_unknown`). Nothing else changed.
+
+**`js/editor_state.js`**: the reducer action `{ type: 'card', patch }` (label `change trainer card`), checked by `checkCardPatch`: refusals `card.shape` (not an object), `card.key` (unknown key, `error.key`
+names it), `card.value` (a bad value, `error.key`); a patch that changes nothing is no edit; `card._unknown` is kept; read-only profiles refuse it (`profile.readonly`). Undo / redo restore the card with the rest.
+
+**`js/trainer_store.js`** (new; pure apart from the injected store; browser + Node; never throws): the ONLY API the trainer ctl uses to write.
+
+| Call | Result |
+|---|---|
+| `await createTrainer(store, { name, avatar?, card? })` | `{ ok: true, id, profile, notSaved }`: a new profile (`card` = the patch over the empty card), made ACTIVE in the same transaction (`store.createActiveProfile`) |
+| `await updateTrainer(store, id, { name?, avatar?, card? })` | `{ ok: true, profile, changed, notSaved }`: `card` is a PATCH (only the keys given change; `card._unknown` and `avatar._unknown` are kept). Reads with `store.loadProfile` (an older document is upgraded first, the usual way), changes ONLY `trainerName` / `avatar` / `card`, writes with `store.saveProfile` (compare-and-swap; history reason `trainer`); when another tab saved in between it reads again (`TRAINER_RETRIES` = 4 tries) and applies the change on top. Nothing different: `changed: false`, nothing written. |
+| `await setActiveTrainer(store, id)` | `{ ok: true }`: a newer build's profile may be made active (the hub shows it read-only); an unreadable one may not |
+| `await listTrainers(store)` | `[{ id, name, avatar: { kind, id }, card, readOnly, active }]` (every readable profile in the store's order; `active` is an addition to the contract's list); `[]` when storage fails |
+
+Every refusal is `{ ok: false, code, message }` (sometimes `key` / `detail`); `TRAINER_CODES[code]` has a plain sentence for each:
+`name` (empty, blank, longer than 10, or a character the ROM font cannot write: `nameIssue`), `avatar` (not `{ kind: 'preset', id: 0..51 }` or `{ kind: 'mon', id: 1..65535 }`, nothing else in it: `avatarIssue`),
+`card` (`checkCardPatch` refused it; `key` names the key), `read-only` (the profile or the whole database is a newer build's; no write is attempted), `not-found`, **`unreadable`** (an addition to the
+contract's list: the stored document cannot be read at all, store.js has quarantined a copy; the UI may word it like `store`), `not-saved` (the browser refused the write, or the upgrade of an older
+document could not be written; nothing changed; `store.status.notSaved` is now true), `conflict` (another tab kept winning for 4 tries), `store` (anything else, including a change with a key other than
+name / avatar / card). An ok result carries `notSaved: true` when the browser keeps nothing (memory only): the trainer exists for this visit only.
+
+**Fixtures** (`tools/fixtures/pokemonarena`, derived from the v5 ones by editing the JSON): `profile-v6-current.json`, `profile-v6-tower.json`, the goldens `profile-v1-full` / `profile-v1-bad` /
+`profile-v2-current` `.expected-v6.json`, and `profile-v7-future.json` (the newer-build fixture now). The v5 fixtures stay and now exercise the 5 -> 6 migration; `profile-v6-future.json` stays too (it is
+a damaged v6 document now, used by nobody of this track).
+
+**Tests**: `node tools/pokemonarena_trainer_card_test.mjs [--mutants] [--browser]`: 37 Node checks (the card, the migration, the editor action, the hub data, the save API on a memory store), 52 source
+mutants each killed by a NAMED check, and with `--browser` group B in a real headless muted Chrome against real IndexedDB (ARENA_PORT 8141 / ARENA_CDP 9341): a stored v5 profile upgraded once (history
+`migration`), not again after a reload, the save API there, and the REAL hub page upgrading a v5 profile in the real `pokemonarena` database once. The profile / career / tower_profile / record / editor suites
+now pin schema 6.
