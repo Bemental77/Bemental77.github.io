@@ -6,6 +6,7 @@
 import { createScreen as online } from './online_screen.js';
 import { createScreen as center } from './center_screen.js';
 import { createScreen as builder } from './builder_screen.js';
+import { createScreen as trainer } from './trainer_screen.js';
 
 /** { app id: createScreen(ui, h) -> { render(f, view) } } */
-export const APP_SCREENS = Object.freeze({ online, center, builder });
+export const APP_SCREENS = Object.freeze({ online, center, builder, trainer });

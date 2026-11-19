@@ -9,4 +9,5 @@ export const APP_CTLS = Object.freeze({
   online: () => import('./online_ctl.js'),
   center: () => import('./center_ctl.js'),
   builder: () => import('./builder_ctl.js'),
+  trainer: () => import('./trainer_ctl.js'),
 });

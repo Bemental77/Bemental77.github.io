@@ -17,8 +17,9 @@ import { decodeText } from './charset.js';
 
 export const TRAINER_TABLE = Object.freeze({ offset: 0x497FBC, stride: 52, count: 1164, classAt: 28, picAt: 30, nameAt: 31 });
 export const CLASS_TABLE = Object.freeze({ offset: 0x43b03c, stride: 16, count: 83 });
-/** Front pictures that are not a person a player would stand as (found by looking at the contact sheet: the ROM uses them for a ghost and the like). Filled in by the TRAINER app track. */
-export const FRONT_EXCLUDE = Object.freeze([]);
+/** Front pictures a player cannot stand as. From the contact sheet of every front choice (2026-11-18, TRAINER app track): 67 (Twins) and 78 (Young Couple) are two people; 137, 138 ('Spirit')
+ *  and 139 lie beyond speciesgfx.js TRAINER_FRONT_COUNT (134), so trainerFront cannot draw them (it throws). */
+export const FRONT_EXCLUDE = Object.freeze([67, 78, 137, 138, 139]);
 export const FIGURE_DEFAULT = Object.freeze({ front: null, back: 0 });
 
 const cache = new WeakMap();
