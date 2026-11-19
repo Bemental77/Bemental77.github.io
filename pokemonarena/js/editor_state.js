@@ -22,8 +22,8 @@
 //   * What a ruleset fixes (Champions: Lv 50, IV 31, stat points) cannot be edited away: the edit is rejected with the ruleset's own code.
 //   * Switching a team's ruleset changes ONLY the ruleset id (no data is destroyed); teamConform is the explicit, undoable "fix it" step.
 //   * No committed state is ever one profile.js checkProfile() rejects, so the autosaver can never hit a ValidationError from an edit.
-//   * Undo holds the last 20 edits (consecutive edits that share a `key` -- one slider drag -- are ONE edit). Undo restores teams, box, name
-//     and settings only; the identity, the stats and the store's rev/updatedAt are never rolled back.
+//   * Undo holds the last 20 edits (consecutive edits that share a `key` -- one slider drag -- are ONE edit). Undo restores teams, box, name,
+//     portrait, trainer card (schema 6: the `card` action, a trainer_card.js checkCardPatch patch) and settings only; the identity, the stats and the store's rev/updatedAt are never rolled back.
 
 import {
   createMon, createTeam, newId, textIssue, checkProfile, checkMon, defaultDeps, PROFILE_LIMITS, SETTING_ENUMS,
@@ -33,6 +33,7 @@ import {
   STAT_ORDER, LIMITS, pointsToEv, evToPoints, hiddenPowerIvs, snapEvsToMinimum, sumStats,
 } from './stats.js';
 import { monsFromDecoded } from './teamcode.js';
+import { checkCardPatch, cardOf, CARD_KEYS } from './trainer_card.js';
 import { moveStatuses, itemStatus, genderOptions, defaultGender, abilityOptions, speciesExclusions, speciesComparator, SPECIES_SORT_IDS, SPECIES_SORTS } from './editor_data.js';
 
 export const EDITOR_LIMITS = Object.freeze({ teamsMax: 16, undoMax: 20, teamSize: 6, boxMax: PROFILE_LIMITS.boxMax });
@@ -104,11 +105,11 @@ export function initialState(profile, { readOnly = false } = {}) {
 const reject = (state, type, code, message, detail) => ({ ...state, error: { code, message, action: type, ...(detail || {}) }, notice: null, result: null });
 
 function restoreContent(current, snapshot) {
-  return { ...current, trainerName: snapshot.trainerName, avatar: snapshot.avatar, settings: snapshot.settings, teams: snapshot.teams, box: snapshot.box };
+  return { ...current, trainerName: snapshot.trainerName, avatar: snapshot.avatar, card: Object.prototype.hasOwnProperty.call(snapshot, 'card') ? snapshot.card : current.card, settings: snapshot.settings, teams: snapshot.teams, box: snapshot.box };
 }
 
 const LABELS = {
-  rename: 'rename profile', avatar: 'change avatar', setting: 'change setting', teamCreate: 'new team', teamRename: 'rename team', teamDuplicate: 'duplicate team', teamDelete: 'delete team',
+  rename: 'rename profile', avatar: 'change avatar', card: 'change trainer card', setting: 'change setting', teamCreate: 'new team', teamRename: 'rename team', teamDuplicate: 'duplicate team', teamDelete: 'delete team',
   teamMove: 'reorder teams', teamRuleset: 'change rules', teamConform: 'convert team to its rules', teamImport: 'import team', saveImport: 'import from a save', monAdd: 'add Pokemon', monRemove: 'remove Pokemon',
   monMove: 'reorder Pokemon', teamSort: 'sort Pokemon', monDuplicate: 'duplicate Pokemon', monSet: 'edit Pokemon', moveSet: 'change move', moveReorder: 'reorder moves', evSet: 'change EVs',
   ivSet: 'change IVs', ivPreset: 'IV preset', evSnap: 'snap EVs', evReset: 'reset EVs', boxCleanup: 'clean up the box',
@@ -289,6 +290,15 @@ function step(state, action, ctx) {
     }
     if (P.avatar.kind === kind && P.avatar.id === id) return { ...state, error: null, notice: null, result: null };
     return commit(state, type, { ...P, avatar: { kind, id } });
+  }
+  if (type === 'card') { // schema 6: { type: 'card', patch } -- a trainer_card.js patch (only CARD_KEYS, each valid); the card's unknown keys (card._unknown) are kept
+    const c = checkCardPatch(action.patch);
+    if (!c.ok) return reject(state, type, c.key === null ? 'card.shape' : CARD_KEYS.includes(c.key) ? 'card.value' : 'card.key', 'card: ' + c.message, { key: c.key });
+    const cur = cardOf(P);
+    if (CARD_KEYS.every((k) => !Object.prototype.hasOwnProperty.call(c.patch, k) || c.patch[k] === cur[k])) return { ...state, error: null, notice: null, result: null };
+    const card = { ...cur, ...c.patch };
+    if (P.card && typeof P.card === 'object' && P.card._unknown && typeof P.card._unknown === 'object') card._unknown = P.card._unknown;
+    return commit(state, type, { ...P, card });
   }
   if (type === 'setting') {
     const key = action.key;

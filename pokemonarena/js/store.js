@@ -437,6 +437,22 @@ export class ArenaStore {
   }
 
   /**
+   * Create a profile AND make it the active one, in ONE read-write transaction (the new-trainer screens, trainer_store.js createTrainer): a failure leaves neither a new profile that is not
+   * active nor an active pointer to nothing. Throws as saveProfile does (and ProfileError from createProfile for a bad `init`). Returns the saved profile.
+   */
+  async createActiveProfile(init = {}) {
+    const p = createProfile(init, this.deps);
+    const saved = await this._tx(['profiles', 'profileHistory', 'meta'], 'readwrite', async (tx) => {
+      const s = await this._commit(tx, p, { reason: 'create', backup: null });
+      await tx.put('meta', { key: 'activeProfileId', value: s.id });
+      return s;
+    });
+    this._announce({ t: 'saved', id: saved.id, rev: saved.rev });
+    this._announce({ t: 'meta', key: 'activeProfileId' });
+    return saved;
+  }
+
+  /**
    * Read, migrate, normalise. Returns
    *   { ok:true, profile, readOnly, migratedFrom, repaired, quarantined }   (a changed document is written back, with its old
    *                                                                          revision in history, unless it is read-only)
