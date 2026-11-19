@@ -102,6 +102,7 @@ export const WORDS = Object.freeze({
   switchList: Object.freeze(['Which TRAINER?', 'A: this one   B: back']),
   backRow: Object.freeze(['Back to the main menu.', 'A: back']),
   made: Object.freeze(['Your TRAINER CARD is ready!', 'A: on to the main menu']),
+  pick: Object.freeze(['Which of your TRAINERS are you?', 'A: choose   B: back']),
   cardKeys: 'A: change it   B: back',
   notKept: Object.freeze(['Saved for this visit only: this', 'browser is not keeping TRAINERS.']),
   failed: Object.freeze({
@@ -175,7 +176,9 @@ function createTrainerHub(ctx) {
     return (ctx.profiles() || []).map((p) => ({ id: p.id, name: String(p.name || ''), readOnly: !!p.readOnly, avatar: avatarOf(p.avatar), card: cardOf(p), rec: p.record ? { battles: p.record.battles | 0 } : null }));
   }
   const activeId = () => (S.trainers ? S.trainers.activeId : ctx.activeId());
-  function active() { const L = trainerList(), id = activeId(); return L.find((t) => t.id === id) || L[0] || null; }
+  // the store's active trainer, else the ONLY one there is (hub_model.js activeOf): the card, the title, the Center and the greeting agree on who "you" are. With several trainers
+  // and no active one, nobody is: the card offers SWITCH to choose (never the first of the list, whose edits would land on a trainer the hub does not call yours).
+  function active() { const L = trainerList(), id = activeId(); return L.find((t) => t.id === id) || (L.length === 1 ? L[0] : null); }
 
   /* -------------------------------------------------------------------------------------------- defaults: every step opens on one */
   const defFront = () => { const F = fronts(); const hit = F.find((c) => c.pic === FRONT_DEFAULT_PIC); return hit ? hit.pic : F.length ? F[0].pic : null; };
@@ -366,10 +369,11 @@ function createTrainerHub(ctx) {
   function startWizard() {
     const p = S.pending || { kind: 'another', name: '', profileId: null, auto: false };
     S.pending = null;
-    // the profile a 'back' welcome updates: the one the shell named, else the active one
-    const a = (p.profileId && trainerList().find((t) => t.id === p.profileId)) || active();
-    const upd = p.kind === 'back' && a && !a.readOnly;
-    S.wiz = { kind: p.kind, mode: upd ? 'update' : 'create', profileId: upd ? a.id : null, name0: upd ? p.name || a.name : '', step: 'welcome', draft: { ...EMPTY }, cur: {}, ret: null, auto: !!p.auto, asked: false, ask: 0 };
+    // the profile a 'back' welcome updates: the one the shell NAMED (never another one in its place: when it is not on the list the store answers not-found and nothing is
+    // written to a trainer the player was not greeted as), else the active one
+    const a = p.profileId ? trainerList().find((t) => t.id === p.profileId) || null : active();
+    const upd = p.kind === 'back' && (p.profileId ? !(a && a.readOnly) : !!a && !a.readOnly);
+    S.wiz = { kind: p.kind, mode: upd ? 'update' : 'create', profileId: upd ? p.profileId || a.id : null, name0: upd ? p.name || (a ? a.name : '') : '', step: 'welcome', draft: { ...EMPTY }, cur: {}, ret: null, auto: !!p.auto, asked: false, ask: 0 };
     S.search = '';
     askWelcome();
   }
@@ -395,7 +399,7 @@ function createTrainerHub(ctx) {
   /** The new-trainer screens' choices as shown: the player's over the profile being updated (its live values), or over nothing for a new trainer. */
   function wizSeen() {
     const w = S.wiz, t = w.mode === 'update' ? trainerList().find((x) => x.id === w.profileId) : null, base = t ? { ...draftOf(t) } : { ...EMPTY };
-    if (w.name0) base.name = w.name0;
+    if (w.name0 && !t) base.name = w.name0;          // (the greeting's name only while the profile is not on the list: a rename made in another tab meanwhile is the name shown and kept)
     return over(w.draft, base);
   }
   const wizHost = () => ({
@@ -420,7 +424,12 @@ function createTrainerHub(ctx) {
   function wizSave() {
     const w = S.wiz, r = resolved(wizSeen());
     S.saving = { what: 'wiz' };
-    return [{ app: ID, type: 'save', mode: w.mode, profileId: w.profileId, name: r.name, avatar: { kind: 'preset', id: r.head }, card: { made: true, look: r.look, front: r.front, back: r.back, partner: r.partner } }];
+    // A portrait the 52 heads cannot show (a Pokemon's, an id past the heads: an imported profile) is KEPT unless the player picked another head than the one the step opened on.
+    const t = w.mode === 'update' ? trainerList().find((x) => x.id === w.profileId) : null, a0 = t ? avatarOf(t.avatar) : null;
+    const shown = (h) => isInt(h) && h >= 0 && h < Math.max(1, headCount());
+    const keep = !!a0 && !(a0.kind === 'preset' && shown(a0.id)) && (!isInt(w.draft.head) || w.draft.head === clamp(resolved(draftOf(t)).head, 0, Math.max(0, headCount() - 1)));
+    const avatar = keep ? undefined : { kind: 'preset', id: r.head };
+    return [{ app: ID, type: 'save', mode: w.mode, profileId: w.profileId, name: r.name, avatar, card: { made: true, look: r.look, front: r.front, back: r.back, partner: r.partner } }];
   }
 
   /* -------------------------------------------------------------------------------------------- THE CARD (the confirm step and the card screen) */
@@ -488,11 +497,11 @@ function createTrainerHub(ctx) {
   // the card screen
   function cardChips() {
     const t = active(), list = [];
-    if (t && trainerList().length > 1) list.push({ id: 'switch', label: 'SWITCH' });
+    if (trainerList().length > 1) list.push({ id: 'switch', label: 'SWITCH' });
     list.push({ id: 'new', label: 'NEW TRAINER' }, { id: 'back', label: 'BACK' });
     return withRects(list);
   }
-  function cardFocusNow() { const t = active(), chips = cardChips(), ids = (t ? CARD_PARTS.slice() : []).concat(chips.map((c) => c.id)); return ids.includes(S.card.focus) ? S.card.focus : t ? 'name' : 'new'; }
+  function cardFocusNow() { const t = active(), chips = cardChips(), ids = (t ? CARD_PARTS.slice() : []).concat(chips.map((c) => c.id)); return ids.includes(S.card.focus) ? S.card.focus : t ? 'name' : ids.includes('switch') ? 'switch' : 'new'; }
   function cardAct(id) {
     const t = active();
     if (id === 'back') return ctx.back();
@@ -510,8 +519,7 @@ function createTrainerHub(ctx) {
   function switchTake(i) {
     const L = trainerList(), t = L[i]; S.sw = null;
     if (!t) return [];
-    const a = active();
-    if (a && t.id === a.id) return [];
+    if (t.id === activeId()) return [];          // (the STORE's active one: a trainer merely shown is still made active)
     S.card.focus = 'name';
     return [{ app: ID, type: 'switch', id: t.id }];
   }
@@ -638,7 +646,7 @@ function createTrainerHub(ctx) {
       const card = t ? cardView(draftOf(t), recText(t), { readOnly: !!t.readOnly }) : null;
       let msg;
       if (S.sw) msg = WORDS.switchList.slice();
-      else if (!t) msg = focus === 'back' ? WORDS.backRow.slice() : WORDS.none.slice();
+      else if (!t) msg = focus === 'back' ? WORDS.backRow.slice() : focus === 'switch' ? WORDS.pick.slice() : trainerList().length ? WORDS.newTrainer.slice() : WORDS.none.slice();
       else if (focus === 'switch') msg = WORDS.switchT.slice();
       else if (focus === 'new') msg = WORDS.newTrainer.slice();
       else if (focus === 'back') msg = WORDS.backRow.slice();

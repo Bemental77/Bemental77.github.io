@@ -1199,7 +1199,7 @@ export function planImport(existing, incoming, mode, deps) {
   if (!IMPORT_MODES.includes(mode)) return { ok: false, code: 'plan.mode', message: 'mode must be new, merge or replace' };
   if (!isObj(incoming) || checkProfile(incoming).length) return { ok: false, code: 'plan.incoming', message: 'the incoming profile is not well formed' };
   const now = d.now();
-  const report = { mode, addedMons: 0, skippedMons: [], remappedMons: 0, addedTeams: 0, skippedTeams: [], boxSize: 0, identity: 'incoming-copy', record: 'copied', recordBattles: battleCount(incoming.stats), tower: 'copied', towerRuns: incoming.tower ? incoming.tower.runs : 0 };
+  const report = { mode, addedMons: 0, skippedMons: [], remappedMons: 0, addedTeams: 0, skippedTeams: [], boxSize: 0, identity: 'incoming-copy', record: 'copied', recordBattles: battleCount(incoming.stats), tower: 'copied', towerRuns: incoming.tower ? incoming.tower.runs : 0, card: 'copied' };
   if (mode === 'new') {
     const p = clone(incoming);
     p.id = newId('p', d);
@@ -1221,6 +1221,9 @@ export function planImport(existing, incoming, mode, deps) {
     if (existing.identity.publicKeyJwk) { p.identity = clone(existing.identity); report.identity = 'kept-local'; } else report.identity = 'adopted-incoming';
     report.record = 'replaced';
     report.tower = 'replaced';
+    // THE TRAINER CARD: a file whose card is not made (an export from before schema 6 reads as the empty card) does not unmake this trainer's: the made card stays, or the
+    // new-trainer screens would greet a player who already made one
+    if (!(isObj(incoming.card) && incoming.card.made === true) && isObj(existing.card) && existing.card.made === true) { p.card = clone(existing.card); report.card = 'kept'; } else report.card = 'replaced';
     report.addedMons = p.box.length;
     report.addedTeams = p.teams.length;
     report.boxSize = p.box.length;
@@ -1229,6 +1232,7 @@ export function planImport(existing, incoming, mode, deps) {
   // merge
   const p = clone(existing);
   p.updatedAt = now;
+  report.card = 'kept';
   const byId = new Map(p.box.map((m) => [m.id, m]));
   const byKey = new Map();
   for (const m of p.box) { const k = monKey(m); if (k) byKey.set(k, m); }

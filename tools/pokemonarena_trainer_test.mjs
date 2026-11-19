@@ -61,8 +61,8 @@ async function runNode(jsDir, verbose) {
     if (verbose && (r !== true || VERBOSE)) console.log(r === true ? 'ok  ' : 'FAIL', name, r === true ? '' : String(r).slice(0, 600));
   }
   const mod = (n) => import(pathToFileURL(path.join(jsDir, n)).href);
-  const [HM, HS, B, T, TH, TS, TC, TGm, TF, ST, TST, HA, HAS, CL, HDL, HD, SG, TE] = await Promise.all(['hub_model.js', 'hub_screen.js', 'battle_ui.js', 'tables.js', 'trainer_hub.js', 'trainer_screen.js', 'trainer_ctl.js', 'trainer_geom.js',
-    'trainer_figures.js', 'store.js', 'trainer_store.js', 'hub_apps.js', 'hub_app_screens.js', 'center_look.js', 'hub_dialog.js', 'hub_data.js', 'speciesgfx.js', 'textentry.js'].map(mod));
+  const [HM, HS, B, T, TH, TS, TC, TGm, TF, ST, TST, HA, HAS, CL, HDL, HD, SG, TE, PR] = await Promise.all(['hub_model.js', 'hub_screen.js', 'battle_ui.js', 'tables.js', 'trainer_hub.js', 'trainer_screen.js', 'trainer_ctl.js', 'trainer_geom.js',
+    'trainer_figures.js', 'store.js', 'trainer_store.js', 'hub_apps.js', 'hub_app_screens.js', 'center_look.js', 'hub_dialog.js', 'hub_data.js', 'speciesgfx.js', 'textentry.js', 'profile.js'].map(mod));
   const read = (f) => fs.readFileSync(path.join(jsDir, f), 'utf8');
   const ui = B.createBattleUi(romBytes), screen = HS.createHubScreen(ui);
   const pack = T.loadPack(romBytes, { verify: 'header', dexText: false });
@@ -467,6 +467,58 @@ async function runNode(jsDir, verbose) {
     return before === 'new' && m.st().card.focus === 'name' && v.trainer.focus === 'name' ? true : J([before, m.st().card.focus, v.trainer.focus]);
   });
 
+  /* ---------------------------------------------------------------------------------------------- the data-safety review (2026-11-19): each defect it reproduced, kept fixed */
+  const notMade = { made: false, look: null, front: null, back: null, partner: null };
+  /** Through a 'back' greeting to YES, with `onPortrait` run on the portrait step. -> the save effect. */
+  function backThrough(m, onPortrait) {
+    answer(m.hub, 0); let fx = [];
+    for (let i = 0; i < 10 && step(m) !== null && !m.app.saving(); i++) { if (step(m) === 'portrait' && onPortrait) { onPortrait(); onPortrait = null; } fx = m.hub.press('a'); }
+    return fxOf(fx, 'save');
+  }
+  await check('D1 "welcome back" KEEPS a portrait the 52 heads cannot show (a Pokemon\'s, an imported id past the heads) when the player did not pick another head; a head picked is written', () => {
+    const data = (avatar) => ({ state: 'ready', activeId: 'p1', profiles: [prof('p1', 'GREEN', { avatar, card: notMade })] });
+    const kept = [{ kind: 'mon', id: 25 }, { kind: 'preset', id: 60000 }].map((av) => { const m = visit('back', data(av), { name: 'GREEN', profileId: 'p1', list: true }); return backThrough(m); });
+    const m = visit('back', data({ kind: 'mon', id: 25 }), { name: 'GREEN', profileId: 'p1', list: true }), picked = backThrough(m, () => m.hub.press('right'));
+    const p = visit('back', data({ kind: 'preset', id: 7 }), { name: 'GREEN', profileId: 'p1', list: true }), preset = backThrough(p);
+    return kept.every((s) => s && s.mode === 'update' && s.avatar === undefined && s.card.made === true) && picked && J(picked.avatar) === J({ kind: 'preset', id: 1 })
+      && preset && J(preset.avatar) === J({ kind: 'preset', id: 7 }) ? true : J([kept, picked, preset]);
+  });
+  await check('D2 "welcome back" shows and keeps a RENAME made in another tab while the screens were open (the store\'s list is read live, the greeting\'s name is not forced over it)', () => {
+    const m = visit('back', { state: 'ready', activeId: 'p1', profiles: [prof('p1', 'GREEN', { card: notMade })] }, { name: 'GREEN', profileId: 'p1', list: true });
+    m.app.setTrainers({ activeId: 'p1', list: [{ id: 'p1', name: 'ASH', avatar: { kind: 'preset', id: 0 }, card: notMade }] });          // (the other tab's rename, read by the ctl)
+    const s = backThrough(m);
+    return s && s.mode === 'update' && s.profileId === 'p1' && s.name === 'ASH' ? true : J(s);
+  });
+  await check('D3 a greeting that names a profile NOT on the list never writes another one in its place (the update goes to the named id; the store answers not-found)', () => {
+    const m = visit('back', { state: 'ready', activeId: 'p1', profiles: [prof('p1', 'RED', { card: notMade })] }, { name: 'MISTY', profileId: 'p2', list: true });
+    const s = backThrough(m);
+    return s && s.mode === 'update' && s.profileId === 'p2' && s.name === 'MISTY' ? true : J(s);
+  });
+  await check('D4 several trainers and NO active one (the active one was deleted): the card shows nobody (as the title does) and offers SWITCH, on the cursor, in words; A on a trainer makes it active', () => {
+    const L = [prof('p1', 'ALPHA', { card: made }), prof('p2', 'BRAVO', { card: made })];
+    const m = mk({ state: 'ready', activeId: null, profiles: L }, { list: true }); m.hub.goto('trainer');
+    const v = m.hub.view(); m.hub.press('a'); const fx = m.hub.press('a'), sw = fxOf(fx, 'switch');
+    return v.trainer.empty === true && J(v.trainer.chips.map((c) => c.id)) === J(['switch', 'new', 'back']) && v.trainer.focus === 'switch' && J(v.msg) === J(W.pick.slice()) && sw && sw.id === 'p1' ? true : J([v.trainer.empty, v.trainer.chips, v.trainer.focus, v.msg, fx]);
+  });
+  await check('D5 the ctl tells the model how a save went EXACTLY ONCE whatever throws after the write (here the success sound): the trainer is made, the screen leaves "Saving..." and comes back to the card', async () => {
+    const M = await memStore();
+    const warn = console.warn; console.warn = () => {};
+    try {
+      const m = visit('new'); const env = ctlFor(m, M.store); await env.ctl.refresh();
+      env.sound.sfx = () => { throw new Error('the audio context is gone'); };
+      const { fx } = aThrough(m);
+      try { await env.ctl.effect(fxOf(fx, 'save')); } catch (_e) { /* judged below */ }
+      const n = (await TST.listTrainers(M.store)).length;
+      return n === 1 && !m.app.saving() && m.hub.path() === 'trainer' ? true : J([n, m.app.saving(), m.hub.path()]);
+    } finally { console.warn = warn; await M.done(); }
+  });
+  await check('D6 an import REPLACE with a file whose card is not made (an export from before schema 6) KEEPS the made card here (report.card kept); a made card in the file replaces it', () => {
+    const ex = PR.createProfile({ trainerName: 'RED', card: { made: true, look: 'w000037', front: 71, back: 1, partner: 6 } });
+    const old = PR.planImport(ex, PR.createProfile({ trainerName: 'OLD' }), 'replace');
+    const neu = PR.planImport(ex, PR.createProfile({ trainerName: 'NEW', card: { made: true, look: 'w000040', front: 5, back: 0, partner: 9 } }), 'replace');
+    return old.ok && J(old.profile.card) === J(ex.card) && old.report.card === 'kept' && old.profile.trainerName === 'OLD' && neu.ok && neu.profile.card.front === 5 && neu.report.card === 'replaced' ? true : J([old.profile && old.profile.card, old.report, neu.profile && neu.profile.card]);
+  });
+
   /* ---------------------------------------------------------------------------------------------- F: failures */
   await check('F1 every refusal of a save is said in the picture and the screen stays (read-only, not saved, a conflict, refused, no storage, anything else)', () => {
     const bad = [];
@@ -613,14 +665,14 @@ const NODE_MUTANTS = [
   { id: 'M2', file: 'trainer_hub.js', from: "armTicks: w.auto ? DIALOG_ARM_TICKS : 0 });", to: 'armTicks: 0 });', fails: 'W2' },
   { id: 'M3', file: 'trainer_hub.js', from: "return [{ app: ID, type: 'later', kind }].concat(kind === 'another' ? ctx.back() : ctx.go('main'));", to: "return [{ app: ID, type: 'later', kind }].concat(ctx.back());", fails: 'W3' },
   { id: 'M4', file: 'trainer_hub.js', from: "      if (action === 'b') return later();\n      if (action === 'up'", to: "      if (action === 'b') return ctx.back();\n      if (action === 'up'", fails: 'W7' },
-  { id: 'M5', file: 'trainer_hub.js', from: "const a = (p.profileId && trainerList().find((t) => t.id === p.profileId)) || active();", to: 'const a = active();', fails: 'W6' },
+  { id: 'M5', file: 'trainer_hub.js', from: "mode: upd ? 'update' : 'create', profileId: upd ? p.profileId || a.id : null,", to: "mode: 'create', profileId: null,", fails: 'W6' },
   { id: 'M6', file: 'trainer_hub.js', from: "return i >= 0 ? i : pk.items.findIndex((x) => x.id === 'preset'); }", to: 'return i >= 0 ? i : 0; }', fails: 'A1' },
   { id: 'M7', file: 'trainer_hub.js', from: "const w = S.wiz, t = w.mode === 'update' ? trainerList().find((x) => x.id === w.profileId) : null,", to: 'const w = S.wiz, t = null,', fails: 'W6' },
   { id: 'M8', file: 'trainer_hub.js', from: "case 'up': return cur > 0 ? cur - 1 : repeat ? 0 : n - 1;", to: "case 'up': return cur > 0 ? cur - 1 : n - 1;", fails: 'K1' },
   { id: 'M9', file: 'trainer_hub.js', from: "case 'right': return cur < n - 1 ? cur + 1 : repeat ? n - 1 : 0;\n    case 'up': return cur - cols", to: "case 'right': return cur < n - 1 ? cur + 1 : 0;\n    case 'up': return cur - cols", fails: 'K4' },
   { id: 'M10', file: 'trainer_hub.js', from: '      if (t.readOnly) return refuse(WORDS.readOnly);\n      S.edit =', to: '      S.edit =', fails: 'E5' },
   { id: 'M11', file: 'trainer_hub.js', from: '    if (same) return ctx.back();', to: '    if (false) return ctx.back();', fails: 'E4' },
-  { id: 'M12', file: 'trainer_hub.js', from: '    if (a && t.id === a.id) return [];\n', to: '', fails: 'E6' },
+  { id: 'M12', file: 'trainer_hub.js', from: '    if (t.id === activeId()) return [];', to: '', fails: 'E6' },
   { id: 'M13', file: 'trainer_hub.js', from: "else if (path === 'trainer-edit') { if (!S.edit) return ctx.go('trainer'); }", to: "else if (path === 'trainer-edit') { /* no guard */ }", fails: 'E7' },
   { id: 'M14', file: 'trainer_hub.js', from: '    if (S.saving) return [];\n    const step = stepNow(path);\n    if (path === \'trainer\')', to: '    const step = stepNow(path);\n    if (path === \'trainer\')', fails: 'F3' },
   { id: 'M15', file: 'trainer_hub.js', from: "const list = q ? all.filter((s) => s.name.toLowerCase().includes(q)) : all;", to: "const list = q ? all.filter((s) => s.name.toLowerCase().startsWith(q)) : all;", fails: 'P1' },
@@ -644,6 +696,14 @@ const NODE_MUTANTS = [
   { id: 'M34', file: 'trainer_hub.js', from: "if (p === 'trainer-new' && ctx.path() === 'trainer') { S.card.focus = 'back'; note(WORDS.made.slice()); }", to: '', fails: 'E10' },
   { id: 'M35', file: 'trainer_hub.js', from: "if (p === 'trainer-new' && ctx.path() === 'trainer') {", to: "if (ctx.path() === 'trainer') {", fails: 'E10' },
   { id: 'M36', file: 'trainer_hub.js', from: "if (!S.card.focus && active()) S.card.focus = 'name';", to: "if (!S.card.focus) S.card.focus = active() ? 'name' : 'new';", fails: 'E11' },
+  { id: 'M37', file: 'trainer_hub.js', from: "const avatar = keep ? undefined : { kind: 'preset', id: r.head };", to: "const avatar = { kind: 'preset', id: r.head };", fails: 'D1' },
+  { id: 'M38', file: 'trainer_hub.js', from: '(!isInt(w.draft.head) || w.draft.head === clamp(', to: '(true || w.draft.head === clamp(', fails: 'D1' },
+  { id: 'M39', file: 'trainer_hub.js', from: 'if (w.name0 && !t) base.name = w.name0;', to: 'if (w.name0) base.name = w.name0;', fails: 'D2' },
+  { id: 'M40', file: 'trainer_hub.js', from: 'profileId: upd ? p.profileId || a.id : null,', to: 'profileId: upd ? (a || active()).id : null,', fails: 'D3' },
+  { id: 'M41', file: 'trainer_hub.js', from: '|| (L.length === 1 ? L[0] : null); }', to: '|| L[0] || null; }', fails: 'D4' },
+  { id: 'M42', file: 'trainer_hub.js', from: "    if (trainerList().length > 1) list.push({ id: 'switch'", to: "    if (active() && trainerList().length > 1) list.push({ id: 'switch'", fails: 'D4' },
+  { id: 'M43', file: 'trainer_ctl.js', from: "    try { res = await work((r) => { res = r; }); } catch (e) { console.warn('[trainer] a save threw:', e); }", to: '    res = await work((r) => { res = r; });', fails: 'D5' },
+  { id: 'M44', file: 'profile.js', from: "if (!(isObj(incoming.card) && incoming.card.made === true) && isObj(existing.card) && existing.card.made === true) { p.card = clone(existing.card); report.card = 'kept'; } else report.card = 'replaced';", to: "report.card = 'replaced';", fails: 'D6' },
 ];
 async function runMutants() {
   let killed = 0, ran = 0;

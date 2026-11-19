@@ -76,26 +76,40 @@ export function createCtl(env) {
     try { await env.refreshData(); } catch (_e) { /* the next refresh shows it */ }
     if (ok) env.sound.sfx('se_success');
   }
-  async function save(eff) {
-    const store = await storeNow();
-    if (!store) { env.run(app.saved({ ok: false, why: 'nostore' })); env.redraw(); return; }
-    const input = { name: eff.name, avatar: eff.avatar, card: eff.card };
-    const r = eff.mode === 'update' && eff.profileId ? await updateTrainer(store, eff.profileId, input) : await createTrainer(store, input);
-    if (!r || !r.ok) { env.run(app.saved({ ok: false, why: whyOf(r && r.code), message: r && r.message })); env.redraw(); return; }
-    await afterWrite(eff.card && eff.card.look, true);
-    env.run(app.saved({ ok: true, notSaved: !!r.notSaved }));
-    env.redraw();
+  // The model is told how a write went EXACTLY ONCE, whatever throws on the way (the store, the refresh, the sound, a redraw): a model left "saving" swallows every press,
+  // B included, and the player is stuck on "Saving..." until a reload. A write that landed is reported ok even when what follows it throws.
+  async function finishing(work) {
+    let res = { ok: false, why: 'failed' };
+    try { res = await work((r) => { res = r; }); } catch (e) { console.warn('[trainer] a save threw:', e); }
+    try { env.run(app.saved(res)); } catch (e) { console.warn('[trainer] saved() threw:', e); }
+    try { env.redraw(); } catch (_e) { /* the next frame draws it */ }
   }
-  async function update(eff) {
-    const store = await storeNow();
-    if (!store) { env.run(app.saved({ ok: false, why: 'nostore' })); env.redraw(); return; }
-    const r = await updateTrainer(store, eff.profileId, eff.patch || {});
-    if (!r || !r.ok) { env.run(app.saved({ ok: false, why: whyOf(r && r.code), message: r && r.message })); env.redraw(); return; }
-    let look = null;
-    if (eff.patch && eff.patch.card && eff.patch.card.look) { const act = await store.getActiveId().catch(() => null); if (act === eff.profileId) look = eff.patch.card.look; }
-    await afterWrite(look, true);
-    env.run(app.saved({ ok: true, notSaved: !!r.notSaved }));
-    env.redraw();
+  function save(eff) {
+    return finishing(async (landed) => {
+      const store = await storeNow();
+      if (!store) return { ok: false, why: 'nostore' };
+      const input = { name: eff.name, avatar: eff.avatar, card: eff.card };
+      const r = eff.mode === 'update' && eff.profileId ? await updateTrainer(store, eff.profileId, input) : await createTrainer(store, input);
+      if (!r || !r.ok) return { ok: false, why: whyOf(r && r.code), message: r && r.message };
+      const ok = { ok: true, notSaved: !!r.notSaved };
+      landed(ok);
+      await afterWrite(eff.card && eff.card.look, true);
+      return ok;
+    });
+  }
+  function update(eff) {
+    return finishing(async (landed) => {
+      const store = await storeNow();
+      if (!store) return { ok: false, why: 'nostore' };
+      const r = await updateTrainer(store, eff.profileId, eff.patch || {});
+      if (!r || !r.ok) return { ok: false, why: whyOf(r && r.code), message: r && r.message };
+      const ok = { ok: true, notSaved: !!r.notSaved };
+      landed(ok);
+      let look = null;
+      if (eff.patch && eff.patch.card && eff.patch.card.look) { const act = await store.getActiveId().catch(() => null); if (act === eff.profileId) look = eff.patch.card.look; }
+      await afterWrite(look, true);
+      return ok;
+    });
   }
   async function switchTo(eff) {
     const store = await storeNow();
