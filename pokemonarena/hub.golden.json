@@ -2,8 +2,8 @@
   "note": "hashes only (fnv1a of the 240x160 RGBA frame); regenerate with node tools/pokemonarena_hub_test.mjs --update",
   "rom": "Pokemon SoulGold v1.1.1",
   "views": {
-    "main-0": "1c99435a",
-    "main-sound": "2dd81504",
+    "main-0": "f22fe007",
+    "main-sound": "16fff594",
     "quick-format": "4d6ee2f6",
     "quick-6v6-hard": "1a569b52",
     "team-kanto": "072e1b9f",
@@ -11,7 +11,10 @@
     "team-empty": "fecb80c5",
     "about-0": "712e4eec",
     "about-3": "85b813e7",
-    "main-scrolled": "48b1a6b4",
+    "main-scrolled": "d6ad93dd",
+    "main-trainer-partner": "5db0331b",
+    "main-no-trainer": "543c4b60",
+    "main-trainer-row": "2f072a79",
     "tower-home-fight": "1592faf4",
     "tower-home-none": "b3337410",
     "tower-home-giveup": "14395325",
@@ -28,12 +31,12 @@
     "tower-ach-8": "0ca33dc9",
     "tower-last": "7c3f726f",
     "tower-noprofile": "b6f6c001",
-    "main-online-row": "d81707c5",
+    "main-online-row": "b6dbc654",
     "entry-name-empty": "aec317c5",
     "entry-name-lower": "8442e686",
     "entry-teamcode-1024": "92995cd6",
-    "dialog-yesno-main": "915960d6",
-    "dialog-notice-more": "3a84bd4f",
+    "dialog-yesno-main": "bae26fc8",
+    "dialog-notice-more": "c0aee9d2",
     "dialog-over-entry": "904e1e82"
   }
 }

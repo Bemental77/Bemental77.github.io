@@ -50,6 +50,7 @@ import { createTowerHub, TOWER_PATHS, isTowerPath, towerParent } from './tower_h
 import { APPS, pathsOf, appOfPath, checkRegistry, createAppHost } from './hub_apps.js';
 import { createDialogLayer, wrapDialog, speakDialog } from './hub_dialog.js';
 import { speakEntry } from './textentry.js';
+import { cardOf } from './trainer_card.js';
 
 export const SCREEN_W = 240, SCREEN_H = 160;
 export const FORMATS = Object.freeze(['3v3', '6v6']);
@@ -64,6 +65,7 @@ export const MAIN_VISIBLE = 8;                   // the main menu shows this man
 export const GEOM = Object.freeze({
   menu: Object.freeze({ x: 12, y: 10, w: 124, pitch: 16, pitchTight: 14, pitchEight: 12 }),
   title: Object.freeze({ x: 148, y: 84, w: 84, h: 16 }),
+  titleNamed: Object.freeze({ x: 148, y: 78, w: 84, h: 28, name: 14 }),          // ... with the active trainer's name under the title (small font, name = its line's offset): the same right edge, grown upwards to just under the mascot
   mascot: Object.freeze({ cx: 186, cy: 38 }),
   about: Object.freeze({ x: 12, y: 12, w: 216, h: 92, pitch: 13 }),
   // ST1: the RECORD screen: a title line (the trainer on the left, the page's name and number on the right), one ROM window for the page (PAGE_W x PAGE_H of recap_model.js) and three buttons under it
@@ -131,6 +133,31 @@ export function heldOf(x) {
   return Object.freeze(Object.fromEntries(ACTIONS.map((a) => [a, on(a)])));
 }
 
+/** The ACTIVE trainer of a list of profiles (the store's active id; with none set, the only profile there is): what the title screen's partner and name, and the first-visit opening, are about. */
+export function activeOf(profiles, activeId) {
+  const ps = Array.isArray(profiles) ? profiles : [];
+  return ps.find((p) => p && p.id === activeId) || (ps.length === 1 ? ps[0] : null);
+}
+export const WELCOME_KEY = 'arena.welcome';          // localStorage 'off' = the test rigs' switch (tools/headless_cdp.mjs seeds it); sessionStorage 'later' = LATER was said in this tab
+/**
+ * THE FIRST-VISIT OPENING (INAPP.md TRAINER, decision 1): does this page greet the player with the NEW TRAINER screens? Pure; boot.js asks it ONCE, after the first data refresh, and reads the
+ * storage values it is given. -> null (not asked) | { kind: 'new' } (no profile in this browser) | { kind: 'back', name, profileId } (the active profile's card is not made: one from before
+ * schema 6, offered the screens pre-filled).
+ *   data      the store reader's result (hub_data.js readHubData): { state, profiles: [{ id, name, readOnly, card? }], activeId, notSaved }
+ *   o         { openedAt: the path the page was OPENED at, path: the open path now, later: sessionStorage[WELCOME_KEY], off: localStorage[WELCOME_KEY], stored: the store opened and keeps profiles }
+ * A page opened at any other address (an invite #online, #center, #builder ...) is not interrupted; storage that is not kept never greets (nothing could be saved).
+ */
+export function welcomePlan(data, o = {}) {
+  if (!data || data.state !== 'ready' || data.notSaved || !o.stored) return null;
+  if (o.openedAt !== 'main' || o.path !== 'main') return null;
+  if (o.off === 'off' || o.later === 'later') return null;
+  const ps = Array.isArray(data.profiles) ? data.profiles : [];
+  if (!ps.length) return { kind: 'new' };
+  const p = activeOf(ps, data.activeId);
+  if (!p || p.readOnly || cardOf(p).made) return null;
+  return { kind: 'back', name: String(p.name || ''), profileId: String(p.id) };
+}
+
 /** Row spacing of a menu of n rows: seven rows do not fit above the text box at the normal 16 px, so they sit 14 px apart; the eight rows of the main menu (RECORD joined it) sit 12 px apart. */
 export function menuPitch(n) { return n > 7 ? GEOM.menu.pitchEight : n > 6 ? GEOM.menu.pitchTight : GEOM.menu.pitch; }
 
@@ -140,6 +167,9 @@ const MAIN_ITEMS = Object.freeze([
   { id: 'online', label: 'PLAY ONLINE', help: ['Battle a friend, or anyone who', 'is open to battles.'] },
   { id: 'tower', label: 'TOWER', help: ['Climb 30 floors of trainers.', 'Win a buff after every floor.'] },
   { id: 'builder', label: 'TEAM BUILDER', help: ['Make a profile and build teams:', 'natures, EVs, IVs, items, moves.'] },
+  // TRAINER CARD (the 'trainer' app, INAPP.md TRAINER): right after TEAM BUILDER, so the five rows above it (and QUICK BATTLE under the cursor at the start) keep their places, it is in the eight
+  // rows shown without scrolling, and it stands beside the other row that is about the player's trainer
+  { id: 'trainer', label: 'TRAINER CARD', help: ['Your trainer: name, look, battle', 'figure, portrait and partner.'] },
   { id: 'record', label: 'RECORD', help: ['Wins, streaks, best hits, favourites', 'and your last battles, by trainer.'] },
   { id: 'import', label: 'IMPORT SAVE', help: ['Bring Pokemon from your own', 'SoulGold save file. It stays here.'] },
   { id: 'controls', label: 'CONTROLS', help: ['Mouse, keyboard, controller and', 'touch all work. Change the keys here.'] },
@@ -172,6 +202,7 @@ export function defaultFormat(size) { return size >= 4 ? '6v6' : size === 3 ? '3
 
 /**
  * opts: { sound: bool, mascot: species id, env: terrain id, quick: { format, cpu }, selection: { profileId, teamId, cpu },
+ *         hasSpecies: (id) -> whether the ROM can draw this species (the active trainer's PARTNER stands on the title screen only then; default: any whole number above 0),
  *         pickMascot: (view-model) -> species id (default keeps the opts.mascot),
  *         measure: (s) -> pixels in the message font, msgPx: the message window's inner width (the Tower wraps its texts by them),
  *         measureFont: (font, s) -> pixels in any ROM font (what an app's ctx.measure and the dialog layer use; default 6 px a character),
@@ -331,8 +362,18 @@ export function createHubModel(opts = {}) {
   }
 
   /* ------------------------------------------------------------------------------------------ view */
+  // THE ACTIVE TRAINER'S PARTNER (card.partner) stands where the day's mascot would, when the ROM has that species
+  const hasSpecies = typeof opts.hasSpecies === 'function' ? opts.hasSpecies : (id) => Number.isInteger(id) && id > 0;
+  const activeProfile = () => activeOf(S.data.profiles, S.data.activeId);
+  function partnerNow() {
+    const p = activeProfile(), id = p && p.card ? p.card.partner : null;
+    if (!Number.isInteger(id)) return null;
+    try { return hasSpecies(id) ? id : null; } catch (_e) { return null; }
+  }
   function mascotNow() {
     if (S.path === 'team') { const t = curTeam(); if (t && t.lead) return { species: t.lead.species, shiny: !!t.lead.shiny, gender: t.lead.gender || null }; }
+    const partner = partnerNow();
+    if (partner) return { species: partner, shiny: false, gender: null };
     return { species: S.mascot, shiny: false, gender: null };
   }
   /* ------------------------------------------------------------------------------------------ the RECORD screen (ST1) */
@@ -430,7 +471,8 @@ export function createHubModel(opts = {}) {
     const row = rs[cur];
     if (S.path === 'main') {
       const w = mainWindow();
-      return { ...base, title: true, menu: { rows: rs.slice(w.off, w.off + w.size).map(({ values, ...r }) => r), cursor: cur - w.off, offset: w.off, total: w.n, up: w.off > 0, down: w.off + w.size < w.n }, about: null, msg: row ? helpFor(row) : ['', ''] };
+      const who = activeProfile();          // the active trainer's name, small on the title side (null: no trainer yet)
+      return { ...base, title: true, trainer: who ? who.name : null, menu: { rows: rs.slice(w.off, w.off + w.size).map(({ values, ...r }) => r), cursor: cur - w.off, offset: w.off, total: w.n, up: w.off > 0, down: w.off + w.size < w.n }, about: null, msg: row ? helpFor(row) : ['', ''] };
     }
     return { ...base, title: true, menu: { rows: rs.map(({ values, ...r }) => r), cursor: cur }, about: null, msg: row ? helpFor(row) : ['', ''] };
   }
@@ -505,6 +547,7 @@ export function createHubModel(opts = {}) {
         case 'tower': return go('tower');
         case 'record': return go('record');
         case 'builder': return go('builder');
+        case 'trainer': return go('trainer');          // ([] while no app owns the path)
         case 'import': return [{ type: 'navigate', url: IMPORT_URL }];
         case 'controls': return [{ type: 'controls' }];
         case 'sound': S.sound = !S.sound; return [{ type: 'sound', on: S.sound }];
@@ -587,7 +630,7 @@ export function createHubModel(opts = {}) {
     teamSettings: () => ({ profileId: S.team.profileId, teamId: S.team.teamId, cpu: S.team.cpu }),
     /** Team data from the store: { state: 'ready' | 'unavailable', note?, profiles: [{ id, name, teams: [{ id, name, size, legal, problems, names[], lead }] }], activeId } */
     setData(d) {
-      S.data = { state: d && d.state === 'unavailable' ? 'unavailable' : 'ready', profiles: d && Array.isArray(d.profiles) ? d.profiles.map((p) => ({ id: String(p.id), name: String(p.name), teams: (p.teams || []).map((t) => ({ id: String(t.id), name: String(t.name), size: t.size | 0, legal: !!t.legal, problems: t.problems | 0, names: (t.names || []).map(String), lead: t.lead || null, ruleset: typeof t.ruleset === 'string' ? t.ruleset : '' })), record: recordOf(p), readOnly: !!p.readOnly, tower: p.tower && typeof p.tower === 'object' ? JSON.parse(JSON.stringify(p.tower)) : null })) : [], note: d && d.note || '', activeId: d && typeof d.activeId === 'string' ? d.activeId : null };
+      S.data = { state: d && d.state === 'unavailable' ? 'unavailable' : 'ready', profiles: d && Array.isArray(d.profiles) ? d.profiles.map((p) => ({ id: String(p.id), name: String(p.name), teams: (p.teams || []).map((t) => ({ id: String(t.id), name: String(t.name), size: t.size | 0, legal: !!t.legal, problems: t.problems | 0, names: (t.names || []).map(String), lead: t.lead || null, ruleset: typeof t.ruleset === 'string' ? t.ruleset : '' })), record: recordOf(p), readOnly: !!p.readOnly, card: cardOf(p), avatar: p.avatar && typeof p.avatar === 'object' ? { kind: String(p.avatar.kind), id: p.avatar.id | 0 } : null, tower: p.tower && typeof p.tower === 'object' ? JSON.parse(JSON.stringify(p.tower)) : null })) : [], note: d && d.note || '', activeId: d && typeof d.activeId === 'string' ? d.activeId : null };
       if (d && d.activeId && !S.team.profileId && S.data.profiles.some((p) => p.id === d.activeId)) S.team.profileId = d.activeId;
       if (S.path === 'team' || S.team.profileId || S.team.teamId) normaliseTeamSel();
       if (S.path === 'record') { const rp = curRecordProfile(); S.record.profileId = rp ? rp.id : null; S.record.page = clamp(S.record.page, 0, recordPages().length - 1); S.record.confirm = null; }

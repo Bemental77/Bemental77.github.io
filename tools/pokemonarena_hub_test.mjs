@@ -51,6 +51,7 @@ const TC = await mod('teamcode.js');
 const BB = await mod('battle_boot.js');
 const EL = await mod('editor_links.js');
 const TE = await mod('textentry.js');
+const HA = await mod('hub_apps.js');
 const rom = L.readRom();
 const GOLDEN = path.join(root, 'pokemonarena', 'hub.golden.json');
 console.log('pokemonarena hub test; ROM', ROM_PATH, rom.length, 'B; node', process.version);
@@ -95,17 +96,25 @@ const toRow = (m, id) => { for (let i = 0; i < 24 && m.rows()[m.state().cursor[m
 const labelOf = (m, id) => { const r = m.rows().find((x) => x.id === id); return r ? r.label : undefined; };
 const plainOk = (v) => { const seen = []; (function walk(x, p) { if (x === undefined || typeof x === 'function') seen.push(p); else if (x && typeof x === 'object') for (const k of Object.keys(x)) walk(x[k], p + '.' + k); })(v, 'view'); return seen; };
 
+// THE TRAINER CARD row opens the 'trainer' app's path. The real app is pokemonarena/js/trainer_hub.js (INAPP.md TRAINER); a model made here hosts it when hub_apps.js lists it, else this stand-in
+const TRAINER_STUB = (() => {
+  const paths = Object.freeze(['trainer', 'trainer-new']), parent = () => 'main';
+  return Object.freeze({ id: 'trainer', paths, parent, create: (ctx) => ({ id: 'trainer', paths, parent, enter() { return []; }, leave() {}, press: (_p, a) => (a === 'b' ? ctx.back() : []), hit: () => null, pointer: () => [], rects: () => [], tick: () => [], view: (_p, base) => ({ ...base }), onData: () => [], wantsText: () => false, type: () => [], speak: () => '', title: () => 'Pokemon Arena - Trainer', state: () => ({}) }) });
+})();
+const WITH_TRAINER = HA.APPS.some((a) => a.id === 'trainer') ? HA.APPS : [...HA.APPS, TRAINER_STUB];
+const card = (o) => ({ made: true, look: null, front: null, back: null, partner: null, ...(o || {}) });
+
 function checkModel(M) {
   const f = []; const t = (name, cond, detail) => { if (!cond) f.push(name + (detail ? ' [' + detail + ']' : '')); };
   const mk = (o) => M.createHubModel({ mascot: 25, ...(o || {}) });
   // ---- main menu
   let m = mk();
-  t('main: ten items in order (W1 added IMPORT SAVE, ST1 added RECORD, the Tower added TOWER, the apps added PLAY ONLINE and moved TEAM BUILDER up)', J(m.rows().map((r) => r.label)) === J(['QUICK BATTLE', 'BATTLE WITH MY TEAM', 'PLAY ONLINE', 'TOWER', 'TEAM BUILDER', 'RECORD', 'IMPORT SAVE', 'CONTROLS', 'SOUND: OFF', 'ABOUT']), J(m.rows().map((r) => r.label)));
-  t('main: ten rows do not fit above the text box, so the menu shows eight and scrolls', m.view().menu.rows.length === 8 && m.view().menu.total === 10 && m.view().menu.down === true && m.view().menu.up === false && m.view().menu.offset === 0, J(m.view().menu));
+  t('main: eleven items in order (W1 added IMPORT SAVE, ST1 added RECORD, the Tower added TOWER, the apps added PLAY ONLINE and moved TEAM BUILDER up, the TRAINER CARD joined after TEAM BUILDER)', J(m.rows().map((r) => r.label)) === J(['QUICK BATTLE', 'BATTLE WITH MY TEAM', 'PLAY ONLINE', 'TOWER', 'TEAM BUILDER', 'TRAINER CARD', 'RECORD', 'IMPORT SAVE', 'CONTROLS', 'SOUND: OFF', 'ABOUT']), J(m.rows().map((r) => r.label)));
+  t('main: eleven rows do not fit above the text box, so the menu shows eight and scrolls', m.view().menu.rows.length === 8 && m.view().menu.total === 11 && m.view().menu.down === true && m.view().menu.up === false && m.view().menu.offset === 0, J(m.view().menu));
   t('main: the cursor starts on the first row', m.view().menu.cursor === 0);
-  press(m, 'up'); t('main: up from the first row wraps to the last, and the window scrolls to show it', m.state().cursor.main === 9 && m.view().menu.cursor === 7 && m.view().menu.offset === 2 && m.view().menu.up === true && m.view().menu.down === false, J(m.view().menu));
+  press(m, 'up'); t('main: up from the first row wraps to the last, and the window scrolls to show it', m.state().cursor.main === 10 && m.view().menu.cursor === 7 && m.view().menu.offset === 3 && m.view().menu.up === true && m.view().menu.down === false, J(m.view().menu));
   press(m, 'down'); t('main: down from the last row wraps to the first, and the window scrolls back', m.state().cursor.main === 0 && m.view().menu.offset === 0);
-  press(m, 'down', 'down', 'down', 'down', 'down', 'down', 'down'); t('main: seven downs reach CONTROLS', m.state().cursor.main === 7 && m.rows()[7].id === 'controls');
+  press(m, 'down', 'down', 'down', 'down', 'down', 'down', 'down', 'down'); t('main: eight downs reach CONTROLS', m.state().cursor.main === 8 && m.rows()[8].id === 'controls');
   t('main: B on the main menu does nothing (a menu is not an exit)', m.press('b').length === 0 && m.path() === 'main');
   // ---- QUICK BATTLE
   m = mk();
@@ -131,6 +140,35 @@ function checkModel(M) {
   e = m.press('b'); t('main: B on the online screen comes back with the cursor on PLAY ONLINE', m.path() === 'main' && e.length === 1 && e[0].path === 'main' && m.rows()[m.state().cursor.main].id === 'online', J(e));
   m = mk(); toRow(m, 'builder'); e = m.press('a');
   t('main: TEAM BUILDER opens the builder screen in the picture (it no longer leaves for the team builder page)', m.path() === 'builder' && e.length === 1 && e[0].type === 'screen' && e[0].path === 'builder' && m.view().app === 'builder' && eff(e, 'navigate').length === 0, J(e));
+  m = mk({ apps: WITH_TRAINER });
+  t('main: TRAINER CARD is the row right after TEAM BUILDER, among the eight shown without scrolling, with two lines of help', m.rows()[4].id === 'builder' && m.rows()[5].id === 'trainer' && m.rows()[5].label === 'TRAINER CARD' && m.view().menu.rows.some((r) => r.id === 'trainer') && (toRow(m, 'trainer'), m.view().msg.length === 2 && m.view().msg.every((l) => typeof l === 'string' && l.length > 0)), J(m.view().msg));
+  e = m.press('a');
+  t('main: A on TRAINER CARD opens the trainer app\'s card (the path trainer), in the picture, and B comes back to the row', m.path() === 'trainer' && e.length >= 1 && e[0].type === 'screen' && e[0].path === 'trainer' && m.view().app === 'trainer' && (m.press('b'), m.path() === 'main' && m.rows()[m.state().cursor.main].id === 'trainer'), J(e));
+  // the active trainer on the title screen: the PARTNER (card.partner) stands where the day's mascot would, the name sits under the title
+  const two = (o) => ({ state: 'ready', activeId: 'p2', profiles: [{ id: 'p1', name: 'RED', teams: [], card: card({ partner: 6 }) }, { id: 'p2', name: 'BLUE', teams: [], card: card({ partner: 9, ...(o || {}) }) }] });
+  m = mk(); m.setData(two());
+  t('title: the ACTIVE trainer\'s partner stands on the main menu instead of the day\'s mascot (not another trainer\'s)', m.view().mascot.species === 9 && m.view().mascot.shiny === false, J(m.view().mascot));
+  t('title: the active trainer\'s name is on the main menu\'s view (drawn small under the title)', m.view().trainer === 'BLUE', J(m.view().trainer));
+  m.goto('quick'); t('title: the partner also stands on the screens the mascot stood on (QUICK BATTLE)', m.view().mascot.species === 9);
+  m = mk(); m.setData(two({ partner: null })); t('title: a trainer with no partner keeps the day\'s mascot', m.view().mascot.species === 25 && m.view().trainer === 'BLUE');
+  m = mk({ hasSpecies: (id) => id !== 9 }); m.setData(two()); t('title: a partner the ROM cannot draw (hasSpecies false) keeps the day\'s mascot', m.view().mascot.species === 25);
+  m = mk(); m.setData({ state: 'ready', activeId: null, profiles: [] }); t('title: with no trainer there is no name and the mascot is the day\'s', m.view().trainer === null && m.view().mascot.species === 25);
+  m = mk(); m.setData({ state: 'ready', activeId: null, profiles: [{ id: 'p1', name: 'RED', teams: [], card: card({ partner: 6 }) }] }); t('title: with no active id the only trainer there is counts as the active one', m.view().trainer === 'RED' && m.view().mascot.species === 6);
+  m = mk(); m.setData(FAKE); press(m, 'down', 'a'); m.setData({ ...FAKE, profiles: FAKE.profiles.map((p) => ({ ...p, card: card({ partner: 6 }) })) }); t('title: MY TEAM still shows the team\'s lead, not the partner', m.view().mascot.species === 25, J(m.view().mascot));
+  // THE FIRST-VISIT OPENING (welcomePlan): the rule boot.js asks once, after the first data refresh
+  const W0 = { openedAt: 'main', path: 'main', later: null, off: null, stored: true };
+  const none = { state: 'ready', activeId: null, profiles: [], notSaved: false };
+  const old = { state: 'ready', activeId: 'p1', profiles: [{ id: 'p1', name: 'RED', teams: [] }], notSaved: false };          // a profile from before schema 6: no card
+  const made = { state: 'ready', activeId: 'p1', profiles: [{ id: 'p1', name: 'RED', teams: [], card: card() }], notSaved: false };
+  t('welcome: an empty browser opened at the main menu is greeted with the NEW TRAINER screens', J(M.welcomePlan(none, W0)) === J({ kind: 'new' }), J(M.welcomePlan(none, W0)));
+  t('welcome: an active profile whose card is not made (from before schema 6) is greeted "welcome back", with its name', J(M.welcomePlan(old, W0)) === J({ kind: 'back', name: 'RED', profileId: 'p1' }) && J(M.welcomePlan({ ...made, profiles: [{ ...made.profiles[0], card: card({ made: false }) }] }, W0)) === J({ kind: 'back', name: 'RED', profileId: 'p1' }), J(M.welcomePlan(old, W0)));
+  t('welcome: an active profile whose card is made is not greeted', M.welcomePlan(made, W0) === null);
+  t('welcome: LATER said in this tab (sessionStorage arena.welcome = later) is not asked again', M.welcomePlan(none, { ...W0, later: 'later' }) === null && M.welcomePlan(none, { ...W0, later: 'x' }) !== null);
+  t('welcome: the test rigs\' switch (localStorage arena.welcome = off) stops it', M.welcomePlan(none, { ...W0, off: 'off' }) === null && M.welcomePlan(old, { ...W0, off: 'off' }) === null && M.welcomePlan(none, { ...W0, off: 'on' }) !== null);
+  t('welcome: storage that is not kept (notSaved), a store that did not open, or data that is not ready never greets', M.welcomePlan({ ...none, notSaved: true }, W0) === null && M.welcomePlan(none, { ...W0, stored: false }) === null && M.welcomePlan({ ...none, state: 'unavailable' }, W0) === null && M.welcomePlan({ ...none, state: 'loading' }, W0) === null && M.welcomePlan(null, W0) === null);
+  t('welcome: a page opened at any other address (an invite #online, #center, #builder) is not interrupted, nor one already moved off the main menu', M.welcomePlan(none, { ...W0, openedAt: 'online' }) === null && M.welcomePlan(none, { ...W0, openedAt: 'builder' }) === null && M.welcomePlan(none, { ...W0, path: 'quick' }) === null);
+  t('welcome: a read-only active profile (a newer build saved it) is not greeted (nothing could be saved to it)', M.welcomePlan({ ...old, profiles: [{ ...old.profiles[0], readOnly: true }] }, W0) === null);
+  t('welcome: the ACTIVE profile decides, not the first one', (M.welcomePlan({ ...made, activeId: 'p2', profiles: [made.profiles[0], { id: 'p2', name: 'BLUE', teams: [] }] }, W0) || {}).name === 'BLUE' && M.welcomePlan({ ...old, activeId: 'p2', profiles: [old.profiles[0], { id: 'p2', name: 'BLUE', teams: [], card: card() }] }, W0) === null);
   t('main: every app path is a hub path the address may name, and an unknown one is not', ['online', 'center', 'builder'].every((p) => M.PATHS.includes(p)) && !M.PATHS.includes('builder-nowhere'), J(M.PATHS));
   m = mk(); toRow(m, 'import'); e = m.press('a'); t('main: IMPORT SAVE navigates to the team builder save-import screen', e.length === 1 && e[0].type === 'navigate' && e[0].url === '/pokemonarena/editor.html#/import' && M.IMPORT_URL === e[0].url, J(e));
   m = mk(); toRow(m, 'controls'); e = m.press('a'); t('main: CONTROLS asks the page to open the Controls panel', e.length === 1 && e[0].type === 'controls', J(e));
@@ -198,7 +236,7 @@ function checkModel(M) {
   t('hit: the middle, top edge and bottom edge of every row map to that row', allRows);
   t('hit: left of the window and below the last row are misses', m.hit(2, 20) === null && m.hit(70, 10 + 7 * 14 + 1) === null && m.hit(200, 20) === null && m.hit(70, 5) === null);
   let ev = m.pointer({ kind: 'move', x: 60, y: 10 + 4 * 12 + 4 }); t('pointer: hover moves the cursor and activates nothing', ev.length === 0 && m.view().menu.cursor === 4);
-  ev = m.pointer({ kind: 'click', x: 60, y: 10 + 7 * 12 + 4 }); t('pointer: a click is cursor + A (CONTROLS)', ev.length === 1 && ev[0].type === 'controls', J(ev));
+  ev = m.pointer({ kind: 'click', x: 60, y: 10 + 7 * 12 + 4 }); t('pointer: a click is cursor + A (IMPORT SAVE, the eighth row shown)', ev.length === 1 && ev[0].type === 'navigate' && ev[0].url === M.IMPORT_URL, J(ev));
   m = mk(); ev = m.pointer({ kind: 'click', x: 60, y: 14 }); t('pointer: clicking QUICK BATTLE opens it', m.path() === 'quick' && ev[0].path === 'quick');
   ev = m.pointer({ kind: 'click', x: 100, y: 10 + 1 * 16 + 4 }); t('pointer: clicking a choice row cycles it (CPU -> HARD)', rowValue(m, 'cpu') === 'HARD', rowValue(m, 'cpu'));
   ev = m.pointer({ kind: 'click', x: 60, y: 10 + 1 * 16 + 4 }); t('pointer: clicking the left half of a choice row steps BACK (CPU HARD -> NORMAL)', rowValue(m, 'cpu') === 'NORMAL' && m.view().menu.cursor === 1, rowValue(m, 'cpu'));
@@ -244,6 +282,20 @@ const MUTANTS = [
   { name: 'IMPORT SAVE does nothing', find: "case 'import': return [{ type: 'navigate', url: IMPORT_URL }];", replace: "case 'import': return [];", expect: 'IMPORT SAVE navigates to the team builder save-import screen' },
   { name: 'the eight-row main menu keeps the 16 px pitch (it would run into the text box)', find: 'return n > 7 ? GEOM.menu.pitchEight : n > 6 ? GEOM.menu.pitchTight : GEOM.menu.pitch;', replace: 'return GEOM.menu.pitch;', expect: 'eight rows sit 12 px apart' },
   { name: 'seven rows are squeezed like eight (the 14 px pitch is lost)', find: 'return n > 7 ? GEOM.menu.pitchEight : n > 6 ? GEOM.menu.pitchTight : GEOM.menu.pitch;', replace: 'return n > 6 ? GEOM.menu.pitchEight : GEOM.menu.pitch;', expect: 'eight rows sit 12 px apart' },
+  // TRAINER: the TRAINER CARD row, the partner, the trainer's name, the first-visit rule (welcomePlan)
+  { name: 'the TRAINER CARD row opens nothing', find: "        case 'trainer': return go('trainer');", replace: '', expect: 'A on TRAINER CARD opens the trainer app' },
+  { name: 'the TRAINER CARD row stands before TEAM BUILDER', find: "  { id: 'builder', label: 'TEAM BUILDER',", replace: "  { id: 'trainer', label: 'TRAINER CARD', help: ['x', 'y'] },\n  { id: 'builder', label: 'TEAM BUILDER',", expect: 'TRAINER CARD is the row right after TEAM BUILDER' },
+  { name: 'the partner is never shown', find: '    if (partner) return { species: partner, shiny: false, gender: null };', replace: '', expect: 'the ACTIVE trainer\'s partner stands on the main menu' },
+  { name: 'the partner is shown whether or not the ROM can draw it', find: 'try { return hasSpecies(id) ? id : null; }', replace: 'try { return id; }', expect: 'a partner the ROM cannot draw' },
+  { name: 'the active trainer is always the first profile', find: 'return ps.find((p) => p && p.id === activeId) || (ps.length === 1 ? ps[0] : null);', replace: 'return ps[0] || null;', expect: 'the ACTIVE trainer\'s partner stands' },
+  { name: 'the data refresh drops the card', find: 'card: cardOf(p), avatar:', replace: 'card: null, avatar:', expect: 'the ACTIVE trainer\'s partner stands' },
+  { name: 'the main menu does not name the trainer', find: 'trainer: who ? who.name : null, menu:', replace: 'trainer: null, menu:', expect: 'the active trainer\'s name is on the main menu' },
+  { name: 'welcome: a made card is greeted again', find: 'if (!p || p.readOnly || cardOf(p).made) return null;', replace: 'if (!p || p.readOnly) return null;', expect: 'an active profile whose card is made is not greeted' },
+  { name: 'welcome: LATER is forgotten', find: "if (o.off === 'off' || o.later === 'later') return null;", replace: "if (o.off === 'off') return null;", expect: 'LATER said in this tab' },
+  { name: 'welcome: the rigs\' switch is ignored', find: "if (o.off === 'off' || o.later === 'later') return null;", replace: "if (o.later === 'later') return null;", expect: 'the test rigs\' switch' },
+  { name: 'welcome: an invite link is interrupted', find: "if (o.openedAt !== 'main' || o.path !== 'main') return null;", replace: "if (o.path !== 'main') return null;", expect: 'a page opened at any other address' },
+  { name: 'welcome: storage that is not kept still greets', find: "if (!data || data.state !== 'ready' || data.notSaved || !o.stored) return null;", replace: "if (!data || data.state !== 'ready') return null;", expect: 'storage that is not kept' },
+  { name: 'welcome: a read-only profile is greeted', find: 'if (!p || p.readOnly || cardOf(p).made) return null;', replace: 'if (!p || cardOf(p).made) return null;', expect: 'a read-only active profile' },
   { name: 'IMPORT SAVE row is dropped from the main menu', find: "  { id: 'import', label: 'IMPORT SAVE',", replace: "  { id: 'importX', label: 'IMPORT SAVE',", expect: 'IMPORT SAVE navigates to the team builder save-import screen' },
 ];
 {
@@ -279,7 +331,7 @@ const frameHash = (v, s = screen) => L.fnv(s.render(v).rgba);
   // every text fits its window: walk the whole state space the menu can reach
   const states = [];
   const walk = (label, fn) => states.push([label, view0(fn)]);
-  walk('main', null); for (let i = 1; i < 10; i++) walk('main' + i, (m) => { for (let k = 0; k < i; k++) m.press('down'); });
+  walk('main', null); for (let i = 1; i < 11; i++) walk('main' + i, (m) => { for (let k = 0; k < i; k++) m.press('down'); });
   walk('sound on', (m) => { toRow(m, 'sound'); m.press('a'); });
   for (const fmt of [0, 1]) for (const cpu of [0, 1, 2]) for (const row of [0, 1, 2, 3]) walk('quick f' + fmt + ' c' + cpu + ' r' + row, (m) => { m.press('a'); if (fmt) m.press('right'); m.press('down'); for (let k = 0; k < cpu; k++) m.press('right'); for (let k = 1; k < row; k++) m.press('down'); if (row === 0) { m.press('up'); } if (row === 3) m.press('down'); });
   for (let ti = 0; ti < 5; ti++) for (const row of [0, 1, 2, 3, 4, 5]) walk('team t' + ti + ' r' + row, (m) => { m.press('down'); m.press('a'); m.press('down'); for (let k = 0; k < ti; k++) m.press('right'); for (let k = 0; k < row - 1; k++) m.press('down'); if (row === 0) m.press('up'); });
@@ -312,6 +364,14 @@ const frameHash = (v, s = screen) => L.fnv(s.render(v).rgba);
   ok(zap(0x6cd02c, 32) !== base, 'R. provenance: zeroing the ROM\'s text colour palette changes the picture');
   ok(zap(0x73a130, 32) !== base, 'R. provenance: zeroing the ROM\'s textbox palette changes the picture');
   const untouched = rom.slice(); ok(frameHash(view0(), HS.createHubScreen(B.createBattleUi(untouched))) === base, 'R. twin: a byte-identical copy of the ROM gives the identical picture');
+  // the active trainer under the title: a ten-letter name fits the title window in the small ROM font, and the name changes the picture (no name: the title window as it always was)
+  const named = (name, partner) => view0((m) => m.setData({ state: 'ready', activeId: 'p1', profiles: [{ id: 'p1', name, teams: [], card: card({ partner }) }] }));
+  const wide = named('WWWWWWWWWW', null), lower = named('Mmmmmmmmmm', null);
+  const tw = [...screen.widths(wide), ...screen.widths(lower)].filter((w) => w.what === 'trainer');
+  ok(tw.length === 2 && tw.every((w) => w.px <= w.max && /^small/.test(w.font)), 'R. the trainer\'s name (ten letters, the most a name has) fits the title window in a small ROM font', J(tw));
+  const noName = view0((m) => m.setData({ state: 'ready', activeId: null, profiles: [] }));
+  ok(frameHash(named('RED', null)) !== frameHash(noName) && frameHash(named('RED', null)) !== frameHash(named('BLUE', null)), 'R. the trainer\'s name is drawn (a name changes the picture, and a different name changes it again)');
+  ok(frameHash(named('RED', 6)) !== frameHash(named('RED', null)), 'R. the partner is drawn where the mascot stood');
   // golden hashes
   const GV = {
     'main-0': view0(), 'main-sound': view0((m) => { toRow(m, 'sound'); m.press('a'); }), 'quick-format': view0((m) => { m.press('a'); }),
@@ -327,6 +387,7 @@ const frameHash = (v, s = screen) => L.fnv(s.render(v).rgba);
   const TW = ['down', 'down', 'down', 'a'];                 // TOWER is the fourth row of the main menu
   Object.assign(GV, {
     'main-scrolled': view0((m) => { m.press('up'); }),
+    'main-trainer-partner': named('RED', 6), 'main-no-trainer': noName, 'main-trainer-row': view0((m) => { toRow(m, 'trainer'); }),
     'tower-home-fight': twView(TF.fight, TW), 'tower-home-none': twView(TF.none, TW), 'tower-home-giveup': twView(TF.fight, [...TW, 'down', 'down', 'a']),
     'tower-new': twView(TF.none, [...TW, 'a']), 'tower-offer3': twView(TF.offer3, [...TW, 'a']), 'tower-offer3-ball2': twView(TF.offer3, [...TW, 'a', 'right']),
     'tower-offer3-take': twView(TF.offer3, [...TW, 'a', 'a']), 'tower-offer3-skip': twView(TF.offer3, [...TW, 'a', 'down']), 'tower-offer5': twView(TF.offer5, [...TW, 'a', 'right', 'right']),

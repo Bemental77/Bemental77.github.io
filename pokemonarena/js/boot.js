@@ -21,7 +21,7 @@
 import { loadVerifiedRom, romUrl, RomLoadError } from './romfetch.js';
 import { loadPack } from './tables.js';
 import { createBattleUi } from './battle_ui.js';
-import { createHubModel, SCREEN_W, SCREEN_H, PATHS, historySeedPlan, historyPlan, entryTrail } from './hub_model.js';          // (historySeedPlan / historyPlan / entryTrail: how the browser's history is kept equal to the model's trail, for ANY hub path: the Tower's and every app's)
+import { createHubModel, SCREEN_W, SCREEN_H, PATHS, historySeedPlan, historyPlan, entryTrail, welcomePlan, WELCOME_KEY } from './hub_model.js';          // (historySeedPlan / historyPlan / entryTrail: how the browser's history is kept equal to the model's trail, for ANY hub path: the Tower's and every app's)
 import { createHubScreen } from './hub_screen.js';
 import { APP_CTLS } from './hub_app_ctls.js';          // how each hub app's ctl is loaded (a function per app that imports the file when called: nothing is loaded here)
 import { readHubData, teamCodeFor, battleHref, pickMascot } from './hub_data.js';
@@ -89,6 +89,7 @@ async function main() {
   let hist = [], flying = 0;                     // hist: the TRAIL of the history entry the browser stands on (hub_model.js: the screens above the main menu, one entry each); flying: when a step back of ours (history.go) was asked for and has not landed yet (0: none)
   const held = new Set();                        // the actions whose press the hub took and that are still down: what an app's tick(path, held) is told
   let model = null, screen = null, ui = null, pack = null, romBytes = null, store = null, touchPad = false, dialogOpen = false, errNav = null;
+  let openedAt = 'main', welcomed = false;      // the path the page was opened at, and whether the first-visit opening was decided (it is, ONCE, at the first data refresh)
   const storage = (() => { try { return window.localStorage; } catch (_e) { return null; } })();
   const session = (() => { try { return window.sessionStorage; } catch (_e) { return null; } })();
   // WHO holds the "a DOM panel is up" state (the hub ignores its own keys and pointer while it is true): the Sound panel, the Controls dialog and the audio bar's music list can be up TOGETHER,
@@ -471,9 +472,21 @@ async function main() {
     const d = await readHubData(store, pack, { tzMinutes: new Date().getTimezoneOffset(), towerSummary: towerMod ? towerMod.summarizeTower : undefined });
     run(model.setData(d));
     hook.data = d;
+    if (!welcomed) { welcomed = true; greet(d); }
     const unsaved = d.notSaved;
     els.note.hidden = !unsaved; els.note.textContent = unsaved ? 'This browser is not keeping profiles (storage is blocked or in private mode), so teams you build here will be lost when you close the page.' : '';
     dirty = true;
+  }
+  // THE FIRST-VISIT OPENING (INAPP.md TRAINER, decision 1; hub_model.js welcomePlan has the rule): a browser with no profile, or whose active profile has no card made yet, opened at the main
+  // menu, is greeted by the NEW TRAINER screens -- unless LATER was said in this tab (sessionStorage), the test rigs switched it off (localStorage 'off'), or the store keeps nothing
+  function greet(d) {
+    const read = (s) => { try { return s ? s.getItem(WELCOME_KEY) : null; } catch (_e) { return null; } };
+    const plan = welcomePlan(d, { openedAt, path: model.path(), later: read(session), off: read(storage), stored: !!store && !(store.status && store.status.notSaved) });
+    hook.welcome = { plan, opened: false };
+    if (!plan || !model.paths.includes('trainer-new')) return;
+    try { const t = model.app('trainer'); if (t && typeof t.welcome === 'function') t.welcome({ kind: plan.kind, name: plan.name || '', profileId: plan.profileId || null }); } catch (e) { console.warn('[trainer] welcome() threw', e); }
+    run(model.goto('trainer-new'));
+    hook.welcome.opened = model.path() === 'trainer-new';
   }
   async function openProfiles() {
     try { store = await openStore(); hook.store = store.status && store.status.notSaved ? 'memory' : 'indexeddb'; try { store.on('external', () => refreshData()); store.on('status', () => refreshData()); } catch (_e) { /* optional */ } }
@@ -654,7 +667,7 @@ async function main() {
       ui = createBattleUi(bytes);
       screen = createHubScreen(ui);
       const saved = readSettings(storage);
-      model = createHubModel({ sound: soundSys ? soundSys.audible() : cries.isSoundOn(), mascot: pickMascot(pack, Math.floor(Date.now() / 86400000)), env: 0, quick: saved.quick, selection: saved.selection, measure: screen.measure, msgPx: screen.msgPx, measureFont: screen.measureFont });          // (the Tower, the apps and the dialog layer wrap their texts by the real font)
+      model = createHubModel({ sound: soundSys ? soundSys.audible() : cries.isSoundOn(), mascot: pickMascot(pack, Math.floor(Date.now() / 86400000)), env: 0, quick: saved.quick, selection: saved.selection, measure: screen.measure, msgPx: screen.msgPx, measureFont: screen.measureFont, hasSpecies: (id) => !!(pack.species[id] && pack.species[id].legal) });          // (the Tower, the apps and the dialog layer wrap their texts by the real font; the active trainer's partner stands on the title screen when the ROM has it)
     } catch (e) {
       if (!verify) { showError(romError(e)); return; }
       // A RECALLED copy only passed romcache.js's cheap checks (length, headers, cartridge header). One that is damaged INSIDE -- a table the menu decodes -- throws right here, before the re-check below is
@@ -670,7 +683,7 @@ async function main() {
     if (errNav) { try { errNav.disable(); } catch (_e) { /* ignore */ } }
     els.status.textContent = 'ROM verified: Pokemon SoulGold v1.1.1 (SHA-256 ' + sha256.slice(0, 8) + '...). Everything on screen is drawn from it; nothing is uploaded.';
     touchPad = coarse();
-    const openAt = pathFromHash(location.hash);
+    const openAt = pathFromHash(location.hash); openedAt = openAt;
     seedHistory(openAt);                             // the history entries the page stands on (`hist`): the ones a fresh arrival is given, or the ones the entry it came back to recorded
     const openFx = model.arrive(openAt, hist);       // the model opens the screen the address names, with that trail (B then walks it); openFx = what the screen's enter(path) asked for
     syncTitle();

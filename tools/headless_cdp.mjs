@@ -25,6 +25,12 @@ const require = createRequire(import.meta.url);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const LOCK = process.env.BROWSER_LOCK_DIR || path.join(os.tmpdir(), 'bemental-browser.lock');
 
+// THE ARENA'S FIRST-VISIT OPENING IS OFF IN THE RIGS (pokemonarena/INAPP.md, TRAINER, decision 2). A browser with no profile that opens /pokemonarena/ is greeted by the NEW TRAINER screens;
+// every suite written before that expects the main menu. So every page this file makes runs WELCOME_SEED before each document: on a /pokemonarena/ page, and only while the key is UNSET,
+// localStorage['arena.welcome'] = 'off' (a test that sets the key itself, or clears storage, is left to do so). withBrowser({ welcome: true }) leaves it out (tools/pokemonarena_trainer_page_test.mjs).
+export const WELCOME_KEY = 'arena.welcome';
+export const WELCOME_SEED = "(function () { try { if (location.pathname.indexOf('/pokemonarena/') === 0 && window.localStorage.getItem('" + WELCOME_KEY + "') === null) window.localStorage.setItem('" + WELCOME_KEY + "', 'off'); } catch (_e) { /* storage blocked: the page cannot keep a profile either, and does not greet */ } })();";
+
 export const CHROME = process.env.CHROME_PATH || [
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
@@ -106,6 +112,7 @@ function killTree(pid) {
 class Page {
   constructor(ws) {
     this.ws = ws; this.id = 0; this.pending = new Map(); this.console = []; this.errors = []; this.handlers = [];
+    this.seedWelcome = true;          // (withBrowser({ welcome: true }) sets it false before init(); a second tab inherits it)
     ws.addEventListener('message', (ev) => {
       const m = JSON.parse(ev.data);
       if (m.id && this.pending.has(m.id)) {
@@ -128,7 +135,10 @@ class Page {
     const id = ++this.id;
     return new Promise((res, rej) => { this.pending.set(id, { res, rej }); this.ws.send(JSON.stringify({ id, method, params })); });
   }
-  async init() { await this.send('Page.enable'); await this.send('Runtime.enable'); await this.send('Log.enable'); }
+  async init() {
+    await this.send('Page.enable'); await this.send('Runtime.enable'); await this.send('Log.enable');
+    if (this.seedWelcome) await this.send('Page.addScriptToEvaluateOnNewDocument', { source: WELCOME_SEED });
+  }
   async setViewport(width, height, { mobile = false, dpr = 1 } = {}) {
     await this.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: dpr, mobile });
     if (mobile) await this.send('Emulation.setTouchEmulationEnabled', { enabled: true });
@@ -180,7 +190,7 @@ class Page {
     const ws = new WebSocket(t.webSocketDebuggerUrl);
     await new Promise((res, rej) => { ws.addEventListener('open', res); ws.addEventListener('error', () => rej(new Error('CDP websocket error (second tab)'))); });
     const tab = new Page(ws);
-    tab.port = this.port;
+    tab.port = this.port; tab.seedWelcome = this.seedWelcome;
     await tab.init();
     await tab.setViewport(width || this.width || 1280, height || this.height || 800, { mobile });
     return tab;
@@ -197,7 +207,8 @@ export async function armFacts(page, claimed) {
 export async function withBrowser(opts, fn) {
   // autoplay: false launches Chrome WITHOUT --autoplay-policy=no-user-gesture-required, i.e. with the policy a real visitor has (a Web Audio context starts only after the page was clicked, tapped or keyed).
   // Every test keeps the permissive default except the one experiment that measures the real policy (tools/pokemonarena_autoplay_test.mjs). The browser stays muted either way (--mute-audio).
-  const { port = 9222, width = 1280, height = 800, mobile = false, args = [], lock = true, autoplay = true } = opts || {};
+  // welcome: true leaves the Arena's first-visit opening ON (WELCOME_SEED above is not installed): only the suite that tests the opening asks for it.
+  const { port = 9222, width = 1280, height = 800, mobile = false, args = [], lock = true, autoplay = true, welcome = false } = opts || {};
   if (!CHROME) throw new Error('chrome.exe not found; set CHROME_PATH');
   const release = lock ? await acquireBrowserLock() : () => {};
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'bemental-chrome-'));
@@ -227,7 +238,7 @@ export async function withBrowser(opts, fn) {
     const ws = new WebSocket(t.webSocketDebuggerUrl);
     await new Promise((res, rej) => { ws.addEventListener('open', res); ws.addEventListener('error', () => rej(new Error('CDP websocket error'))); });
     page = new Page(ws);
-    page.port = port; page.width = width; page.height = height;
+    page.port = port; page.width = width; page.height = height; page.seedWelcome = !welcome;
     await page.init();
     await page.setViewport(width, height, { mobile });
     // the arm-difference proof: the arm must report what it claims, or no verdict is printed (a placebo arm is VOID, not a pass)

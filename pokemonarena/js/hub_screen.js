@@ -160,6 +160,7 @@ export function createHubScreen(ui, opts = {}) {
 
   // THE APPS' screens and the text entry get the same pieces and a few more (pokemonarena/INAPP.md "The app interface" lists them)
   const fitText = (font, s, maxPx) => { let t = ui.safeText(String(s)); while (t.length > 0 && width(font, t) > maxPx) t = t.slice(0, -1); return t; };
+  const trainerFont = (s, maxPx) => ui.fitFont(s, maxPx, ['small', 'smallNarrow']);
   const chip = (f, r, label, on) => { ui.panel(f, r.x, r.y, r.w, r.h, on ? 'sel' : 'normal', true); textCentre(f, pickFont(label, r.w - 6), label, r.x + r.w / 2, r.y, TEXT.dark, TEXT.shadow); };
   const helpers = Object.freeze({ text, textRight, textCentre, width, fitFont: (s, px, fonts) => ui.fitFont(s, px, fonts), fitText, wrap: tower.wrap, drawMenu, drawMessage, chip, SCREEN_W, SCREEN_H });
   const entry = createTextEntryScreen(ui, helpers);
@@ -228,9 +229,10 @@ export function createHubScreen(ui, opts = {}) {
       } else {
         drawMessage(f, view.msg);
         if (view.title) {
-          const t = GEOM.title;
+          const named = typeof view.trainer === 'string' && view.trainer !== '', t = named ? GEOM.titleNamed : GEOM.title;          // (the main menu names the active trainer under the title, small)
           ui.drawWindow(f, t.x, t.y, t.w, t.h);
           textCentre(f, 'normal', 'POK{E}MON ARENA', t.x + t.w / 2, t.y + 1);
+          if (named) { const nf = trainerFont(view.trainer, t.w - 4); textCentre(f, nf, fitText(nf, view.trainer, t.w - 4), t.x + t.w / 2, t.y + t.name); }
         }
         if (view.menu) drawMenu(f, view.menu);
       }
@@ -249,6 +251,7 @@ export function createHubScreen(ui, opts = {}) {
     widths(view) {
       const out = [];
       (view.msg || []).forEach((ln) => out.push({ what: 'msg', font: 'normal', px: ln ? width('normal', ui.safeText(ln)) : 0, max: R.msg.w - 4 }));
+      if (view.title && typeof view.trainer === 'string' && view.trainer) { const g = GEOM.titleNamed, nf = trainerFont(view.trainer, g.w - 4); out.push({ what: 'trainer', font: nf, px: width(nf, ui.safeText(view.trainer)), max: g.w - 4 }); }
       if (view.about) view.about.lines.forEach((ln, i) => out.push({ what: 'about', font: i ? 'small' : 'normal', px: width(i ? 'small' : 'normal', ui.safeText(ln)), max: GEOM.about.w - 4 }));
       if (view.dialog) {
         view.dialog.lines.forEach((ln) => { const font = dialogFont(ln, R.msg.w - 4); out.push({ what: 'dialog', font, px: ln ? width(font, ln) : 0, max: R.msg.w - 4 }); });
