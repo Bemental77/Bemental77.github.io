@@ -131,6 +131,25 @@ async function toSlot(page, i, press) {
   return false;
 }
 
+/* ------------------------------------------------------------------------------------------------ NEW TRAINER: the trainer app's screens (pokemonarena/INAPP.md TRAINER: one way to make a trainer) */
+const trw = (page) => page.eval(`${HUB}.model.state().apps.trainer.wiz`);
+const asking = (page) => page.eval(`!!(${HUB}.dialog.current() && ${HUB}.dialog.current().id === 'trainer:welcome')`);
+/**
+ * The builder's NEW TRAINER was pressed: walk the NEW TRAINER screens it opened with one device's gestures (act: { welcome() (a page or the answer of the welcome), up(), pick(index) (take a row or a picture), yes() }), name the trainer
+ * with `typeName()` at NEW NAME, take every other step's default, YES; then wait for the builder's list, where the trainer made is ACTIVE.
+ */
+async function walkNewTrainer(page, act, typeName) {
+  await waitPath(page, 'trainer-new');
+  for (let i = 0; i < 12 && (await asking(page)); i++) await act.welcome();          // the welcome's pages, then LET'S GO
+  for (let i = 0; i < 8 && (await trw(page)) && (await trw(page)).cur !== 0; i++) await act.up();          // NEW NAME is the first row; the cursor opens on the first offered name
+  await act.pick(0); await waitFor(page, `${HUB}.wantsText()`);
+  await typeName();
+  for (let i = 0; i < 12; i++) { const w = await trw(page); if (!w || w.step === 'card') break; await act.pick(w.cur); }
+  await act.yes();
+  await waitPath(page, 'builder'); await waitBuilder(page);
+  await waitFor(page, `(${HUB}.view().builder.list.rows || []).some((r) => r.tag === 'ACTIVE')`);
+}
+
 async function session(name, opts, fn) {
   console.log('--- ' + name + ' (' + opts.width + 'x' + opts.height + (opts.mobile ? ' mobile' : '') + ') ' + loadPct());
   try {
@@ -162,9 +181,10 @@ try {
     ok((await page.eval('location.hash')) === '#builder' && /Team Builder/.test(await page.eval('document.title')) && (await b(page)).kind === 'trainers', tag + 'TEAM BUILDER opens the trainers screen in the picture (#builder; the same page)', await page.eval('location.pathname + location.hash'));
     ok((await page.eval(`${HUB}.apps.loaded().includes('builder')`)) && clean(await faults(page)), tag + 'the builder\'s ctl loaded (and with it the kit) and nothing faulted', J(await faults(page)));
     await shot(page, 'keys_01_trainers_none');
-    // NEW TRAINER, typed on the real keyboard
-    await key(page, 'a'); await waitFor(page, `${HUB}.wantsText()`);
-    await typeWord(page, 'Ash'); await waitPath(page, 'builder-teams');
+    // NEW TRAINER (the trainer app's screens), the name typed on the real keyboard; back on the list A opens the new trainer's teams
+    await key(page, 'a');
+    await walkNewTrainer(page, { welcome: () => key(page, 'a'), up: () => key(page, 'up'), pick: () => key(page, 'a'), yes: () => key(page, 'a') }, () => typeWord(page, 'Ash'));
+    await key(page, 'a'); await waitPath(page, 'builder-teams');
     ok((await st(page)).tag === 'SAVED' && /ASH|Ash/.test((await b(page)).title) && (await page.eval('location.hash')) === '#builder-teams', tag + 'a trainer typed on the real keyboard is made and its (empty) teams are shown', (await b(page)).title);
     // NEW TEAM
     await key(page, 'a'); await waitPath(page, 'builder-team');
@@ -297,9 +317,13 @@ try {
     ok((await page.eval(`document.querySelectorAll('[data-btn]').length`)) === 6 && (await page.eval(`[...document.querySelectorAll('[data-btn]')].map((e) => e.dataset.btn).sort().join()`)) === 'a,b,down,left,right,up', tag + 'the on-screen pad has the d-pad, A and B and nothing else (so every other function needs a chip or a row)');
     // the main menu: a tap on TEAM BUILDER
     await tapRect(rowRect('builder')); await waitPath(page, 'builder'); await waitBuilder(page);
-    await tapRect(rowRect('new')); await waitFor(page, `${HUB}.wantsText()`);
-    await shot(page, 'touch_01_entry');
-    await tapWord('RED'); await waitPath(page, 'builder-teams');
+    await tapRect(rowRect('new'));
+    const tapIndex = async (i) => { const r = await page.eval(`${HUB}.model.rects().find((x) => (x.kind === 'row' || x.kind === 'cell') && x.index === ${i}) || null`); if (r) await tap(r.x + r.w / 2, r.y + r.h / 2); };
+    await walkNewTrainer(page, {
+      welcome: async () => { const rs = await page.eval(`${HUB}.model.rects()`); if (rs.length) await tap(rs[0].x + rs[0].w / 2, rs[0].y + rs[0].h / 2); else await tap(120, 136); },
+      up: () => pad('up'), pick: tapIndex, yes: () => tapRect(`${HUB}.model.rects().find((x) => x.kind === 'chip' && x.id === 'yes') || null`),
+    }, async () => { await shot(page, 'touch_01_entry'); await tapWord('RED'); });
+    await tapRect(`(() => { const m = ${HUB}.view().menu, i = m.rows.findIndex((r) => r.tag === 'ACTIVE'); return i < 0 ? null : ${HUB}.model.rects()[i]; })()`); await waitPath(page, 'builder-teams');
     ok((await st(page)).profile !== null && /RED TEAMS 0\/16/.test((await b(page)).title), tag + 'NEW TRAINER, the name tapped key by key on the in-picture keyboard, its OK chip: the trainer RED is made', (await b(page)).title);
     await tapRect(rowRect('new')); await waitPath(page, 'builder-team');
     // a tap on the first slot: the species picker
@@ -413,10 +437,14 @@ try {
     for (let i = 0; i < 12; i++) { const id = await page.eval(`(() => { const m = ${HUB}.view().menu; return m.rows[m.cursor].id; })()`); if (id === 'builder') break; await btn('down'); }
     await btn('a'); await waitPath(page, 'builder'); await waitBuilder(page);
     // NEW TRAINER: the in-picture keyboard, walked with the d-pad; START accepts
-    await btn('a'); await waitFor(page, `${HUB}.wantsText()`);
-    await btn('a'); await btn('right'); await btn('a'); await btn('right'); await btn('a');          // A, B, C
-    const typed = await page.eval(`${HUB}.view().entry.value`);
-    await btn('start'); await waitPath(page, 'builder-teams');
+    await btn('a');
+    let typed = null;
+    await walkNewTrainer(page, { welcome: () => btn('a'), up: () => btn('up'), pick: () => btn('a'), yes: () => btn('a') }, async () => {
+      await btn('a'); await btn('right'); await btn('a'); await btn('right'); await btn('a');          // A, B, C
+      typed = await page.eval(`${HUB}.view().entry.value`);
+      await btn('start');
+    });
+    await btn('a'); await waitPath(page, 'builder-teams');
     ok(typed === 'ABC' && /ABC TEAMS/.test((await b(page)).title), tag + 'a name is typed with the d-pad and A on the in-picture keyboard and accepted with START', typed);
     await btn('a'); await waitPath(page, 'builder-team');
     await btn('a'); await waitPath(page, 'builder-species');
