@@ -1905,6 +1905,8 @@ export function createScene(opts) {
     summary: () => (S.result ? S.result.summary : null),
     recapPages: () => (S.result && S.result.recap ? recapPages() : []),
     recap: { open: openRecap, close: closeRecap, step: recapStep },
+    // TRAINER (INAPP.md): who this battle shows, as the ROM runs are handed it: the player's name, the back figure (a ROM back picture index, 'M' / 'F', or undefined = the ROM's default) and the foe's ROM trainer id (0 = the engine's default)
+    trainerInfo: () => ({ playerName, playerBack, foeTrainer: trainerId() }),
     get mode() { return S.mode; },
     get ended() { return S.ended; },
   };
