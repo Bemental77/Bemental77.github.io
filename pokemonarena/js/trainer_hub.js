@@ -404,7 +404,7 @@ function createTrainerHub(ctx) {
   });
   function wizNext() {
     const w = S.wiz, i = STEPS.indexOf(w.step);
-    if (w.ret === 'card' && w.step !== 'front') { w.ret = null; w.step = 'card'; return []; }
+    if (w.ret === 'card' && w.step !== 'front') { w.ret = null; w.step = 'card'; w.cardFocus = 'yes'; return []; }          // (a part changed from the card: back on the card, on YES)
     w.step = STEPS[Math.min(STEPS.length - 1, i + 1)];
     if (w.step === 'card') w.cardFocus = 'yes';
     return [];
@@ -693,7 +693,7 @@ function createTrainerHub(ctx) {
       const c = t.cells.find((x) => x.on); says.push(String(t.title).replace(/ \d+\/\d+$/, '') + '.', c ? 'Picture ' + (c.label || c.id + 1) + (c.used ? ', the one in use' : '') + '.' : '');
     } else if (t.kind === 'grid') says.push(String(t.title).replace(/ \d+\/\d+$/, '') + '. Trainer ' + (t.cursor + 1) + ' on this page.');
     else if (t.kind === 'welcome') says.push('Welcome.');
-    return says.concat((v.msg || []).filter(Boolean)).filter(Boolean).join(' ').replace(/\{E\}/g, 'E');
+    return says.concat((v.msg || []).filter(Boolean)).filter(Boolean).join(' ').replace(/\{E\}/g, 'E').replace(/\{MALE\}/g, ' male').replace(/\{FEMALE\}/g, ' female').replace(/\{[A-Z]+\}/g, '');
   }
 
   return {

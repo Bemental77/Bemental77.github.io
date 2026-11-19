@@ -360,8 +360,9 @@ async function runNode(jsDir, verbose) {
     const m = toCard();
     const part = m.hub.rects().find((r) => r.kind === 'part' && r.id === 'figure');
     m.hub.pointer({ kind: 'click', x: part.x + 5, y: part.y + 5 });
-    const s1 = step(m); m.hub.press('right'); m.hub.press('a'); const s2 = step(m); m.hub.press('right'); m.hub.press('a'); const s3 = step(m);
+    const s1 = step(m); m.hub.press('right'); m.hub.press('a'); const s2 = step(m); m.hub.press('right'); m.hub.press('a'); const s3 = step(m), f3 = m.st().wiz.focus;
     const fr = m.st().wiz.draft.front, bk = m.st().wiz.draft.back;
+    if (f3 !== 'yes') return 'after a part was changed the card is not on YES: ' + f3;
     const lookBefore = m.st().wiz.draft.look;
     const look = m.hub.rects().find((r) => r.kind === 'part' && r.id === 'look'); m.hub.pointer({ kind: 'click', x: look.x + 3, y: look.y + 3 });
     const s4 = step(m); m.hub.press('right'); m.hub.press('b');
@@ -550,10 +551,12 @@ async function runNode(jsDir, verbose) {
     const onlyHashes = Object.values(golden).every((h) => /^[0-9a-f]{8}$/.test(h));
     return !off.length && Object.keys(golden).length === Object.keys(shots).length && Object.keys(shots).length > 20 && onlyHashes ? true : J(off);
   });
-  await check('G4 the screen reader is told each screen (and the welcome\'s {E} is read as E)', () => {
+  await check('G4 the screen reader is told each screen, in words (no font token: {E} is read as E, the sex signs as words)', () => {
     const m = toCard(); const s1 = m.hub.speak(m.hub.view());
     const p = toPartner(); const s2 = p.hub.speak(p.hub.view());
-    return /trainer card/i.test(s1) && /Is this right/.test(s1) && /Selected: Pikachu/.test(s2) && /POKEMON/.test(s2) && !/\{E\}/.test(s2) ? true : J([s1, s2]);
+    p.hub.press('y'); p.hub.type({ text: 'nidoran' }); p.hub.press('start');
+    const s3 = p.hub.speak(p.hub.view()), withSign = CH.species.some((s) => /^Nidoran\{(FE)?MALE\}$/.test(s.name));
+    return /trainer card/i.test(s1) && /Is this right/.test(s1) && /Selected: Pikachu/.test(s2) && /POKEMON/.test(s2) && withSign && /Nidoran (fe)?male/.test(s3) && ![s1, s2, s3].some((x) => /[{}]/.test(x)) ? true : J([s1, s2, s3, withSign]);
   });
 
   /* ---------------------------------------------------------------------------------------------- Z: the random walk */
@@ -603,7 +606,7 @@ const NODE_MUTANTS = [
   { id: 'M13', file: 'trainer_hub.js', from: "else if (path === 'trainer-edit') { if (!S.edit) return ctx.go('trainer'); }", to: "else if (path === 'trainer-edit') { /* no guard */ }", fails: 'E7' },
   { id: 'M14', file: 'trainer_hub.js', from: '    if (S.saving) return [];\n    const step = stepNow(path);\n    if (path === \'trainer\')', to: '    const step = stepNow(path);\n    if (path === \'trainer\')', fails: 'F3' },
   { id: 'M15', file: 'trainer_hub.js', from: "const list = q ? all.filter((s) => s.name.toLowerCase().includes(q)) : all;", to: "const list = q ? all.filter((s) => s.name.toLowerCase().startsWith(q)) : all;", fails: 'P1' },
-  { id: 'M16', file: 'trainer_hub.js', from: "    if (w.ret === 'card' && w.step !== 'front') { w.ret = null; w.step = 'card'; return []; }", to: "    if (w.ret === 'card') { w.ret = null; w.step = 'card'; return []; }", fails: 'C2' },
+  { id: 'M16', file: 'trainer_hub.js', from: "    if (w.ret === 'card' && w.step !== 'front') { w.ret = null; w.step = 'card'; w.cardFocus = 'yes'; return []; }", to: "    if (w.ret === 'card') { w.ret = null; w.step = 'card'; w.cardFocus = 'yes'; return []; }", fails: 'C2' },
   { id: 'M17', file: 'trainer_hub.js', from: "      const why = r && WORDS.failed[r.why] ? r.why : 'failed';\n      note(WORDS.failed[why], true);\n", to: '', fails: 'F1' },
   { id: 'M18', file: 'trainer_ctl.js', from: "    if (look) { try { saveLook(env.storage, look); } catch (_e) { /* the Center falls back to the card's look */ } }\n", to: '', fails: 'A2' },
   { id: 'M19', file: 'trainer_ctl.js', from: "export const WHY = Object.freeze({ 'read-only': 'readonly',", to: "export const WHY = Object.freeze({ 'read-only': 'failed',", fails: 'F2' },
@@ -617,6 +620,8 @@ const NODE_MUTANTS = [
   { id: 'M29', file: 'trainer_hub.js', from: 'species = isInt(seen.partner) ? seen.partner : S.mascotSet || !isInt(hubMascot) ? S.mascot : hubMascot;', to: 'species = isInt(seen.partner) ? seen.partner : S.mascot;', fails: 'W8' },
   { id: 'M30', file: 'trainer_hub.js', from: '        if (r.notSaved) ctx.notify(WORDS.notKept.slice());', to: '', fails: 'F4' },
   { id: 'M31', file: 'trainer_ctl.js', from: '    if (!r.ok) { app.failed(whyOf(r.code)); env.redraw(); return; }', to: '    if (!r.ok) { env.redraw(); return; }', fails: 'F5' },
+  { id: 'M32', file: 'trainer_hub.js', from: "w.step = 'card'; w.cardFocus = 'yes'; return []; }", to: "w.step = 'card'; return []; }", fails: 'C2' },
+  { id: 'M33', file: 'trainer_hub.js', from: ".replace(/\\{MALE\\}/g, ' male').replace(/\\{FEMALE\\}/g, ' female').replace(/\\{[A-Z]+\\}/g, '');", to: ';', fails: 'G4' },
   { id: 'M28', file: 'trainer_hub.js', from: "    onData() { return S.trainers ? [{ app: ID, type: 'data' }] : []; },", to: "    onData() { return [{ app: ID, type: 'data' }]; },", fails: 'E9' },
 ];
 async function runMutants() {
