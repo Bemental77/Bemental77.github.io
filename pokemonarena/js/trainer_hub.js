@@ -80,7 +80,6 @@ export const WORDS = Object.freeze({
   editKeys: 'A: keep it   B: cancel',
   newName: 'Type a name of your own.',
   newNameKeys: 'A: the keyboard   B: back',
-  nameEmpty: Object.freeze(['A name needs a letter or a number.', 'Try again.']),
   look: 'How you look in the TRAINER CENTER.',
   front: 'How OTHERS see you in battle.',
   back: 'How YOU see yourself in battle.',
@@ -155,7 +154,6 @@ function createTrainerHub(ctx) {
     input: 0,
   };
   const entry = createEntrySlot();
-  const measure = (s) => ctx.measure('normal', s);
   const PX = ctx.msgPx - 12;
 
   /* -------------------------------------------------------------------------------------------- what the ROM and the store gave */
@@ -187,22 +185,21 @@ function createTrainerHub(ctx) {
     const c = t ? cardOf({ card: t.card }) : cardOf(null), a = t ? avatarOf(t.avatar) : null;
     return { name: t ? t.name : '', look: c.look, front: c.front, back: c.back, head: a && a.kind === 'preset' ? a.id : null, partner: c.partner };
   }
+  const EMPTY = Object.freeze({ name: '', look: null, front: null, back: null, head: null, partner: null });
+  /** The player's own choices (a draft: null = not chosen here) over a base (the profile's own values, read NOW: the store's full list may arrive after the screens opened). */
+  function over(d, base) { const o = {}; for (const k of Object.keys(EMPTY)) o[k] = d[k] !== null && d[k] !== undefined && d[k] !== '' ? d[k] : base[k]; return o; }
 
   /* -------------------------------------------------------------------------------------------- the message box */
   function note(lines, bad) { S.flash = { lines: [String(lines[0] || ''), String(lines[1] || '')], bad: !!bad, seq: S.input }; }
   const refuse = (lines) => { note(lines, true); return [{ type: 'sfx', key: 'se_failure' }]; };
-  /** Two lines from a sentence and a keys line: the sentence wrapped to the box when it is too long for one line (then the keys are left out). */
-  function two(sentence, keys) {
-    const s = String(sentence);
-    if (measure(s) <= PX) return [s, keys || ''];
-    const pages = wrapDialog(s, ctx.measure, PX);
-    return pages.length ? [String(pages[0][0] || ''), String(pages[0][1] || '')] : [s, ''];
-  }
+  /** Two lines: a sentence and a keys line. (Every sentence with a name in it fits one line at the longest name and species: tools/pokemonarena_trainer_test.mjs G2 measures them.) */
+  const two = (sentence, keys) => [String(sentence), keys || ''];
 
   /* -------------------------------------------------------------------------------------------- THE STEPS: one picker each, shared by the new-trainer screens and the editor */
-  // A HOST is what a step works for: { draft, cur, edit (bool), take(value) -> effects, back() -> effects }. The step reads and writes host.cur[step] (its cursor) and calls take / back.
+  // A HOST is what a step works for: { draft (the player's choices: written by A), seen() (the draft over the profile's values: what is shown), cur, edit (bool), take() -> effects,
+  // back() -> effects }. The step reads seen(), writes draft and host.cur[step] (its cursor), and calls take / back.
   function nameRows(host) {
-    const rows = [{ id: 'new', label: 'NEW NAME' }], own = host.draft.name;
+    const rows = [{ id: 'new', label: 'NEW NAME' }], own = host.seen().name;
     if (own && !PRESET_NAMES.includes(own)) rows.push({ id: 'own', label: own });
     for (const n of PRESET_NAMES) rows.push({ id: 'preset', label: n });
     return rows;
@@ -226,7 +223,7 @@ function createTrainerHub(ctx) {
   }
   /** Where a step's cursor starts: on what the draft holds, else on the default. */
   function defIndex(step, host, pk) {
-    const d = host.draft, r = resolved(d);
+    const d = host.seen(), r = resolved(d);
     switch (step) {
       case 'name': { const i = pk.items.findIndex((x) => x.id !== 'new' && x.label === d.name); return i >= 0 ? i : pk.items.findIndex((x) => x.id === 'preset'); }
       case 'partner': { const i = pk.items.findIndex((x) => x.species === r.partner); return i >= 0 ? i : pk.n > 1 ? 1 : 0; }
@@ -238,7 +235,7 @@ function createTrainerHub(ctx) {
     }
   }
   const curOf = (step, host, pk) => clamp(isInt(host.cur[step]) ? host.cur[step] : defIndex(step, host, pk), 0, Math.max(0, pk.n - 1));
-  const ready = (step) => step === 'name' || (S.choices && pickerOf(step, { draft: { name: '' }, cur: {} }).n > 0) || (step === 'partner' && !!S.choices);
+  const ready = (step) => step === 'name' || (S.choices && pickerOf(step, { draft: EMPTY, seen: () => EMPTY, cur: {} }).n > 0) || (step === 'partner' && !!S.choices);
 
   /** A takes the highlighted thing of a step. -> effects. */
   function takeAt(step, host, i) {
@@ -261,12 +258,10 @@ function createTrainerHub(ctx) {
     }
   }
   function openName(host) {
-    const own = host.draft.name && !PRESET_NAMES.includes(host.draft.name) ? host.draft.name : '';
+    const seen = host.seen().name, own = seen && !PRESET_NAMES.includes(seen) ? seen : '';
     entry.open({ id: 'trainer:name', title: 'YOUR NAME?', value: own, max: NAME_MAX, charset: 'name' }, (r) => {
       if (!r.ok) return [];
-      const v = String(r.value).trim();
-      if (!v) return refuse(WORDS.nameEmpty);
-      host.draft.name = v.slice(0, NAME_MAX);
+      host.draft.name = String(r.value).trim().slice(0, NAME_MAX);          // (the entry's OK never accepts a blank field: textentry.js submit)
       host.cur.name = null;
       return host.take();
     });
@@ -333,8 +328,8 @@ function createTrainerHub(ctx) {
     if (!ready(step)) return { v: { kind: 'wait', title: STEP_TITLES[step], line: 'LOADING...' }, msg: WORDS.wait.slice() };
     const pk = pickerOf(step, host), cur = curOf(step, host, pk), first = Math.floor(cur / pk.per) * pk.per, pages = Math.ceil(pk.n / pk.per), page = Math.floor(first / pk.per);
     const chips = pages > 1 ? [TG.strip.pgup, TG.strip.pgdn].map((c) => ({ id: c.id, label: c.id === 'pgup' ? '{UP}' : '{DOWN}', x: c.x, y: c.y, w: c.w, h: c.h, off: c.id === 'pgup' ? page === 0 : page >= pages - 1 })) : [];
-    const keys = host.edit ? WORDS.editKeys : WORDS.keys, r = resolved(host.draft);
-    const title = STEP_TITLES[step] + (pk.kind === 'list' && step === 'name' ? '' : ' ' + (step === 'partner' ? Math.max(0, cur) + '/' + (pk.n - 1) : (cur + 1) + '/' + pk.n));
+    const keys = host.edit ? WORDS.editKeys : WORDS.keys, r = resolved(host.seen());
+    const title = STEP_TITLES[step] + (pk.kind === 'list' && step === 'name' ? '' : ' ' + (step === 'partner' ? (cur > 0 ? cur + '/' + (pk.n - 1) : '(' + (pk.n - 1) + ')') : (cur + 1) + '/' + pk.n));
     if (pk.kind === 'list') {
       const rows = pk.items.slice(first, first + pk.per).map((it) => ({ label: it.label }));
       const it = pk.items[cur];
@@ -361,21 +356,20 @@ function createTrainerHub(ctx) {
   /* -------------------------------------------------------------------------------------------- THE NEW TRAINER SCREENS */
   function begin(spec) {
     const kind = spec && (spec.kind === 'new' || spec.kind === 'back') ? spec.kind : 'another';
-    S.pending = { kind, name: spec && typeof spec.name === 'string' ? spec.name.slice(0, NAME_MAX) : '', auto: kind !== 'another' };
+    S.pending = { kind, name: spec && typeof spec.name === 'string' ? spec.name.slice(0, NAME_MAX) : '', profileId: spec && typeof spec.profileId === 'string' ? spec.profileId : null, auto: kind !== 'another' };
   }
   function startWizard() {
-    const p = S.pending || { kind: 'another', name: '', auto: false };
+    const p = S.pending || { kind: 'another', name: '', profileId: null, auto: false };
     S.pending = null;
-    const a = active();
+    // the profile a 'back' welcome updates: the one the shell named, else the active one
+    const a = (p.profileId && trainerList().find((t) => t.id === p.profileId)) || active();
     const upd = p.kind === 'back' && a && !a.readOnly;
-    const draft = upd ? draftOf(a) : { name: '', look: null, front: null, back: null, head: null, partner: null };
-    if (upd && p.name) draft.name = p.name;
-    S.wiz = { kind: p.kind, mode: upd ? 'update' : 'create', profileId: upd ? a.id : null, step: 'welcome', draft, cur: {}, ret: null, auto: !!p.auto, asked: false, ask: 0 };
+    S.wiz = { kind: p.kind, mode: upd ? 'update' : 'create', profileId: upd ? a.id : null, name0: upd ? p.name || a.name : '', step: 'welcome', draft: { ...EMPTY }, cur: {}, ret: null, auto: !!p.auto, asked: false, ask: 0 };
     S.search = '';
     askWelcome();
   }
   function welcomePages(w) {
-    const paras = w.kind === 'back' ? ['Welcome back, ' + (w.draft.name || 'TRAINER') + '!'].concat(WORDS.welcome.back) : WORDS.welcome[w.kind] || WORDS.welcome.another;
+    const paras = w.kind === 'back' ? ['Welcome back, ' + (wizSeen().name || 'TRAINER') + '!'].concat(WORDS.welcome.back) : WORDS.welcome[w.kind] || WORDS.welcome.another;
     const pages = [];
     for (const p of paras) for (const pg of wrapDialog(p, ctx.measure, PX)) pages.push(pg);
     return pages.slice(0, 16);
@@ -393,8 +387,14 @@ function createTrainerHub(ctx) {
     return [{ app: ID, type: 'later', kind }].concat(kind === 'another' ? ctx.back() : ctx.go('main'));
   }
   function letsGo() { ctx.dialog.close(DIALOG_ID); S.wiz.step = 'name'; return []; }
+  /** The new-trainer screens' choices as shown: the player's over the profile being updated (its live values), or over nothing for a new trainer. */
+  function wizSeen() {
+    const w = S.wiz, t = w.mode === 'update' ? trainerList().find((x) => x.id === w.profileId) : null, base = t ? { ...draftOf(t) } : { ...EMPTY };
+    if (w.name0) base.name = w.name0;
+    return over(w.draft, base);
+  }
   const wizHost = () => ({
-    draft: S.wiz.draft, cur: S.wiz.cur, edit: false,
+    draft: S.wiz.draft, seen: wizSeen, cur: S.wiz.cur, edit: false,
     take: () => wizNext(),
     back: () => wizBack(),
   });
@@ -407,15 +407,13 @@ function createTrainerHub(ctx) {
   }
   function wizBack() {
     const w = S.wiz;
-    if (w.step === 'welcome') return later();
     if (w.ret === 'card' && w.step !== 'back') { w.ret = null; w.step = 'card'; return []; }
     w.step = STEPS[Math.max(0, STEPS.indexOf(w.step) - 1)];
     if (w.step === 'welcome') askWelcome();
     return [];
   }
   function wizSave() {
-    const w = S.wiz, r = resolved(w.draft);
-    if (!r.name) { w.step = 'name'; return refuse(WORDS.nameEmpty); }
+    const w = S.wiz, r = resolved(wizSeen());
     S.saving = { what: 'wiz' };
     return [{ app: ID, type: 'save', mode: w.mode, profileId: w.profileId, name: r.name, avatar: { kind: 'preset', id: r.head }, card: { made: true, look: r.look, front: r.front, back: r.back, partner: r.partner } }];
   }
@@ -426,7 +424,14 @@ function createTrainerHub(ctx) {
     const r = resolved(d), lk = lookFor(r.look, looks());
     return { name: r.name, rec: rec || '', look: lk === null ? lookId(r.look) : lk, head: isInt(r.head) ? r.head : null, front: r.front, partner: r.partner, partnerName: speciesName(r.partner), figure: frontLabel(r.front), ...(extra || {}) };
   }
-  const recText = (t) => { const c = t && t.rec; if (!c) return ''; if (isInt(c.wins) && isInt(c.losses)) return 'W' + c.wins + ' L' + c.losses; return isInt(c.battles) ? 'BATTLES ' + c.battles : ''; };
+  /** The record line of a card: what the trainer list carries, else what hub data gives (its battles). */
+  function recText(t) {
+    let c = t && t.rec;
+    if (!c && t) { const p = (ctx.profiles() || []).find((x) => x && x.id === t.id); c = p && p.record ? { battles: p.record.battles | 0 } : null; }
+    if (!c) return '';
+    if (isInt(c.wins) && isInt(c.losses)) return 'W' + c.wins + ' L' + c.losses;
+    return isInt(c.battles) ? 'BATTLES ' + c.battles : '';
+  }
   /** The rows of the card's focus grid: the name; the four pictures; the chips. */
   function cardGrid(chips, parts) { const g = []; if (parts) { g.push(['name'], ['look', 'portrait', 'figure', 'partner']); } g.push(chips.map((c) => c.id)); return g; }
   const centreOf = (id, chips) => { const c = chips.find((x) => x.id === id); const r = c || (CARD_PARTS.includes(id) ? cardRect(id) : null); return r ? r.x + r.w / 2 : 120; };
@@ -491,7 +496,7 @@ function createTrainerHub(ctx) {
     if (CARD_PARTS.includes(id)) {
       if (!t) return [];
       if (t.readOnly) return refuse(WORDS.readOnly);
-      S.edit = { field: id, profileId: t.id, i: 0, draft: draftOf(t), cur: {} };
+      S.edit = { field: id, profileId: t.id, i: 0, draft: { ...EMPTY }, cur: {} };
       return ctx.go('trainer-edit');
     }
     return [];
@@ -525,14 +530,16 @@ function createTrainerHub(ctx) {
 
   /* -------------------------------------------------------------------------------------------- THE EDITOR (one choice of the active trainer) */
   const editStep = () => FIELDS[S.edit.field][S.edit.i];
-  const editHost = () => ({ draft: S.edit.draft, cur: S.edit.cur, edit: true, take: () => editNext(), back: () => editBack() });
+  /** The editor's choice as shown: the player's over the trainer's own values. */
+  function editSeen() { const t = trainerList().find((x) => x.id === S.edit.profileId); return over(S.edit.draft, t ? draftOf(t) : { ...EMPTY }); }
+  const editHost = () => ({ draft: S.edit.draft, seen: editSeen, cur: S.edit.cur, edit: true, take: () => editNext(), back: () => editBack() });
   function editNext() {
     const e = S.edit, steps = FIELDS[e.field];
     if (e.i < steps.length - 1) { e.i++; return []; }
     const t = trainerList().find((x) => x.id === e.profileId);
     if (!t) return refuse(WORDS.failed.failed);
     if (t.readOnly) return refuse(WORDS.readOnly);
-    const r = resolved(e.draft), before = resolved(draftOf(t));
+    const r = resolved(editSeen()), before = resolved(draftOf(t));
     let patch;
     switch (e.field) {
       case 'name': patch = { name: r.name }; break;
@@ -541,8 +548,10 @@ function createTrainerHub(ctx) {
       case 'portrait': patch = { avatar: { kind: 'preset', id: r.head } }; break;
       default: patch = { card: { partner: r.partner } };
     }
-    const same = e.field === 'name' ? r.name === before.name : e.field === 'look' ? r.look === (cardOf({ card: t.card }).look) : e.field === 'figure' ? r.front === cardOf({ card: t.card }).front && r.back === cardOf({ card: t.card }).back
-      : e.field === 'portrait' ? !!t.avatar && t.avatar.kind === 'preset' && t.avatar.id === r.head : r.partner === cardOf({ card: t.card }).partner;
+    // nothing changed when the stored value is the one taken (a card value still null is a change: the default shown is then written down)
+    const c = cardOf({ card: t.card });
+    const same = e.field === 'name' ? r.name === before.name : e.field === 'look' ? r.look === c.look : e.field === 'figure' ? r.front === c.front && r.back === c.back
+      : e.field === 'portrait' ? !!t.avatar && t.avatar.kind === 'preset' && t.avatar.id === r.head : r.partner === c.partner;
     if (same) return ctx.back();          // nothing changed: nothing to save
     S.saving = { what: 'edit' };
     return [{ app: ID, type: 'update', profileId: e.profileId, field: e.field, patch }];
@@ -640,7 +649,7 @@ function createTrainerHub(ctx) {
     }
     if (step === 'card') {
       const w = S.wiz, chips = confirmChips(), focus = w.cardFocus || 'yes';
-      const card = cardView(w.draft, '', null);
+      const card = cardView(wizSeen(), '', null);
       const msg = focus === 'yes' ? WORDS.confirm.slice() : focus === 'change' ? WORDS.change.slice() : two('Change your ' + PART_WORDS[focus] + '?', 'A: change it   B: back');
       return { v: { kind: 'card', screen: 'confirm', card, empty: false, focus, chips: chips.map((c) => ({ ...c, on: c.id === focus })), sw: null, walk: [1, 0, 2, 0][((tick | 0) >> 3) & 3], title: STEP_TITLES.card }, msg };
     }
@@ -716,8 +725,8 @@ function createTrainerHub(ctx) {
       const w = S.wiz, e = S.edit;
       return {
         ready: !!S.choices, active: activeId() || null, trainers: trainerList().length,
-        wiz: w ? { kind: w.kind, mode: w.mode, step: w.step, draft: { ...w.draft }, focus: w.step === 'card' ? w.cardFocus || 'yes' : null, cur: w.step !== 'welcome' && w.step !== 'card' && ready(w.step) ? curOf(w.step, wizHost(), pickerOf(w.step, wizHost())) : null } : null,
-        edit: e ? { field: e.field, step: editStep(), draft: { ...e.draft }, cur: ready(editStep()) ? curOf(editStep(), editHost(), pickerOf(editStep(), editHost())) : null } : null,
+        wiz: w ? { kind: w.kind, mode: w.mode, step: w.step, draft: wizSeen(), focus: w.step === 'card' ? w.cardFocus || 'yes' : null, cur: w.step !== 'welcome' && w.step !== 'card' && ready(w.step) ? curOf(w.step, wizHost(), pickerOf(w.step, wizHost())) : null } : null,
+        edit: e ? { field: e.field, step: editStep(), draft: editSeen(), cur: ready(editStep()) ? curOf(editStep(), editHost(), pickerOf(editStep(), editHost())) : null } : null,
         card: { focus: cardFocusNow(), sw: S.sw ? S.sw.cursor : null }, search: S.search, saving: S.saving ? S.saving.what : null, note: S.flash ? S.flash.lines.join(' ').slice(0, 80) : null,
         entry: entry.isOpen() ? entry.entry().state() : null,
       };
@@ -752,8 +761,10 @@ function createTrainerHub(ctx) {
       return [];
     },
     saving: () => !!S.saving,
+    /** Something the ctl could not do outside a save (SWITCH TRAINER refused): its words in the message box until the next input. why: a key of WORDS.failed. */
+    failed(why) { S.input++; note(WORDS.failed[why] || WORDS.failed.failed, true); },
     /** (tests) the draft of the open new-trainer screens / editor, resolved: what YES / A would save. */
-    draft: () => (S.wiz ? resolved(S.wiz.draft) : S.edit ? resolved(S.edit.draft) : null),
+    draft: () => (S.wiz ? resolved(wizSeen()) : S.edit ? resolved(editSeen()) : null),
   };
 }
 

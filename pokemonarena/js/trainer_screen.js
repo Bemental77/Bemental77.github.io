@@ -132,7 +132,7 @@ export function createScreen(ui, h) {
       ui.drawWindow(f, g.pic.x, g.pic.y, g.pic.w, g.pic.h);
       put(f, v.what === 'front' ? front(c.id) : v.what === 'back' ? back(c.id) : head(c.id), g.pic.x, g.pic.y);
       ui.panel(f, g.chip.x, g.chip.y, g.chip.w, g.chip.h, c.on ? 'sel' : 'normal', true);
-      t(f, { s: c.label, x: g.chip.x + g.chip.w / 2, y: g.chip.y - 1, align: 'centre', max: g.chip.w - 6, fonts: FONTS, fg: c.used ? COL.blue : TEXT.dark, sh: TEXT.shadow, what: 'pic label' });
+      t(f, { s: c.label, x: g.chip.x + g.chip.w / 2, y: g.chip.y - 1, align: 'centre', max: g.chip.w - 6, fonts: FONTS, fg: TEXT.dark, sh: TEXT.shadow, what: 'pic label' });
     });
     message(f, view);
   }
