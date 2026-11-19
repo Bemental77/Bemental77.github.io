@@ -448,6 +448,24 @@ async function runNode(jsDir, verbose) {
       return quiet.length === 0 && fx.length === 1 && fx[0].type === 'data' && m.hub.view().trainer.card.name === 'ROSSO' ? true : J([quiet, fx, m.hub.view().trainer.card]);
     } finally { await M.done(); }
   });
+  await check('E10 a trainer just MADE lands on its card with the cursor on BACK and "Your TRAINER CARD is ready!": the next A goes on to the main menu, not into the NAME editor; an EDIT saved keeps the cursor on the part edited', () => {
+    const m = visit('new', { state: 'ready', activeId: null, profiles: [] }, { list: true }); aThrough(m);
+    m.app.saved({ ok: true });
+    const at = { path: m.hub.path(), focus: m.st().card.focus, msg: m.hub.view().msg };
+    m.hub.press('a');
+    const then = m.hub.path();
+    const e = mk({ state: 'ready', activeId: 'p1', profiles: [prof('p1', 'RED', { card: made })] }, { list: true });
+    e.hub.goto('trainer'); focus(e, 'look'); e.hub.press('a'); e.hub.press('right'); e.hub.press('a'); e.app.saved({ ok: true });
+    return at.path === 'trainer' && at.focus === 'back' && J(at.msg) === J(W.made.slice()) && then === 'main' && e.hub.path() === 'trainer' && e.st().card.focus === 'look' ? true : J([at, then, e.hub.path(), e.st().card.focus]);
+  });
+  await check('E11 the card opened BEFORE the store answered (the page loaded at #trainer): once the trainer arrives the cursor is on the NAME, not on NEW TRAINER', () => {
+    const m = mk(); m.hub.goto('trainer');
+    const before = m.hub.view().trainer.focus;
+    m.hub.setData({ state: 'ready', activeId: 'p1', profiles: [prof('p1', 'RED', { card: made })] });
+    m.app.setTrainers({ activeId: 'p1', list: [{ id: 'p1', name: 'RED', avatar: { kind: 'preset', id: 4 }, card: made }] });
+    const v = m.hub.view();
+    return before === 'new' && m.st().card.focus === 'name' && v.trainer.focus === 'name' ? true : J([before, m.st().card.focus, v.trainer.focus]);
+  });
 
   /* ---------------------------------------------------------------------------------------------- F: failures */
   await check('F1 every refusal of a save is said in the picture and the screen stays (read-only, not saved, a conflict, refused, no storage, anything else)', () => {
@@ -623,6 +641,9 @@ const NODE_MUTANTS = [
   { id: 'M32', file: 'trainer_hub.js', from: "w.step = 'card'; w.cardFocus = 'yes'; return []; }", to: "w.step = 'card'; return []; }", fails: 'C2' },
   { id: 'M33', file: 'trainer_hub.js', from: ".replace(/\\{MALE\\}/g, ' male').replace(/\\{FEMALE\\}/g, ' female').replace(/\\{[A-Z]+\\}/g, '');", to: ';', fails: 'G4' },
   { id: 'M28', file: 'trainer_hub.js', from: "    onData() { return S.trainers ? [{ app: ID, type: 'data' }] : []; },", to: "    onData() { return [{ app: ID, type: 'data' }]; },", fails: 'E9' },
+  { id: 'M34', file: 'trainer_hub.js', from: "if (p === 'trainer-new' && ctx.path() === 'trainer') { S.card.focus = 'back'; note(WORDS.made.slice()); }", to: '', fails: 'E10' },
+  { id: 'M35', file: 'trainer_hub.js', from: "if (p === 'trainer-new' && ctx.path() === 'trainer') {", to: "if (ctx.path() === 'trainer') {", fails: 'E10' },
+  { id: 'M36', file: 'trainer_hub.js', from: "if (!S.card.focus && active()) S.card.focus = 'name';", to: "if (!S.card.focus) S.card.focus = active() ? 'name' : 'new';", fails: 'E11' },
 ];
 async function runMutants() {
   let killed = 0, ran = 0;

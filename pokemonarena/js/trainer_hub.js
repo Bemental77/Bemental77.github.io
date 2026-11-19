@@ -101,6 +101,7 @@ export const WORDS = Object.freeze({
   switchT: Object.freeze(['Play as another of your TRAINERS.', 'A: choose   B: back']),
   switchList: Object.freeze(['Which TRAINER?', 'A: this one   B: back']),
   backRow: Object.freeze(['Back to the main menu.', 'A: back']),
+  made: Object.freeze(['Your TRAINER CARD is ready!', 'A: on to the main menu']),
   cardKeys: 'A: change it   B: back',
   notKept: Object.freeze(['Saved for this visit only: this', 'browser is not keeping TRAINERS.']),
   failed: Object.freeze({
@@ -705,7 +706,9 @@ function createTrainerHub(ctx) {
       S.flash = null;
       if (path === 'trainer-new') startWizard();
       else if (path === 'trainer-edit') { if (!S.edit) return ctx.go('trainer'); }
-      else if (path === 'trainer') { S.sw = null; if (!S.card.focus) S.card.focus = active() ? 'name' : 'new'; }
+      // (no trainer known yet, e.g. the page opened AT #trainer before the store answered: the focus stays unset, so cardFocusNow() gives the name once the trainer arrives,
+      // instead of keeping NEW TRAINER under the cursor of a player who has one)
+      else if (path === 'trainer') { S.sw = null; if (!S.card.focus && active()) S.card.focus = 'name'; }
       return [{ app: ID, type: 'opened', path }];
     },
     leave(path) {
@@ -763,7 +766,13 @@ function createTrainerHub(ctx) {
       S.input++;
       if (r && r.ok) {
         if (r.notSaved) ctx.notify(WORDS.notKept.slice());          // (a browser that is not keeping profiles: the trainer lives for this visit only, and the player is told)
-        const p = ctx.path(); return p === 'trainer-new' || p === 'trainer-edit' ? ctx.back() : [];
+        const p = ctx.path();
+        if (p !== 'trainer-new' && p !== 'trainer-edit') return [];
+        const fx = ctx.back();
+        // A trainer just MADE lands on its card with the cursor on BACK (A goes on to the main menu): a player who pressed A through every step and keeps pressing it must not
+        // fall into the NAME editor, which is where the card's default cursor (the name) would send them.
+        if (p === 'trainer-new' && ctx.path() === 'trainer') { S.card.focus = 'back'; note(WORDS.made.slice()); }
+        return fx;
       }
       const why = r && WORDS.failed[r.why] ? r.why : 'failed';
       note(WORDS.failed[why], true);
