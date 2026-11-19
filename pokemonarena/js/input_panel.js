@@ -143,7 +143,7 @@ export function mountControlsPanel(container, opts = {}) {
     const root = h('section', { class: 'ip', 'aria-labelledby': 'ip-title', dataset: { ip: 'panel' } },
       h('h2', { id: 'ip-title' }, 'Controls'),
       h('p', { class: 'ip-dim' }, 'Keyboard, mouse, touch and controller all work on every screen, and you can switch between them at any time. Change a key or button below by choosing it and pressing the new one.'),
-      h('p', { class: 'ip-dim', dataset: { ip: 'mute-key' } }, 'The M key mutes and unmutes the sound on every page (the Sound button opens the volume panel). M is not one of the twelve actions; a key you bind to an action is left alone.'),
+      h('p', { class: 'ip-dim', dataset: { ip: 'mute-key' } }, 'The O key mutes and unmutes the sound on every page (the Sound button opens the volume panel). O is not one of the twelve actions: bind it to one and it does that action instead.'),
       h('p', { class: 'ip-dim', dataset: { ip: 'pad-escape' } }, 'If a controller stops working after a change here: hold Start and Select together for 2 seconds anywhere in the game and its buttons go back to the defaults.'),
       h('div', { class: 'ip-readout', dataset: { ip: 'readout' }, 'aria-live': 'off' }, readoutText()),
       h('p', { class: 'ip-status', role: 'status', 'aria-live': 'polite', dataset: { ip: 'status', tone: status.tone } }, status.text),

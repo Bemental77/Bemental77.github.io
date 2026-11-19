@@ -6,7 +6,7 @@
 //   [ mute ]  [ ----o------ ]  70%  [ music ]        mute / unmute        master volume (the SAME mixer setting the Sound panel's Master slider moves)        menu music
 //
 //   * The slider and the mute button drive the page's one mixer (audio_mixer.js): the same stored setting as the Sound panel, so moving either moves the other, a reload keeps it,
-//     the M key and another tab are followed. Moving the slider up while muted unmutes (nobody drags a volume slider to stay silent).
+//     the mute key (O) and another tab are followed. Moving the slider up while muted unmutes (nobody drags a volume slider to stay silent).
 //   * A click, tap or key on the bar is a user activation like any other: the mixer's own listeners (audio_mixer.js attach, on the window in the capture phase) start the sound BEFORE the bar's
 //     handlers run. The bar still calls mixer.unlock() itself (harmless once the context exists) for an activation that arrives with no pointer or key event first, such as a screen reader's click.
 //   * FOCUS. After a POINTER use of the bar (a click on mute or on the music button that closes the list, a slider released) focus goes back to the page's input target (`[data-input-target]`: the
@@ -16,8 +16,8 @@
 //   * The music changer (hub and editor only; the battle page picks its music by the battle) is a small popover: previous / next, Automatic (the game's own song for each menu),
 //     every song menu_music.js can play on the soundtrack in use, and Off (no music; the menus keep their sound effects). The choice is stored (menu_music.js) and applies to every menu page.
 //   * THE LIST IS A MODAL DIALOG (role="dialog" aria-modal="true"). While it is open every key typed in it belongs to it: the arrows, the keys the player's bindings give the d-pad (W A S D by default:
-//     "arrows or WASD move" holds here too) and Home / End pick songs, Tab stays inside, Esc closes, and every other key (Z, X, Backspace, PageUp / PageDown ...) is kept from the page behind it
-//     (stopPropagation; Enter and Space still press the focused button natively; M still reaches the global mute shortcut). A CONTROLLER: the hub's own input is told through sys.menuDialog (its dialog
+//     "arrows or WASD move" holds here too) and Home / End pick songs, Tab stays inside, Esc closes, and every other key (M, N, Z, X, Backspace, PageUp / PageDown ...) is kept from the page behind it
+//     (stopPropagation; Enter and Space still press the focused button natively; O still reaches the global mute shortcut). A CONTROLLER: the hub's own input is told through sys.menuDialog (its dialog
 //     counter), because a controller press does not come through a key event, so it ignores the pad while the list is open; the list then gets a navigation layer of its own (sys.dialogNav, only where
 //     the page has none over the whole page: the hub): the d-pad moves through it, A picks the focused song, B closes it and gives the focus back to the music button. On the team editor aria-modal makes
 //     the page's own uinav.js scope the d-pad and Tab to the list and B close it (sys.dialogNav is null there).
@@ -28,6 +28,8 @@
 // Import-safe in Node: nothing touches window/document at import.
 
 import { toPercent, fromPercent, VOLUME_STEP } from './audio_mixer.js';
+import { codeOf, MUTE_KEY } from './input.js';                        // the mute key (O): the list lets it through to sound_system.js, as it lets Esc through
+const MUTE_LABEL = 'O';
 
 export const BAR_ID = 'audioBar';
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -87,7 +89,7 @@ export function mountAudioBar({ doc, win, sys, host }) {
 
   /* ------------------------------------------------------------------------------- the parts */
   const fold = h(doc, 'button', { type: 'button', class: 'ab-btn ab-fold', id: 'abFold', 'aria-label': 'Sound controls', 'aria-expanded': 'false', title: 'Sound controls' }, icon(doc, 'on'));
-  const mute = h(doc, 'button', { type: 'button', class: 'ab-btn ab-mute', id: 'abMute', 'aria-pressed': 'false', 'aria-label': 'Mute', title: 'Mute (M)' }, icon(doc, 'on', 'ab-ic-on'), icon(doc, 'off', 'ab-ic-off'));
+  const mute = h(doc, 'button', { type: 'button', class: 'ab-btn ab-mute', id: 'abMute', 'aria-pressed': 'false', 'aria-label': 'Mute', title: 'Mute (' + MUTE_LABEL + ')' }, icon(doc, 'on', 'ab-ic-on'), icon(doc, 'off', 'ab-ic-off'));
   let touch = null;                                                  // { x0, moved } while a finger is down on the slider (see sound_panel.js: a finger that scrolls the page must not set the volume)
   const range = h(doc, 'input', { type: 'range', class: 'ab-vol', id: 'abVolume', min: 0, max: 100, step: VOLUME_STEP, value: toPercent(mixer.volume('master')), 'aria-label': 'Volume', title: 'Volume' });
   const out = h(doc, 'output', { class: 'ab-val', for: 'abVolume', 'aria-hidden': 'true' }, toPercent(mixer.volume('master')) + '%');
@@ -115,7 +117,7 @@ export function mountAudioBar({ doc, win, sys, host }) {
   for (const t of ['pointerup', 'pointercancel']) range.addEventListener(t, () => { setTimeout(handBack, 0); });
   mute.addEventListener('click', (e) => {
     mixer.unlock(); mixer.toggleMuted(); paint();
-    if (typeof sys.toast === 'function') sys.toast(mixer.muted() ? 'Sound muted (M)' : 'Sound on (M)');
+    if (typeof sys.toast === 'function') sys.toast(mixer.muted() ? 'Sound muted (' + MUTE_LABEL + ')' : 'Sound on (' + MUTE_LABEL + ')');
     if (e.detail > 0) handBack(); // a pointer click (detail > 0) gives the keyboard back to the page; Enter / Space on the focused button (detail 0) keep their place
   });
   fold.addEventListener('click', () => { const open = !el.classList.contains('ab-open'); el.classList.toggle('ab-open', open); fold.setAttribute('aria-expanded', String(open)); if (!open) closeMenu(); });
@@ -123,7 +125,7 @@ export function mountAudioBar({ doc, win, sys, host }) {
   function paint() {
     const muted = mixer.muted(), p = toPercent(mixer.volume('master'));
     el.dataset.muted = String(muted);
-    mute.setAttribute('aria-pressed', String(muted)); mute.title = muted ? 'Unmute (M)' : 'Mute (M)';
+    mute.setAttribute('aria-pressed', String(muted)); mute.title = muted ? 'Unmute (' + MUTE_LABEL + ')' : 'Mute (' + MUTE_LABEL + ')';
     if (String(range.value) !== String(p)) range.value = String(p);
     range.setAttribute('aria-valuetext', p + ' percent' + (muted ? ', muted' : ''));
     out.textContent = p + '%';
@@ -215,8 +217,8 @@ export function mountAudioBar({ doc, win, sys, host }) {
     return true;
   }
   // The keys of the list (it is modal, see the header). The arrows, and the keys bound to the d-pad (WASD), move through the songs and PICK them (a radio group); Tab stays inside; Esc is handled in openMenu (document capture). EVERY OTHER key
-  // is kept from the page behind the list: input.js listens on the window, so stopping the event here is enough to keep Z / X / Backspace / PageUp / PageDown (and the direction keys, which the list has taken for itself) from driving the hub or the
-  // editor. No preventDefault on those: Enter and Space must still press the focused button natively. M is left alone on purpose: it is the global mute shortcut (sound_system.js, on the document).
+  // is kept from the page behind the list: input.js listens on the window, so stopping the event here is enough to keep M / N / Z / X / Backspace / PageUp / PageDown (and the direction keys, which the list has taken for itself) from driving the hub or the
+  // editor. No preventDefault on those: Enter and Space must still press the focused button natively. O is left alone on purpose: it is the global mute shortcut (sound_system.js, on the document). M is A (input.js) and is kept from the page like Z.
   function onMenuKey(e) {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     const radios = Array.from(listEl.querySelectorAll('[role="radio"]'));
@@ -237,7 +239,7 @@ export function mountAudioBar({ doc, win, sys, host }) {
         else if (!e.shiftKey && (a === f[f.length - 1] || !menu.contains(a))) { e.preventDefault(); f[0].focus({ preventScroll: true }); }
       }
     }
-    else if (e.key === 'Escape' || e.code === 'KeyM' || e.key === 'm' || e.key === 'M') { /* Esc closed the list already (document capture); M reaches the mute shortcut */ }
+    else if (e.key === 'Escape' || codeOf(e) === MUTE_KEY || e.key === 'o' || e.key === 'O') { /* Esc closed the list already (document capture); O reaches the mute shortcut */ }
     else e.stopPropagation();
   }
   // After a pointer use of the bar the keyboard goes back to the page (header: FOCUS). While the list is open the focus belongs inside it, so it returns to the checked song instead.

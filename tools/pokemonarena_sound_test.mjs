@@ -899,6 +899,31 @@ head('6. sound_system.js: the low-HP warning (the game\'s red zone, once per sta
       const { sys } = await make(); const sc = stubScene(); sc.state = () => { throw new Error('boom'); }; sys.battleFrame(sc, 'normal', true); return typeof sys.state().frameError === 'string';
     });
 
+    /* ---- the mute key: O (input.js MUTE_KEY). M is A since 2026-11-18 (INAPP.md TRAINER, decision 6), so M must never mute ---- */
+    const IN = await importFrom(dir, 'input.js');
+    const keyRig = async ({ input = true, stored = null } = {}) => {
+      const log = {}; const scope = makeScope(); installFakeAudio(scope, log); const FD = fakeDom(); Object.assign(FD.doc, makeScope(), { hidden: false });
+      const inp = input ? IN.createInput({ target: makeScope(), document: Object.assign(makeScope(), { hidden: false }), storage: memStore(stored ? { 'arena.bindings': JSON.stringify(stored) } : {}), getGamepads: () => [], raf: null, layoutMap: null }) : null;
+      const sys = SS.createSoundSystem({ window: scope, document: FD.doc, storage: memStore(), noPrompt: true, bar: false, page: 'hub', input: () => inp, loadMusic: async () => makeStubMusic({}), loadMap: async () => makeStubMap(SYS_SONGS) });
+      const press = (code, key) => { const e = { type: 'keydown', code, key, repeat: false, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; } }; FD.doc.dispatch('keydown', e); return sys.mixer.muted(); };
+      return { sys, inp, press };
+    };
+    await step('mute key: M does NOT mute (M is the keyboard\'s A; bindings.get() reports the defaults too, so the shortcut yields to it)', async () => {
+      const { inp, press } = await keyRig(); return inp.bindings.get().keyboard.a[0] === 'KeyM' && press('KeyM', 'm') === false && press('KeyM', 'M') === false;
+    });
+    await step('mute key: O mutes and O unmutes; the toast names O', async () => {
+      const { press } = await keyRig(); const a = press('KeyO', 'o'), b = press('KeyO', 'o');
+      return SS.MUTE_KEY === 'KeyO' && a === true && b === false && SS.muteToast(true) === 'Sound muted (O)' && SS.muteToast(false) === 'Sound on (O)';
+    });
+    await step('mute key: with no input layer (it failed to load) M still does not mute and O still does', async () => {
+      const { press } = await keyRig({ input: false }); return press('KeyM', 'm') === false && press('KeyO', 'o') === true;
+    });
+    await step('mute key: a player who binds O to an action gets the action (theirs wins): O no longer mutes', async () => {
+      const { press } = await keyRig({ stored: { v: 1, keyboard: { x: ['KeyC', 'KeyO'] } } }); return press('KeyO', 'o') === false;
+    });
+    await step('mute key: another layout\'s "o" on a key the game uses (Dvorak types o on the S key: down) moves, it does not mute', async () => {
+      const { press } = await keyRig(); return press('KeyS', 'o') === false;
+    });
     /* ---- the prompt's words ---- */
     await step('prompt text: BOTH variants say what to do (click, tap or press a key) and that a controller button cannot (the layout decides which one is shown); neither carries the old "(that is a browser rule)" clause; the short one is short', () => {
       const P = SS.PROMPT_TEXT; return /Click, tap or press/.test(P.long) && /Click, tap or press/.test(P.short) && /controller button cannot/i.test(P.long) && /controller button cannot/i.test(P.short) && !/browser rule/.test(P.long + P.short) && P.short.length < 80 && P.long.length < 140;
@@ -990,9 +1015,16 @@ head('6. sound_system.js: the low-HP warning (the game\'s red zone, once per sta
       { id: 'S21 the team editor loads the engine (and the Ultra Violet ROM) with Off: effects is true for every page', from: "(page === 'hub' || page === 'battle')", to: 'true', expect: 'menu music Off, effects are a page option: the hub and the battle page load the engine, the team editor loads nothing (Ultra Violet chosen: no ROM fetch either); the `effects` option overrides the default' },
       { id: 'S22 the effects option is ignored', from: 'const effects = opts.effects !== undefined ? opts.effects === true :', to: 'const effects = ', expect: 'menu music Off, effects are a page option: the hub and the battle page load the engine, the team editor loads nothing (Ultra Violet chosen: no ROM fetch either); the `effects` option overrides the default' },
       { id: 'S11 the opponent counts', from: "const p = st && st.player;", to: "const p = st && (st.foe || st.player);", expect: 'low-HP: only the PLAYER\'s Pokemon counts (the opponent in the red zone makes no beep)' },
+      // the mute key (O), TRAINER contract decision 6
+      { id: 'K1 the mute key is M again', from: "if (code !== MUTE_KEY && e.key !== 'o' && e.key !== 'O') return;", to: "if (code !== 'KeyM' && e.key !== 'm' && e.key !== 'M') return;", expect: 'mute key: O mutes and O unmutes; the toast names O' },
+      { id: 'K2 M mutes as well', from: "if (code !== MUTE_KEY && e.key !== 'o' && e.key !== 'O') return;", to: "if (code !== MUTE_KEY && code !== 'KeyM' && e.key !== 'o' && e.key !== 'O') return;", expect: 'mute key: with no input layer (it failed to load) M still does not mute and O still does' },
+      { id: 'K3 M mutes as well and the shortcut yields only to a binding of O', from: "if (code !== MUTE_KEY && e.key !== 'o' && e.key !== 'O') return;", to: "if (code !== MUTE_KEY && code !== 'KeyM' && e.key !== 'o' && e.key !== 'O') return;", also: [["l.includes(MUTE_KEY) || (code && l.includes(code))", 'l.includes(MUTE_KEY)']], expect: 'mute key: M does NOT mute (M is the keyboard\'s A; bindings.get() reports the defaults too, so the shortcut yields to it)' },
+      { id: 'K4 a binding of O does not win', from: "l.includes(MUTE_KEY) || (code && l.includes(code))", to: "(code && code !== MUTE_KEY && l.includes(code))", expect: 'mute key: a player who binds O to an action gets the action (theirs wins): O no longer mutes' },
+      { id: 'K5 a key the game uses mutes when it types o', from: "l.includes(MUTE_KEY) || (code && l.includes(code))", to: 'l.includes(MUTE_KEY)', expect: 'mute key: another layout\'s "o" on a key the game uses (Dvorak types o on the S key: down) moves, it does not mute' },
+      { id: 'K6 the toast still names M', from: "export const MUTE_KEY_LABEL = 'O';", to: "export const MUTE_KEY_LABEL = 'M';", expect: 'mute key: O mutes and O unmutes; the toast names O' },
     ];
     for (const m of SYSM) {
-      let d; try { d = sysMut(m.id.split(' ')[0], m.from, m.to); } catch (e) { C.ok(false, 'mutant ' + m.id + ' could not be applied', e.message); continue; }
+      let d; try { d = sysMut(m.id.split(' ')[0], m.from, m.to); for (const [f2, t2] of m.also || []) mutate(d, 'sound_system.js', f2, t2); } catch (e) { C.ok(false, 'mutant ' + m.id + ' could not be applied', e.message); continue; }
       let res; try { res = await sysBattery(d); } catch (e) { C.ok(false, 'mutant ' + m.id + ' broke the harness', e.message); continue; }
       const failed = res.filter((r) => !r.ok).map((r) => r.name);
       C.ok(failed.includes(m.expect), 'mutant ' + m.id + ' trips its named check', 'failed: ' + failed.join(' | ').slice(0, 500));

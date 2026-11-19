@@ -8,7 +8,7 @@
 // THE HUB'S APPS (hub_apps.js: online, center, builder). The model delegates their screens to js/<id>_hub.js and the renderer to js/<id>_screen.js; THIS file carries their effects out without
 // knowing any of them: an effect with a string `app` is handed to that app's ctl (js/<id>_ctl.js: createCtl(env) -> { effect, enter?, leave?, dispose? }; hub_app_ctls.js lists them), which is loaded the first time one of the
 // app's screens is entered or one of its effects appears. A REAL KEYBOARD TYPES INTO A TEXT ENTRY: while the model says wantsText(), a capture listener turns printable keys, Backspace, Enter,
-// Escape, Delete, Home, End and the left / right arrows into model.type(...) and keeps them from the input layer (so Z, X, W, A, S, D, M, P and Enter are letters, not buttons), and a paste
+// Escape, Delete, Home, End and the left / right arrows into model.type(...) and keeps them from the input layer (so M, N, Z, X, W, A, S, D, O, P and Enter are letters, not buttons), and a paste
 // delivers its text. pokemonarena/INAPP.md "The app interface" is the contract.
 // THE BROWSER'S HISTORY IS THE MODEL'S TRAIL (hub_model.js): one entry per screen above the main menu, each recording its trail, so B, the browser's Back button, a reload and a deep link
 // agree (syncHistory / popstate / seedHistory below). NOTHING AN APP THROWS STOPS THE PAGE: its model is guarded (hub_apps.js; reportFaults says what happened), its renderer too
@@ -386,7 +386,7 @@ async function main() {
     else if (key === 'Dead') { e.preventDefault(); e.stopPropagation(); return; }          // a dead key (an accent waiting for its letter) is not a letter yet and never a button
     else return;                                                           // Tab, the function keys, the up / down arrows (those two still move the key cursor) ...
     if (nativeUse(t, key, e.code) !== 'none') return;                      // Enter or Space on a focused page button presses that button
-    e.preventDefault(); e.stopPropagation();                               // ... and nothing else sees the key: not the input layer (no game button), not the M-mutes shortcut
+    e.preventDefault(); e.stopPropagation();                               // ... and nothing else sees the key: not the input layer (no game button), not the O-mutes shortcut
     heldAsText.add(e.code || e.key);
     typeText(input);
   }, true);
@@ -523,7 +523,7 @@ async function main() {
   /* ---- input ---- */
   function wireInput() {
     if (!input) {
-      window.addEventListener('keydown', (e) => { if (dialogOpen || e.ctrlKey || e.metaKey || e.altKey) return; const m = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', Enter: 'a', z: 'a', x: 'b', Backspace: 'b', Escape: 'b' }[e.key]; if (m) { e.preventDefault(); run(model.press(m)); } });
+      window.addEventListener('keydown', (e) => { if (dialogOpen || e.ctrlKey || e.metaKey || e.altKey) return; const m = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', Enter: 'a', m: 'a', n: 'b', z: 'a', x: 'b', Backspace: 'b', Escape: 'b' }[e.key]; if (m) { e.preventDefault(); run(model.press(m)); } });
       return;
     }
     hook.input = input;
@@ -690,7 +690,7 @@ async function main() {
       window.requestAnimationFrame(() => window.setTimeout(recheck, 0));
     }
     makeHook();
-    if (soundSys) { soundSys.setRom({ bytes, pack }); soundSys.menuMusic.set('hub'); window.__arenaSound = soundSys; soundSys.mixer.on((ev) => { if (ev.type === 'mute') { model.setSound(soundSys.audible()); dirty = true; } }); }       // MU3: the ROM's music (nothing is heard before the first click / tap / key); the SOUND row follows the M key
+    if (soundSys) { soundSys.setRom({ bytes, pack }); soundSys.menuMusic.set('hub'); window.__arenaSound = soundSys; soundSys.mixer.on((ev) => { if (ev.type === 'mute') { model.setSound(soundSys.audible()); dirty = true; } }); }       // MU3: the ROM's music (nothing is heard before the first click / tap / key); the SOUND row follows the mute key (O)
     focusCanvas();
     runLoop();
     if (openFx.length) run(openFx);
