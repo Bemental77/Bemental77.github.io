@@ -54,17 +54,21 @@ function createStubAnimator(o = {}) {
   // is ready; an event (ids 2..9) lasts 30 frames. Frame 3 emits a sound (114), frame 5 a cry (the foe's species). draw() fills the whole screen with a colour of (id, frame).
   function buildSys(id, ctx) {
     const intro = id === 0 || id === 1, total = intro ? 90 : 30, listeners = {};
-    let f = 0, done = false, ready = false, msgs = 0, waiting = false, keys = 0, acked = 0;
+    let f = 0, done = false, ready = false, msgs = 0, waiting = false, keys = 0, acked = 0, prevKeys = 0, printLeft = 0;
     const fire = (ev, p) => { for (const fn of listeners[ev] || []) fn(p); };
-    return {
+    // o.printFrames = N: the intro behaves as the ROM was MEASURED to (INAPP.md "The opening's A"): for N steps after a message it is still printing and IGNORES A, then it waits at the {FB} for a NEW
+    // press (an edge: A released, then pressed), and it says so through run.textActive (printing or waiting). Without it the stub takes any held A at once and has no textActive (the old contract).
+    const run = {
       kind: 'system', id,
       get done() { return done; }, get ready() { return ready; }, get frame() { return f; }, error: null,
       setKeys(m) { keys = m; calls.sysKeys.push(m); },
       step() {
         calls.steps++;
-        if (waiting) { if (keys & 1) { waiting = false; acked++; } else return; }
+        const edge = (keys & 1) && !(prevKeys & 1); prevKeys = keys;
+        if (waiting && o.printFrames) { if (printLeft > 0) { printLeft--; calls.sysLostA = (calls.sysLostA | 0) + (keys & 1 ? 1 : 0); return; } if (!edge) return; waiting = false; acked++; }
+        else if (waiting) { if (keys & 1) { waiting = false; acked++; } else return; }
         f++;
-        if (intro && msgs < 3 && f === 10 + 25 * msgs) { msgs++; waiting = true; fire('message', { text: 'message ' + msgs + '{FB}', window: 0 }); }
+        if (intro && msgs < 3 && f === 10 + 25 * msgs) { msgs++; waiting = true; printLeft = o.printFrames | 0; fire('message', { text: 'message ' + msgs + '{FB}', window: 0 }); }
         if (f === 3) fire('sound', { index: 114, pan: 0 });
         if (f === 5) { calls.sysCries = (calls.sysCries || 0) + 1; fire('cry', { species: ctx.foe.species, pan: 0 }); }
         if (f >= total && !waiting && (!intro || acked >= 3)) { ready = true; done = true; calls.sysEnded++; }
@@ -75,6 +79,8 @@ function createStubAnimator(o = {}) {
       },
       on(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); }, dispose() {}, battlerState() { return { x: 0, y: 0, dx: 0, dy: 0, visible: true }; },
     };
+    if (o.printFrames) Object.defineProperty(run, 'textActive', { get: () => waiting && !done, enumerable: true });
+    return run;
   }
   function startSys(id, ctx) { calls.sysStarts.push({ id, ctx, tick: calls.tick }); return buildSys(id, ctx); }
   // round 4: animator.prepare('system', id, ctx) -> a handle (advance(ms) until ready, begin() once, dispose()). o.prepAdvances = advances a handle needs (default 3); o.prepFail = 'advance' | 'begin' | 'prepare'
@@ -548,6 +554,22 @@ async function core(M, opts = {}) {
     t('system: A is pressed for the run once per message it printed (it waits at each)', stubSys.calls.sysKeys.filter((k) => k === 1).length >= 3 && stubSys.calls.sysEnded >= 1, stubSys.calls.sysKeys.filter((k) => k === 1).length + ' presses');
     t('system: the intro ended (the run was ready) and both leads stand on the scene afterwards', !info.log.length && info.sys >= 1, JSON.stringify(info.log) + ' sys ' + info.sys);
     t('system: sound and cry events of the run reach hooks.onSound / hooks.onCry', sys.hooks.sounds.some((x) => x[0] === 114) && stubSys.calls.sysCries >= 1 && stubSys.calls.sysCries === (stubSys.calls.sysBegins || stubSys.calls.sysStarts.length) && sys.hooks.cries.length === stubSys.calls.cries + stubSys.calls.sysCries && sys.hooks.cries.every((c) => c[0] > 0), sys.hooks.cries.length + ' vs ' + (stubSys.calls.cries + stubSys.calls.sysCries));
+    // THE OPENING'S A (INAPP.md "The opening's A"): the real ROM prints its first message for ~38 frames and ignores an A that arrives meanwhile. A player who holds A through the opening types the
+    // scene's copy fast, and the scene's one A for the ROM landed inside that print: lost, and the opening stood on "would like to battle!" until SYS_MAX (3000 frames, 50 s) cut it. The stub here
+    // prints for 38 steps (o.printFrames) as the ROM does. Held: the opening must end on its own, inside 700 ticks, uncut, with the A offered again (aRetry). Not held: the first A is taken, no retry.
+    {
+      const introA = async (held) => {
+        const st = await makeAnimator({ system: true, printFrames: 38 });
+        const b = makeBattle(M, { seed, cfg: mkCfg(onSys), animator: st });
+        let n = 0, seen = false, ticks = 0;
+        while (n++ < 4000) { const c = b.scene.S.cur, inIntro = !!c && c.t === 'sysintro'; if (inIntro) { seen = true; ticks++; } else if (seen) break; b.scene.hold(held && inIntro, false); b.scene.tick(); }
+        const info = b.scene.animInfo();
+        return { seen, ticks, ended: st.calls.sysEnded, lost: st.calls.sysLostA | 0, retry: info.aRetry, cut: info.log.filter((x) => /cut system intro/.test(x)).length };
+      };
+      const held = await introA(true), free = await introA(false);
+      t('system: the opening A: a player holding A through the opening does not stall it on its first message (the ROM ignores an A while it prints; the scene offers it again until taken)', held.seen && held.ended >= 1 && held.cut === 0 && held.ticks < 700 && held.lost >= 1 && held.retry >= 1, J(held));
+      t('system: the opening A: without a held button the first A is taken and never offered again (the same frames as before)', free.seen && free.ended >= 1 && free.cut === 0 && free.retry === 0 && free.lost === 0, J(free));
+    }
     // every old step that has a system event became one
     const cnt = (str, ch) => (str.match(new RegExp(ch, 'g')) || []).length;
     const ids = stubSys.calls.sysStarts.slice(1).map((x) => x.id);
@@ -1058,6 +1080,28 @@ ok(realFails.length === 0, '1. every anim-scene check passes on the real tree ('
     introRows.push([label, n, diff(last.data, sc.rgba)]);
   }
   for (const [label, n, d] of introRows) ok(d <= 0 && n > 200, '4. handoff: the intro\'s last frame (' + n + ' frames) is the scene\'s action menu: ' + label, d + ' of 38400 px differ');
+  // THE OPENING'S A on the REAL ROM (INAPP.md "The opening's A"): (a) the measured fact the fix rests on: an A pressed while the first message is still being printed is lost, one pressed after it is
+  // taken; (b) a player holding A through the opening (the page's scene, the real run) reaches the action menu, uncut, in about the ticks of an opening nobody touched (it stood still for SYS_MAX before)
+  {
+    const lostAt = (F) => {
+      const run = animator.start('system', 1, { foe: spec(introCases[0][1]), player: spec(introCases[0][2]), environment: ENV, keys: null, trainer: 1 });
+      let first = -1, msgs = 0, n = 0;
+      run.on('message', () => { msgs++; if (first < 0) first = run.frame; });
+      while (!run.done && n++ < 400 && msgs < 2) { run.setKeys(first >= 0 && run.frame >= first + F && run.frame < first + F + 3 ? 1 : 0); run.step(); }
+      return { taken: msgs >= 2, first, active: run.textActive };
+    };
+    const early = lostAt(5), late = lostAt(60);
+    ok(!early.taken && early.active === true && late.taken, '4. opening A (ROM): an A 5 frames into the first message is ignored (the printer is still up: textActive), one 60 frames in is taken', JSON.stringify({ early, late }));
+    const heldIntro = (held) => {
+      const b = makeBattle(real, { seed: 3, cfg: mkCfg({ on: true }), animator, sceneOpts: { sysClock: (cpu) => cpu.icount / 1000 } });
+      let n = 0, seen = false, ticks = 0;
+      while (n++ < 4000) { const c = b.scene.S.cur, inIntro = !!c && c.t === 'sysintro'; if (inIntro) { seen = true; ticks++; } else if (seen) break; b.scene.hold(held && inIntro, false); b.scene.tick(); }
+      const info = b.scene.animInfo();
+      return { seen, ticks, retry: info.aRetry, cut: info.log.filter((x) => /cut system intro/.test(x)).length, log: info.log.slice(0, 2) };
+    };
+    const h = heldIntro(true), u = heldIntro(false);
+    ok(h.seen && u.seen && h.cut === 0 && u.cut === 0 && h.retry >= 1 && u.retry === 0 && h.ticks <= u.ticks + 60, '4. opening A (ROM): A held through the opening reaches the action menu (' + h.ticks + ' ticks, untouched ' + u.ticks + '), uncut, the A offered again ' + h.retry + ' time(s)', JSON.stringify({ h, u }));
+  }
   // negative control: the experience of the level left out (what a first version did) must show: the trainer foe's level text is recomputed by the ROM
   {
     const [, foe, me] = introCases[0];
@@ -1254,6 +1298,8 @@ if (process.env.ARENA_SKIP_MUTANTS !== '1') {
     ['scene.js', 'cry events are not forwarded', (s) => s.replace("run.on('cry', (ev) => { A.cries++; if (!A.mute && hooks.onCry && ev) hooks.onCry(ev.species, ev.pan); });", "run.on('cry', () => { A.cries++; });")],
     ['scene.js', 'SYSTEM: the intro is never bundled (the old lead steps play)', (s) => s.replace('&& !P[viewSide].shown && sysOn(SYS.introTrainer)) {', '&& !P[viewSide].shown && false) {')],
     ['scene.js', 'SYSTEM: the scene never presses A for the run (it waits for ever at its first message)', (s) => s.replace('st.shown = tw.lines(); st.tw = null; r.setKeys(KEY_A); st.keyLeft = 3;', 'st.shown = tw.lines(); st.tw = null;')],
+    ['scene.js', 'SYSTEM/opening A: the A for the first message of the opening is offered once only (lost while the ROM prints: the opening stands still until SYS_MAX)', (s) => s.replace('      else if (st.ackA && st.keyLeft === 0) introRetryA(st, r);' + String.fromCharCode(10), '')],
+    ['scene.js', 'SYSTEM/opening A: the A is offered again for every message, {FB} or not, and whether or not the ROM took it', (s) => s.replace('if (st.msgQ.length || r.done || r.ready || r.textActive !== true) { st.ackA = false; return; }', 'if (st.msgQ.length || r.done || r.ready) { st.ackA = false; return; }').replace('st.ackA = st.fb; st.ackGap = 0;', 'st.ackA = true; st.ackGap = 0;')],
     ['scene.js', 'SYSTEM: events are never started (hits / faints / send-outs / recalls stay the old steps)', (s) => s.replace('if (st.noSys || !sysOn(id)) { dropPrep(P); return false; }', 'if (true) { dropPrep(P); return false; }')],
     ['scene.js', 'SYSTEM: nothing is prepared ahead (every event run is prepared on the tick its step begins)', (s) => s.replace('nx.prep = sysOn(id) ? makeSysRun(nx, kind, id, proj) : null;', 'nx.prep = null;')],
     ['scene.js', 'SYSTEM: the experience of the level is not given (the trainer foe shows the wrong level)', (s) => s.replace('const pspec = (m, o) => partySpec(m, o, expOf);', 'const pspec = (m, o) => partySpec(m, o);')],

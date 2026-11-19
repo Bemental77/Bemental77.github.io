@@ -1471,3 +1471,34 @@ node tools/pokemonarena_online_page_test.mjs tokens --mutants             # 39 p
 ```
 
 FOREIGN hunks of this fix: `js/scene.js` (the row, 4 lines), `tools/pokemonarena_tower_test.mjs` Q34 and `tools/pokemonarena_tower_page_test.mjs` (one line each: they named `#openBtn`).
+
+### The opening's A (2026-11-18)
+
+**Reported by three test runs, never deterministic:** a CPU battle stood still on "CPU Easy would like to battle!" (step `sysintro`, mode `steps`) and no button moved it; a rerun passed. It was a real
+defect of the game, not of the drivers: a player who presses or holds A (or B) while the opening's first message is typed hits it.
+
+**The cause** (measured on the real run, `battle_sys.js` SystemRun, trainer intro id 1): the ROM prints the first message ("... would like to battle!{FB}", the only `{FB}` of the opening) for about
+38 frames and IGNORES an A that arrives meanwhile; only then does it wait at the `{FB}` for a NEW press. An A 36..72 frames into the run (the message comes at frame 35) was lost, one at 74 or later taken.
+The scene typed its own copy of the message and sent the ROM ONE A (3 frames) when that copy had been read: `MSG_HOLD` (36) frames after typing it, which is after the ROM's wait has begun. A held A or
+B types the copy faster and cuts the hold to 6 frames, so the A landed at frame ~70, inside the print, and was lost; nothing pressed A again, and the run sat at its `{FB}` until `SYS_MAX` (3000 frames,
+~50 s) cut it, while the player's buttons reach the scene and never the run.
+
+**The fix** (`js/scene.js` `introRetryA`, `js/battle_sys.js` `SystemRun.textActive`): the A of a `{FB}` message is offered again, `A_GAP` (4) frames after each release, while the ROM's text printer is
+still up (`textActive`: gTextPrinters' head is set) and no newer message has come. The first offer is unchanged, so an opening whose first A is taken plays the same frames as before (the anim-scene
+goldens are unchanged); a run without `textActive` is never pressed again. `animInfo().aRetry` counts the extra offers.
+
+**Checks** (`tools/pokemonarena_anim_scene_test.mjs`): core `system: the opening A: a player holding A through the opening does not stall it ...` and `... without a held button the first A is taken and
+never offered again` (the stub intro prints for 38 steps as the ROM does: `printFrames`), killing the mutants `SYSTEM/opening A: the A for the first message of the opening is offered once only` and
+`SYSTEM/opening A: the A is offered again for every message ...`; on the real ROM, `4. opening A (ROM): an A 5 frames into the first message is ignored ..., one 60 frames in is taken` and
+`4. opening A (ROM): A held through the opening reaches the action menu ...`.
+
+**Reproduction** (scratch probe, battle.html alone, desktop 1280x800, keys: the team picked, then A every ~70 ms until the action menu, 40 s limit): before the fix 6 of 20 battles (seeds 1000-1019)
+stood on the first message with the scene's A released (`hold` 6 or 8 = the held-button path, `keyLeft` 0, the run not ready); after it 0 of 40 (seeds 1000-1039, the six that stalled included).
+In Node with the real ROM, A held through the opening: before, every seed ran to the 3000-frame cut; after, the action menu in 431-507 ticks (untouched: 457-527).
+
+**Not explained:** one phone run of `pokemonarena_journey_test.mjs` after the fix still stopped with "battle bot made no progress for 600 inputs in mode steps"; two more full runs (105 passed each) and four
+phone-only runs, and ten whole phone battles of the scratch probe (worst wait of the bot 253 inputs), did not repeat it. The bot now prints the scene's state when it gives up, so the next one says where.
+
+```bash
+node tools/pokemonarena_anim_scene_test.mjs     # 133 passed, 72/72 mutants killed (two new: SYSTEM/opening A)
+```

@@ -140,7 +140,8 @@ async function playBattle(page, vp, label, { forfeit = false, maxMs = 420000 } =
     else await press(page, vp, 'a');                                                     // typed text: A skips ahead
     n++;
     await sleep(vp.touch ? 40 : 30);
-    if (same > 600) throw new Error('battle bot made no progress for 600 inputs in mode ' + s.mode);
+    // a stall prints the scene's state whole (the failure line is cut at 300 characters), so one that does not come back on a rerun is still diagnosable (INAPP.md "The opening's A")
+    if (same > 600) { const d = await page.eval("(() => { const a = window.__arenaBattle, S = a.scene.S, c = S.cur, r = c && c.run; const flat = (o) => { if (!o) return null; const x = {}; for (const k of Object.keys(o)) { const v = o[k]; if (v === null || ['number', 'string', 'boolean'].includes(typeof v)) x[k] = v; } return x; }; return { mode: S.mode, tick: S.tick, cur: flat(c), tw: c && c.tw ? { done: c.tw.done, waiting: c.tw.waiting, lines: c.tw.lines() } : null, run: r ? { frame: r.frame, done: r.done, ready: r.ready, textActive: r.textActive } : null, P: c && c.P ? flat(c.P) : null, q: S.queue.slice(0, 12).map((x) => x.t + (x.kind ? ':' + x.kind : '')), held: S.held, hidden: document.hidden, paused: !!a.paused, controlsOpen: !!a.controlsOpen, anim: a.animInfo(), text: a.getState().text, turn: a.ctl.turn, winner: a.ctl.winner, ask: a.ask ? a.ask.state() : null }; })()").catch((e) => String(e)); console.log('  ' + label + ' STALLED, the scene: ' + JSON.stringify(d)); throw new Error('battle bot made no progress for 600 inputs in mode ' + s.mode + ' (the scene is printed above)'); }
   }
 }
 

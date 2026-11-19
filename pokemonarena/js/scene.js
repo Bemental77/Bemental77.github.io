@@ -844,7 +844,7 @@ export function createScene(opts) {
 
   /* ---- AN1 round 3: the battle's SYSTEM animations (animator.start('system', id, ctx); anim_sys.js, ANIM.md "Round 3") ---- */
   const sysOn = (id) => !!animCfg() && sysPlayable(animator, id);
-  const SYS_MAX = 3000, KEY_A = 1;
+  const SYS_MAX = 3000, KEY_A = 1, A_GAP = 4;            // A_GAP: frames with A released before the opening's A is offered again (introRetryA)
   const expOf = (sp, lv) => { const g = pack.species[sp] && pack.species[sp].growthRate, row = pack.exp && pack.exp[g]; return row && row[lv] !== undefined ? row[lv] : 0; };
   const pspec = (m, o) => partySpec(m, o, expOf);
   // round 4: the foe trainer's ROM picture follows the CPU level (opts.cpuLevel, opts.trainerChoices from anim_sys.js trainerChoices(rom)) and is the same for the whole battle; the player's back sprite follows opts.playerGender
@@ -1020,7 +1020,7 @@ export function createScene(opts) {
   }
   // the battle's opening: one run; the scene's own messages are typed over it (the run draws without BG0), one per ROM message, and A is pressed for the ROM when each is read
   function startSysIntro(st) {
-    st.n = 0; st.msg = 0; st.tw = null; st.hold = 0; st.waitN = 0; st.shown = null; st.keyLeft = 0; st.msgQ = []; st.kind = 'system'; st.id = SYS.introTrainer; st.run = null; st.P = null;
+    st.n = 0; st.msg = 0; st.tw = null; st.hold = 0; st.waitN = 0; st.shown = null; st.keyLeft = 0; st.msgQ = []; st.fb = false; st.ackA = false; st.ackGap = 0; st.kind = 'system'; st.id = SYS.introTrainer; st.run = null; st.P = null;
     if (sysOn(SYS.introTrainer)) {
       const ctx = Object.assign({ foe: pspec(st.foe), player: pspec(st.player), environment: opts.env | 0, keys: null, seed: animMix(A.seed, ++A.n), maxFrames: SYS_MAX }, trainerId() > 1 ? { trainer: trainerId() } : {}, opts.playerGender === 'F' || opts.playerGender === 'M' ? { gender: opts.playerGender } : {}, opts.sysClock ? { clock: opts.sysClock } : {});
       st.P = newPrep(SYS.introTrainer, ctx, false);
@@ -1055,8 +1055,10 @@ export function createScene(opts) {
     if (firstOfTick) {                                                               // text and keys advance once per frame; the ROM may step several times (BATTLE SPEED)
       st.tickId = S.tick;
       if (st.keyLeft > 0 && --st.keyLeft === 0) r.setKeys(0);
+      else if (st.ackA && st.keyLeft === 0) introRetryA(st, r);
       if (!st.tw && st.msgQ.length) {
-        st.msgQ.shift();
+        const m = st.msgQ.shift();
+        st.fb = !!(m && typeof m.text === 'string' && m.text.includes('{FB}')); st.ackA = false;         // the ROM holds THIS message at its {FB} until it takes an A
         const text = st.texts[st.msg++];
         st.tw = createTypewriter({ text: safeMsg(text), measure: (x) => ui.measure('normal', x), maxWidth: R.msg.w - 4, delay });
         st.hold = 0; st.waitN = 0; st.shown = null;
@@ -1065,13 +1067,25 @@ export function createScene(opts) {
         const tw = st.tw, fast = S.held.a || S.held.b;
         if (!tw.done && !tw.waiting) tw.tick(fast);
         else if (tw.waiting) { if (++st.waitN >= PAGE_AUTO || fast) { tw.next(); st.waitN = 0; } }
-        else if (++st.hold >= MSG_HOLD || (fast && st.hold >= 6)) { st.shown = tw.lines(); st.tw = null; r.setKeys(KEY_A); st.keyLeft = 3; }       // read: A for the ROM's wait
+        else if (++st.hold >= MSG_HOLD || (fast && st.hold >= 6)) { st.shown = tw.lines(); st.tw = null; r.setKeys(KEY_A); st.keyLeft = 3; st.ackA = st.fb; st.ackGap = 0; }       // read: A for the ROM's wait (offered again until the ROM takes it: introRetryA)
       }
     }
     try { r.step(); } catch (e) { A.log.push('system intro step() threw: ' + String(e && e.message ? e.message : e).slice(0, 80)); finishSysIntro(st); return true; }
     st.n++;
     if (r.ready || r.done || st.n >= SYS_MAX) { if (!(r.ready || r.done)) A.log.push('cut system intro after ' + st.n + ' frames'); finishSysIntro(st); return true; }
     return false;
+  }
+  // THE OPENING THAT STOOD STILL ON "<trainer> would like to battle!" FOR 50 SECONDS (reproduced in the page: 6 of 20 battles whose player pressed A through the opening; INAPP.md "The opening's A").
+  // The ROM prints that message for ~38 frames and IGNORES A while it prints; only then does it wait at the message's {FB} for a NEW press (measured on the real run: an A at frame 36..72 after the
+  // battle's start is lost, from 74 on it is taken; the message comes at 35). The scene sends that A once, when its OWN copy of the message has been read: MSG_HOLD (36) frames after typing it, which is
+  // after the ROM's wait has begun, but a player holding A or B types the copy faster and cuts the hold to 6 frames, and that A then landed while the ROM was still printing. It was lost, and nothing
+  // pressed A again: the run sat at its {FB} until SYS_MAX cut it, with no button of the player able to help (the run hears only the scene's keys).
+  // So the A of a {FB} message is offered AGAIN, A_GAP frames after each release, while the ROM's text printer is still up (run.textActive, battle_sys.js) and no newer message has come. The first offer is
+  // unchanged, so a battle whose first A is taken plays the same frames as before; a run that cannot say (no textActive) is never pressed again.
+  function introRetryA(st, r) {
+    if (st.msgQ.length || r.done || r.ready || r.textActive !== true) { st.ackA = false; return; }
+    if (++st.ackGap < A_GAP) return;
+    r.setKeys(KEY_A); st.keyLeft = 3; st.ackGap = 0; A.aRetry = (A.aRetry | 0) + 1;
   }
   function finishSysIntro(st) {
     const r = st.run;
@@ -1879,7 +1893,7 @@ export function createScene(opts) {
     setAnimator: (a) => { animator = a || null; },
     // AN1: what the animation layer did this battle (the page's diagnostics and the tests): how many animations the animator played, what it said about each
     // (exact | approx | fallback | none, by "kind:id"), sounds forwarded, presses that skipped, the front-picture swaps in flight, and the problems it logged
-    animInfo: () => ({ active: !!animCfg(), animator: !!animator, played: A.played, sounds: A.sounds, cries: A.cries, sys: A.sysPlayed, waited: A.waited, restale: A.restale | 0, shed: A.shed | 0, skipped: A.skipped, coverage: Object.assign({}, A.coverage), byId: Object.assign({}, A.byId), running: A.step ? { kind: A.step.kind, id: A.step.id, n: A.step.n } : null, mon: A.mon.map((m) => (m ? { t: m.t, len: m.len } : null)), log: A.log.slice(), notes: A.notes.slice() }),
+    animInfo: () => ({ active: !!animCfg(), animator: !!animator, played: A.played, sounds: A.sounds, cries: A.cries, sys: A.sysPlayed, waited: A.waited, aRetry: A.aRetry | 0, restale: A.restale | 0, shed: A.shed | 0, skipped: A.skipped, coverage: Object.assign({}, A.coverage), byId: Object.assign({}, A.byId), running: A.step ? { kind: A.step.kind, id: A.step.id, n: A.step.n } : null, mon: A.mon.map((m) => (m ? { t: m.t, len: m.len } : null)), log: A.log.slice(), notes: A.notes.slice() }),
     choose: { move: chooseMove, party: chooseParty, result: chooseResult, action: actionActivate, preview: previewToggle },
     // ST1: the recap. setCareer({ state: 'saved' | 'duplicate' | 'none' | 'error', profileName, callouts, stats, note, note2 }) tells the RECORD page what was written (the page calls it when the store has answered)
     setCareer(info) { S.career = info && typeof info === 'object' ? { ...info } : null; S.careerVer++; },

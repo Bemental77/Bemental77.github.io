@@ -638,6 +638,9 @@ export class SystemRun {
 
   /** Hold these keys (a KEY mask) on top of the key policy until changed. (A prepared intro has run its first iteration already: the mask applies from the second.) */
   setKeys(mask) { this.manualKeys = mask >>> 0; }
+  /** The game has a text printer up (gTextPrinters' head is set): it is printing a message, or holding one at its {FB} wait for a NEW A press. False once the run is done or its engine was
+   *  taken back. The scene offers the opening's A again while this is true (scene.js introRetryA): the ROM ignores an A that arrives while the message is still being printed. */
+  get textActive() { return !this.done && !this.reclaimed && !!this.eng && this.eng.mem.read32(SYS.textPrinterHead) !== 0; }
 
   battlerState(side) {
     if (this.frozen) return this.frozen.battlers[side === 'player' || side === 0 ? 0 : 1];
